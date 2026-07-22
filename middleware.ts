@@ -58,7 +58,18 @@ export async function middleware(request: NextRequest) {
     return new NextResponse('Too many requests', { status: 429 });
   }
 
-  const publicPaths = ['/api/auth/login', '/api/auth/signup', '/api/auth/signup-otp/request', '/api/auth/login-otp/request', '/api/auth/login-otp/verify', '/api/auth/magic-link/request', '/api/auth/magic-link/verify', '/api/auth/verify-2fa', '/api/auth/recovery-2fa', '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback', '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm', '/api/public/', '/api/newsletter/'];
+  const publicPaths = [
+    '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
+    '/api/auth/signup-otp/request', '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
+    '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
+    '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
+    '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback',
+    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
+    '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
+    '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
+    '/api/admin/login', '/api/admin/seed', '/api/admin/check-setup',
+    '/api/public/', '/api/newsletter/',
+  ];
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) && !publicPaths.some(p => pathname.startsWith(p))) {
     const cookie = request.cookies.get('__session')?.value;
     if (!cookie) {

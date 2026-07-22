@@ -311,407 +311,463 @@ export async function logoutHandler(request: NextRequest) {
 
 // Email OTP - request
 export async function requestEmailOtpHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user || !user.email) return new NextResponse('User email missing', { status: 400 });
-  const code = generateOtpCode();
-  await storeOtp(session.userId, 'email', code);
-  await sendEmailOtp(user.email, code);
-  return new NextResponse('OTP sent to email', { status: 200 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user || !user.email) return new NextResponse('User email missing', { status: 400 });
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'email', code);
+    await sendEmailOtp(user.email, code);
+    return new NextResponse('OTP sent to email', { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL OTP REQUEST]', err?.message || err);
+    return new NextResponse('Failed to send OTP', { status: 500 });
+  }
 }
 
 // Email OTP - verify
 export async function verifyEmailOtpHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-  const { code } = await request.json();
-  if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
-  const ok = await verifyOtpCode(session.userId, 'email', code);
-  if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
-  // Mark email as verified – for simplicity we set secondaryEmail to email if not set
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { secondaryEmail: undefined }, // placeholder – real verification flag could be added later
-  });
-  return new NextResponse('Email OTP verified', { status: 200 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const { code } = await request.json();
+    if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
+    const ok = await verifyOtpCode(session.userId, 'email', code);
+    if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { secondaryEmail: undefined },
+    });
+    return new NextResponse('Email OTP verified', { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL OTP VERIFY]', err?.message || err);
+    return new NextResponse('OTP verification failed', { status: 500 });
+  }
 }
 
 // Phone OTP - request
 export async function requestPhoneOtpHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user || !user.phoneNumber) return new NextResponse('User phone missing', { status: 400 });
-  const code = generateOtpCode();
-  await storeOtp(session.userId, 'phone', code);
-  await sendPhoneOtp(user.phoneNumber, code);
-  return new NextResponse('OTP sent to phone', { status: 200 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user || !user.phoneNumber) return new NextResponse('User phone missing', { status: 400 });
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'phone', code);
+    await sendPhoneOtp(user.phoneNumber, code);
+    return new NextResponse('OTP sent to phone', { status: 200 });
+  } catch (err: any) {
+    console.error('[PHONE OTP REQUEST]', err?.message || err);
+    return new NextResponse('Failed to send OTP', { status: 500 });
+  }
 }
 
 // Phone OTP - verify
 export async function verifyPhoneOtpHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-  const { code } = await request.json();
-  if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
-  const ok = await verifyOtpCode(session.userId, 'phone', code);
-  if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
-  // In a real system, mark phone as verified; placeholder no-op.
-  return new NextResponse('Phone OTP verified', { status: 200 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const { code } = await request.json();
+    if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
+    const ok = await verifyOtpCode(session.userId, 'phone', code);
+    if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
+    return new NextResponse('Phone OTP verified', { status: 200 });
+  } catch (err: any) {
+    console.error('[PHONE OTP VERIFY]', err?.message || err);
+    return new NextResponse('OTP verification failed', { status: 500 });
+  }
 }
 
 // Google OAuth - start flow
 export async function googleAuthRedirectHandler(request: NextRequest) {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  if (!clientId || !redirectUri) {
-    return new NextResponse('Google OAuth not configured', { status: 500 });
+  try {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+    if (!clientId || !redirectUri) {
+      return new NextResponse('Google OAuth not configured', { status: 500 });
+    }
+    const sp = request.nextUrl.searchParams;
+    const redirectTo = sp.get('redirect');
+    const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const nonce = crypto.randomUUID();
+    const stateToken = await signOauthStateToken(nonce, safeRedirect);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'openid email profile',
+      access_type: 'offline',
+      prompt: 'consent',
+      state: stateToken,
+    });
+    const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+    const res = NextResponse.redirect(googleAuthUrl);
+    setOauthStateCookie(res, nonce);
+    return res;
+  } catch (err: any) {
+    console.error('[GOOGLE AUTH]', err?.message || err);
+    return new NextResponse('Failed to initiate Google auth', { status: 500 });
   }
-  const sp = request.nextUrl.searchParams;
-  const redirectTo = sp.get('redirect');
-  const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
-  const nonce = crypto.randomUUID();
-  const stateToken = await signOauthStateToken(nonce, safeRedirect);
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: 'code',
-    scope: 'openid email profile',
-    access_type: 'offline',
-    prompt: 'consent',
-    state: stateToken,
-  });
-  const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-  const res = NextResponse.redirect(googleAuthUrl);
-  setOauthStateCookie(res, nonce);
-  return res;
 }
 
 // Google OAuth callback handler
 export async function googleAuthCallbackHandler(request: NextRequest) {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
-  if (!clientId || !clientSecret || !redirectUri) {
-    return new NextResponse('Google OAuth not configured', { status: 500 });
-  }
-  const code = request.nextUrl.searchParams.get('code');
-  const stateParam = request.nextUrl.searchParams.get('state');
-  const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-  const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
-  if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-    return new NextResponse('Invalid OAuth state', { status: 400 });
-  }
-  const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
-  if (!code) {
-    return new NextResponse('Missing code', { status: 400 });
-  }
+  try {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+    if (!clientId || !clientSecret || !redirectUri) {
+      return new NextResponse('Google OAuth not configured', { status: 500 });
+    }
+    const code = request.nextUrl.searchParams.get('code');
+    const stateParam = request.nextUrl.searchParams.get('state');
+    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      return new NextResponse('Invalid OAuth state', { status: 400 });
+    }
+    const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
+    if (!code) {
+      return new NextResponse('Missing code', { status: 400 });
+    }
 
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      code,
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uri: redirectUri,
-      grant_type: 'authorization_code',
-    }).toString(),
-  });
-  if (!tokenRes.ok) {
-    return new NextResponse('Failed to exchange token', { status: 500 });
-  }
-  const tokenData = await tokenRes.json();
-  const accessToken = tokenData.access_token;
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }).toString(),
+    });
+    if (!tokenRes.ok) {
+      return new NextResponse('Failed to exchange token', { status: 500 });
+    }
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
 
-  const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!userInfoRes.ok) {
-    return new NextResponse('Failed to fetch user info', { status: 500 });
-  }
-  const profile = await userInfoRes.json();
-  const googleId = profile.id as string;
-  const email = profile.email as string;
-  const name = profile.name as string;
-  const photoUrl = profile.picture as string | undefined;
+    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!userInfoRes.ok) {
+      return new NextResponse('Failed to fetch user info', { status: 500 });
+    }
+    const profile = await userInfoRes.json();
+    const googleId = profile.id as string;
+    const email = profile.email as string;
+    const name = profile.name as string;
+    const photoUrl = profile.picture as string | undefined;
 
-  // Find or create user
-  let user = await prisma.user.findUnique({ where: { googleId } });
-  if (!user) {
-    user = await prisma.user.findUnique({ where: { email } });
-    if (user) {
-      // link googleId + update profile from OAuth
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { googleId, photoUrl: user.photoUrl || photoUrl || undefined },
-      });
+    let user = await prisma.user.findUnique({ where: { googleId } });
+    if (!user) {
+      user = await prisma.user.findUnique({ where: { email } });
+      if (user) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { googleId, photoUrl: user.photoUrl || photoUrl || undefined },
+        });
+      } else {
+        user = await prisma.user.create({
+          data: {
+            email, name, googleId, photoUrl: photoUrl || undefined,
+          },
+        });
+        await prisma.auditEvent.create({
+          data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'google', email } },
+        });
+      }
     } else {
-      // create new user (no password needed for OAuth)
-      user = await prisma.user.create({
-        data: {
-          email, name, googleId, photoUrl: photoUrl || undefined,
-        },
-      });
-      // Log the new OAuth user creation
-      await prisma.auditEvent.create({
-        data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'google', email } },
-      });
+      if (!user.photoUrl && photoUrl) {
+        await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
+      }
     }
-  } else {
-    // Existing OAuth user — refresh photo if not set
-    if (!user.photoUrl && photoUrl) {
-      await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
-    }
+
+    await prisma.integration.upsert({
+      where: { userId_provider: { userId: user.id, provider: 'google' } },
+      update: { connected: true, metadata: { googleId, email } },
+      create: { userId: user.id, provider: 'google', connected: true, metadata: { googleId, email } },
+    });
+
+    const ip = request.headers.get('x-forwarded-for') || '';
+    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
+    setSessionCookie(res, token);
+    clearOauthStateCookie(res);
+    return res;
+  } catch (err: any) {
+    console.error('[GOOGLE CALLBACK]', err?.message || err);
+    return new NextResponse('Google OAuth callback failed', { status: 500 });
   }
-
-  // Create Integration record
-  await prisma.integration.upsert({
-    where: { userId_provider: { userId: user.id, provider: 'google' } },
-    update: { connected: true, metadata: { googleId, email } },
-    create: { userId: user.id, provider: 'google', connected: true, metadata: { googleId, email } },
-  });
-
-  // Create session
-  const ip = request.headers.get('x-forwarded-for') || '';
-  const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-  const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
-  setSessionCookie(res, token);
-  clearOauthStateCookie(res);
-  return res;
 }
 
 // GitHub OAuth - start flow
 export async function githubAuthRedirectHandler(request: NextRequest) {
-  const clientId = process.env.GITHUB_CLIENT_ID;
-  const redirectUri = process.env.GITHUB_REDIRECT_URI;
-  if (!clientId || !redirectUri) {
-    return new NextResponse('GitHub OAuth not configured', { status: 500 });
+  try {
+    const clientId = process.env.GITHUB_CLIENT_ID;
+    const redirectUri = process.env.GITHUB_REDIRECT_URI;
+    if (!clientId || !redirectUri) {
+      return new NextResponse('GitHub OAuth not configured', { status: 500 });
+    }
+    const sp = request.nextUrl.searchParams;
+    const redirectTo = sp.get('redirect');
+    const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const nonce = crypto.randomUUID();
+    const stateToken = await signOauthStateToken(nonce, safeRedirect);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      scope: 'read:user user:email',
+      state: stateToken,
+    });
+    const githubAuthUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+    const res = NextResponse.redirect(githubAuthUrl);
+    setOauthStateCookie(res, nonce);
+    return res;
+  } catch (err: any) {
+    console.error('[GITHUB AUTH]', err?.message || err);
+    return new NextResponse('Failed to initiate GitHub auth', { status: 500 });
   }
-  const sp = request.nextUrl.searchParams;
-  const redirectTo = sp.get('redirect');
-  const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
-  const nonce = crypto.randomUUID();
-  const stateToken = await signOauthStateToken(nonce, safeRedirect);
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'read:user user:email',
-    state: stateToken,
-  });
-  const githubAuthUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
-  const res = NextResponse.redirect(githubAuthUrl);
-  setOauthStateCookie(res, nonce);
-  return res;
 }
 
 // GitHub OAuth callback handler
 export async function githubAuthCallbackHandler(request: NextRequest) {
-  const clientId = process.env.GITHUB_CLIENT_ID;
-  const clientSecret = process.env.GITHUB_CLIENT_SECRET;
-  const redirectUri = process.env.GITHUB_REDIRECT_URI;
-  if (!clientId || !clientSecret || !redirectUri) {
-    return new NextResponse('GitHub OAuth not configured', { status: 500 });
-  }
-  const code = request.nextUrl.searchParams.get('code');
-  const stateParam = request.nextUrl.searchParams.get('state');
-  const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-  const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
-  if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-    return new NextResponse('Invalid OAuth state', { status: 400 });
-  }
-  if (!code) {
-    return new NextResponse('Missing code', { status: 400 });
-  }
+  try {
+    const clientId = process.env.GITHUB_CLIENT_ID;
+    const clientSecret = process.env.GITHUB_CLIENT_SECRET;
+    const redirectUri = process.env.GITHUB_REDIRECT_URI;
+    if (!clientId || !clientSecret || !redirectUri) {
+      return new NextResponse('GitHub OAuth not configured', { status: 500 });
+    }
+    const code = request.nextUrl.searchParams.get('code');
+    const stateParam = request.nextUrl.searchParams.get('state');
+    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      return new NextResponse('Invalid OAuth state', { status: 400 });
+    }
+    if (!code) {
+      return new NextResponse('Missing code', { status: 400 });
+    }
 
-  const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
-  });
-  if (!tokenRes.ok) {
-    return new NextResponse('Failed to exchange token', { status: 500 });
-  }
-  const tokenData = await tokenRes.json();
-  const accessToken = tokenData.access_token;
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
+    });
+    if (!tokenRes.ok) {
+      return new NextResponse('Failed to exchange token', { status: 500 });
+    }
+    const tokenData = await tokenRes.json();
+    const accessToken = tokenData.access_token;
 
-  const userInfoRes = await fetch('https://api.github.com/user', {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!userInfoRes.ok) {
-    return new NextResponse('Failed to fetch user info', { status: 500 });
-  }
-  const profile = await userInfoRes.json();
-  const githubId = String(profile.id);
-  let email = profile.email;
-  const name = profile.name || profile.login;
-  const photoUrl = profile.avatar_url as string | undefined;
-
-  if (!email) {
-    const emailsRes = await fetch('https://api.github.com/user/emails', {
+    const userInfoRes = await fetch('https://api.github.com/user', {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (emailsRes.ok) {
-      const emails = await emailsRes.json();
-      const primary = emails.find((e: any) => e.primary) || emails[0];
-      if (primary) email = primary.email;
+    if (!userInfoRes.ok) {
+      return new NextResponse('Failed to fetch user info', { status: 500 });
     }
-  }
+    const profile = await userInfoRes.json();
+    const githubId = String(profile.id);
+    let email = profile.email;
+    const name = profile.name || profile.login;
+    const photoUrl = profile.avatar_url as string | undefined;
 
-  let user = await prisma.user.findUnique({ where: { githubId } });
-  if (!user && email) {
-    user = await prisma.user.findUnique({ where: { email } });
-    if (user) {
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { githubId, photoUrl: user.photoUrl || photoUrl || undefined },
+    if (!email) {
+      const emailsRes = await fetch('https://api.github.com/user/emails', {
+        headers: { Authorization: `Bearer ${accessToken}` },
       });
+      if (emailsRes.ok) {
+        const emails = await emailsRes.json();
+        const primary = emails.find((e: any) => e.primary) || emails[0];
+        if (primary) email = primary.email;
+      }
+    }
+
+    let user = await prisma.user.findUnique({ where: { githubId } });
+    if (!user && email) {
+      user = await prisma.user.findUnique({ where: { email } });
+      if (user) {
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { githubId, photoUrl: user.photoUrl || photoUrl || undefined },
+        });
+      } else {
+        user = await prisma.user.create({
+          data: {
+            email: email || `${githubId}@github.user`, name, githubId,
+            photoUrl: photoUrl || undefined,
+          },
+        });
+        await prisma.auditEvent.create({
+          data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'github', email } },
+        });
+      }
+    } else if (user) {
+      if (!user.photoUrl && photoUrl) {
+        await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
+      }
     } else {
-      user = await prisma.user.create({
-        data: {
-          email: email || `${githubId}@github.user`, name, githubId,
-          photoUrl: photoUrl || undefined,
-        },
-      });
-      await prisma.auditEvent.create({
-        data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'github', email } },
-      });
+      return new NextResponse('GitHub email not available', { status: 400 });
     }
-  } else if (user) {
-    // Existing OAuth user — refresh photo if not set
-    if (!user.photoUrl && photoUrl) {
-      await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
-    }
-  } else {
-    return new NextResponse('GitHub email not available', { status: 400 });
+
+    await prisma.integration.upsert({
+      where: { userId_provider: { userId: user.id, provider: 'github' } },
+      update: { connected: true, metadata: { githubId, email } },
+      create: { userId: user.id, provider: 'github', connected: true, metadata: { githubId, email } },
+    });
+
+    const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
+    const ip = request.headers.get('x-forwarded-for') || '';
+    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
+    setSessionCookie(res, token);
+    clearOauthStateCookie(res);
+    return res;
+  } catch (err: any) {
+    console.error('[GITHUB CALLBACK]', err?.message || err);
+    return new NextResponse('GitHub OAuth callback failed', { status: 500 });
   }
-
-  // Create Integration record
-  await prisma.integration.upsert({
-    where: { userId_provider: { userId: user.id, provider: 'github' } },
-    update: { connected: true, metadata: { githubId, email } },
-    create: { userId: user.id, provider: 'github', connected: true, metadata: { githubId, email } },
-  });
-
-  const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
-  const ip = request.headers.get('x-forwarded-for') || '';
-  const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-  const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
-  setSessionCookie(res, token);
-  clearOauthStateCookie(res);
-  return res;
 }
 
 // Activity feed
 export async function activityHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
 
-  const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 20, 100);
-  const logs = await prisma.log.findMany({
-    where: { userId: session.userId },
-    orderBy: { createdAt: 'desc' },
-    take: limit,
-  });
+    const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 20, 100);
+    const logs = await prisma.log.findMany({
+      where: { userId: session.userId },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    });
 
-  return NextResponse.json(logs);
+    return NextResponse.json(logs);
+  } catch (err: any) {
+    console.error('[ACTIVITY]', err?.message || err);
+    return new NextResponse('Failed to fetch activity', { status: 500 });
+  }
 }
 
 // Workspace list
 export async function listWorkspacesHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
 
-  const workspaces = await prisma.workspace.findMany({
-    where: {
-      OR: [
-        { ownerId: session.userId },
-        { memberships: { some: { userId: session.userId } } },
-      ],
-    },
-    select: {
-      id: true,
-      name: true,
-      slug: true,
-      createdAt: true,
-      owner: { select: { id: true, email: true, name: true } },
-      _count: { select: { memberships: true } },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
+    const workspaces = await prisma.workspace.findMany({
+      where: {
+        OR: [
+          { ownerId: session.userId },
+          { memberships: { some: { userId: session.userId } } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        createdAt: true,
+        owner: { select: { id: true, email: true, name: true } },
+        _count: { select: { memberships: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
-  return NextResponse.json(workspaces);
+    return NextResponse.json(workspaces);
+  } catch (err: any) {
+    console.error('[LIST WORKSPACES]', err?.message || err);
+    return new NextResponse('Failed to fetch workspaces', { status: 500 });
+  }
 }
 
 // Workspace create
 export async function createWorkspaceHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
 
-  const body = await request.json();
-  const { name, slug } = body;
-  if (!name || !slug) return new NextResponse('name and slug required', { status: 400 });
+    const body = await request.json();
+    const { name, slug } = body;
+    if (!name || !slug) return new NextResponse('name and slug required', { status: 400 });
 
-  const existing = await prisma.workspace.findUnique({ where: { slug } });
-  if (existing) return new NextResponse('Slug already taken', { status: 409 });
+    const existing = await prisma.workspace.findUnique({ where: { slug } });
+    if (existing) return new NextResponse('Slug already taken', { status: 409 });
 
-  const workspace = await prisma.workspace.create({
-    data: { name, slug, ownerId: session.userId },
-  });
+    const workspace = await prisma.workspace.create({
+      data: { name, slug, ownerId: session.userId },
+    });
 
-  // Make owner an admin member
-  await prisma.membership.create({
-    data: { userId: session.userId, workspaceId: workspace.id, role: 'ADMIN' },
-  });
+    await prisma.membership.create({
+      data: { userId: session.userId, workspaceId: workspace.id, role: 'ADMIN' },
+    });
 
-  return NextResponse.json(workspace, { status: 201 });
+    return NextResponse.json(workspace, { status: 201 });
+  } catch (err: any) {
+    console.error('[CREATE WORKSPACE]', err?.message || err);
+    return new NextResponse('Failed to create workspace', { status: 500 });
+  }
 }
 
 export async function profileHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) {
-    return new NextResponse('Unauthenticated', { status: 401 });
-  }
-
-  if (request.method === 'GET') {
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        photoUrl: true,
-        secondaryEmail: true,
-        phoneNumber: true,
-        occupation: true,
-      },
-    });
-    if (!user) return new NextResponse('User not found', { status: 404 });
-    return NextResponse.json(user);
-  }
-
-  if (request.method === 'PATCH') {
-    const body = await request.json();
-    const schema = z.object({
-      name: z.string().min(1).optional(),
-      photoUrl: z.string().optional().nullable(),
-      secondaryEmail: z.string().email().optional(),
-      phoneNumber: z.string().optional(),
-      occupation: z.string().optional(),
-    });
-    const parsed = schema.safeParse(body);
-    if (!parsed.success) {
-      return new NextResponse('Invalid payload', { status: 400 });
+  try {
+    const session = await getSession(request);
+    if (!session) {
+      return new NextResponse('Unauthenticated', { status: 401 });
     }
-    const updated = await prisma.user.update({
-      where: { id: session.userId },
-      data: parsed.data,
-    });
-    return NextResponse.json(updated);
-  }
 
-  return new NextResponse('Method not allowed', { status: 405 });
+    if (request.method === 'GET') {
+      const user = await prisma.user.findUnique({
+        where: { id: session.userId },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          photoUrl: true,
+          secondaryEmail: true,
+          phoneNumber: true,
+          occupation: true,
+          gender: true,
+          birthday: true,
+        },
+      });
+      if (!user) return new NextResponse('User not found', { status: 404 });
+      return NextResponse.json(user);
+    }
+
+    if (request.method === 'PATCH') {
+      const body = await request.json();
+      const schema = z.object({
+        name: z.string().min(1).optional(),
+        photoUrl: z.string().optional().nullable(),
+        secondaryEmail: z.string().email().optional(),
+        phoneNumber: z.string().optional(),
+        occupation: z.string().optional(),
+        gender: z.string().optional(),
+        birthday: z.string().optional().nullable(),
+      });
+      const parsed = schema.safeParse(body);
+      if (!parsed.success) {
+        return new NextResponse('Invalid payload', { status: 400 });
+      }
+      const data: any = { ...parsed.data };
+      if (data.birthday && typeof data.birthday === 'string') {
+        data.birthday = new Date(data.birthday);
+      }
+      const updated = await prisma.user.update({
+        where: { id: session.userId },
+        data,
+      });
+      return NextResponse.json(updated);
+    }
+
+    return new NextResponse('Method not allowed', { status: 405 });
+  } catch (err: any) {
+    console.error('[PROFILE]', err?.message || err);
+    return new NextResponse('Failed to fetch or update profile', { status: 500 });
+  }
 }
 
 // Password reset — request (send email with code + link)
@@ -858,18 +914,23 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
 // ─── Workspace Delete (user-facing) ───
 
 export async function deleteWorkspaceHandler(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
 
-  const { workspaceId } = await request.json();
-  if (!workspaceId) return new NextResponse('workspaceId required', { status: 400 });
+    const { workspaceId } = await request.json();
+    if (!workspaceId) return new NextResponse('workspaceId required', { status: 400 });
 
-  const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId } });
-  if (!workspace) return new NextResponse('Workspace not found', { status: 404 });
-  if (workspace.ownerId !== session.userId) {
-    return new NextResponse('Only the owner can delete a workspace', { status: 403 });
+    const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId } });
+    if (!workspace) return new NextResponse('Workspace not found', { status: 404 });
+    if (workspace.ownerId !== session.userId) {
+      return new NextResponse('Only the owner can delete a workspace', { status: 403 });
+    }
+
+    await prisma.workspace.delete({ where: { id: workspaceId } });
+    return new NextResponse('Workspace deleted', { status: 200 });
+  } catch (err: any) {
+    console.error('[DELETE WORKSPACE]', err?.message || err);
+    return new NextResponse('Failed to delete workspace', { status: 500 });
   }
-
-  await prisma.workspace.delete({ where: { id: workspaceId } });
-  return new NextResponse('Workspace deleted', { status: 200 });
 }
