@@ -1,0 +1,96 @@
+
+> @tirbeo/api@0.0.1 build C:\Users\gwbis\Downloads\Tirbeo-All\apps\api
+> prisma generate && next build
+
+Environment variables loaded from .env
+Prisma schema loaded from prisma\schema.prisma
+┌─────────────────────────────────────────────────────────┐
+│  Update available 6.19.3 -> 7.8.0                       │
+│                                                         │
+│  This is a major update - please follow the guide at    │
+│  https://pris.ly/d/major-version-upgrade                │
+│                                                         │
+│  Run the following to update                            │
+│    npm i --save-dev prisma@latest                       │
+│    npm i @prisma/client@latest                          │
+└─────────────────────────────────────────────────────────┘
+
+✔ Generated Prisma Client (v6.19.3) to .\..\..\node_modules\.pnpm\@prisma+client@6.19.3_prisma@6.19.3_typescript@5.9.3__typescript@5.9.3\node_modules\@prisma\client in 3.15s
+
+Start by importing your Prisma Client (See: https://pris.ly/d/importing-client)
+
+Tip: Want to turn off tips and other hints? https://pris.ly/tip-4-nohints
+
+   ▲ Next.js 15.5.19
+   - Environments: .env.local, .env
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully in 30.7s
+   Skipping validation of types
+   Skipping linting
+   Collecting page data ...
+   Generating static pages (0/28) ...
+   Generating static pages (7/28) 
+   Generating static pages (14/28) 
+   Generating static pages (21/28) 
+ ✓ Generating static pages (28/28)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                                  Size  First Load JS
+┌ ƒ /api/[[...slug]]                        206 B         101 kB
+├ ƒ /api/admin/2fa                          206 B         101 kB
+├ ƒ /api/admin/activity                     206 B         101 kB
+├ ƒ /api/admin/analytics                    206 B         101 kB
+├ ƒ /api/admin/audit                        206 B         101 kB
+├ ƒ /api/admin/check-setup                  206 B         101 kB
+├ ƒ /api/admin/email/config                 206 B         101 kB
+├ ƒ /api/admin/email/templates              206 B         101 kB
+├ ƒ /api/admin/email/templates/[id]         206 B         101 kB
+├ ƒ /api/admin/email/test                   206 B         101 kB
+├ ƒ /api/admin/heartbeat                    206 B         101 kB
+├ ƒ /api/admin/layout-config                206 B         101 kB
+├ ƒ /api/admin/login                        206 B         101 kB
+├ ƒ /api/admin/me                           206 B         101 kB
+├ ƒ /api/admin/media                        206 B         101 kB
+├ ƒ /api/admin/media/[id]                   206 B         101 kB
+├ ƒ /api/admin/moderation/reports           206 B         101 kB
+├ ƒ /api/admin/moderation/reports/[id]      206 B         101 kB
+├ ƒ /api/admin/moderation/stats             206 B         101 kB
+├ ƒ /api/admin/monitor/[[...action]]        206 B         101 kB
+├ ƒ /api/admin/notifications                206 B         101 kB
+├ ƒ /api/admin/notifications/[id]           206 B         101 kB
+├ ƒ /api/admin/notifications/prefs          206 B         101 kB
+├ ƒ /api/admin/preferences                  206 B         101 kB
+├ ƒ /api/admin/roles/[[...action]]          206 B         101 kB
+├ ƒ /api/admin/routes/[[...action]]         206 B         101 kB
+├ ƒ /api/admin/search                       206 B         101 kB
+├ ƒ /api/admin/seed                         206 B         101 kB
+├ ƒ /api/admin/site-config/[[...action]]    206 B         101 kB
+├ ƒ /api/admin/stats                        206 B         101 kB
+├ ƒ /api/admin/theme                        206 B         101 kB
+├ ƒ /api/admin/users/[[...action]]          206 B         101 kB
+├ ƒ /api/admin/users/[id]/password          206 B         101 kB
+├ ƒ /api/admin/workspaces/[[...action]]     206 B         101 kB
+├ ƒ /api/newsletter/subscribe               206 B         101 kB
+├ ƒ /api/public/landing                     206 B         101 kB
+├ ƒ /api/public/theme                       206 B         101 kB
+├ ƒ /auth/github/callback                   206 B         101 kB
+└ ƒ /auth/google/callback                   206 B         101 kB
++ First Load JS shared by all              101 kB
+  ├ chunks/4557610a-fefa5be19e77ed4a.js   54.2 kB
+  ├ chunks/654-88835e56b231b9bb.js        44.8 kB
+  └ other shared chunks (total)           1.84 kB
+
+Route (pages)                                Size  First Load JS
+─ ○ /404                                  2.29 kB        99.3 kB
++ First Load JS shared by all               97 kB
+  ├ chunks/framework-cbb8e5e776295776.js  59.4 kB
+  ├ chunks/main-98801ca993307d07.js       35.4 kB
+  └ other shared chunks (total)           2.23 kB
+
+ƒ Middleware                              97.5 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

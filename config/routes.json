@@ -1,0 +1,30 @@
+[
+  {
+    "path": "auth/login",
+    "target": "",
+    "method": "POST",
+    "allowedRoles": ["guest"],
+    "internal": true
+  },
+  {
+    "path": "users/me",
+    "target": "",
+    "method": "GET",
+    "allowedRoles": ["member", "admin"],
+    "internal": true
+  },
+  {
+    "path": "auth/signup",
+    "target": "",
+    "method": "POST",
+    "allowedRoles": ["guest"],
+    "internal": true
+  },
+  {
+    "path": "auth/logout",
+    "target": "",
+    "method": "POST",
+    "allowedRoles": ["member", "admin"],
+    "internal": true
+  }
+]
