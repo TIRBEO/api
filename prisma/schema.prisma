@@ -62,10 +62,11 @@ model User {
   notificationPref     NotificationPreference?
   contentReports       ContentReport[]     @relation("ContentReporter")
   contentReviews       ContentReport[]     @relation("ContentReviewer")
-  mediaUploads         Media[]
-  auditEvents          AuditEvent[]
-  recoveryCodes        RecoveryCode[]
-  integrations         Integration[]
+   mediaUploads         Media[]
+   auditEvents          AuditEvent[]
+   recoveryCodes        RecoveryCode[]
+   integrations         Integration[]
+   savedThemes          SavedTheme[]
 
   @@index([email])
   @@index([adminRole])
@@ -460,6 +461,21 @@ model ThemeConfig {
   updatedAt DateTime @updatedAt
 
   @@index([isActive])
+}
+
+// ─── Per-User Saved Custom Themes ─────────────────────
+
+model SavedTheme {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  config    Json     // ThemeConfig-like JSON blob
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name])
+  @@index([userId])
 }
 
 
