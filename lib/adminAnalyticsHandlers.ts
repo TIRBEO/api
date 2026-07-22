@@ -61,7 +61,7 @@ export async function analyticsHandler(request: NextRequest) {
     // User signups per day (last 30 days)
     prisma.$queryRaw<Array<{ date: string; count: bigint }>>`
       SELECT DATE(created_at) as date, COUNT(*)::int as count
-      FROM "User"
+      FROM "users"
       WHERE created_at >= ${thirtyDaysAgo}
       GROUP BY DATE(created_at)
       ORDER BY date ASC
@@ -69,7 +69,7 @@ export async function analyticsHandler(request: NextRequest) {
     // Activity per day (heartbeats, last 30 days)
     prisma.$queryRaw<Array<{ date: string; count: bigint }>>`
       SELECT DATE(created_at) as date, COUNT(*)::int as count
-      FROM "Session"
+      FROM "sessions"
       WHERE created_at >= ${thirtyDaysAgo}
       GROUP BY DATE(created_at)
       ORDER BY date ASC

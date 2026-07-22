@@ -40,7 +40,6 @@ import {
   integrationsHandler,
   userActivityHandler,
   preferencesHandler,
-  savedThemesHandler,
   setPasswordHandler,
   requestProfileEditOtpHandler,
   verifyProfileEditOtpHandler,
@@ -71,7 +70,6 @@ const INTERNAL_ROUTES = [
   'profile', 'security/password', 'security/sessions', 'security/set-password',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
   'notifications', 'integrations', 'user/activity', 'preferences',
-  'preferences/themes', 'preferences/themes/delete',
   'email/config', 'email/templates', 'email/test',
 ];
 
@@ -96,14 +94,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     const allowed = ['GET', 'PATCH', 'DELETE'];
     if (allowed.includes(method.toUpperCase())) {
       return { path: 'email/templates/[name]', method, internal: true, allowedRoles: ['guest'], meta: { templateName } };
-    }
-  }
-
-  // Handle preferences/themes/{id} dynamic route (DELETE)
-  if (slug.length === 3 && slug[0] === 'preferences' && slug[1] === 'themes') {
-    const themeId = slug[2];
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'preferences/themes/[id]', method, internal: true, allowedRoles: ['guest'], meta: { themeId } };
     }
   }
 
@@ -145,8 +135,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'integrations': ['GET', 'POST', 'DELETE'],
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
-      'preferences/themes': ['GET', 'POST'],
-      'preferences/themes/delete': ['POST'],
       'email/config': ['GET', 'PATCH'],
       'email/templates': ['GET', 'POST'],
       'email/test': ['POST'],
@@ -326,12 +314,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'preferences':
         resp = await preferencesHandler(request);
-        break;
-      case 'preferences/themes':
-        resp = await savedThemesHandler(request);
-        break;
-      case 'preferences/themes/[id]':
-        resp = await savedThemesHandler(request, (route as any).meta.themeId);
         break;
       case 'email/config':
         resp = await emailConfigHandler(request);

@@ -249,61 +249,6 @@ export async function preferencesHandler(request: NextRequest) {
   return new NextResponse('Method not allowed', { status: 405 });
 }
 
-// GET/POST /api/preferences/themes — List or create saved custom themes
-// DELETE /api/preferences/themes/{id} — Delete a saved theme (handled via themeId param)
-export async function savedThemesHandler(request: NextRequest, themeId?: string) {
-  const session = await getSession(request);
-  if (!session) return new NextResponse('Unauthorized', { status: 401 });
-
-  // DELETE /api/preferences/themes/{id}
-  if (request.method === 'DELETE' && themeId) {
-    // Verify ownership before delete
-    const theme = await (prisma as any).savedTheme.findUnique({ where: { id: themeId } });
-    if (!theme || theme.userId !== session.userId) {
-      return new NextResponse('Theme not found', { status: 404 });
-    }
-    await (prisma as any).savedTheme.delete({ where: { id: themeId } });
-    return new NextResponse('Theme deleted', { status: 200 });
-  }
-
-  // GET /api/preferences/themes — List user's saved themes
-  if (request.method === 'GET') {
-    try {
-      const themes = await (prisma as any).savedTheme.findMany({
-        where: { userId: session.userId },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true, name: true, config: true, createdAt: true },
-      });
-      return NextResponse.json(themes);
-    } catch {
-      // Table might not exist yet — return empty array
-      return NextResponse.json([]);
-    }
-  }
-
-  // POST /api/preferences/themes — Create a new saved theme
-  if (request.method === 'POST') {
-    const body = await request.json();
-    const { name, config } = body;
-    if (!name || typeof name !== 'string' || !config) {
-      return new NextResponse('name and config required', { status: 400 });
-    }
-    try {
-      const theme = await (prisma as any).savedTheme.upsert({
-        where: { userId_name: { userId: session.userId, name: name.trim() } },
-        update: { config },
-        create: { userId: session.userId, name: name.trim(), config },
-      });
-      return NextResponse.json(theme);
-    } catch (err: any) {
-      console.error('[SAVED THEMES] Create error:', err?.message);
-      return new NextResponse('Failed to save theme', { status: 500 });
-    }
-  }
-
-  return new NextResponse('Method not allowed', { status: 405 });
-}
-
 // POST /api/security/set-password — OAuth users can set a password after verifying via OTP
 export async function setPasswordHandler(request: NextRequest) {
   const session = await getSession(request);

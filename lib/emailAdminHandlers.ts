@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession } from './session';
-import { sendEmail, FALLBACK_TEMPLATES } from './email';
+import { sendEmail } from './email';
 import { z } from 'zod';
 
 async function requireAdmin(request: NextRequest) {
