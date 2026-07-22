@@ -29,7 +29,12 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   if (first === 'blocked') {
     const body = await request.json();
     const entry = await prisma.blocklist.create({
-      data: { ip: body.ip || null, userId: body.userId || null, reason: body.reason || null },
+      data: {
+        type: body.type || 'ip',
+        value: body.value || body.ip || body.userId || '',
+        reason: body.reason || null,
+        addedById: session.userId,
+      },
     });
     return NextResponse.json(entry, { status: 201 });
   }
@@ -46,9 +51,9 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     const body = await request.json();
     if (body.id) {
       await prisma.blocklist.delete({ where: { id: body.id } });
-    } else {
+    } else if (body.value) {
       await prisma.blocklist.deleteMany({
-        where: { OR: [{ ip: body.ip }, { userId: body.userId }] },
+        where: { type: body.type || 'ip', value: body.value },
       });
     }
     return new NextResponse('Blocked removed', { status: 200 });
