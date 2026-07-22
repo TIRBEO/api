@@ -135,6 +135,15 @@ export async function emailTestHandler(request: NextRequest) {
   const parsed = schema.safeParse(body);
   if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
 
+  const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
+  const diagnostics = {
+    hasDbConfig: !!config,
+    dbEnabled: config?.enabled ?? null,
+    dbApiKey: config?.apiKey ? '••••' + config.apiKey.slice(-4) : null,
+    dbProvider: config?.provider ?? null,
+    envApiKey: process.env.RESEND_API_KEY ? '••••' + process.env.RESEND_API_KEY.slice(-4) : null,
+  };
+
   const result = await sendEmail(parsed.data.to, 'Tirbeo Test Email', '<p style="font-family:system-ui;padding:24px">This is a test email from Tirbeo. If you received this, your email configuration is working.</p>');
-  return NextResponse.json(result);
+  return NextResponse.json({ ...result, diagnostics });
 }

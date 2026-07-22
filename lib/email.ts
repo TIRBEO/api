@@ -58,18 +58,18 @@ export async function sendEmail(
     console.warn('[EMAIL] Failed to load config from DB:', e?.message);
   }
 
-  const apiKey = config?.apiKey || process.env.RESEND_API_KEY || '';
+  const dbApiKey = config?.apiKey || '';
+  const apiKey = dbApiKey || process.env.RESEND_API_KEY || '';
   const provider = config?.provider || 'resend';
   const enabled = config?.enabled !== false;
 
   if (!apiKey) {
-    console.error(`[EMAIL] No API key configured. Cannot send to ${to}: ${subject}`);
+    console.error(`[EMAIL] No API key configured (DB: ${dbApiKey ? 'set' : 'empty'}, ENV: ${process.env.RESEND_API_KEY ? 'set' : 'missing'}). Cannot send to ${to}: ${subject}`);
     return { success: false, error: 'No email API key configured' };
   }
 
-  if (!enabled && config) {
-    console.log(`[EMAIL] Config disabled. Would send to ${to}: ${subject}`);
-    return { success: true, messageId: 'noop' };
+  if (!enabled && dbApiKey) {
+    console.warn(`[EMAIL] DB config disabled but API key present. Falling through to env var. Sending to ${to}: ${subject}`);
   }
 
   const fromEmail = options?.fromEmail || config?.fromEmail || 'noreply@tirbeo.app';
