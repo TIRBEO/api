@@ -2,7 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '../../../../lib/session';
 import { prisma } from '../../../../lib/db/prisma';
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
+
   const theme = await prisma.themeConfig.findFirst({ where: { isActive: true } });
   if (!theme) {
     return NextResponse.json(getDefaultTheme());

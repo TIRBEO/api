@@ -216,16 +216,12 @@ export async function requestSignupOtpHandler(request: NextRequest) {
     try {
       const result = await sendSignupOtpEmail(email, code);
       emailSent = result.success;
+      if (!emailSent) console.log(`[SIGNUP OTP] Email failed for ${email}, code: ${code}`);
     } catch (emailErr) {
       console.error('[SIGNUP OTP] Email send error:', emailErr);
-    }
-    const resp: any = { message: 'Verification code sent to email' };
-    if (!emailSent) {
-      resp.devCode = code;
-      resp.devMessage = 'Email delivery failed. Use this code for testing.';
       console.log(`[SIGNUP OTP] FALLBACK CODE for ${email}: ${code}`);
     }
-    return NextResponse.json(resp, { status: 200 });
+    return NextResponse.json({ message: 'Verification code sent to email' }, { status: 200 });
   } catch (err: any) {
     console.error('[SIGNUP OTP REQUEST]', err?.message || err, err?.stack);
     return new NextResponse(`Failed to process request: ${err?.message || 'unknown'}`, { status: 500 });
@@ -240,7 +236,6 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-    // Always return success to prevent email enumeration
     if (!user) {
       return NextResponse.json({ message: 'If an account exists, a code has been sent.' });
     }
@@ -251,16 +246,12 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     try {
       const result = await sendSignupOtpEmail(email, code, 'login_otp');
       emailSent = result.success;
+      if (!emailSent) console.log(`[LOGIN OTP] Email failed for ${email}, code: ${code}`);
     } catch (emailErr) {
       console.error('[LOGIN OTP] Email send error:', emailErr);
-    }
-    const resp: any = { message: 'Verification code sent to your email' };
-    if (!emailSent) {
-      resp.devCode = code;
-      resp.devMessage = 'Email delivery failed. Use this code for testing.';
       console.log(`[LOGIN OTP] FALLBACK CODE for ${email}: ${code}`);
     }
-    return NextResponse.json(resp, { status: 200 });
+    return NextResponse.json({ message: 'Verification code sent to your email' }, { status: 200 });
   } catch (err: any) {
     console.error('[LOGIN OTP REQUEST]', err?.message || err, err?.stack);
     return new NextResponse(`Failed to process request: ${err?.message || 'unknown'}`, { status: 500 });
@@ -331,14 +322,16 @@ export async function verifyEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-    const { code } = await request.json();
+    const { code, email } = await request.json();
     if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
     const ok = await verifyOtpCode(session.userId, 'email', code);
     if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
-    await prisma.user.update({
-      where: { id: session.userId },
-      data: { secondaryEmail: undefined },
-    });
+    if (email && typeof email === 'string') {
+      await prisma.user.update({
+        where: { id: session.userId },
+        data: { secondaryEmail: email },
+      });
+    }
     return new NextResponse('Email OTP verified', { status: 200 });
   } catch (err: any) {
     console.error('[EMAIL OTP VERIFY]', err?.message || err);

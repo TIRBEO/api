@@ -1,6 +1,11 @@
 import { prisma } from './db/prisma';
 import { sendTemplateEmail } from './email';
-import { sendToUser } from './ws/server';
+
+// WebSocket send - no-op in serverless (Vercel has no persistent connections)
+function sendToUser(_userId: string, _data: unknown) {
+  // In serverless, WebSocket connections don't persist between invocations.
+  // This is handled by the client polling or using Server-Sent Events.
+}
 
 type NotifType = 'mention' | 'comment' | 'report' | 'system' | 'digest' | 'admin_alert';
 
@@ -25,13 +30,11 @@ export async function createNotification(input: CreateNotifInput) {
     },
   });
 
-  // Push via WebSocket
   sendToUser(input.userId, {
     type: 'notification',
     data: { id: notif.id, userId: notif.userId, type: notif.type, title: notif.title, body: notif.body, link: notif.link, icon: notif.icon, read: false, createdAt: notif.createdAt.toISOString() },
   });
 
-  // Check if user wants instant email
   const prefs = await prisma.notificationPreference.findUnique({ where: { userId: input.userId } });
   if (prefs?.emailDigest === 'instant') {
     const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });

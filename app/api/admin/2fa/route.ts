@@ -12,7 +12,8 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const body = await request.json().catch(() => ({}));
+  const cloned = request.clone();
+  const body = await cloned.json().catch(() => ({}));
   const action = body._action || '';
 
   switch (action) {

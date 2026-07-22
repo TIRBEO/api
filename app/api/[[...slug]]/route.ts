@@ -148,7 +148,10 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
 }
 
 function isBlocked(ip?: string, userId?: string, blocked: any[] = []) {
-  return blocked.some((entry: any) => entry.ip === ip || entry.userId === userId);
+  return blocked.some((entry: any) =>
+    (entry.type === 'ip' && entry.value === ip) ||
+    (entry.type === 'user' && entry.value === userId)
+  );
 }
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {

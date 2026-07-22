@@ -5,26 +5,6 @@ import { requireAdmin, requireRole, canManageRole, getAdminRole } from './sessio
 import { cachedJson } from './response';
 import { createAuditEvent } from './audit';
 
-async function auditLog(actorId: string, action: string, entityType: string, entityId: string, metadata?: Record<string, unknown>) {
-  await prisma.log.create({
-    data: {
-      ip: '',
-      method: 'ADMIN',
-      path: `/admin/${entityType}/${entityId}`,
-      userId: actorId,
-      status: 0,
-    },
-  });
-  await createAuditEvent({
-    actorId,
-    action,
-    targetType: entityType,
-    targetId: entityId,
-    metadata,
-    severity: action.includes('delete') ? 'warning' : 'info',
-  });
-}
-
 // ─── Users (super_admin / admin / manager) ───
 
 export async function listUsers(request: NextRequest) {
@@ -553,7 +533,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
   });
 
   await createAuditEvent({
-    actorId: session.userId ?? session.id ?? '',
+    actorId: session.userId,
     action: 'password.reset',
     targetType: 'user',
     targetId: userId,

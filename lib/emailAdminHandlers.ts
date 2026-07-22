@@ -1,21 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
-import { getSession } from './session';
+import { requireAdmin } from './session';
 import { sendEmail } from './email';
 import { z } from 'zod';
 
-async function requireAdmin(request: NextRequest) {
-  const session = await getSession(request);
-  if (!session) return null;
-  const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { adminRole: true } });
-  if (!user?.adminRole) return null;
-  return session.userId;
-}
-
 // GET /api/email/config — get current email config
 export async function emailConfigHandler(request: NextRequest) {
-  const adminId = await requireAdmin(request);
-  if (!adminId) return new NextResponse('Unauthorized', { status: 401 });
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
 
   if (request.method === 'GET') {
     const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
@@ -59,8 +51,8 @@ export async function emailConfigHandler(request: NextRequest) {
 // GET /api/email/templates — list all templates
 // POST /api/email/templates — create new template
 export async function emailTemplatesHandler(request: NextRequest) {
-  const adminId = await requireAdmin(request);
-  if (!adminId) return new NextResponse('Unauthorized', { status: 401 });
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
 
   if (request.method === 'GET') {
     const templates = await prisma.emailTemplate.findMany({ orderBy: { createdAt: 'asc' } });
@@ -95,8 +87,8 @@ export async function emailTemplatesHandler(request: NextRequest) {
 // PATCH /api/email/templates/[name] — update template
 // DELETE /api/email/templates/[name] — delete template
 export async function emailTemplateDetailHandler(request: NextRequest, name: string) {
-  const adminId = await requireAdmin(request);
-  if (!adminId) return new NextResponse('Unauthorized', { status: 401 });
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
 
   const existing = await prisma.emailTemplate.findUnique({ where: { name } });
   if (!existing) return new NextResponse('Template not found', { status: 404 });
@@ -132,8 +124,8 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
 
 // POST /api/email/test — send a test email
 export async function emailTestHandler(request: NextRequest) {
-  const adminId = await requireAdmin(request);
-  if (!adminId) return new NextResponse('Unauthorized', { status: 401 });
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
 
   const body = await request.json();
   const schema = z.object({
