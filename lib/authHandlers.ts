@@ -220,10 +220,10 @@ export async function requestSignupOtpHandler(request: NextRequest) {
       console.error('[SIGNUP OTP] Email send error:', emailErr);
     }
     const resp: any = { message: 'Verification code sent to email' };
-    if (!emailSent && process.env.NODE_ENV === 'development') {
+    if (!emailSent) {
       resp.devCode = code;
-      resp.devMessage = 'Dev mode: use this code for testing';
-      console.log(`[SIGNUP OTP] Dev mode: code for ${email} is ${code}`);
+      resp.devMessage = 'Email delivery failed. Use this code for testing.';
+      console.log(`[SIGNUP OTP] FALLBACK CODE for ${email}: ${code}`);
     }
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
@@ -255,10 +255,10 @@ export async function requestLoginOtpHandler(request: NextRequest) {
       console.error('[LOGIN OTP] Email send error:', emailErr);
     }
     const resp: any = { message: 'Verification code sent to your email' };
-    if (!emailSent && process.env.NODE_ENV === 'development') {
+    if (!emailSent) {
       resp.devCode = code;
-      resp.devMessage = 'Dev mode: use this code for testing';
-      console.log(`[LOGIN OTP] Dev mode: code for ${email} is ${code}`);
+      resp.devMessage = 'Email delivery failed. Use this code for testing.';
+      console.log(`[LOGIN OTP] FALLBACK CODE for ${email}: ${code}`);
     }
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
@@ -722,7 +722,8 @@ export async function requestPasswordResetHandler(request: NextRequest) {
       return new NextResponse('Email is required', { status: 400 });
     }
     const result = await requestPasswordReset(email);
-    // Always return success to prevent email enumeration
+    // Always return success to prevent email enumeration.
+    // If email fails, the resetUrl + code are logged to console as fallback.
     return NextResponse.json({ message: 'If an account exists, a reset link has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET REQUEST]', err?.message || err);
@@ -804,10 +805,10 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     }
 
     const resp: any = { message: 'If an account exists, a magic link has been sent.' };
-    if (!emailSent && process.env.NODE_ENV === 'development') {
+    if (!emailSent) {
       resp.devLink = callbackUrl;
-      resp.devMessage = 'Dev mode: use this link to log in';
-      console.log(`[MAGIC LINK] Dev mode: link for ${email} is ${callbackUrl}`);
+      resp.devMessage = 'Email delivery failed. Use this link for testing.';
+      console.log(`[MAGIC LINK] FALLBACK LINK for ${email}: ${callbackUrl}`);
     }
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {

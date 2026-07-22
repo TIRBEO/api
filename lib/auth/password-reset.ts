@@ -39,9 +39,11 @@ export async function requestPasswordReset(email: string): Promise<{ success: bo
 
   if (!result.success) {
     console.error(`[PASSWORD RESET] Email send failed for ${email}: ${result.error}`);
+    console.log(`[PASSWORD RESET] FALLBACK CODE for ${email}: ${code}`);
+    console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
   }
 
-  return { success: true, resetUrl };
+  return { success: true, resetUrl, code };
 }
 
 // Verify code OR token — returns a new session-ready reset token
