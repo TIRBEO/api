@@ -21,6 +21,7 @@ export async function extendedProfileHandler(request: NextRequest) {
         reduceMotion: true, highContrast: true,
         emailVerified: true, phoneVerified: true, is2FAEnabled: true,
         companyName: true, companyRole: true, industry: true, companySize: true,
+        gender: true, birthday: true,
         createdAt: true, updatedAt: true,
         passwordHash: true, googleId: true, githubId: true,
       },
@@ -60,6 +61,8 @@ export async function extendedProfileHandler(request: NextRequest) {
       companyRole: z.string().optional().nullable(),
       industry: z.string().optional().nullable(),
       companySize: z.string().optional().nullable(),
+      gender: z.string().optional().nullable(),
+      birthday: z.string().optional().nullable(),
     });
     const parsed = schema.safeParse(body);
     if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
@@ -74,6 +77,7 @@ export async function extendedProfileHandler(request: NextRequest) {
         dateFormat: true, timeFormat: true, fontSize: true,
         reduceMotion: true, highContrast: true,
         companyName: true, companyRole: true, industry: true, companySize: true,
+        gender: true, birthday: true,
         emailVerified: true, phoneVerified: true, is2FAEnabled: true,
         createdAt: true, updatedAt: true,
       },

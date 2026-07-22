@@ -50,6 +50,8 @@ model User {
   companyRole      String?
   industry         String?
   companySize      String?
+  gender           String?
+  birthday         DateTime?
   createdAt        DateTime    @default(now())
   updatedAt        DateTime    @updatedAt
 
