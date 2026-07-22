@@ -53,6 +53,20 @@ import {
   emailTestHandler,
 } from '../../../lib/emailAdminHandlers';
 
+import {
+  securityEventsHandler,
+  totpSetupHandler,
+  totpVerifyHandler,
+  totpDisableHandler,
+  backupCodesRegenerateHandler,
+  phonesAddHandler,
+  phonesRemoveHandler,
+  recoveryEmailHandler,
+  passwordCheckHandler,
+  sessionsRevokeAllHandler,
+  sessionRevokeHandler,
+} from '../../../lib/securityHandlers';
+
 const appUrl = (subdomain: string, path: string) =>
   `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
 
@@ -68,6 +82,9 @@ const INTERNAL_ROUTES = [
   'auth/password-reset/request', 'auth/password-reset/verify', 'auth/password-reset/confirm',
   'users/me', 'activity', 'workspaces', 'workspaces/delete',
   'profile', 'security/password', 'security/sessions', 'security/set-password',
+  'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
+  'security/backup-codes/regenerate', 'security/phones', 'security/recovery-email',
+  'security/password-check', 'security/sessions/revoke-all',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
   'notifications', 'integrations', 'user/activity', 'preferences',
   'email/config', 'email/templates', 'email/test',
@@ -94,6 +111,14 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     const allowed = ['GET', 'PATCH', 'DELETE'];
     if (allowed.includes(method.toUpperCase())) {
       return { path: 'email/templates/[name]', method, internal: true, allowedRoles: ['guest'], meta: { templateName } };
+    }
+  }
+
+  // Handle security/sessions/{id} dynamic route
+  if (slug.length === 3 && slug[0] === 'security' && slug[1] === 'sessions' && slug[2] !== 'revoke-all') {
+    const sessionId = slug[2];
+    if (method.toUpperCase() === 'DELETE') {
+      return { path: 'security/sessions/[id]', method, internal: true, allowedRoles: ['guest'], meta: { sessionId } };
     }
   }
 
@@ -128,6 +153,15 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'security/password': ['POST'],
       'security/sessions': ['GET', 'DELETE'],
       'security/set-password': ['POST'],
+      'security/events': ['GET'],
+      'security/totp/setup': ['POST'],
+      'security/totp/verify': ['POST'],
+      'security/totp/disable': ['DELETE'],
+      'security/backup-codes/regenerate': ['POST'],
+      'security/phones': ['POST', 'DELETE'],
+      'security/recovery-email': ['PUT'],
+      'security/password-check': ['POST'],
+      'security/sessions/revoke-all': ['DELETE'],
       'profile/request-edit-otp': ['POST'],
       'profile/verify-edit-otp': ['POST'],
       'profile/avatar': ['POST'],
@@ -296,6 +330,36 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'security/set-password':
         resp = await setPasswordHandler(request);
+        break;
+      case 'security/events':
+        resp = await securityEventsHandler(request);
+        break;
+      case 'security/totp/setup':
+        resp = await totpSetupHandler(request);
+        break;
+      case 'security/totp/verify':
+        resp = await totpVerifyHandler(request);
+        break;
+      case 'security/totp/disable':
+        resp = await totpDisableHandler(request);
+        break;
+      case 'security/backup-codes/regenerate':
+        resp = await backupCodesRegenerateHandler(request);
+        break;
+      case 'security/phones':
+        resp = (method.toUpperCase() === 'POST') ? await phonesAddHandler(request) : await phonesRemoveHandler(request);
+        break;
+      case 'security/recovery-email':
+        resp = await recoveryEmailHandler(request);
+        break;
+      case 'security/password-check':
+        resp = await passwordCheckHandler(request);
+        break;
+      case 'security/sessions/revoke-all':
+        resp = await sessionsRevokeAllHandler(request);
+        break;
+      case 'security/sessions/[id]':
+        resp = await sessionRevokeHandler(request, (route as any).meta.sessionId);
         break;
       case 'profile/request-edit-otp':
         resp = await requestProfileEditOtpHandler(request);
