@@ -712,6 +712,9 @@ export async function profileHandler(request: NextRequest) {
     }
 
     if (request.method === 'GET') {
+      // Update lastActiveAt so user shows as "online"
+      prisma.user.update({ where: { id: session.userId }, data: { lastActiveAt: new Date() } }).catch(() => {});
+
       const user = await prisma.user.findUnique({
         where: { id: session.userId },
         select: {
@@ -724,10 +727,31 @@ export async function profileHandler(request: NextRequest) {
           occupation: true,
           gender: true,
           birthday: true,
+          bio: true,
+          country: true,
+          language: true,
+          timezone: true,
+          website: true,
+          linkedin: true,
+          github: true,
+          twitter: true,
+          companyName: true,
+          companyRole: true,
+          industry: true,
+          companySize: true,
+          adminRole: true,
+          is2FAEnabled: true,
+          createdAt: true,
+          updatedAt: true,
+          lastActiveAt: true,
+          emailVerified: true,
+          phoneVerified: true,
+          passwordHash: true,
+          preferences: true,
         },
       });
       if (!user) return new NextResponse('User not found', { status: 404 });
-      return NextResponse.json(user);
+      return NextResponse.json({ ...user, hasPassword: !!(user as any).passwordHash });
     }
 
     if (request.method === 'PATCH') {
@@ -736,10 +760,22 @@ export async function profileHandler(request: NextRequest) {
         name: z.string().min(1).optional(),
         photoUrl: z.string().optional().nullable(),
         secondaryEmail: z.string().email().optional(),
-        phoneNumber: z.string().optional(),
-        occupation: z.string().optional(),
-        gender: z.string().optional(),
+        phoneNumber: z.string().optional().nullable(),
+        occupation: z.string().optional().nullable(),
+        gender: z.string().optional().nullable(),
         birthday: z.string().optional().nullable(),
+        bio: z.string().optional().nullable(),
+        country: z.string().optional().nullable(),
+        language: z.string().optional().nullable(),
+        timezone: z.string().optional().nullable(),
+        website: z.string().optional().nullable(),
+        linkedIn: z.string().optional().nullable(),
+        github: z.string().optional().nullable(),
+        twitter: z.string().optional().nullable(),
+        companyName: z.string().optional().nullable(),
+        companyRole: z.string().optional().nullable(),
+        industry: z.string().optional().nullable(),
+        companySize: z.string().optional().nullable(),
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
@@ -749,10 +785,26 @@ export async function profileHandler(request: NextRequest) {
       if (data.birthday && typeof data.birthday === 'string') {
         data.birthday = new Date(data.birthday);
       }
+      // Map camelCase to Prisma field names
+      if ('linkedIn' in data) { data.linkedin = data.linkedIn; delete data.linkedIn; }
+      if ('companyName' in data) { data.companyName = data.companyName; }
       const updated = await prisma.user.update({
         where: { id: session.userId },
         data,
       });
+
+      // Log activity
+      prisma.auditEvent.create({
+        data: {
+          actorId: session.userId,
+          action: 'profile.updated',
+          targetType: 'user',
+          targetId: session.userId,
+          metadata: { fields: Object.keys(data) } as any,
+          severity: 'info',
+        },
+      }).catch(() => {});
+
       return NextResponse.json(updated);
     }
 

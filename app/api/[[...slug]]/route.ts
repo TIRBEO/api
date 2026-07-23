@@ -44,6 +44,7 @@ import {
   requestProfileEditOtpHandler,
   verifyProfileEditOtpHandler,
   avatarUploadHandler,
+  heartbeatHandler,
 } from '../../../lib/userHandlers';
 
 import {
@@ -87,6 +88,7 @@ const INTERNAL_ROUTES = [
   'security/password-check', 'security/sessions/revoke-all',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
   'notifications', 'integrations', 'user/activity', 'preferences',
+  'admin/heartbeat',
   'email/config', 'email/templates', 'email/test',
 ];
 
@@ -169,6 +171,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'integrations': ['GET', 'POST', 'DELETE'],
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
+      'admin/heartbeat': ['POST'],
       'email/config': ['GET', 'PATCH'],
       'email/templates': ['GET', 'POST'],
       'email/test': ['POST'],
@@ -381,6 +384,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'preferences':
         resp = await preferencesHandler(request);
+        break;
+      case 'admin/heartbeat':
+        resp = await heartbeatHandler(request);
         break;
       case 'email/config':
         resp = await emailConfigHandler(request);

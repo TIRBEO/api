@@ -263,7 +263,14 @@ export async function preferencesHandler(request: NextRequest) {
           timeFormat: true, fontSize: true, reduceMotion: true, highContrast: true, preferences: true,
         },
       });
-      return NextResponse.json(user);
+      // Flatten extra fields from preferences JSON blob to top level
+      const prefs = (user?.preferences as Record<string, any>) || {};
+      return NextResponse.json({
+        ...user,
+        weekStart: prefs.weekStart || null,
+        currency: prefs.currency || null,
+        defaultLanding: prefs.defaultLanding || null,
+      });
     }
 
     if (request.method === 'PATCH') {
@@ -281,7 +288,21 @@ export async function preferencesHandler(request: NextRequest) {
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
-      await prisma.user.update({ where: { id: session.userId }, data: parsed.data });
+      const data: Record<string, any> = { ...parsed.data };
+      // Merge extra fields into preferences JSON blob
+      const extraKeys = ['weekStart', 'currency', 'defaultLanding'];
+      const existingPrefs = (await prisma.user.findUnique({ where: { id: session.userId }, select: { preferences: true } }))?.preferences as Record<string, any> || {};
+      for (const key of extraKeys) {
+        if (data[key] !== undefined) {
+          data.preferences = { ...existingPrefs, ...data.preferences, [key]: data[key] };
+          delete data[key];
+        }
+      }
+      // Also merge preferences if present
+      if (data.preferences && typeof data.preferences === 'object') {
+        data.preferences = { ...existingPrefs, ...data.preferences };
+      }
+      await prisma.user.update({ where: { id: session.userId }, data });
       return new NextResponse('Preferences updated', { status: 200 });
     }
 
@@ -319,6 +340,22 @@ export async function setPasswordHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[SET PASSWORD]', err?.message || err);
     return new NextResponse('Failed to set password', { status: 500 });
+  }
+}
+
+export async function heartbeatHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (session?.userId) {
+      await prisma.user.update({
+        where: { id: session.userId },
+        data: { lastActiveAt: new Date() },
+      });
+    }
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[HEARTBEAT]', err?.message || err);
+    return NextResponse.json({ ok: true });
   }
 }
 
