@@ -72,6 +72,11 @@ import {
   sessionRevokeHandler,
 } from '../../../lib/securityHandlers';
 
+import {
+  apiKeysHandler,
+  apiKeyDeleteHandler,
+} from '../../../lib/developerHandlers';
+
 const appUrl = (subdomain: string, path: string) =>
   `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
 
@@ -96,6 +101,7 @@ const INTERNAL_ROUTES = [
   'email/config', 'email/templates', 'email/test',
   'public/help-config',
   'districts',
+  'developer/api-keys',
 ];
 
 let routeCache: { data: any[]; ts: number } | null = null;
@@ -145,6 +151,14 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     const workspaceId = slug[1];
     if (method.toUpperCase() === 'DELETE') {
       return { path: 'workspaces/[id]', method, internal: true, allowedRoles: ['guest'], meta: { workspaceId } };
+    }
+  }
+
+  // Handle developer/api-keys/{id} dynamic route
+  if (slug.length === 3 && slug[0] === 'developer' && slug[1] === 'api-keys') {
+    const keyId = slug[2];
+    if (method.toUpperCase() === 'DELETE') {
+      return { path: 'developer/api-keys/[id]', method, internal: true, allowedRoles: ['guest'], meta: { keyId } };
     }
   }
 
@@ -202,6 +216,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/test': ['POST'],
       'public/help-config': ['GET'],
       'districts': ['GET'],
+      'developer/api-keys': ['GET', 'POST'],
     };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
@@ -435,6 +450,12 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'districts':
         resp = await districtsHandler(request);
+        break;
+      case 'developer/api-keys':
+        resp = await apiKeysHandler(request);
+        break;
+      case 'developer/api-keys/[id]':
+        resp = await apiKeyDeleteHandler(request, (route as any).meta.keyId);
         break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
