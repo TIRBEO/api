@@ -103,16 +103,29 @@ export async function changePasswordHandler(request: NextRequest) {
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
     const body = await request.json();
-    const { currentPassword, newPassword } = body;
-    if (!currentPassword || !newPassword || newPassword.length < 8) {
-      return new NextResponse('Invalid payload', { status: 400 });
+    const { currentPassword, newPassword, otpCode } = body;
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      return new NextResponse('Password must be at least 8 characters', { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, passwordHash: true } });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
-    if (user.passwordHash && !(await verifyPassword(user.passwordHash, currentPassword))) {
-      return new NextResponse('Current password is incorrect', { status: 401 });
+    if (user.passwordHash) {
+      // User has a password — require currentPassword
+      if (!currentPassword) {
+        return new NextResponse('Current password required', { status: 400 });
+      }
+      if (!(await verifyPassword(user.passwordHash, currentPassword))) {
+        return new NextResponse('Current password is incorrect', { status: 401 });
+      }
+    } else {
+      // Passwordless (OAuth-only) user — require OTP
+      if (!otpCode || typeof otpCode !== 'string') {
+        return new NextResponse('Verification code required for passwordless accounts', { status: 400 });
+      }
+      const ok = await verifyOtpCode(session.userId, 'email', otpCode);
+      if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
     }
 
     const newHash = await hashPassword(newPassword);
@@ -326,6 +339,8 @@ export async function preferencesHandler(request: NextRequest) {
 
     if (request.method === 'PATCH') {
       const body = await request.json();
+      const bodyStr = JSON.stringify(body);
+      if (bodyStr.length > 10240) return new NextResponse('Payload too large (max 10KB)', { status: 413 });
       const schema = z.object({
         theme: z.enum(['light', 'dark', 'system']).optional(),
         language: z.string().optional(),

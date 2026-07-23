@@ -255,7 +255,8 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 }
 
 async function handler(request: NextRequest, slug: string[], method: string) {
-  const ip = request.headers.get('x-forwarded-for') || '';
+  const rawIp = request.headers.get('x-forwarded-for') || '';
+  const ip = rawIp.split(',')[0].trim();
   let session: any = null;
   try {
     session = await getSession(request);

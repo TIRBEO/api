@@ -59,19 +59,19 @@ export async function loginHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({ where: { email }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true } });
     if (!user) {
-      return new NextResponse("This account doesn't exist. Please sign up first.", { status: 404 });
+      return new NextResponse('Invalid email or password', { status: 401 });
     }
     if (user.isBanned) {
-      return new NextResponse('This account has been suspended. Contact support.', { status: 403 });
+      return new NextResponse('Account suspended', { status: 403 });
     }
     if (user.isSuspended) {
-      return new NextResponse('This account is temporarily suspended.', { status: 403 });
+      return new NextResponse('Account suspended', { status: 403 });
     }
     if (!user.passwordHash) {
-      return new NextResponse('This account uses social login. Please sign in with Google or GitHub.', { status: 401 });
+      return new NextResponse('Invalid email or password', { status: 401 });
     }
     if (!(await verifyPassword(user.passwordHash, password))) {
-      return new NextResponse('Incorrect password. Please try again.', { status: 401 });
+      return new NextResponse('Invalid email or password', { status: 401 });
     }
 
     if (user.is2FAEnabled) {
@@ -79,7 +79,7 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ needs2FA: true, tempToken });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token);
@@ -109,7 +109,7 @@ export async function verify2faLoginHandler(request: NextRequest) {
       return new NextResponse('Invalid 2FA code', { status: 401 });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token);
@@ -144,7 +144,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       data: { used: true, usedAt: new Date() },
     });
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token);
@@ -188,7 +188,7 @@ export async function signupHandler(request: NextRequest) {
       data: { email, passwordHash, name },
     });
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email }, { status: 201 });
     setSessionCookie(res, token);
@@ -228,7 +228,7 @@ export async function requestSignupOtpHandler(request: NextRequest) {
     return NextResponse.json({ message: 'Verification code sent to email' }, { status: 200 });
   } catch (err: any) {
     console.error('[SIGNUP OTP REQUEST]', err?.message || err, err?.stack);
-    return new NextResponse(`Failed to process request: ${err?.message || 'unknown'}`, { status: 500 });
+    return new NextResponse('Failed to process request', { status: 500 });
   }
 }
 
@@ -256,7 +256,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     return NextResponse.json({ message: 'Verification code sent to your email' }, { status: 200 });
   } catch (err: any) {
     console.error('[LOGIN OTP REQUEST]', err?.message || err, err?.stack);
-    return new NextResponse(`Failed to process request: ${err?.message || 'unknown'}`, { status: 500 });
+    return new NextResponse('Failed to process request', { status: 500 });
   }
 }
 
@@ -269,7 +269,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
     if (!user) {
-      return new NextResponse('No account found with this email', { status: 404 });
+      return new NextResponse('Invalid email or code', { status: 401 });
     }
 
     const otpOk = await verifySignupOtp(email, otpCode);
@@ -277,7 +277,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
       return new NextResponse('Invalid or expired verification code', { status: 400 });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token);
@@ -486,7 +486,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       create: { userId: user.id, provider: 'google', connected: true, metadata: { googleId, email } },
     });
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
     setSessionCookie(res, token);
@@ -615,7 +615,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     });
 
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.redirect(redirectTo || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`);
     setSessionCookie(res, token);
@@ -952,7 +952,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return new NextResponse('User not found', { status: 404 });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token: sessionToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ email: user.email });
     setSessionCookie(res, sessionToken);
