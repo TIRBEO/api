@@ -751,7 +751,8 @@ export async function profileHandler(request: NextRequest) {
         },
       });
       if (!user) return new NextResponse('User not found', { status: 404 });
-      return NextResponse.json({ ...user, hasPassword: !!(user as any).passwordHash });
+      const { passwordHash: _pw, ...safeUser } = user as any;
+      return NextResponse.json({ ...safeUser, hasPassword: !!_pw });
     }
 
     if (request.method === 'PATCH') {
@@ -791,9 +792,17 @@ export async function profileHandler(request: NextRequest) {
       const updated = await prisma.user.update({
         where: { id: session.userId },
         data,
+        select: {
+          id: true, email: true, name: true, photoUrl: true,
+          phoneNumber: true, occupation: true, bio: true,
+          website: true, linkedin: true, github: true, twitter: true,
+          country: true, timezone: true, language: true,
+          companyName: true, companyRole: true, industry: true, companySize: true,
+          gender: true, birthday: true, secondaryEmail: true,
+          createdAt: true, updatedAt: true,
+        },
       });
 
-      // Log activity
       prisma.auditEvent.create({
         data: {
           actorId: session.userId,

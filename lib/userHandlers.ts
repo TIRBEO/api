@@ -247,7 +247,11 @@ export async function integrationsHandler(request: NextRequest) {
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
     if (request.method === 'GET') {
-      const integrations = await prisma.integration.findMany({ where: { userId: session.userId }, orderBy: { createdAt: 'desc' } });
+      const integrations = await prisma.integration.findMany({
+        where: { userId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, provider: true, connected: true, createdAt: true, updatedAt: true },
+      });
       return NextResponse.json(integrations);
     }
 

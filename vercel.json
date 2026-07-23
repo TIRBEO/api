@@ -1,5 +1,6 @@
 {
-  "installCommand": "npm install",
-  "buildCommand": "npm run build",
-  "outputDirectory": ".next"
+  "installCommand": "npx pnpm@10.10.0 install --ignore-scripts",
+  "buildCommand": "npx prisma generate && npx next build",
+  "outputDirectory": ".next",
+  "framework": "nextjs"
 }

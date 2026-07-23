@@ -98,12 +98,22 @@ const INTERNAL_ROUTES = [
   'districts',
 ];
 
+let routeCache: { data: any[]; ts: number } | null = null;
+let blockCache: { data: any[]; ts: number } | null = null;
+const CACHE_TTL = 30000;
+
 async function loadRoutes() {
-  return prisma.route.findMany({ where: { enabled: true } });
+  if (routeCache && Date.now() - routeCache.ts < CACHE_TTL) return routeCache.data;
+  const data = await prisma.route.findMany({ where: { enabled: true } });
+  routeCache = { data, ts: Date.now() };
+  return data;
 }
 
 async function loadBlocked() {
-  return prisma.blocklist.findMany();
+  if (blockCache && Date.now() - blockCache.ts < CACHE_TTL) return blockCache.data;
+  const data = await prisma.blocklist.findMany();
+  blockCache = { data, ts: Date.now() };
+  return data;
 }
 
 function matchRoute(slug: string[], method: string, routes: any[]) {
@@ -471,7 +481,20 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     body: method !== 'GET' && method !== 'HEAD' ? await request.text() : undefined,
   };
 
-  const upstreamResponse = await fetch(targetUrl, init);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await fetch(targetUrl, { ...init, signal: controller.signal });
+  } catch (e: any) {
+    clearTimeout(timeout);
+    if (e?.name === 'AbortError') {
+      await logRequest({ ip, method, path: slug.join('/'), userId: session?.userId, status: 504 });
+      return new NextResponse('Gateway timeout', { status: 504 });
+    }
+    throw e;
+  }
+  clearTimeout(timeout);
   const responseHeaders = new Headers(upstreamResponse.headers);
   const response = new NextResponse(await upstreamResponse.text(), {
     status: upstreamResponse.status,
