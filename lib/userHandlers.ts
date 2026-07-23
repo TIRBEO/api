@@ -188,9 +188,55 @@ export async function notificationsHandler(request: NextRequest) {
       return new NextResponse('Notifications updated', { status: 200 });
     }
 
+    if (request.method === 'DELETE') {
+      const id = request.nextUrl.searchParams.get('id');
+      if (id) {
+        await prisma.notification.deleteMany({ where: { id, userId: session.userId } });
+      } else {
+        await prisma.notification.deleteMany({ where: { userId: session.userId } });
+      }
+      return new NextResponse('Notifications deleted', { status: 200 });
+    }
+
     return new NextResponse('Method not allowed', { status: 405 });
   } catch (err: any) {
     console.error('[NOTIFICATIONS]', err?.message || err);
+    return new NextResponse('Failed to process request', { status: 500 });
+  }
+}
+
+export async function notificationPrefsHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthorized', { status: 401 });
+
+    if (request.method === 'GET') {
+      let prefs = await prisma.notificationPreference.findUnique({ where: { userId: session.userId } });
+      if (!prefs) {
+        prefs = await prisma.notificationPreference.create({ data: { userId: session.userId } });
+      }
+      return NextResponse.json(prefs);
+    }
+
+    if (request.method === 'PUT') {
+      const body = await request.json();
+      const allowed = ['emailDigest', 'digestTime', 'mention', 'comment', 'report', 'system', 'marketing', 'security', 'product'];
+      const data: Record<string, any> = {};
+      for (const key of allowed) {
+        if (body[key] !== undefined) data[key] = body[key];
+      }
+      // Upsert
+      await prisma.notificationPreference.upsert({
+        where: { userId: session.userId },
+        create: { userId: session.userId, ...data },
+        update: data,
+      });
+      return new NextResponse('Notification preferences updated', { status: 200 });
+    }
+
+    return new NextResponse('Method not allowed', { status: 405 });
+  } catch (err: any) {
+    console.error('[NOTIFICATION_PREFS]', err?.message || err);
     return new NextResponse('Failed to process request', { status: 500 });
   }
 }

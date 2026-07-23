@@ -979,3 +979,45 @@ export async function deleteWorkspaceHandler(request: NextRequest) {
     return new NextResponse('Failed to delete workspace', { status: 500 });
   }
 }
+
+export async function deleteWorkspaceByIdHandler(request: NextRequest, workspaceId: string) {
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+
+    const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId } });
+    if (!workspace) return new NextResponse('Workspace not found', { status: 404 });
+    if (workspace.ownerId !== session.userId) {
+      return new NextResponse('Only the owner can delete a workspace', { status: 403 });
+    }
+
+    await prisma.workspace.delete({ where: { id: workspaceId } });
+    return new NextResponse('Workspace deleted', { status: 200 });
+  } catch (err: any) {
+    console.error('[DELETE WORKSPACE BY ID]', err?.message || err);
+    return new NextResponse('Failed to delete workspace', { status: 500 });
+  }
+}
+
+// ─── Public Help Config ───
+
+export async function helpConfigHandler(request: NextRequest) {
+  return NextResponse.json({
+    articles: [
+      { id: "1", title: "Getting Started with Tirbeo", content: "Welcome to Tirbeo! This guide will help you set up your account, configure your profile, and explore the platform.", category: "Getting Started", icon: "zap" },
+      { id: "2", title: "How to Change Your Password", content: "Go to Security → Change Password. Enter your current password, then your new password (minimum 8 characters).", category: "Security", icon: "shield" },
+      { id: "3", title: "Setting Up Two-Factor Authentication", content: "Navigate to Security → Two-Factor Authentication. You can use an authenticator app or SMS verification.", category: "Security", icon: "shield" },
+      { id: "4", title: "Managing Your Notifications", content: "Go to Preferences → Notifications to configure what alerts you receive.", category: "Account", icon: "bell" },
+      { id: "5", title: "Customizing Your Dashboard", content: "Open Preferences to personalize your experience. Change themes, adjust fonts, modify colors.", category: "Account", icon: "settings" },
+      { id: "6", title: "Connecting Third-Party Accounts", content: "Visit Integrations to connect Google, GitHub, and other services.", category: "Account", icon: "link" },
+      { id: "7", title: "Understanding Your Activity Log", content: "The Activity page shows a complete history of everything that happened on your account.", category: "Account", icon: "activity" },
+      { id: "8", title: "Managing Active Sessions", content: "In Security → Active Sessions, you can see all devices currently signed into your account.", category: "Security", icon: "shield" },
+      { id: "9", title: "Recovery Options", content: "Set up recovery email and phone in Security → Recovery Options.", category: "Security", icon: "shield" },
+      { id: "10", title: "Backup Codes", content: "In Security → Backup Codes, you can generate one-time codes for emergency access.", category: "Security", icon: "shield" },
+      { id: "11", title: "Reporting a Bug", content: "Found a bug? Report it through our GitHub issues page or contact support directly.", category: "Support", icon: "bug" },
+      { id: "12", title: "Privacy & Data", content: "Your privacy matters. You can export all your data from Preferences → Data & Privacy.", category: "Account", icon: "globe" },
+    ],
+    contactEmail: "support@tirbeo.app",
+    faqEnabled: true,
+  });
+}

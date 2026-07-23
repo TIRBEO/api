@@ -30,6 +30,8 @@ import {
   requestPasswordResetHandler,
   verifyPasswordResetHandler,
   confirmPasswordResetHandler,
+  deleteWorkspaceByIdHandler,
+  helpConfigHandler,
 } from '../../../lib/authHandlers';
 
 import {
@@ -45,6 +47,7 @@ import {
   verifyProfileEditOtpHandler,
   avatarUploadHandler,
   heartbeatHandler,
+  notificationPrefsHandler,
 } from '../../../lib/userHandlers';
 
 import {
@@ -87,9 +90,10 @@ const INTERNAL_ROUTES = [
   'security/backup-codes/regenerate', 'security/phones', 'security/recovery-email',
   'security/password-check', 'security/sessions/revoke-all',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'integrations', 'user/activity', 'preferences',
+  'notifications', 'notifications/prefs', 'integrations', 'user/activity', 'preferences',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test',
+  'public/help-config',
 ];
 
 async function loadRoutes() {
@@ -121,6 +125,14 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     const sessionId = slug[2];
     if (method.toUpperCase() === 'DELETE') {
       return { path: 'security/sessions/[id]', method, internal: true, allowedRoles: ['guest'], meta: { sessionId } };
+    }
+  }
+
+  // Handle workspaces/{id} dynamic route
+  if (slug.length === 2 && slug[0] === 'workspaces' && slug[1] !== 'delete') {
+    const workspaceId = slug[1];
+    if (method.toUpperCase() === 'DELETE') {
+      return { path: 'workspaces/[id]', method, internal: true, allowedRoles: ['guest'], meta: { workspaceId } };
     }
   }
 
@@ -167,7 +179,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'profile/request-edit-otp': ['POST'],
       'profile/verify-edit-otp': ['POST'],
       'profile/avatar': ['POST'],
-      'notifications': ['GET', 'PATCH'],
+      'notifications': ['GET', 'PATCH', 'DELETE'],
+      'notifications/prefs': ['GET', 'PUT'],
       'integrations': ['GET', 'POST', 'DELETE'],
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
@@ -175,6 +188,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/config': ['GET', 'PATCH'],
       'email/templates': ['GET', 'POST'],
       'email/test': ['POST'],
+      'public/help-config': ['GET'],
     };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
@@ -322,6 +336,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'workspaces/delete':
         resp = await deleteWorkspaceHandler(request);
         break;
+      case 'workspaces/[id]':
+        resp = await deleteWorkspaceByIdHandler(request, (route as any).meta.workspaceId);
+        break;
       case 'profile':
         resp = await extendedProfileHandler(request);
         break;
@@ -376,6 +393,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'notifications':
         resp = await notificationsHandler(request);
         break;
+      case 'notifications/prefs':
+        resp = await notificationPrefsHandler(request);
+        break;
       case 'integrations':
         resp = await integrationsHandler(request);
         break;
@@ -396,6 +416,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'email/test':
         resp = await emailTestHandler(request);
+        break;
+      case 'public/help-config':
+        resp = await helpConfigHandler(request);
         break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
