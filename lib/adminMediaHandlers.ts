@@ -99,8 +99,7 @@ export async function uploadMediaHandler(request: NextRequest) {
     });
     url = `${r2PublicUrl}/${r2Key}`;
   } else {
-    const base64 = buffer.toString('base64');
-    url = `data:${file.type};base64,${base64}`;
+    return new NextResponse('File storage not configured. Contact admin.', { status: 503 });
   }
   let width: number | null = null;
   let height: number | null = null;

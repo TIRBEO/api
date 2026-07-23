@@ -57,9 +57,15 @@ export async function loginHandler(request: NextRequest) {
     }
     const { email, password } = parsed.data;
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const user = await prisma.user.findUnique({ where: { email }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true } });
     if (!user) {
       return new NextResponse("This account doesn't exist. Please sign up first.", { status: 404 });
+    }
+    if (user.isBanned) {
+      return new NextResponse('This account has been suspended. Contact support.', { status: 403 });
+    }
+    if (user.isSuspended) {
+      return new NextResponse('This account is temporarily suspended.', { status: 403 });
     }
     if (!user.passwordHash) {
       return new NextResponse('This account uses social login. Please sign in with Google or GitHub.', { status: 401 });
@@ -70,7 +76,7 @@ export async function loginHandler(request: NextRequest) {
 
     if (user.is2FAEnabled) {
       const tempToken = await signTemp2faToken(user.id);
-      return NextResponse.json({ needs2FA: true, tempToken, userId: user.id });
+      return NextResponse.json({ needs2FA: true, tempToken });
     }
 
     const ip = request.headers.get('x-forwarded-for') || '';
@@ -94,7 +100,7 @@ export async function verify2faLoginHandler(request: NextRequest) {
     const userId = await verifyTemp2faToken(tempToken);
     if (!userId) return new NextResponse('Invalid or expired temp token', { status: 401 });
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, totpSecret: true, is2FAEnabled: true } });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
       return new NextResponse('2FA not enabled', { status: 400 });
     }
@@ -123,7 +129,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     const userId = await verifyTemp2faToken(tempToken);
     if (!userId) return new NextResponse('Invalid or expired temp token', { status: 401 });
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, is2FAEnabled: true } });
     if (!user || !user.is2FAEnabled) {
       return new NextResponse('2FA not enabled', { status: 400 });
     }
@@ -216,10 +222,8 @@ export async function requestSignupOtpHandler(request: NextRequest) {
     try {
       const result = await sendSignupOtpEmail(email, code);
       emailSent = result.success;
-      if (!emailSent) console.log(`[SIGNUP OTP] Email failed for ${email}, code: ${code}`);
     } catch (emailErr) {
       console.error('[SIGNUP OTP] Email send error:', emailErr);
-      console.log(`[SIGNUP OTP] FALLBACK CODE for ${email}: ${code}`);
     }
     return NextResponse.json({ message: 'Verification code sent to email' }, { status: 200 });
   } catch (err: any) {
@@ -246,10 +250,8 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     try {
       const result = await sendSignupOtpEmail(email, code, 'login_otp');
       emailSent = result.success;
-      if (!emailSent) console.log(`[LOGIN OTP] Email failed for ${email}, code: ${code}`);
     } catch (emailErr) {
       console.error('[LOGIN OTP] Email send error:', emailErr);
-      console.log(`[LOGIN OTP] FALLBACK CODE for ${email}: ${code}`);
     }
     return NextResponse.json({ message: 'Verification code sent to your email' }, { status: 200 });
   } catch (err: any) {
@@ -305,7 +307,7 @@ export async function requestEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
     if (!user || !user.email) return new NextResponse('User email missing', { status: 400 });
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
@@ -344,7 +346,7 @@ export async function requestPhoneOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, phoneNumber: true } });
     if (!user || !user.phoneNumber) return new NextResponse('User phone missing', { status: 400 });
     const code = generateOtpCode();
     await storeOtp(session.userId, 'phone', code);
@@ -636,6 +638,7 @@ export async function activityHandler(request: NextRequest) {
       where: { userId: session.userId },
       orderBy: { createdAt: 'desc' },
       take: limit,
+      select: { id: true, method: true, path: true, status: true, createdAt: true },
     });
 
     return NextResponse.json(logs);
@@ -685,12 +688,18 @@ export async function createWorkspaceHandler(request: NextRequest) {
     const body = await request.json();
     const { name, slug } = body;
     if (!name || !slug) return new NextResponse('name and slug required', { status: 400 });
+    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 64) {
+      return new NextResponse('Name must be 2-64 characters', { status: 400 });
+    }
+    if (typeof slug !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || slug.length < 2 || slug.length > 48) {
+      return new NextResponse('Slug must be 2-48 lowercase alphanumeric characters (dashes allowed)', { status: 400 });
+    }
 
     const existing = await prisma.workspace.findUnique({ where: { slug } });
     if (existing) return new NextResponse('Slug already taken', { status: 409 });
 
     const workspace = await prisma.workspace.create({
-      data: { name, slug, ownerId: session.userId },
+      data: { name: name.trim(), slug: slug.trim(), ownerId: session.userId },
     });
 
     await prisma.membership.create({
@@ -746,13 +755,13 @@ export async function profileHandler(request: NextRequest) {
           lastActiveAt: true,
           emailVerified: true,
           phoneVerified: true,
-          passwordHash: true,
           preferences: true,
+          passwordHash: true,
         },
       });
       if (!user) return new NextResponse('User not found', { status: 404 });
-      const { passwordHash: _pw, ...safeUser } = user as any;
-      return NextResponse.json({ ...safeUser, hasPassword: !!_pw });
+      const { passwordHash, ...safeUser } = user as any;
+      return NextResponse.json({ ...safeUser, hasPassword: !!passwordHash });
     }
 
     if (request.method === 'PATCH') {
@@ -892,7 +901,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
       return new NextResponse('Email is required', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, name: true } });
     // Always return success to prevent email enumeration
     if (!user) {
       return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
@@ -916,9 +925,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
     const resp: any = { message: 'If an account exists, a magic link has been sent.' };
     if (!emailSent) {
-      resp.devLink = callbackUrl;
-      resp.devMessage = 'Email delivery failed. Use this link for testing.';
-      console.log(`[MAGIC LINK] FALLBACK LINK for ${email}: ${callbackUrl}`);
+      console.log(`[MAGIC LINK] Email delivery failed for ${email}`);
     }
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
@@ -940,14 +947,14 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return new NextResponse('Invalid or expired magic link', { status: 401 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true } });
     if (!user) {
       return new NextResponse('User not found', { status: 404 });
     }
 
     const ip = request.headers.get('x-forwarded-for') || '';
     const { token: sessionToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const res = NextResponse.json({ id: user.id, email: user.email });
+    const res = NextResponse.json({ email: user.email });
     setSessionCookie(res, sessionToken);
 
     await createAuditEvent({

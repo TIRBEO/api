@@ -4,6 +4,8 @@ const nextConfig = {
   eslint: { ignoreDuringBuilds: true },
   serverExternalPackages: ['ioredis', 'argon2'],
   webpack: (config, { isServer }) => {
+    config.output = config.output || {};
+    config.output.hashFunction = 'xxhash64';
     if (isServer) {
       config.externals = [...(config.externals || []), 'ioredis', 'argon2'];
     }

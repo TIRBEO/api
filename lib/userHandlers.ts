@@ -108,7 +108,7 @@ export async function changePasswordHandler(request: NextRequest) {
       return new NextResponse('Invalid payload', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, passwordHash: true } });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
     if (user.passwordHash && !(await verifyPassword(user.passwordHash, currentPassword))) {
@@ -172,6 +172,7 @@ export async function notificationsHandler(request: NextRequest) {
         where: { userId: session.userId },
         orderBy: { createdAt: 'desc' },
         take: limit,
+        select: { id: true, type: true, title: true, body: true, link: true, icon: true, priority: true, read: true, readAt: true, createdAt: true },
       });
       const unread = await prisma.notification.count({ where: { userId: session.userId, read: false } });
       return NextResponse.json({ notifications, unread });
@@ -378,7 +379,7 @@ export async function setPasswordHandler(request: NextRequest) {
       return new NextResponse('OTP code required', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true } });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
     const ok = await verifyOtpCode(session.userId, 'email', otpCode);
@@ -415,7 +416,7 @@ export async function requestProfileEditOtpHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
     if (!user?.email) return new NextResponse('No email on file', { status: 400 });
 
     const code = generateOtpCode();
@@ -490,9 +491,7 @@ export async function avatarUploadHandler(request: NextRequest) {
       });
       photoUrl = `${r2PublicUrl}/avatars/${fileName}`;
     } else {
-      const arrayBuffer = await file.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString('base64');
-      photoUrl = `data:${file.type};base64,${base64}`;
+      return new NextResponse('File storage not configured. Contact admin.', { status: 503 });
     }
 
     await prisma.user.update({

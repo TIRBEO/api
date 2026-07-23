@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession } from './session';
 import { generateSecret, generateTotpUri, verifyTotp as verifyTotpCode } from './auth/totp';
+import { verifyPassword } from './auth/password';
 import { createAuditEvent } from './audit';
+import { randomInt } from 'crypto';
 
 // GET /api/security/events — security audit events for current user
 export async function securityEventsHandler(request: NextRequest) {
@@ -14,6 +16,7 @@ export async function securityEventsHandler(request: NextRequest) {
       where: { actorId: session.userId },
       orderBy: { createdAt: 'desc' },
       take: 20,
+      select: { id: true, action: true, metadata: true, createdAt: true },
     });
 
     const formatted = events.map(e => ({
@@ -39,7 +42,7 @@ export async function totpSetupHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
     const secret = generateSecret();
@@ -68,7 +71,7 @@ export async function totpVerifyHandler(request: NextRequest) {
       return new NextResponse('Invalid code', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, totpSecret: true, is2FAEnabled: true } });
     if (!user || !user.totpSecret) {
       return new NextResponse('No TOTP secret found. Run setup first.', { status: 400 });
     }
@@ -102,6 +105,30 @@ export async function totpDisableHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
+    const body = await request.json().catch(() => ({}));
+    const { password, totpCode } = body as { password?: string; totpCode?: string };
+
+    if (!password && !totpCode) {
+      return new NextResponse('Password or TOTP code required to disable 2FA', { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { id: true, passwordHash: true, totpSecret: true, is2FAEnabled: true },
+    });
+    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user.is2FAEnabled) return new NextResponse('2FA is not enabled', { status: 400 });
+
+    if (password) {
+      if (!user.passwordHash || !(await verifyPassword(user.passwordHash, password))) {
+        return new NextResponse('Incorrect password', { status: 401 });
+      }
+    } else if (totpCode) {
+      if (!user.totpSecret) return new NextResponse('No TOTP secret', { status: 400 });
+      const ok = await verifyTotpCode(totpCode, user.totpSecret);
+      if (!ok) return new NextResponse('Invalid TOTP code', { status: 401 });
+    }
+
     await prisma.user.update({
       where: { id: session.userId },
       data: { totpSecret: null, is2FAEnabled: false },
@@ -131,7 +158,7 @@ export async function backupCodesRegenerateHandler(request: NextRequest) {
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
     const codes = Array.from({ length: 10 }, () =>
-      Array.from({ length: 8 }, () => '0123456789'[Math.floor(Math.random() * 10)]).join('')
+      Array.from({ length: 8 }, () => '0123456789'[randomInt(10)]).join('')
     );
 
     await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
@@ -156,10 +183,14 @@ export async function phonesAddHandler(request: NextRequest) {
     if (!number || typeof number !== 'string') {
       return new NextResponse('Phone number required', { status: 400 });
     }
+    const clean = number.replace(/[\s\-()]/g, '');
+    if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
+      return new NextResponse('Invalid phone number format', { status: 400 });
+    }
 
     await prisma.user.update({
       where: { id: session.userId },
-      data: { phoneNumber: number },
+      data: { phoneNumber: clean },
     });
 
     return NextResponse.json({ ok: true });
@@ -197,6 +228,9 @@ export async function recoveryEmailHandler(request: NextRequest) {
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email required', { status: 400 });
     }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return new NextResponse('Invalid email format', { status: 400 });
+    }
 
     await prisma.user.update({
       where: { id: session.userId },
@@ -216,7 +250,30 @@ export async function passwordCheckHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthorized', { status: 401 });
 
-    return NextResponse.json({ weak: 0, reused: 0, total: 1 });
+    const { password } = await request.json().catch(() => ({ password: '' }));
+    if (!password || typeof password !== 'string') {
+      return new NextResponse('Password required', { status: 400 });
+    }
+
+    let strength = 0;
+    if (password.length >= 8) strength++;
+    if (password.length >= 12) strength++;
+    if (/[a-z]/.test(password) && /[A-Z]/.test(password)) strength++;
+    if (/\d/.test(password)) strength++;
+    if (/[^a-zA-Z0-9]/.test(password)) strength++;
+    const weak = strength < 3 ? 1 : 0;
+
+    let reused = 0;
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { passwordHash: true },
+    });
+    if (user?.passwordHash) {
+      const { verifyPassword } = await import('./auth/password');
+      if (await verifyPassword(user.passwordHash, password)) reused = 1;
+    }
+
+    return NextResponse.json({ weak, reused, strength, total: 1 });
   } catch (err: any) {
     console.error('[PASSWORD CHECK]', err?.message || err);
     return new NextResponse('Failed to check passwords', { status: 500 });
