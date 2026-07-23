@@ -538,3 +538,11 @@ model ThemeConfig {
   @@map("theme_configs")
   @@index([isActive])
 }
+
+model District {
+  id       Int    @id @default(autoincrement())
+  name     String @unique
+  province Int
+
+  @@map("districts")
+}

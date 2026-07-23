@@ -48,6 +48,7 @@ import {
   avatarUploadHandler,
   heartbeatHandler,
   notificationPrefsHandler,
+  districtsHandler,
 } from '../../../lib/userHandlers';
 
 import {
@@ -94,6 +95,7 @@ const INTERNAL_ROUTES = [
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test',
   'public/help-config',
+  'districts',
 ];
 
 async function loadRoutes() {
@@ -189,6 +191,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/templates': ['GET', 'POST'],
       'email/test': ['POST'],
       'public/help-config': ['GET'],
+      'districts': ['GET'],
     };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
@@ -419,6 +422,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'public/help-config':
         resp = await helpConfigHandler(request);
+        break;
+      case 'districts':
+        resp = await districtsHandler(request);
         break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);

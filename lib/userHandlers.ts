@@ -502,3 +502,16 @@ export async function avatarUploadHandler(request: NextRequest) {
     return new NextResponse('Failed to upload avatar', { status: 500 });
   }
 }
+
+export async function districtsHandler(request: NextRequest) {
+  try {
+    if (request.method === 'GET') {
+      const districts = await prisma.district.findMany({ orderBy: { name: 'asc' } });
+      return NextResponse.json(districts);
+    }
+    return new NextResponse('Method not allowed', { status: 405 });
+  } catch (err: any) {
+    console.error('[DISTRICTS]', err?.message || err);
+    return new NextResponse('Failed to fetch districts', { status: 500 });
+  }
+}
