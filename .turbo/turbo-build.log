@@ -1,0 +1,135 @@
+
+> @tirbeo/api@0.0.1 build C:\Users\gwbis\Downloads\Tirbeo-All\apps\api
+> prisma generate && next build
+
+Loaded Prisma config from prisma.config.ts.
+
+Prisma schema loaded from prisma\schema.prisma.
+
+✔ Generated Prisma Client (v7.9.1) to .\..\..\node_modules\.pnpm\@prisma+client@7.9.1_prisma@7.9.1_@types+react@19.2.18_react-dom@19.2.8_react@19.2.8__react@1_milngwwx7bqrxdbpvrsteu4z4a\node_modules\@prisma\client in 1.40s
+
+Start by importing your Prisma Client (See: https://pris.ly/d/importing-client)
+
+
+▲ Next.js 16.2.12 (Turbopack)
+- Environments: .env.local, .env
+
+  Creating an optimized production build ...
+Turbopack build encountered 1 warnings:
+./apps/api/next.config.js
+Encountered unexpected file in NFT list
+A file was traced that indicates that the whole project was traced unintentionally. Somewhere in the import trace below, there are:
+- filesystem operations (like path.join, path.resolve or fs.readFile), or
+- very dynamic requires (like require('./' + foo)).
+To resolve this, you can
+- remove them if possible, or
+- only use them in development, or
+- make sure they are statically scoped to some subfolder: path.join(process.cwd(), 'data', bar), or
+- add ignore comments: path.join(/*turbopackIgnore: true*/ process.cwd(), bar)
+
+Import trace:
+  App Route:
+    ./apps/api/next.config.js
+    ./apps/api/app/image/[...path]/route.ts
+
+
+✓ Compiled successfully in 30.3s
+  Skipping validation of types
+  Finished TypeScript config validation in 210ms ...
+  Collecting page data using 15 workers ...
+  Generating static pages using 15 workers (0/55) ...
+  Generating static pages using 15 workers (13/55) 
+  Generating static pages using 15 workers (27/55) 
+  Generating static pages using 15 workers (41/55) 
+✓ Generating static pages using 15 workers (55/55) in 5.9s
+  Finalizing page optimization ...
+
+Route (app)
+┌ ○ /_not-found
+├ ƒ /api/[[...slug]]
+├ ƒ /api/admin/2fa
+├ ƒ /api/admin/activity
+├ ƒ /api/admin/analytics
+├ ƒ /api/admin/audit
+├ ƒ /api/admin/authorize
+├ ƒ /api/admin/branding
+├ ƒ /api/admin/check-setup
+├ ƒ /api/admin/email/config
+├ ƒ /api/admin/email/templates
+├ ƒ /api/admin/email/templates/[id]
+├ ƒ /api/admin/email/test
+├ ƒ /api/admin/forms
+├ ƒ /api/admin/forms/[id]
+├ ƒ /api/admin/groups
+├ ƒ /api/admin/heartbeat
+├ ƒ /api/admin/integrations
+├ ƒ /api/admin/layout-config
+├ ƒ /api/admin/login
+├ ƒ /api/admin/me
+├ ƒ /api/admin/media
+├ ƒ /api/admin/media/[id]
+├ ƒ /api/admin/moderation/reports
+├ ƒ /api/admin/moderation/reports/[id]
+├ ƒ /api/admin/moderation/stats
+├ ƒ /api/admin/monitor/[[...action]]
+├ ƒ /api/admin/notifications
+├ ƒ /api/admin/notifications/[id]
+├ ƒ /api/admin/notifications/prefs
+├ ƒ /api/admin/ous
+├ ƒ /api/admin/preferences
+├ ƒ /api/admin/reserved-addresses
+├ ƒ /api/admin/reserved-addresses/[id]
+├ ƒ /api/admin/roles/[[...action]]
+├ ƒ /api/admin/roles/[id]
+├ ƒ /api/admin/roles/[id]/members
+├ ƒ /api/admin/routes/[[...action]]
+├ ƒ /api/admin/search
+├ ƒ /api/admin/security/blocks
+├ ƒ /api/admin/security/blocks/[targetType]/[targetId]
+├ ƒ /api/admin/security/events
+├ ƒ /api/admin/security/score
+├ ƒ /api/admin/seed
+├ ƒ /api/admin/site-config/[[...action]]
+├ ƒ /api/admin/stats
+├ ƒ /api/admin/support/tickets
+├ ƒ /api/admin/support/tickets/[id]
+├ ƒ /api/admin/support/tickets/[id]/reply
+├ ƒ /api/admin/theme
+├ ƒ /api/admin/tickets
+├ ƒ /api/admin/tickets/[id]
+├ ƒ /api/admin/tickets/[id]/reply
+├ ƒ /api/admin/users/[[...action]]
+├ ƒ /api/admin/users/[id]/password
+├ ƒ /api/admin/verify-2fa
+├ ƒ /api/admin/workspaces/[[...action]]
+├ ƒ /api/captcha/admin
+├ ƒ /api/captcha/admin/analytics
+├ ƒ /api/captcha/admin/blocks
+├ ƒ /api/captcha/admin/logs
+├ ƒ /api/captcha/challenge
+├ ƒ /api/captcha/image/[id]
+├ ƒ /api/captcha/status
+├ ƒ /api/captcha/verify
+├ ƒ /api/newsletter/subscribe
+├ ƒ /api/public/app-config
+├ ƒ /api/public/landing
+├ ƒ /api/public/landing-config
+├ ƒ /api/public/theme
+├ ƒ /api/security/log
+├ ƒ /api/support/tickets
+├ ƒ /api/support/tickets/[id]
+├ ƒ /api/support/tickets/[id]/reply
+├ ƒ /auth/discord
+├ ƒ /auth/discord/callback
+├ ƒ /auth/github
+├ ƒ /auth/github/callback
+├ ƒ /auth/google
+├ ƒ /auth/google/callback
+└ ƒ /image/[...path]
+
+
+ƒ Proxy (Middleware)
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

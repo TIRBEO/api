@@ -1,0 +1,2294 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id String                  @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email String                  @unique
+  passwordHash String                  @default("") @map("password_hash")
+  name String?
+  photoUrl String? @map("photo_url")
+  bio String?
+  secondaryEmail String? @map("secondary_email")
+  phoneNumber String? @map("phone_number")
+  phoneVerified Boolean? @map("phone_verified")                @default(false)
+  emailVerified Boolean?                @default(false) @map("email_verified")
+  username String?                 @unique
+  gender String?
+  birthday DateTime?               @db.Timestamptz(6)
+  googleId String? @map("google_id")                 @unique
+  githubId String? @map("github_id")                 @unique
+  discordId String? @map("discord_id")                 @unique
+  occupation String?
+  companyName String? @map("company_name")
+  companyRole String? @map("company_role")
+  industry String?
+  companySize String? @map("company_size")
+  website String?
+  linkedin String?
+  githubUsername String? @map("github_username")
+  twitter String?
+  country String?
+  timezone String?
+  language String?                 @default("en")
+  theme String?                 @default("system")
+  dateFormat String? @map("date_format")                 @default("MM/DD/YYYY")
+  timeFormat String? @map("time_format")                 @default("12h")
+  fontSize String? @map("font_size")                 @default("default")
+  reduceMotion Boolean? @map("reduce_motion")                @default(false)
+  highContrast Boolean? @map("high_contrast")                @default(false)
+  preferences Json?                   @default("{}")
+  totpSecret String?                 @map("totp_secret")
+  is2FAEnabled Boolean?                @default(false) @map("is_2fa_enabled")
+  isBanned Boolean? @map("is_banned")                @default(false)
+  isSuspended Boolean? @map("is_suspended")                @default(false)
+  suspendReason String? @map("suspend_reason")
+  suspendedUntil DateTime? @map("suspended_until")               @db.Timestamptz(6)
+  adminRole String?                 @map("admin_role")
+  lastActiveAt DateTime? @map("last_active_at")               @db.Timestamptz(6)
+  lastLoginAt DateTime? @map("last_login_at")               @db.Timestamptz(6)
+  lastLoginIp String? @map("last_login_ip")
+  loginCount Int? @map("login_count")                    @default(0)
+  karmaPoints Int? @map("karma_points")                    @default(0)
+  isVerified Boolean? @map("is_verified")                @default(false)
+  createdAt DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  activityStreaks activity_streaks?
+  apiKeys ApiKey[]
+  apiUsageLogs api_usage_logs[]
+  auditEvents AuditEvent[]            @relation("AuditActor")
+  blocklist Blocklist[]
+  contentReports ContentReport[]
+  contentReportsReviewed ContentReport[]         @relation("content_reports_reviewed_byTousers")
+  emailPreferences email_preferences?
+  integrations Integration[]
+  invoices invoices[]
+  loginHistory login_history[]
+  media Media[]
+  memberships Membership[]
+  notificationPreferences NotificationPreference?
+  notifications Notification[]
+  otps Otp[]
+  passwordResetTokens PasswordResetToken[]
+  paymentMethods payment_methods[]
+  recoveryCodes RecoveryCode[]
+  savedThemes saved_themes[]
+  securityEvents SecurityEvent[]
+  sessions Session[]
+  passkeys Passkey[]
+  subscriptions subscriptions[]
+  userFeatureFlags user_feature_flags[]
+  userPasswords UserPassword[]
+  blogPosts Blog[] @relation("BlogAuthor")
+  customerTickets Ticket[] @relation("TicketCustomer")
+  assignedTickets Ticket[] @relation("TicketAssignee")
+  ticketMessages TicketMessage[] @relation("TicketMessageAuthor")
+  followers follows[] @relation("FollowsFollower")
+  following follows[] @relation("FollowsFollowing")
+  profileViewsViewed profile_views[] @relation("ProfileViewViewer")
+  profileViews profile_views[] @relation("ProfileViewProfile")
+  apps apps[] @relation("AppOwner")
+  supportAgents support_agents[] @relation("SupportAgentUser")
+  userRolesUserRolesAssignedByIdTousers UserRole[]              @relation("user_roles_assigned_by_idTousers")
+  roles UserRole[]
+  userSettings user_settings?
+  verificationRequestsVerificationRequestsReviewedByTousers verification_requests[] @relation("verification_requests_reviewed_byTousers")
+  verificationRequestsVerificationRequestsUserIdTousers verification_requests[] @relation("verification_requests_user_idTousers")
+  webhooks webhooks[]
+  workspaceInvites workspace_invites[]
+  workspaces Workspace[]
+  authorizationCodes authorization_codes[]
+  accessTokens access_tokens[]
+  refreshTokens refresh_tokens[]
+  oAuthConsents oAuthConsent[]
+  formCollaborators formCollaborator[]
+  responseNotes responseNote[]
+  forms form[]
+  groupMembers GroupMember[]
+  supportTickets SupportTicket[]
+  supportTicketReplies SupportTicketReply[]
+  projects projects[]
+
+  @@index([adminRole], map: "idx_users_admin_role")
+  @@index([createdAt], map: "idx_users_created")
+  @@index([email], map: "idx_users_email")
+  @@index([githubId], map: "idx_users_github_id")
+  @@index([googleId], map: "idx_users_google_id")
+  @@index([isBanned], map: "idx_users_is_banned")
+  @@index([lastActiveAt], map: "idx_users_last_active")
+  @@map("users")
+}
+
+model UserRole {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String    @map("user_id")
+  roleId String    @map("role_id")
+  assignedById String? @map("assigned_by_id")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  usersUserRolesAssignedByIdTousers User?     @relation("user_roles_assigned_by_idTousers", fields: [assignedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  role app_roles @relation(fields: [roleId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  user User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, roleId])
+  @@index([roleId], map: "idx_user_roles_role")
+  @@index([userId], map: "idx_user_roles_user")
+  @@map("user_roles")
+}
+
+model Session {
+  id         String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String          @map("user_id")
+  token      String?
+  status     session_status? @default(active)
+  expiresAt  DateTime        @map("expires_at") @db.Timestamptz(6)
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt DateTime?       @map("last_used_at") @db.Timestamptz(6)
+  userAgent  String?         @map("user_agent")
+  ipAddress  String?         @map("ip_address")
+  location   String?
+  deviceName String?         @map("device_name")
+  revokedAt  DateTime?       @map("revoked_at") @db.Timestamptz(6)
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([expiresAt], map: "idx_sessions_expires")
+  @@index([status], map: "idx_sessions_status")
+  @@index([token], map: "idx_sessions_token")
+  @@index([userId], map: "idx_sessions_user")
+  @@map("sessions")
+}
+
+model RecoveryCode {
+  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String    @map("user_id")
+  code      String
+  used      Boolean?  @default(false)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+  users     User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([code], map: "idx_recovery_codes_code")
+  @@index([userId], map: "idx_recovery_codes_user")
+  @@map("recovery_codes")
+}
+
+model Media {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  uploadedBy String @map("uploaded_by")
+  url String
+  filename String?
+  mimeType String?  @map("mime_type")
+  sizeBytes BigInt? @map("size_bytes")
+  width Int?
+  height Int?
+  duration Float?
+  altText String?  @map("alt_text")
+  isPublic Boolean? @map("is_public") @default(true)
+  metadata Json?    @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at") @default(now()) @db.Timestamptz(6)
+  user User     @relation(fields: [uploadedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([mimeType], map: "idx_media_mime")
+  @@index([isPublic], map: "idx_media_public")
+  @@index([uploadedBy], map: "idx_media_uploader")
+  @@map("media")
+}
+
+model SecurityEvent {
+  id String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String?         @map("user_id")
+  eventType String @map("event_type")
+  severity severity_level? @default(info)
+  ipAddress String?         @map("ip_address")
+  userAgent String?         @map("user_agent")
+  metadata Json?           @default("{}")
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  user User?           @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([createdAt], map: "idx_security_events_created")
+  @@index([eventType], map: "idx_security_events_type")
+  @@index([userId], map: "idx_security_events_user")
+  @@map("security_events")
+}
+
+model AuditEvent {
+  id         String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  actorId    String?         @map("actor_id")
+  action     String
+  targetType String?         @map("target_type")
+  targetId   String?         @map("target_id")
+  metadata   Json?           @default("{}")
+  severity   severity_level? @default(info)
+  ipAddress  String?         @map("ip_address")
+  userAgent  String?         @map("user_agent")
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  actor      User?           @relation("AuditActor", fields: [actorId], references: [id], onUpdate: NoAction)
+
+  @@index([action], map: "idx_audit_events_action")
+  @@map("audit_events")
+}
+
+model ContentReport {
+  id String         @id @default(dbgenerated("(gen_random_uuid())::text"))
+  reporterId String         @map("reporter_id")
+  targetType String         @map("target_type")
+  targetId String         @map("target_id")
+  reason String
+  description String?
+  status report_status? @default(pending)
+  reviewedById String? @map("reviewed_by")
+  reviewedAt DateTime?      @map("reviewed_at") @db.Timestamptz(6)
+  actionTaken String? @map("action_taken")
+  notes String?
+  createdAt DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  reporter User           @relation(fields: [reporterId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reviewedBy User?          @relation("content_reports_reviewed_byTousers", fields: [reviewedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([reporterId], map: "idx_content_reports_reporter")
+  @@index([status], map: "idx_content_reports_status")
+  @@index([targetType, targetId], map: "idx_content_reports_target")
+  @@map("content_reports")
+}
+
+model Notification {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String   @map("user_id")
+  type String
+  title String
+  body String?
+  icon String?
+  link String?
+  isRead Boolean? @map("is_read") @default(false)
+  metadata Json?    @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([createdAt(sort: Desc)], map: "idx_notifications_created")
+  @@index([isRead], map: "idx_notifications_read")
+  @@index([userId], map: "idx_notifications_user")
+  @@map("notifications")
+}
+
+model NotificationPreference {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String   @unique @map("user_id")
+  type String   @default("all")
+  email Boolean? @default(true)
+  push Boolean? @default(true)
+  inApp Boolean? @map("in_app") @default(true)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@map("notification_preferences")
+}
+
+model ApiKey {
+  id String           @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String           @map("user_id")
+  name String
+  keyHash String           @unique @map("key_hash")
+  keyPrefix String @map("key_prefix")
+  permissions Json?            @default("{}")
+  isActive Boolean? @map("is_active")         @default(true)
+  lastUsedAt DateTime?        @map("last_used_at") @db.Timestamptz(6)
+  expiresAt DateTime?        @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  revokedAt DateTime?        @map("revoked_at") @db.Timestamptz(6)
+  user User             @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  apiUsageLogs api_usage_logs[]
+
+  @@index([keyHash], map: "idx_api_keys_hash")
+  @@index([keyPrefix], map: "idx_api_keys_prefix")
+  @@index([userId], map: "idx_api_keys_user")
+  @@map("api_keys")
+}
+
+model Setting {
+  id String              @id @default(uuid())
+  key String              @unique
+  value Json
+  type String              @default("string")
+  group String              @default("general")
+  label String?
+  description String?
+  isSecret Boolean             @default(false) @map("is_secret")
+  createdAt DateTime            @default(now()) @map("created_at")
+  updatedAt DateTime            @updatedAt @map("updated_at")
+  settingOverrides setting_overrides[]
+
+  @@index([key])
+  @@index([group])
+  @@map("settings")
+}
+
+model SiteConfig {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  app       String   @unique
+  config    Json     @default("{}")
+  updatedBy String?  @map("updated_by")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([app], map: "idx_site_configs_app")
+  @@map("site_configs")
+}
+
+model ThemeConfig {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name String   @unique
+  isActive Boolean? @default(false) @map("is_active")
+  isDefault Boolean? @map("is_default") @default(false)
+  bgPrimary String? @map("bg_primary")  @default("#08150F")
+  bgSecondary String? @map("bg_secondary")  @default("#101c13")
+  bgCard String? @map("bg_card")  @default("#12271D")
+  bgElevated String? @map("bg_elevated")  @default("#1a3326")
+  textPrimary String? @map("text_primary")  @default("#F2EEE8")
+  textSecondary String? @map("text_secondary")  @default("#B7C6BE")
+  textMuted String? @map("text_muted")  @default("#6b8a7a")
+  accentPrimary String? @map("accent_primary")  @default("#569578")
+  accentSecondary String? @map("accent_secondary")  @default("#275d46")
+  accentHover String? @map("accent_hover")  @default("#6aab8d")
+  success String?  @default("#59C173")
+  warning String?  @default("#F4B942")
+  error String?  @default("#E45D5D")
+  borderColor String? @map("border_color")  @default("rgba(255,255,255,0.08)")
+  borderHover String? @map("border_hover")  @default("rgba(255,255,255,0.14)")
+  borderRadius String? @map("border_radius")  @default("16px")
+  fontPrimary String? @map("font_primary")  @default("Inter")
+  fontHeading String? @map("font_heading")  @default("Plus Jakarta Sans")
+  logoUrl String? @map("logo_url")
+  brandName String? @map("brand_name")  @default("Tirbeo")
+  brandTagline String? @map("brand_tagline")  @default("Premium Social Platform")
+  lightBgPrimary String? @map("light_bg_primary")
+  lightBgSecondary String? @map("light_bg_secondary")
+  lightTextPrimary String? @map("light_text_primary")
+  lightAccentPrimary String? @map("light_accent_primary")
+  emailHeaderBg String? @map("email_header_bg")  @default("linear-gradient(135deg,#022B22,#275D46,#569578)")
+  emailButtonColor String? @map("email_button_color")  @default("#569578")
+  emailTextColor String? @map("email_text_color")  @default("#B7C6BE")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([isActive], map: "idx_theme_configs_active")
+  @@map("theme_configs")
+}
+
+model FeatureFlag {
+  id String               @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key String               @unique
+  name String
+  description String?
+  isActive Boolean? @map("is_active")             @default(false)
+  rolloutPct Int? @map("rollout_pct")                 @default(100)
+  metadata Json?                @default("{}")
+  createdAt DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  userFeatureFlags user_feature_flags[]
+  targets feature_flag_targets[]
+
+  @@index([isActive], map: "idx_feature_flags_active")
+  @@index([key], map: "idx_feature_flags_key")
+  @@map("feature_flags")
+}
+
+model Ticket {
+  id String               @id @default(uuid())
+  customerId String               @map("customer_id")
+  subject String
+  description String?
+  category String               @default("general")
+  priority String               @default("normal")
+  status String               @default("open")
+  source String               @default("web")
+  application String?
+  queueId String? @map("queue_id")
+  assignedId String? @map("assigned_id")
+  slaId String? @map("sla_id")
+  closedAt DateTime?            @map("closed_at")
+  createdAt DateTime             @default(now()) @map("created_at")
+  updatedAt DateTime             @updatedAt @map("updated_at")
+  ticketAssignments ticket_assignments[]
+  attachments ticket_attachments[]
+  messages TicketMessage[]
+  queue support_queues?      @relation(fields: [queueId], references: [id])
+  slas slas?                @relation(fields: [slaId], references: [id])
+  customer User @relation("TicketCustomer", fields: [customerId], references: [id])
+  assigned User? @relation("TicketAssignee", fields: [assignedId], references: [id])
+
+  @@index([customerId])
+  @@index([status])
+  @@index([assignedId])
+  @@index([createdAt])
+  @@index([priority])
+  @@index([queueId])
+  @@map("tickets")
+}
+
+model TicketMessage {
+  id         String   @id @default(uuid())
+  ticketId   String   @map("ticket_id")
+  authorId   String   @map("author_id")
+  content    String
+  isInternal Boolean  @default(false) @map("is_internal")
+  createdAt  DateTime @default(now()) @map("created_at")
+  ticket     Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author     User     @relation("TicketMessageAuthor", fields: [authorId], references: [id])
+
+  @@index([ticketId])
+  @@index([authorId])
+  @@map("ticket_messages")
+}
+
+model Blog {
+  id String           @id @default(uuid())
+  title String
+  slug String           @unique
+  excerpt String?
+  content String?
+  coverImage String? @map("cover_image")
+  authorId String           @map("author_id")
+  categoryId String? @map("category_id")
+  status String           @default("draft")
+  seoTitle String? @map("seo_title")
+  seoDescription String? @map("seo_description")
+  canonicalUrl String? @map("canonical_url")
+  viewCount Int              @default(0) @map("view_count")
+  publishedAt DateTime?        @map("published_at")
+  scheduledAt DateTime? @map("scheduled_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+  comments blog_comments[]
+  tags blog_tags[]
+  versions blog_versions[]
+  category blog_categories? @relation(fields: [categoryId], references: [id])
+  author User @relation("BlogAuthor", fields: [authorId], references: [id])
+
+  @@index([slug])
+  @@index([status])
+  @@index([authorId])
+  @@index([categoryId])
+  @@index([publishedAt])
+  @@map("blogs")
+}
+
+model Page {
+  id String          @id @default(uuid())
+  title String
+  slug String          @unique
+  content String?
+  components Json            @default("[]")
+  status String          @default("draft")
+  layout String          @default("default")
+  seoTitle String? @map("seo_title")
+  seoDescription String? @map("seo_description")
+  isHomePage Boolean         @default(false) @map("is_home_page")
+  publishedAt DateTime?       @map("published_at")
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+  versions page_versions[]
+
+  @@index([slug])
+  @@index([status])
+  @@map("pages")
+}
+
+model Route {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  path String
+  method String   @default("GET")
+  target String?
+  description String?
+  allowedRoles String[] @map("allowed_roles") @default(["member"])
+  internal Boolean? @default(false)
+  enabled Boolean? @default(true)
+  rateLimit Int? @map("rate_limit")
+  cacheTtl Int? @map("cache_ttl")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([path, method])
+  @@map("routes")
+}
+
+model Blocklist {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  targetType String @map("target_type")
+  targetId String @map("target_id")
+  reason String?
+  blockedBy String? @map("blocked_by")
+  isActive Boolean? @map("is_active")  @default(true)
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")  @default(now()) @db.Timestamptz(6)
+  users User?     @relation(fields: [blockedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([targetType, targetId])
+  @@index([isActive], map: "idx_blocklist_active")
+  @@index([targetType], map: "idx_blocklist_type")
+  @@map("blocklist")
+}
+
+model ReservedAddress {
+  id        String   @id @default(uuid())
+  address   String   @unique
+  reason    String   @default("reserved")
+  level     String   @default("hard")
+  category  String   @default("system")
+  addedById String?  @map("added_by_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([category])
+  @@index([address])
+  @@index([level])
+  @@map("reserved_addresses")
+}
+
+model Subscriber {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email     String   @unique
+  name      String?
+  source    String?  @default("landing")
+  status    String?  @default("active")
+  tags      Json?    @default("[]")
+  metadata  Json?    @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([createdAt], map: "idx_subscribers_created")
+  @@index([email], map: "idx_subscribers_email")
+  @@index([status], map: "idx_subscribers_status")
+  @@map("subscribers")
+}
+
+model Feedback {
+  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  message   String    @db.Text
+  email     String?
+  lang      String?
+  source    String?   @default("landing")
+  status    String?   @default("new")
+  metadata  Json?     @default("{}")
+  createdAt DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  @@index([createdAt], map: "idx_feedback_created")
+  @@index([email], map: "idx_feedback_email")
+  @@index([status], map: "idx_feedback_status")
+  @@map("feedback")
+}
+
+model achievements {
+  id String          @id @default(dbgenerated("(gen_random_uuid())"))
+  type AchievementType
+  name String
+  description String?
+  icon String?
+  badge String?
+  userId String @map("user_id")
+  earnedAt DateTime @map("earned_at")        @default(now())
+
+  @@unique([userId, type])
+  @@index([type])
+  @@index([userId])
+}
+
+model activities {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  type String
+  title String
+  description String?
+  metadata Json?
+  createdAt DateTime @map("created_at") @default(now())
+
+  @@index([createdAt])
+  @@index([type])
+  @@index([userId])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model activity_streaks {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String @map("user_id")    @unique
+  currentStreak Int? @map("current_streak")      @default(0)
+  longestStreak Int? @map("longest_streak")      @default(0)
+  lastActiveDate DateTime? @map("last_active_date") @db.Timestamptz(6)
+  totalActiveDays Int? @map("total_active_days")      @default(0)
+  updatedAt DateTime @map("updated_at")  @default(now()) @db.Timestamptz(6)
+  users User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model api_usage_logs {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String? @map("user_id")
+  apiKeyId String? @map("api_key_id")
+  endpoint String
+  method String
+  statusCode Int @map("status_code")
+  duration Int?
+  ip String?
+  userAgent String? @map("user_agent")
+  metadata Json?    @default("{}")
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+  apiKeys ApiKey?  @relation(fields: [apiKeyId], references: [id], onUpdate: NoAction)
+  users User?    @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([apiKeyId], map: "idx_api_usage_apikey")
+  @@index([createdAt], map: "idx_api_usage_created")
+  @@index([endpoint], map: "idx_api_usage_endpoint")
+  @@index([userId], map: "idx_api_usage_user")
+}
+
+model app_oauth_clients {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  appId String @map("app_id")
+  clientId String @map("client_id")   @unique
+  clientSecret String? @map("client_secret")
+  redirectUris Json @map("redirect_uris")     @default("[]")
+  grants Json     @default("[]")
+  scopes Json     @default("[]")
+  isActive Boolean @map("is_active")  @default(true)
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at")
+  apps apps     @relation(fields: [appId], references: [id], onDelete: Cascade)
+  authorizationCodes authorization_codes[]
+  accessTokens access_tokens[]
+  refreshTokens refresh_tokens[]
+  oAuthConsents oAuthConsent[]
+
+  @@index([appId])
+  @@index([clientId])
+}
+
+model authorization_codes {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  clientId String @map("client_id")
+  userId String @map("user_id")
+  code String   @unique
+  redirectUri String @map("redirect_uri")
+  scopes Json
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  usedAt DateTime? @map("used_at") @db.Timestamptz(6)
+  codeChallenge String?  @map("code_challenge")
+  codeChallengeMethod String? @map("code_challenge_method")
+  createdAt DateTime @map("created_at") @default(now())
+  app app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  user User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([userId])
+  @@index([code])
+}
+
+model access_tokens {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  clientId String @map("client_id")
+  userId String @map("user_id")
+  token String   @unique
+  scopes Json
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt DateTime @map("created_at") @default(now())
+  app app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  user User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([userId])
+  @@index([token])
+}
+
+model refresh_tokens {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  clientId String @map("client_id")
+  userId String @map("user_id")
+  token String   @unique
+  scopes Json
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt DateTime @map("created_at") @default(now())
+  app app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  user User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([userId])
+  @@index([token])
+}
+
+model oAuthConsent {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  clientId String @map("client_id")
+  userId String @map("user_id")
+  scopes Json
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+  app app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  user User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, userId])
+  @@index([clientId])
+  @@index([userId])
+}
+
+model app_permissions {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  appId String @map("app_id")
+  name String
+  key String
+  description String?
+  createdAt DateTime @map("created_at") @default(now())
+  apps apps     @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@unique([appId, key])
+  @@index([appId])
+  @@index([key])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model app_roles {
+  id String     @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name String     @unique
+  description String?
+  color String?    @default("#4f7aff")
+  icon String?    @default("shield")
+  isSystem Boolean? @map("is_system")   @default(false)
+  permissions Json?      @default("{}")
+  createdAt DateTime @map("created_at")   @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")   @default(now()) @db.Timestamptz(6)
+  userRoles UserRole[]
+
+  @@index([name], map: "idx_app_roles_name")
+}
+
+model apps {
+  id String              @id @default(dbgenerated("(gen_random_uuid())"))
+  name String
+  slug String              @unique
+  description String?
+  icon String?
+  url String?
+  status String              @default("active")
+  isPublic Boolean @map("is_public")             @default(true)
+  ownerId String @map("owner_id")
+  version String              @default("1.0.0")
+  createdAt DateTime @map("created_at")            @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+  oauthClients app_oauth_clients[]
+  permissions app_permissions[]
+  owner User @relation("AppOwner", fields: [ownerId], references: [id])
+
+  @@index([ownerId])
+  @@index([slug])
+}
+
+model blog_categories {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  name String   @unique
+  slug String   @unique
+  description String?
+  sortOrder Int @map("sort_order")      @default(0)
+  createdAt DateTime @map("created_at") @default(now())
+  blogs Blog[]
+
+  @@index([slug])
+}
+
+model blog_comments {
+  id String          @id @default(dbgenerated("(gen_random_uuid())"))
+  blogId String @map("blog_id")
+  authorId String @map("author_id")
+  content String
+  parentId String? @map("parent_id")
+  status String          @default("approved")
+  createdAt DateTime @map("created_at")        @default(now())
+  blogs Blog            @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  blogComments blog_comments?  @relation("blog_commentsToblog_comments", fields: [parentId], references: [id])
+  otherBlogComments blog_comments[] @relation("blog_commentsToblog_comments")
+
+  @@index([authorId])
+  @@index([blogId])
+}
+
+model blog_tags {
+  id String @id @default(dbgenerated("(gen_random_uuid())"))
+  name String
+  blogId String @map("blog_id")
+  blogs Blog   @relation(fields: [blogId], references: [id], onDelete: Cascade)
+
+  @@unique([blogId, name])
+}
+
+model blog_versions {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  blogId String @map("blog_id")
+  title String
+  content String?
+  version Int
+  createdBy String @map("created_by")
+  createdAt DateTime @map("created_at") @default(now())
+  blogs Blog     @relation(fields: [blogId], references: [id], onDelete: Cascade)
+
+  @@unique([blogId, version])
+  @@index([blogId])
+}
+
+model bookmarks {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  entityType String @map("entity_type")
+  entityId String @map("entity_id")
+  createdAt DateTime @map("created_at")  @default(now())
+  projectId String?
+  postId String?
+  posts posts?    @relation(fields: [postId], references: [id])
+  projects projects? @relation(fields: [projectId], references: [id])
+
+  @@unique([userId, entityType, entityId])
+}
+
+model comments {
+  id String     @id @default(dbgenerated("(gen_random_uuid())"))
+  content String
+  authorId String @map("author_id")
+  entityType String @map("entity_type")
+  entityId String @map("entity_id")
+  parentId String? @map("parent_id")
+  createdAt DateTime @map("created_at")   @default(now())
+  projectId String?
+  postId String?
+  comments comments?  @relation("commentsTocomments", fields: [parentId], references: [id], onDelete: Cascade)
+  otherComments comments[] @relation("commentsTocomments")
+  posts posts?     @relation(fields: [postId], references: [id])
+  projects projects?  @relation(fields: [projectId], references: [id])
+  likes likes[]
+
+  @@index([authorId])
+  @@index([entityType, entityId])
+  @@index([parentId])
+}
+
+model communities {
+  id String              @id @default(dbgenerated("(gen_random_uuid())"))
+  name String
+  slug String              @unique
+  description String?
+  avatarUrl String? @map("avatar_url")
+  coverUrl String? @map("cover_url")
+  category String?
+  memberCount Int @map("member_count")                 @default(0)
+  isPublic Boolean @map("is_public")             @default(true)
+  userId String @map("user_id")
+  createdAt DateTime @map("created_at")            @default(now())
+  updatedAt DateTime @map("updated_at")
+  communityMembers community_members[]
+
+  @@index([slug])
+  @@index([userId])
+}
+
+model community_members {
+  id String      @id @default(dbgenerated("(gen_random_uuid())"))
+  communityId String @map("community_id")
+  userId String @map("user_id")
+  role String      @default("member")
+  joinedAt DateTime @map("joined_at")    @default(now())
+  communities communities @relation(fields: [communityId], references: [id], onDelete: Cascade)
+
+  @@unique([communityId, userId])
+}
+
+model daily_stats {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  date DateTime @unique @db.Timestamptz(6)
+  totalUsers Int? @map("total_users")     @default(0)
+  activeUsers Int? @map("active_users")     @default(0)
+  newSignups Int? @map("new_signups")     @default(0)
+  totalRequests Int? @map("total_requests")     @default(0)
+  errorCount Int? @map("error_count")     @default(0)
+  avgResponseMs Float? @map("avg_response_ms")   @default(0)
+  topEndpoints Json? @map("top_endpoints")    @default("[]")
+  topErrors Json? @map("top_errors")    @default("[]")
+  metadata Json?    @default("{}")
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+
+  @@index([date], map: "idx_daily_stats_date")
+}
+
+model data_exports {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  type String    @default("full")
+  format String    @default("json")
+  status String    @default("pending")
+  fileUrl String? @map("file_url")
+  fileSize Int? @map("file_size")
+  expiresAt DateTime? @map("expires_at")
+  requestedAt DateTime @map("requested_at")  @default(now())
+  completedAt DateTime? @map("completed_at")
+
+  @@index([status])
+  @@index([userId])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model District {
+  id       Int    @id @default(autoincrement())
+  name     String @unique
+  province Int
+
+  @@index([province], map: "idx_districts_province")
+  @@map("districts")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model emailConfig {
+  id                  String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  provider            String   @default("resend") // resend | smtp
+  // Resend
+  resendApiKey        String?
+  resendDomain        String?  @default("send.tirbeo.app")
+  // SMTP
+  smtpHost            String?
+  smtpPort            Int?     @default(587)
+  smtpUser            String?
+  smtpPass            String?
+  // Default sender
+  defaultFromEmail    String   @default("noreply@send.tirbeo.app")
+  defaultFromName     String   @default("Tirbeo")
+  // Per-type overrides
+  welcomeFromEmail    String?
+  welcomeFromName     String?
+  otpFromEmail        String?
+  otpFromName         String?
+  resetFromEmail      String?
+  resetFromName       String?
+  notifyFromEmail     String?
+  notifyFromName      String?
+  alertFromEmail      String?
+  alertFromName       String?
+  formsFromEmail      String?  @default("forms@send.tirbeo.app")
+  formsFromName       String?  @default("Tirbeo Forms")
+  // DKIM / custom domain settings
+  customDomain        String?
+  dkimEnabled         Boolean  @default(false)
+  // Status
+  enabled             Boolean  @default(true)
+  createdAt           DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("email_configs")
+}
+
+model emailTemplate {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String   @unique
+  label       String?
+  subject     String
+  htmlBody    String
+  variables   Json?    @default("[]")
+  fromEmail   String?
+  fromName    String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("email_templates")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model email_logs {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  toEmail String @map("to_email")
+  fromEmail String? @map("from_email")
+  subject String
+  template String?
+  status String?   @default("sent")
+  threadId String? @map("thread_id")
+  replyTo String? @map("reply_to")
+  openedAt DateTime? @map("opened_at") @db.Timestamptz(6)
+  clickedAt DateTime? @map("clicked_at") @db.Timestamptz(6)
+  error String?
+  createdAt DateTime @map("created_at")  @default(now()) @db.Timestamptz(6)
+
+  @@index([createdAt], map: "idx_email_logs_created")
+  @@index([status], map: "idx_email_logs_status")
+  @@index([threadId], map: "idx_email_logs_thread")
+  @@index([toEmail], map: "idx_email_logs_to")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model email_preferences {
+  id String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")   @unique
+  securityAlerts Boolean @map("security_alerts")  @default(true)
+  billingReminders Boolean @map("billing_reminders")  @default(true)
+  productUpdates Boolean @map("product_updates")  @default(true)
+  newFeatures Boolean @map("new_features")  @default(false)
+  monthlyNewsletter Boolean @map("monthly_newsletter")  @default(true)
+  tipsAndTricks Boolean @map("tips_and_tricks")  @default(false)
+  digestFrequency String @map("digest_frequency")   @default("never")
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at") @default(now()) @db.Timestamptz(6)
+  users User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model feature_flag_targets {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  flagId String @map("flag_id")
+  targetType String @map("target_type")
+  targetId String? @map("target_id")
+  enabled Boolean  @default(true)
+  createdAt DateTime @map("created_at") @default(now())
+  featureFlag FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+
+  @@index([flagId])
+  @@index([targetType, targetId])
+}
+
+model follows {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  followerId String @map("follower_id")
+  followingId String @map("following_id")
+  createdAt DateTime @map("created_at") @default(now())
+  follower User @relation("FollowsFollower", fields: [followerId], references: [id])
+  following User @relation("FollowsFollowing", fields: [followingId], references: [id])
+
+  @@unique([followerId, followingId])
+  @@index([createdAt])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+model incident_events {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  incidentId String @map("incident_id")
+  type String
+  message String?
+  createdBy String? @map("created_by")
+  createdAt DateTime @map("created_at")  @default(now())
+  incidents incidents @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+}
+
+model incidents {
+  id String            @id @default(dbgenerated("(gen_random_uuid())"))
+  title String
+  description String?
+  severity String            @default("minor")
+  status String            @default("investigating")
+  services Json              @default("[]")
+  applications Json              @default("[]")
+  ownerId String? @map("owner_id")
+  resolvedAt DateTime? @map("resolved_at")
+  postmortem String?
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+  events incident_events[]
+
+  @@index([severity])
+  @@index([status])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Integration {
+  id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId       String @map("user_id")
+  provider      String
+  connected     Boolean?  @default(false)
+  accessToken  String? @map("access_token")
+  refreshToken String? @map("refresh_token")
+  expiresAt    DateTime? @db.Timestamptz(6) @map("expires_at")
+  metadata      Json?     @default("{}")
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt    DateTime  @default(now()) @db.Timestamptz(6) @map("updated_at")
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, provider])
+  @@index([userId], map: "idx_integrations_user")
+  @@map("integrations")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model invoices {
+  id String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  subscriptionId String? @map("subscription_id")        @db.Uuid
+  stripeInvoiceId String? @map("stripe_invoice_id")
+  invoiceNumber String @map("invoice_number")
+  amount Int
+  currency String         @default("usd")
+  status String         @default("pending")
+  description String?
+  periodStart DateTime? @map("period_start")      @db.Timestamptz(6)
+  periodEnd DateTime? @map("period_end")      @db.Timestamptz(6)
+  paidAt DateTime? @map("paid_at")      @db.Timestamptz(6)
+  invoicePdf String? @map("invoice_pdf")
+  createdAt DateTime @map("created_at")       @default(now()) @db.Timestamptz(6)
+  subscriptions subscriptions? @relation(fields: [subscriptionId], references: [id], onUpdate: NoAction)
+  users User           @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([createdAt(sort: Desc)], map: "idx_invoices_created_at")
+  @@index([status], map: "idx_invoices_status")
+  @@index([userId], map: "idx_invoices_user_id")
+}
+
+model job_attempts {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  jobId String @map("job_id")
+  attempt Int
+  status String
+  error String?
+  startedAt DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  createdAt DateTime @map("created_at")  @default(now())
+  jobs jobs      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+}
+
+model jobs {
+  id String         @id @default(dbgenerated("(gen_random_uuid())"))
+  type String
+  queue String         @default("default")
+  payload Json           @default("{}")
+  status String         @default("pending")
+  attempts Int            @default(0)
+  maxAttempts Int @map("max_attempts")            @default(3)
+  error String?
+  startedAt DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  createdAt DateTime @map("created_at")       @default(now())
+  updatedAt DateTime @map("updated_at")
+  jobAttempts job_attempts[]
+
+  @@index([createdAt])
+  @@index([queue])
+  @@index([status])
+  @@index([type])
+}
+
+model likes {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  entityType String @map("entity_type")
+  entityId String @map("entity_id")
+  createdAt DateTime @map("created_at")  @default(now())
+  projectId String?
+  postId String?
+  commentId String?
+  comments comments? @relation(fields: [commentId], references: [id])
+  posts posts?    @relation(fields: [postId], references: [id])
+  projects projects? @relation(fields: [projectId], references: [id])
+
+  @@unique([userId, entityType, entityId])
+}
+
+model LinkedAccount {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())"))
+  userId      String @map("user_id")
+  provider     String
+  providerId  String @map("provider_id")
+  email        String?
+  displayName String? @map("display_name")
+  avatarUrl   String? @map("avatar_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @map("updated_at")
+
+  @@unique([provider, providerId])
+  @@index([provider])
+  @@index([userId])
+  @@map("linked_accounts")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model login_history {
+  id String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+  deviceName String? @map("device_name")
+  browser String?
+  os String?
+  location String?
+  country String?
+  status String   @default("successful")
+  failureReason String? @map("failure_reason")
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+  users User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([createdAt(sort: Desc)], map: "idx_login_history_created_at")
+  @@index([status], map: "idx_login_history_status")
+  @@index([userId], map: "idx_login_history_user_id")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Log {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  ip         String?
+  method     String
+  path       String
+  userId    String? @map("user_id")
+  status     Int?
+  duration   Int?
+  size       Int?
+  createdAt DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+
+  @@index([createdAt], map: "idx_logs_created")
+  @@index([ip], map: "idx_logs_ip")
+  @@index([path], map: "idx_logs_path")
+  @@index([userId], map: "idx_logs_user")
+  @@map("logs")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Membership {
+  id           String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String @map("user_id")
+  workspaceId String @map("workspace_id")
+  role         workspace_role? @default(MEMBER)
+  createdAt   DateTime        @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt   DateTime        @default(now()) @db.Timestamptz(6) @map("updated_at")
+  users        User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  workspaces   Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, workspaceId])
+  @@index([workspaceId], map: "idx_memberships_workspace")
+  @@map("memberships")
+}
+
+model messages {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  conversationId String @map("conversation_id")
+  senderId String @map("sender_id")
+  content String
+  read Boolean  @default(false)
+  createdAt DateTime @map("created_at") @default(now())
+
+  @@index([conversationId])
+  @@index([senderId])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Otp {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String @map("user_id")
+  type       String
+  otpHash   String @map("otp_hash")
+  expiresAt DateTime @db.Timestamptz(6) @map("expires_at")
+  attempts   Int?     @default(0)
+  createdAt DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+  users      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([expiresAt], map: "idx_otps_expires")
+  @@index([type], map: "idx_otps_type")
+  @@index([userId], map: "idx_otps_user")
+  @@map("otps")
+}
+
+model page_versions {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  pageId String @map("page_id")
+  title String
+  content String?
+  components Json     @default("[]")
+  version Int
+  createdBy String @map("created_by")
+  createdAt DateTime @map("created_at") @default(now())
+  pages Page     @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@unique([pageId, version])
+  @@index([pageId])
+}
+
+model PasskeyChallenge {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  nonce      String   @unique
+  challenge  String
+  type       String
+  userId    String? @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@index([nonce])
+  @@map("passkey_challenges")
+}
+
+model Passkey {
+  id                    String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId               String @map("user_id")
+  credentialId         String   @unique @map("credential_id")
+  credentialPublicKey Bytes @map("credential_public_key")
+  counter               BigInt   @default(0)
+  transports            String?
+  deviceName           String? @map("device_name")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @map("updated_at") @updatedAt
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([credentialId])
+  @@index([userId])
+  @@map("passkeys")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model PasswordResetToken {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String @map("user_id")
+  token      String    @unique
+  expiresAt DateTime  @db.Timestamptz(6) @map("expires_at")
+  usedAt    DateTime? @db.Timestamptz(6) @map("used_at")
+  createdAt DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  users      User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([token], map: "idx_password_reset_token")
+  @@index([userId], map: "idx_password_reset_user")
+  @@map("password_reset_tokens")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model payment_methods {
+  id String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  stripePaymentMethodId String? @map("stripe_payment_method_id")
+  brand String
+  lastFour String @map("last_four")
+  expMonth Int @map("exp_month")
+  expYear Int @map("exp_year")
+  isDefault Boolean @map("is_default")  @default(false)
+  billingDetails Json? @map("billing_details")    @default("{}")
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+  users User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_payment_methods_user_id")
+}
+
+model plans {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  name String   @unique
+  slug String   @unique
+  description String?
+  price Int      @default(0)
+  currency String   @default("usd")
+  interval String   @default("month")
+  features Json     @default("[]")
+  limits Json     @default("{}")
+  isPublic Boolean @map("is_public")  @default(true)
+  isFree Boolean @map("is_free")  @default(true)
+  sortOrder Int @map("sort_order")      @default(0)
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+
+  @@index([isPublic])
+  @@index([slug])
+}
+
+model post_hashtags {
+  id String @id @default(dbgenerated("(gen_random_uuid())"))
+  tag String
+  postId String @map("post_id")
+  posts posts  @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, tag])
+}
+
+model posts {
+  id String          @id @default(dbgenerated("(gen_random_uuid())"))
+  title String?
+  content String
+  excerpt String?
+  authorId String @map("author_id")
+  visibility String          @default("public")
+  type String          @default("post")
+  starCount Int @map("star_count")             @default(0)
+  likeCount Int @map("like_count")             @default(0)
+  commentCount Int @map("comment_count")             @default(0)
+  viewCount Int @map("view_count")             @default(0)
+  shareCount Int @map("share_count")             @default(0)
+  isPinned Boolean @map("is_pinned")         @default(false)
+  slug String?
+  thumbnailUrl String? @map("thumbnail_url")
+  createdAt DateTime @map("created_at")        @default(now())
+  updatedAt DateTime @map("updated_at")
+  bookmarks bookmarks[]
+  comments comments[]
+  likes likes[]
+  postHashtags post_hashtags[]
+
+  @@index([authorId])
+  @@index([createdAt])
+  @@index([visibility])
+}
+
+model profile_views {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  viewerId String? @map("viewer_id")
+  profileId String @map("profile_id")
+  userAgent String? @map("user_agent")
+  ipAddress String? @map("ip_address")
+  createdAt DateTime @map("created_at") @default(now())
+  viewer User? @relation("ProfileViewViewer", fields: [viewerId], references: [id])
+  profile User @relation("ProfileViewProfile", fields: [profileId], references: [id])
+
+  @@index([createdAt])
+  @@index([profileId, createdAt])
+  @@index([viewerId])
+}
+
+model project_tags {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  name String
+  projectId String @map("project_id")
+  projects projects @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, name])
+}
+
+model projects {
+  id String         @id @default(dbgenerated("(gen_random_uuid())"))
+  title String
+  description String?
+  content String?
+  githubUrl String? @map("github_url")
+  demoUrl String? @map("demo_url")
+  language String?
+  category String         @default("other")
+  visibility String         @default("public")
+  isStartup Boolean @map("is_startup")        @default(false)
+  pinned Boolean        @default(false)
+  starCount Int @map("star_count")            @default(0)
+  forkCount Int @map("fork_count")            @default(0)
+  viewCount Int @map("view_count")            @default(0)
+  thumbnailUrl String? @map("thumbnail_url")
+  userId String @map("user_id")
+  createdAt DateTime @map("created_at")  @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+  bookmarks bookmarks[]
+  comments comments[]
+  likes likes[]
+  projectTags project_tags[]
+  user User     @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([category])
+  @@index([userId])
+  @@index([visibility])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model rate_limit_entries {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key String
+  window String
+  count Int?     @default(1)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+
+  @@unique([key, window])
+  @@index([expiresAt], map: "idx_rate_limit_expires")
+  @@index([key], map: "idx_rate_limit_key")
+}
+
+model report_schedules {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  reportId String @map("report_id")
+  cron String
+  format String    @default("csv")
+  recipients Json      @default("[]")
+  enabled Boolean   @default(true)
+  lastSentAt DateTime? @map("last_sent_at")
+  createdAt DateTime @map("created_at")  @default(now())
+  reports reports   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+}
+
+model reports {
+  id String             @id @default(dbgenerated("(gen_random_uuid())"))
+  name String
+  description String?
+  type String             @default("custom")
+  config Json               @default("{}")
+  createdBy String @map("created_by")
+  isScheduled Boolean @map("is_scheduled")            @default(false)
+  schedule String?
+  lastRunAt DateTime? @map("last_run_at")
+  createdAt DateTime @map("created_at")           @default(now())
+  updatedAt DateTime @map("updated_at")
+  reportSchedules report_schedules[]
+
+  @@index([createdBy])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model saved_themes {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String @map("user_id")
+  name String
+  config Json
+  isDefault Boolean? @map("is_default") @default(false)
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at") @default(now()) @db.Timestamptz(6)
+  users User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, name])
+  @@index([userId], map: "idx_saved_themes_user")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model scheduled_tasks {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name String    @unique
+  handler String
+  cron String
+  isActive Boolean? @map("is_active")  @default(true)
+  lastRunAt DateTime? @map("last_run_at") @db.Timestamptz(6)
+  nextRunAt DateTime? @map("next_run_at") @db.Timestamptz(6)
+  lastStatus String? @map("last_status")
+  lastError String? @map("last_error")
+  runCount Int? @map("run_count")      @default(0)
+  metadata Json?     @default("{}")
+  createdAt DateTime @map("created_at")  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")  @default(now()) @db.Timestamptz(6)
+
+  @@index([isActive], map: "idx_scheduled_tasks_active")
+  @@index([nextRunAt], map: "idx_scheduled_tasks_next_run")
+}
+
+model setting_overrides {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  settingId String @map("setting_id")
+  scope String
+  scopeId String? @map("scope_id")
+  value Json
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at")
+  settings Setting  @relation(fields: [settingId], references: [id], onDelete: Cascade)
+
+  @@unique([settingId, scope, scopeId])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model SignupOtp {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email      String
+  otpHash   String @map("otp_hash")
+  expiresAt DateTime @db.Timestamptz(6) @map("expires_at")
+  attempts   Int?     @default(0)
+  createdAt DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+
+  @@index([email], map: "idx_signup_otps_email")
+  @@index([expiresAt], map: "idx_signup_otps_expires")
+  @@map("signup_otps")
+}
+
+model slas {
+  id String           @id @default(dbgenerated("(gen_random_uuid())"))
+  name String           @unique
+  firstResponse Int @map("first_response")              @default(3600)
+  resolutionTime Int @map("resolution_time")              @default(86400)
+  escalationTime Int? @map("escalation_time")
+  priority String           @default("normal")
+  workingHoursOnly Boolean @map("working_hours_only")          @default(true)
+  createdAt DateTime @map("created_at")         @default(now())
+  updatedAt DateTime @map("updated_at")
+  supportQueues support_queues[]
+  tickets Ticket[]
+}
+
+model startups {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  title String
+  description String?
+  stage String   @default("idea")
+  funding String?
+  industry String?
+  website String?
+  logoUrl String? @map("logo_url")
+  userId String @map("user_id")
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at")
+
+  @@index([stage])
+  @@index([userId])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model subscriptions {
+  id String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  plan String     @default("free")
+  status String     @default("active")
+  billingCycle String @map("billing_cycle")     @default("monthly")
+  currentPeriodStart DateTime @map("current_period_start")   @default(now()) @db.Timestamptz(6)
+  currentPeriodEnd DateTime @map("current_period_end")   @default(dbgenerated("(now() + '1 mon'::interval)")) @db.Timestamptz(6)
+  canceledAt DateTime? @map("canceled_at")  @db.Timestamptz(6)
+  trialEnd DateTime? @map("trial_end")  @db.Timestamptz(6)
+  stripeSubscriptionId String? @map("stripe_subscription_id")
+  stripeCustomerId String? @map("stripe_customer_id")
+  metadata Json?      @default("{}")
+  createdAt DateTime @map("created_at")   @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")   @default(now()) @db.Timestamptz(6)
+  invoices invoices[]
+  users User       @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([plan], map: "idx_subscriptions_plan")
+  @@index([status], map: "idx_subscriptions_status")
+  @@index([userId], map: "idx_subscriptions_user_id")
+}
+
+model support_agents {
+  id String         @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  queueId String @map("queue_id")
+  role String         @default("agent")
+  isActive Boolean @map("is_active")        @default(true)
+  maxTickets Int @map("max_tickets")            @default(10)
+  createdAt DateTime @map("created_at")       @default(now())
+  queue support_queues @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  user User @relation("SupportAgentUser", fields: [userId], references: [id])
+
+  @@unique([userId, queueId])
+  @@index([userId])
+}
+
+model support_queues {
+  id String           @id @default(dbgenerated("(gen_random_uuid())"))
+  name String           @unique
+  slug String           @unique
+  description String?
+  managerId String? @map("manager_id")
+  autoAssign Boolean @map("auto_assign")          @default(true)
+  slaId String? @map("sla_id")
+  workingHours Json @map("working_hours")             @default("{}")
+  createdAt DateTime @map("created_at")         @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+  agents support_agents[]
+  slas slas?            @relation(fields: [slaId], references: [id])
+  tickets Ticket[]
+
+  @@index([slug])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model system_services {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  name String    @unique
+  slug String    @unique
+  description String?
+  type String    @default("api")
+  status String    @default("operational")
+  url String?
+  version String?
+  lastCheckedAt DateTime? @map("last_checked_at")
+  createdAt DateTime @map("created_at")  @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+
+  @@index([slug])
+  @@index([status])
+}
+
+model ticket_assignments {
+  id String    @id @default(dbgenerated("(gen_random_uuid())"))
+  ticketId String @map("ticket_id")
+  agentId String @map("agent_id")
+  assignedBy String @map("assigned_by")
+  assignedAt DateTime @map("assigned_at")  @default(now())
+  unassignedAt DateTime? @map("unassigned_at")
+  tickets Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([agentId])
+  @@index([ticketId])
+}
+
+model ticket_attachments {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  ticketId String @map("ticket_id")
+  fileName String @map("file_name")
+  fileSize Int @map("file_size")
+  mimeType String @map("mime_type")
+  url String
+  uploadedBy String @map("uploaded_by")
+  createdAt DateTime @map("created_at") @default(now())
+  tickets Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+}
+
+model user_apps {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")
+  name String
+  description String   @default("")
+  url String
+  icon String?
+  color String?
+  status String   @default("active")
+  notifications Int      @default(0)
+  sortOrder Int @map("sort_order")      @default(0)
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+
+  @@index([userId])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model user_feature_flags {
+  id String      @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String @map("user_id")
+  flagId String @map("flag_id")
+  isEnabled Boolean? @map("is_enabled")    @default(true)
+  createdAt DateTime @map("created_at")    @default(now()) @db.Timestamptz(6)
+  featureFlags FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users User        @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, flagId])
+  @@index([flagId], map: "idx_user_feature_flags_flag")
+  @@index([userId], map: "idx_user_feature_flags_user")
+}
+
+model user_mailboxes {
+  id String   @id @default(dbgenerated("(gen_random_uuid())"))
+  userId String @map("user_id")   @unique
+  address String   @unique
+  forwardTo String @map("forward_to")
+  isActive Boolean @map("is_active")  @default(true)
+  verified Boolean  @default(false)
+  createdAt DateTime @map("created_at") @default(now())
+  updatedAt DateTime @map("updated_at") @updatedAt
+
+  @@index([address])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model UserPassword {
+  id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId       String @map("user_id")
+  label         String    @default("default")
+  passwordHash String @map("password_hash")
+  isPrimary    Boolean?  @default(false) @map("is_primary")
+  lastUsedAt  DateTime? @db.Timestamptz(6) @map("last_used_at")
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt    DateTime  @default(now()) @db.Timestamptz(6) @map("updated_at")
+  users         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_user_passwords_user")
+  @@map("user_passwords")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model user_settings {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String @map("user_id")   @unique
+  emailDigest String? @map("email_digest")  @default("daily")
+  digestTime String? @map("digest_time")  @default("08:00")
+  mentionNotif Boolean? @map("mention_notif") @default(true)
+  commentNotif Boolean? @map("comment_notif") @default(true)
+  reportNotif Boolean? @map("report_notif") @default(true)
+  systemNotif Boolean? @map("system_notif") @default(true)
+  marketingNotif Boolean? @map("marketing_notif") @default(false)
+  pushEnabled Boolean? @map("push_enabled") @default(true)
+  soundEnabled Boolean? @map("sound_enabled") @default(true)
+  profileVisibility String? @map("profile_visibility")  @default("public")
+  showOnlineStatus Boolean? @map("show_online_status") @default(true)
+  showLastSeen Boolean? @map("show_last_seen") @default(true)
+  allowMentions Boolean? @map("allow_mentions") @default(true)
+  allowDms Boolean? @map("allow_dms") @default(true)
+  sidebarCollapsed Boolean? @map("sidebar_collapsed") @default(false)
+  defaultPage String? @map("default_page")  @default("/dashboard")
+  compactMode Boolean? @map("compact_mode") @default(false)
+  updatedAt DateTime @map("updated_at") @default(now()) @db.Timestamptz(6)
+  users User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model verification_requests {
+  id String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  status String    @default("pending")
+  fullName String @map("full_name")
+  description String?
+  documentUrls Json? @map("document_urls")     @default("[]")
+  notes String?
+  reviewedBy String? @map("reviewed_by")
+  reviewedAt DateTime? @map("reviewed_at") @db.Timestamptz(6)
+  rejectionReason String? @map("rejection_reason")
+  submittedAt DateTime @map("submitted_at")  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")  @default(now()) @db.Timestamptz(6)
+  usersVerificationRequestsReviewedByTousers User?     @relation("verification_requests_reviewed_byTousers", fields: [reviewedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  usersVerificationRequestsUserIdTousers User      @relation("verification_requests_user_idTousers", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([status], map: "idx_verification_requests_status")
+  @@index([userId], map: "idx_verification_requests_user_id")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model webhook_deliveries {
+  id String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  webhookId String @map("webhook_id")
+  event String
+  payload Json
+  status String?  @default("pending")
+  response String?
+  duration Int?
+  retries Int?     @default(0)
+  createdAt DateTime @map("created_at") @default(now()) @db.Timestamptz(6)
+
+  @@index([createdAt], map: "idx_webhook_deliveries_created")
+  @@index([status], map: "idx_webhook_deliveries_status")
+  @@index([webhookId], map: "idx_webhook_deliveries_webhook")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model webhooks {
+  id String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String @map("user_id")
+  name String
+  url String
+  secret String
+  events Json?     @default("[]")
+  isActive Boolean? @map("is_active")  @default(true)
+  lastTriggeredAt DateTime? @map("last_triggered_at") @db.Timestamptz(6)
+  failCount Int? @map("fail_count")      @default(0)
+  createdAt DateTime @map("created_at")  @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @map("updated_at")  @default(now()) @db.Timestamptz(6)
+  users User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([isActive], map: "idx_webhooks_active")
+  @@index([userId], map: "idx_webhooks_user")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model workspace_invites {
+  id String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  workspaceId String @map("workspace_id")
+  email String
+  role workspace_role? @default(MEMBER)
+  invitedById String @map("invited_by_id")
+  token String          @unique
+  expiresAt DateTime @map("expires_at")        @db.Timestamptz(6)
+  acceptedAt DateTime? @map("accepted_at")       @db.Timestamptz(6)
+  createdAt DateTime @map("created_at")        @default(now()) @db.Timestamptz(6)
+  users User            @relation(fields: [invitedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  workspaces Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([email], map: "idx_workspace_invites_email")
+  @@index([token], map: "idx_workspace_invites_token")
+  @@index([workspaceId], map: "idx_workspace_invites_workspace")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model Workspace {
+  id String              @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name String
+  slug String              @unique
+  description String?
+  ownerId String @map("owner_id")
+  isPublic Boolean?            @default(false) @map("is_public")
+  createdAt DateTime            @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt DateTime            @default(now()) @db.Timestamptz(6) @map("updated_at")
+  memberships Membership[]
+  workspaceInvites workspace_invites[]
+  users User                @relation(fields: [ownerId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([ownerId], map: "idx_workspaces_owner")
+  @@index([slug], map: "idx_workspaces_slug")
+  @@map("workspaces")
+}
+
+enum AchievementType {
+  FIRST_PROJECT
+  FIRST_POST
+  FIRST_FOLLOWER
+  STREAK_7
+  STREAK_30
+  CONTRIBUTOR
+  MAINTAINER
+  MENTOR
+  BETA_USER
+  EARLY_ADOPTER
+}
+
+enum report_status {
+  pending
+  reviewed
+  dismissed
+  actioned
+}
+
+model form {
+  id                   String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  title                String
+  description          String?
+  ownerId              String
+  publicId             String   @unique
+  status               String   @default("draft")
+  viewCount            Int      @default(0)
+  responseCount        Int      @default(0)
+  lastSubmissionAt     DateTime? @db.Timestamptz(6)
+  submissionCountToday Int      @default(0)
+  publishedAt          DateTime? @db.Timestamptz(6)
+  thankYouMessage      String?  @default("Thank you for your response!")
+  allowCollaboratorEdits Boolean  @default(false)
+  captchaEnabled       Boolean  @default(false)
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  fields               formField[]
+  pages                formPage[]
+  collaborators        formCollaborator[]
+  versions             formVersion[]
+  notifications        formNotification?
+  responses            response[]
+  user                 User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@index([publicId])
+  @@index([status])
+  @@map("forms")
+}
+
+model formCollaborator {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId    String
+  userId    String
+  role      String   @default("editor")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([formId, userId])
+  @@index([formId])
+  @@index([userId])
+  @@map("form_collaborators")
+}
+
+model formField {
+  id          String              @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId      String?
+  pageId      String?
+  type        String
+  label       String
+  placeholder String?
+  required    Boolean             @default(false)
+  options     formFieldOption[]
+  order       Int                 @default(0)
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  form        form?               @relation(fields: [formId], references: [id], onDelete: Cascade)
+  page        formPage?           @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  responseAnswers responseAnswer[] @relation("ResponseAnswerField")
+
+  @@index([formId])
+  @@index([pageId])
+  @@map("form_fields")
+}
+
+model formFieldOption {
+  id     String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  fieldId String
+  label  String
+  value  String?
+  order  Int      @default(0)
+  field  formField @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+
+  @@index([fieldId])
+  @@map("form_field_options")
+}
+
+model formPage {
+  id     String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId String
+  title  String
+  order  Int       @default(0)
+  fields formField[]
+  form   form      @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+  @@map("form_pages")
+}
+
+model formVersion {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId    String
+  version   Int
+  data      Json
+  createdBy String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+  @@map("form_versions")
+}
+
+model formNotification {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId    String   @unique
+  email     String
+  events    Json     @default("[]")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@map("form_notifications")
+}
+
+model response {
+  id                String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId            String
+  respondentEmail   String?
+  respondentName    String?
+  ipAddress         String?
+  userAgent         String?
+  status            String   @default("completed")
+  completedAt       DateTime? @db.Timestamptz(6)
+  duration          Int?
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  answers           responseAnswer[]
+  notes             responseNote[]
+  form              form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+  @@index([status])
+  @@map("responses")
+}
+
+model responseAnswer {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  responseId String
+  fieldId   String
+  value     Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  response  response @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  field     formField @relation("ResponseAnswerField", fields: [fieldId], references: [id])
+
+  @@index([responseId])
+  @@index([fieldId])
+  @@map("response_answers")
+}
+
+model responseNote {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  responseId String
+  userId    String
+  content   String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  response  response @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([responseId])
+  @@index([userId])
+  @@map("response_notes")
+}
+
+model Group {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String   @unique
+  description String?
+  slug        String   @unique
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+  members     GroupMember[]
+
+  @@index([slug])
+  @@map("groups")
+}
+
+model GroupMember {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  groupId   String   @map("group_id")
+  userId    String   @map("user_id")
+  role      String?  @default("member")
+  joinedAt  DateTime @default(now()) @db.Timestamptz(6) @map("joined_at")
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@index([groupId])
+  @@map("group_members")
+}
+
+model OrganizationalUnit {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String   @unique
+  description String?
+  slug        String   @unique
+  parentId    String?  @map("parent_id")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([slug])
+  @@index([parentId])
+  @@map("organizational_units")
+}
+
+enum session_status {
+  active
+  expired
+  revoked
+}
+
+enum severity_level {
+  info
+  warning
+  error
+  critical
+}
+
+enum workspace_role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model CaptchaChallenge {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  sessionId   String    @map("session_id")
+  userId      String?   @map("user_id")
+  difficulty  String    @default("easy") // easy, medium, hard
+  challengeType String @default("image") // image, math, word
+  question    String
+  answerHash  String    @map("answer_hash")
+  options     Json?     // For multiple choice
+  imageUrl    String?   @map("image_url")
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  expiresAt   DateTime  @db.Timestamptz(6) @map("expires_at")
+  attempts    Int       @default(0)
+  solved      Boolean   @default(false)
+  solvedAt    DateTime? @map("solved_at") @db.Timestamptz(6)
+  ipAddress   String?   @map("ip_address")
+  userAgent   String?   @map("user_agent")
+  rayId       String    @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  attemptLogs CaptchaAttempt[]
+
+  @@index([sessionId])
+  @@index([userId])
+  @@index([rayId])
+  @@index([difficulty])
+  @@map("captcha_challenges")
+}
+
+model CaptchaAttempt {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  challengeId String    @map("challenge_id")
+  userId      String?   @map("user_id")
+  sessionId   String    @map("session_id")
+  answer      String
+  isCorrect   Boolean   @default(false) @map("is_correct")
+  ipAddress   String?   @map("ip_address")
+  userAgent   String?   @map("user_agent")
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+
+  challenge CaptchaChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  @@index([challengeId])
+  @@index([userId])
+  @@index([sessionId])
+  @@map("captcha_attempts")
+}
+
+model CaptchaBlock {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String?   @map("user_id")
+  sessionId   String    @map("session_id")
+  ipAddress   String    @map("ip_address")
+  reason      String    // "too_many_attempts", "suspicious_activity", "rate_limit"
+  difficulty  String    @default("hard")
+  blockedAt   DateTime  @default(now()) @db.Timestamptz(6) @map("blocked_at")
+  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
+  unblockedAt DateTime? @map("unblocked_at") @db.Timestamptz(6)
+  unblockedBy String?   @map("unblocked_by")
+  rayId       String    @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  metadata    Json?     // Additional context
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([ipAddress])
+  @@index([rayId])
+  @@map("captcha_blocks")
+}
+
+model CaptchaSettings {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key         String   @unique
+  value       Json
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("captcha_settings")
+}
+
+model CaptchaLog {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String?   @map("user_id")
+  sessionId   String    @map("session_id")
+  ipAddress   String    @map("ip_address")
+  eventType   String    @map("event_type") // "challenge_shown", "attempt_failed", "blocked", "unblocked", "settings_changed"
+  difficulty  String?
+  rayId       String?   @map("ray_id")
+  metadata    Json?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+
+  @@index([userId])
+  @@index([sessionId])
+  @@index([ipAddress])
+  @@index([eventType])
+  @@index([rayId])
+  @@map("captcha_logs")
+}
+
+model SupportTicket {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String?   @map("user_id")
+  email       String
+  subject     String
+  message     String    @db.Text
+  status      String    @default("open")
+  priority    String    @default("medium")
+  category    String    @default("general")
+  rayId       String?
+  metadata    Json?
+  assignedTo  String?   @map("assigned_to")
+  resolvedAt  DateTime? @map("resolved_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  user    User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  replies SupportTicketReply[]
+
+  @@index([userId])
+  @@index([email])
+  @@index([status])
+  @@index([category])
+  @@index([rayId])
+  @@map("support_tickets")
+}
+
+model SupportTicketReply {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  ticketId  String   @map("ticket_id")
+  userId    String?   @map("user_id")
+  message   String   @db.Text
+  isAdmin   Boolean  @default(false) @map("is_admin")
+  createdAt DateTime @default(now()) @db.Timestamptz(6) @map("created_at")
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user   User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId])
+  @@index([userId])
+  @@map("support_ticket_replies")
+}

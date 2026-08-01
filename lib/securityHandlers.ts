@@ -1,0 +1,500 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { NextRequest, NextResponse } from 'next/server';
+import { prisma } from './db/prisma';
+import { getSession } from './session';
+import { jsonUnauthorized, jsonError } from './response';
+import { createAuditEvent } from './audit';
+import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } from './auth/totp';
+import { hashRecoveryCode } from './auth/password';
+import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
+import { sendTemplateEmail } from './email';
+
+// ─── POST /api/security/phones/send-otp ─────────────────────
+export async function phonesSendOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { number } = await request.json();
+    if (!number || typeof number !== 'string') {
+      return new NextResponse('Phone number required', { status: 400 });
+    }
+    const clean = number.replace(/[\s\-()]/g, '');
+    if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
+      return new NextResponse('Invalid phone number format', { status: 400 });
+    }
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'phone', code);
+    await sendPhoneOtp(clean, code);
+    return NextResponse.json({ ok: true, message: 'Verification code sent' });
+  } catch (err: any) {
+    console.error('[PHONES SEND OTP]', err?.message || err);
+    return new NextResponse('Failed to send OTP', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/phones/verify-otp ────────────────────
+export async function phonesVerifyOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { number, code } = await request.json();
+    if (!number || typeof number !== 'string' || !code || typeof code !== 'string' || code.length !== 6) {
+      return new NextResponse('Invalid request', { status: 400 });
+    }
+    const clean = number.replace(/[\s\-()]/g, '');
+    if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
+      return new NextResponse('Invalid phone number format', { status: 400 });
+    }
+    const ok = await verifyOtpCode(session.userId, 'phone', code);
+    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { phoneNumber: clean, phoneVerified: true },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'phone.verified',
+      targetType: 'user',
+      targetId: session.userId,
+      metadata: { phoneNumber: clean },
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[PHONES VERIFY]', err?.message || err);
+    return new NextResponse('Failed to verify OTP', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/phones (add directly) ───────────────
+export async function phonesAddHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { number } = await request.json();
+    if (!number || typeof number !== 'string') {
+      return new NextResponse('Phone number required', { status: 400 });
+    }
+    const clean = number.replace(/[\s\-()]/g, '');
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { phoneNumber: clean, phoneVerified: true },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'phone.added',
+      targetType: 'user',
+      targetId: session.userId,
+      metadata: { phoneNumber: clean },
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true, number: clean });
+  } catch (err: any) {
+    console.error('[PHONES ADD]', err?.message || err);
+    return new NextResponse('Failed to add phone', { status: 500 });
+  }
+}
+
+// ─── DELETE /api/security/phones ─────────────────────────────
+export async function phonesRemoveHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { number } = await request.json();
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { phoneNumber: null, phoneVerified: false },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'phone.removed',
+      targetType: 'user',
+      targetId: session.userId,
+      metadata: { phoneNumber: number },
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[PHONES REMOVE]', err?.message || err);
+    return new NextResponse('Failed to remove phone', { status: 500 });
+  }
+}
+
+// ─── GET /api/security/events ────────────────────────────────
+export async function securityEventsHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 100);
+
+    const auditLogs = await prisma.auditEvent.findMany({
+      where: { actorId: session.userId },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: {
+        id: true, action: true, targetType: true, targetId: true,
+        metadata: true, severity: true, createdAt: true,
+      },
+    });
+
+    const events = auditLogs.map((log) => {
+      let type: 'sign_in' | 'password_change' | '2fa_enable' | '2fa_disable' | 'recovery_change' | 'session_revoke' | 'passkey_add' = 'sign_in';
+      if (log.action.includes('password')) type = 'password_change';
+      else if (log.action.includes('totp.enabled') || log.action.includes('2fa.enable')) type = '2fa_enable';
+      else if (log.action.includes('totp.disabled') || log.action.includes('2fa.disable')) type = '2fa_disable';
+      else if (log.action.includes('recovery')) type = 'recovery_change';
+      else if (log.action.includes('session.revoked') || log.action.includes('sessions.revoked')) type = 'session_revoke';
+      else if (log.action.includes('passkey')) type = 'passkey_add';
+      else if (log.action.includes('login') || log.action.includes('phone.verified') || log.action.includes('backup_codes') || log.action.includes('recovery_email')) type = 'sign_in';
+
+      const meta = (log.metadata as Record<string, any>) || {};
+      return {
+        id: log.id,
+        type,
+        description: formatAuditAction(log.action, meta),
+        date: log.createdAt.toISOString(),
+        location: meta.location || undefined,
+        ip: meta.ip || undefined,
+        userAgent: meta.userAgent || undefined,
+      };
+    });
+
+    return NextResponse.json({ events });
+  } catch (err: any) {
+    console.error('[SECURITY EVENTS]', err?.message || err);
+    return new NextResponse('Failed to fetch events', { status: 500 });
+  }
+}
+
+function formatAuditAction(action: string, meta: Record<string, any>): string {
+  if (action.includes('login')) return 'Signed in to your account';
+  if (action.includes('phone.verified')) return 'Phone number verified';
+  if (action.includes('phone.added')) return 'Phone number added';
+  if (action.includes('phone.removed')) return 'Phone number removed';
+  if (action.includes('totp.enabled')) return 'Two-factor authentication enabled';
+  if (action.includes('totp.disabled')) return 'Two-factor authentication disabled';
+  if (action.includes('backup_codes.regenerated')) return 'Backup codes regenerated';
+  if (action.includes('recovery_email.verified')) return 'Recovery email verified';
+  if (action.includes('recovery_email.updated')) return 'Recovery email updated';
+  if (action.includes('session.revoked')) return 'A session was signed out';
+  if (action.includes('sessions.revoked_all')) return 'All other sessions signed out';
+  if (action.includes('password')) return 'Password was changed';
+  if (action.includes('passkey')) return 'Passkey registered';
+  return action.replace(/[._-]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// ─── POST /api/security/totp/setup ───────────────────────────
+export async function totpSetupHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const secret = generateSecret();
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
+    const uri = generateTotpUri(secret, user?.email || 'user');
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { totpSecret: secret },
+    });
+    return NextResponse.json({ secret, uri });
+  } catch (err: any) {
+    console.error('[TOTP SETUP]', err?.message || err);
+    return new NextResponse('Failed to setup TOTP', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/totp/verify ──────────────────────────
+export async function totpVerifyHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { code } = await request.json();
+    if (!code || typeof code !== 'string' || code.length !== 6) {
+      return new NextResponse('Invalid code', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { totpSecret: true },
+    });
+    if (!user?.totpSecret) {
+      return new NextResponse('TOTP not set up', { status: 400 });
+    }
+    const valid = await verifyTotp(code, user.totpSecret);
+    if (!valid) {
+      return new NextResponse('Invalid code', { status: 400 });
+    }
+    const recoveryCodes = generateRecoveryCodes(8);
+    for (const rc of recoveryCodes) {
+      await prisma.recoveryCode.create({
+        data: { userId: session.userId, code: hashRecoveryCode(rc) },
+      });
+    }
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { is2FAEnabled: true },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'totp.enabled',
+      targetType: 'user',
+      targetId: session.userId,
+      severity: 'info',
+    });
+
+    const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
+    if (userEmail?.email) {
+      sendTemplateEmail(userEmail.email, 'login_alert', {
+        name: userEmail.email.split('@')[0],
+        location: 'Security Settings',
+        device: request.headers.get('user-agent') || 'Unknown device',
+        loginTime: new Date().toLocaleString(),
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({ ok: true, backupCodes: recoveryCodes });
+  } catch (err: any) {
+    console.error('[TOTP VERIFY]', err?.message || err);
+    return new NextResponse('Failed to verify TOTP', { status: 500 });
+  }
+}
+
+// ─── DELETE /api/security/totp/disable ───────────────────────
+export async function totpDisableHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { totpCode } = await request.json();
+    if (!totpCode || typeof totpCode !== 'string' || totpCode.length !== 6) {
+      return new NextResponse('Invalid code', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { totpSecret: true },
+    });
+    if (!user?.totpSecret) {
+      return new NextResponse('TOTP not configured', { status: 400 });
+    }
+    const valid = await verifyTotp(totpCode, user.totpSecret);
+    if (!valid) {
+      return new NextResponse('Invalid code', { status: 400 });
+    }
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { totpSecret: null, is2FAEnabled: false },
+    });
+    await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'totp.disabled',
+      targetType: 'user',
+      targetId: session.userId,
+      severity: 'warning',
+    });
+
+    const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
+    if (userEmail?.email) {
+      sendTemplateEmail(userEmail.email, 'suspicious_login', {
+        name: userEmail.email.split('@')[0],
+        location: 'Security Settings',
+        device: request.headers.get('user-agent') || 'Unknown device',
+        loginTime: new Date().toLocaleString(),
+        ipAddress: request.headers.get('x-forwarded-for')?.split(',')[0].trim() || 'unknown',
+        dashboardUrl: 'https://tirbeo.app/dashboard',
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[TOTP DISABLE]', err?.message || err);
+    return new NextResponse('Failed to disable TOTP', { status: 500 });
+  }
+}
+
+// ─── GET /api/security/backup-codes ─────────────────────────
+export async function backupCodesListHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const count = await prisma.recoveryCode.count({ where: { userId: session.userId } });
+    // Codes are stored hashed and are only shown once at creation — never returned here.
+    return NextResponse.json({ codes: [], count, enabled: count > 0 });
+  } catch (err: any) {
+    console.error('[BACKUP CODES LIST]', err?.message || err);
+    return new NextResponse('Failed to fetch backup codes', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/backup-codes/regenerate ──────────────
+export async function backupCodesRegenerateHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
+    const codes = generateRecoveryCodes(8);
+    for (const code of codes) {
+      await prisma.recoveryCode.create({
+        data: { userId: session.userId, code: hashRecoveryCode(code) },
+      });
+    }
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'backup_codes.regenerated',
+      targetType: 'user',
+      targetId: session.userId,
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true, codes });
+  } catch (err: any) {
+    console.error('[BACKUP CODES REGEN]', err?.message || err);
+    return new NextResponse('Failed to regenerate codes', { status: 500 });
+  }
+}
+
+// ─── PUT /api/security/recovery-email ────────────────────────
+export async function recoveryEmailHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { email } = await request.json();
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return new NextResponse('Valid email required', { status: 400 });
+    }
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { secondaryEmail: email },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'recovery_email.updated',
+      targetType: 'user',
+      targetId: session.userId,
+      metadata: { email },
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[RECOVERY EMAIL]', err?.message || err);
+    return new NextResponse('Failed to update recovery email', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/recovery-email/send-code ─────────────
+export async function recoveryEmailSendCodeHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { email } = await request.json();
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return new NextResponse('Valid email required', { status: 400 });
+    }
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'email', code);
+    await sendEmailOtp(email, code);
+    return NextResponse.json({ ok: true, message: 'Verification code sent' });
+  } catch (err: any) {
+    console.error('[RECOVERY EMAIL SEND]', err?.message || err);
+    return new NextResponse('Failed to send code', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/recovery-email/verify ────────────────
+export async function recoveryEmailVerifyHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { email, code } = await request.json();
+    if (!email || !code || typeof code !== 'string') {
+      return new NextResponse('Email and code required', { status: 400 });
+    }
+    const ok = await verifyOtpCode(session.userId, 'email', code);
+    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { secondaryEmail: email },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'recovery_email.verified',
+      targetType: 'user',
+      targetId: session.userId,
+      metadata: { email },
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[RECOVERY EMAIL VERIFY]', err?.message || err);
+    return new NextResponse('Failed to verify email', { status: 500 });
+  }
+}
+
+// ─── POST /api/security/password-check ───────────────────────
+export async function passwordCheckHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { passwordHash: true },
+    });
+    const hasPassword = !!user?.passwordHash && user.passwordHash.length > 0;
+    return NextResponse.json({
+      hasPassword,
+      weak: !hasPassword ? 0 : 0,
+      reused: 0,
+      total: 1,
+      score: hasPassword ? 'good' : 'no_password',
+      label: hasPassword ? 'Password is set' : 'No password set',
+      feedback: [],
+    });
+  } catch (err: any) {
+    console.error('[PASSWORD CHECK]', err?.message || err);
+    return new NextResponse('Failed to check password', { status: 500 });
+  }
+}
+
+// ─── DELETE /api/security/sessions/revoke-all ────────────────
+export async function sessionsRevokeAllHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    await prisma.session.updateMany({
+      where: { userId: session.userId, status: 'active', id: { not: session.sessionId } },
+      data: { status: 'revoked', revokedAt: new Date() },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'sessions.revoked_all',
+      targetType: 'user',
+      targetId: session.userId,
+      severity: 'warning',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[SESSIONS REVOKE ALL]', err?.message || err);
+    return new NextResponse('Failed to revoke sessions', { status: 500 });
+  }
+}
+
+// ─── DELETE /api/security/sessions/[id] ──────────────────────
+export async function sessionRevokeHandler(request: NextRequest, sessionId: string) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    if (!sessionId) return new NextResponse('Session ID required', { status: 400 });
+    await prisma.session.updateMany({
+      where: { id: sessionId, userId: session.userId },
+      data: { status: 'revoked', revokedAt: new Date() },
+    });
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'session.revoked',
+      targetType: 'session',
+      targetId: sessionId,
+      severity: 'info',
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err: any) {
+    console.error('[SESSION REVOKE]', err?.message || err);
+    return new NextResponse('Failed to revoke session', { status: 500 });
+  }
+}
