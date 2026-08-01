@@ -1,5 +1,4 @@
 {
-  "installCommand": "pnpm install",
-  "buildCommand": "pnpm --filter @tirbeo/api build",
-  "outputDirectory": ".next"
+    "installCommand":  "pnpm install",
+    "buildCommand":  "pnpm build"
 }
