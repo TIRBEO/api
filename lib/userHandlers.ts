@@ -147,6 +147,12 @@ export async function changePasswordHandler(request: NextRequest) {
       }
       const ok = await verifyOtpCode(session.userId, 'email', otpCode);
       if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+     }
+
+    const { checkPasswordBreach } = await import('./auth/breach');
+    const breach = await checkPasswordBreach(newPassword);
+    if (breach.breached) {
+      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
     }
 
     const newHash = await hashPassword(newPassword);

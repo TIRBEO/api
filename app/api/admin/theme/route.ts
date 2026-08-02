@@ -75,7 +75,7 @@ function getDefaultTheme() {
     textPrimary: '#F2EEE8',
     textSecondary: '#B7C6BE',
     textMuted: '#6b8a7a',
-    accentPrimary: '#569578',
+    accentPrimary: '#8AB4F8',
     accentSecondary: '#275d46',
     accentHover: '#6aab8d',
     success: '#59C173',
@@ -88,8 +88,8 @@ function getDefaultTheme() {
     borderRadius: '16px',
     brandName: 'Tirbeo',
     brandTagline: 'Premium Social Platform',
-    emailHeaderBg: 'linear-gradient(135deg,#022B22,#275D46,#569578)',
-    emailButtonColor: '#569578',
+    emailHeaderBg: 'linear-gradient(135deg,#1A73E8,#4285F4,#8AB4F8)',
+    emailButtonColor: '#8AB4F8',
     emailTextColor: '#B7C6BE',
   };
 }

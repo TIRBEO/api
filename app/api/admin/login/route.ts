@@ -71,9 +71,9 @@ async function handleVerify(request: NextRequest) {
     const ip = request.headers.get('x-forwarded-for') || '';
     const { createSession, setSessionCookie } = await import('@/lib/session');
     const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
 
     const { sendTemplateEmail: sendLoginAlert } = await import('../../../../lib/email');
     sendLoginAlert(user.email, 'login_alert', {

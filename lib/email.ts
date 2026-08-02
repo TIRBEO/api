@@ -229,8 +229,8 @@ function applyThemeColors(html: string, colors: Record<string, string>): string 
   if (colors.BG_PRIMARY) colorMap['#08150F'] = colors.BG_PRIMARY;
   if (colors.BG_CARD) colorMap['#12271D'] = colors.BG_CARD;
   if (colors.BG_PRIMARY) colorMap['#101C13'] = colors.BG_PRIMARY;
-  if (colors.ACCENT_SECONDARY) colorMap['#275D46'] = colors.ACCENT_SECONDARY;
-  if (colors.ACCENT_PRIMARY) colorMap['#569578'] = colors.ACCENT_PRIMARY;
+  if (colors.ACCENT_SECONDARY) colorMap['#4285F4'] = colors.ACCENT_SECONDARY;
+  if (colors.ACCENT_PRIMARY) colorMap['#8AB4F8'] = colors.ACCENT_PRIMARY;
   if (colors.TEXT_SECONDARY) colorMap['#B7C6BE'] = colors.TEXT_SECONDARY;
   if (colors.ACCENT_SECONDARY) colorMap['#214434'] = colors.ACCENT_SECONDARY;
   if (colors.ACCENT_SECONDARY) colorMap['#173124'] = colors.ACCENT_SECONDARY;

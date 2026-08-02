@@ -4,6 +4,7 @@ import { signPasswordResetToken, verifyPasswordResetToken } from './jwt';
 import { addMinutes } from 'date-fns';
 import { sendTemplateEmail } from '../email';
 import { randomInt } from 'crypto';
+import { enforceResendCooldown } from './resend-cooldown';
 
 const RESET_TTL_MINUTES = 15;
 
@@ -83,7 +84,12 @@ type ResetMethod = 'otp' | 'magic_link';
 export async function requestPasswordReset(
   email: string,
   method: ResetMethod = 'otp'
-): Promise<{ success: boolean; error?: string; resetUrl?: string; code?: string }> {
+): Promise<{ success: boolean; error?: string; resetUrl?: string; code?: string; retryAfterMs?: number }> {
+  const cooldown = enforceResendCooldown(`password-reset:${email.toLowerCase()}`);
+  if (!cooldown.allowed) {
+    return { success: false, error: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs };
+  }
+
   const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
   if (!user) {
     // Don't reveal if user exists

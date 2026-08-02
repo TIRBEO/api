@@ -4,9 +4,38 @@ const WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS = 30;
 const AUTH_MAX = 5;
 
+interface ApiLimits {
+  rateLimitEnabled: boolean;
+  rateLimitPerMinute: number;
+}
+
+let cachedLimits: ApiLimits | null = null;
+let cachedAt = 0;
+const CONFIG_TTL = 30_000;
+
+async function getApiLimits(): Promise<ApiLimits> {
+  if (cachedLimits && Date.now() - cachedAt < CONFIG_TTL) return cachedLimits;
+  let limits: ApiLimits = { rateLimitEnabled: true, rateLimitPerMinute: MAX_REQUESTS };
+  try {
+    const { prisma } = await import('../db/prisma');
+    const record = await prisma.siteConfig.findUnique({ where: { app: 'api' } });
+    const c: any = record?.config || {};
+    limits = {
+      rateLimitEnabled: c.rateLimitEnabled !== undefined ? !!c.rateLimitEnabled : true,
+      rateLimitPerMinute: typeof c.rateLimitPerMinute === 'number' && c.rateLimitPerMinute > 0
+        ? c.rateLimitPerMinute
+        : MAX_REQUESTS,
+    };
+  } catch {}
+  cachedLimits = limits;
+  cachedAt = Date.now();
+  return limits;
+}
+
 const ROUTE_LIMITS: Record<string, number> = {
   'auth/login': 10,
   'auth/signup': 5,
+  'auth/email-exists': 20,
   'auth/email-otp/request': 5,
   'auth/phone-otp/request': 5,
   'auth/magic-link/request': 5,
@@ -44,8 +73,12 @@ async function getRedis() {
   return redis;
 }
 
-export async function checkRateLimit(key: string, isAuth = false): Promise<boolean> {
-  const max = isAuth ? AUTH_MAX : MAX_REQUESTS;
+export async function checkRateLimit(key: string, isAuth = false, routeLimit?: number): Promise<boolean> {
+  const limits = await getApiLimits();
+  if (!limits.rateLimitEnabled) return true;
+  const configuredMax = limits.rateLimitPerMinute;
+  const defaultMax = isAuth ? AUTH_MAX : MAX_REQUESTS;
+  const max = Math.min(routeLimit ?? defaultMax, configuredMax);
   const r = await getRedis();
 
   if (r) {

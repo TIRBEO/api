@@ -257,7 +257,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
 
     // Create session
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token } = await createSession(
+    const { token, refreshToken } = await createSession(
       passkey.user.id,
       request.headers.get('user-agent') || undefined,
       ip,
@@ -276,7 +276,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       id: passkey.user.id,
       email: passkey.user.email,
     });
-    setSessionCookie(res, token);
+     setSessionCookie(res, token, refreshToken);
     return res;
   } catch (err: any) {
     console.error('[PASSKEY AUTH VERIFY]', err?.message || err);

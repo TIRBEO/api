@@ -8,6 +8,7 @@ import { checkRateLimit, ROUTE_LIMITS } from '../../../lib/auth/rate-limit';
 import {
   loginHandler,
   signupHandler,
+  emailExistsHandler,
   verifySignupEmailHandler,
   logoutHandler,
   profileHandler,
@@ -40,10 +41,13 @@ import {
   suspiciousLoginDenyHandler,
   verifyHandler,
   deleteWorkspaceByIdHandler,
-  helpConfigHandler,
-  faqHandler,
-  cliTokenHandler,
-} from '../../../lib/authHandlers';
+   helpConfigHandler,
+   faqHandler,
+   cliTokenHandler,
+   sessionHandler,
+   refreshHandler,
+   sessionRevokeByTokenHandler,
+ } from '../../../lib/authHandlers';
 
 import {
   oauthAuthorizeHandler,
@@ -195,7 +199,7 @@ const appUrl = (subdomain: string, path: string) =>
   `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
 
 const INTERNAL_ROUTES = [
-  'auth/login', 'auth/signup', 'auth/logout',
+  'auth/login', 'auth/signup', 'auth/email-exists', 'auth/logout',
   'auth/email-otp/request', 'auth/email-otp/verify',
   'auth/phone-otp/request', 'auth/phone-otp/verify',
   'auth/signup-otp/request',
@@ -205,9 +209,12 @@ const INTERNAL_ROUTES = [
   'auth/discord', 'auth/discord/callback',
   'auth/verify-2fa', 'auth/recovery-2fa',
   'auth/password-reset/request', 'auth/password-reset/verify', 'auth/password-reset/confirm',
-  'auth/account-recovery',
-  'auth/suspicious-login/confirm', 'auth/suspicious-login/deny',
-  'auth/verify-email', 'auth/verify',
+   'auth/account-recovery',
+   'auth/suspicious-login/confirm', 'auth/suspicious-login/deny',
+   'auth/session',
+   'auth/refresh',
+   'security/session-revoke',
+   'auth/verify-email', 'auth/verify',
   'users/me', 'activity', 'workspaces', 'workspaces/delete',
   'profile', 'security/password', 'security/sessions', 'security/set-password',
   'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
@@ -450,6 +457,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     const methodMap: Record<string, string[]> = {
       'auth/login': ['POST'],
       'auth/signup': ['POST'],
+      'auth/email-exists': ['POST'],
       'auth/verify-email': ['POST'],
       'auth/logout': ['POST'],
       'auth/email-otp/request': ['POST'],
@@ -472,11 +480,13 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/password-reset/request': ['POST'],
       'auth/password-reset/verify': ['POST'],
       'auth/password-reset/confirm': ['POST'],
-      'auth/account-recovery': ['POST'],
-      'auth/suspicious-login/confirm': ['POST'],
-      'auth/suspicious-login/deny': ['POST'],
-      'auth/verify': ['POST'],
-      'users/me': ['GET', 'PATCH'],
+       'auth/account-recovery': ['POST'],
+       'auth/suspicious-login/confirm': ['POST'],
+       'auth/suspicious-login/deny': ['POST'],
+       'auth/session': ['GET'],
+       'auth/refresh': ['POST'],
+        'security/session-revoke': ['POST'],
+       'users/me': ['GET', 'PATCH'],
       'activity': ['GET'],
       'workspaces': ['GET', 'POST'],
       'workspaces/delete': ['POST'],
@@ -671,7 +681,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   const routeLimit = ROUTE_LIMITS[pathStr];
   if (routeLimit) {
     const isAuth = pathStr.startsWith('auth/');
-    const allowed = await checkRateLimit(`${pathStr}:${ip}`, isAuth);
+    const allowed = await checkRateLimit(`${pathStr}:${ip}`, isAuth, routeLimit);
     if (!allowed) {
       console.warn(`[RATE LIMIT] Exceeded — path: ${pathStr}, ip: ${ip}`);
       await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 429 });
@@ -688,6 +698,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/signup':
         resp = await signupHandler(request);
+        break;
+      case 'auth/email-exists':
+        resp = await emailExistsHandler(request);
         break;
       case 'auth/verify-email':
         resp = await verifySignupEmailHandler(request);
@@ -742,6 +755,24 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/discord/callback':
         resp = await discordAuthCallbackHandler(request);
+        break;
+      case 'auth/session':
+        resp = await sessionHandler(request);
+        break;
+      case 'auth/refresh':
+        resp = await refreshHandler(request);
+        break;
+      case 'security/session-revoke':
+        resp = await sessionRevokeByTokenHandler(request);
+        break;
+      case 'auth/account-recovery':
+        resp = await accountRecoveryHandler(request);
+        break;
+      case 'auth/suspicious-login/confirm':
+        resp = await suspiciousLoginConfirmHandler(request);
+        break;
+      case 'auth/suspicious-login/deny':
+        resp = await suspiciousLoginDenyHandler(request);
         break;
       case 'auth/verify-2fa':
         resp = await verify2faLoginHandler(request);
@@ -1201,6 +1232,9 @@ case 'forms/[id]/responses/[responseId]':
          else resp = new NextResponse('Method not allowed', { status: 405 });
          break;
       case 'forms/public':
+        resp = await publicDirectory(request);
+        break;
+      case 'forms/directory':
         resp = await publicDirectory(request);
         break;
       case 'forms/public/[publicId]':

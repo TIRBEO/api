@@ -18,7 +18,7 @@ export async function GET() {
       '--text': theme.textPrimary || '#F2EEE8',
       '--text-secondary': theme.textSecondary || '#B7C6BE',
       '--text-muted': theme.textMuted || '#6b8a7a',
-      '--accent': theme.accentPrimary || '#569578',
+      '--accent': theme.accentPrimary || '#8AB4F8',
       '--accent-hover': theme.accentHover || '#6aab8d',
       '--accent-muted': theme.accentSecondary || '#275d46',
       '--success': theme.success || '#59C173',
@@ -31,8 +31,8 @@ export async function GET() {
       '--radius': theme.borderRadius || '16px',
       '--logo-url': theme.logoUrl || '',
       '--brand-name': theme.brandName || 'Tirbeo',
-      '--email-header-bg': theme.emailHeaderBg || 'linear-gradient(135deg,#022B22,#275D46,#569578)',
-      '--email-button-color': theme.emailButtonColor || '#569578',
+      '--email-header-bg': theme.emailHeaderBg || 'linear-gradient(135deg,#1A73E8,#4285F4,#8AB4F8)',
+      '--email-button-color': theme.emailButtonColor || '#8AB4F8',
       '--email-text-color': theme.emailTextColor || '#B7C6BE',
     };
 
@@ -64,7 +64,7 @@ function getDefaultColors(): Record<string, string> {
     '--text': '#F2EEE8',
     '--text-secondary': '#B7C6BE',
     '--text-muted': '#6b8a7a',
-    '--accent': '#569578',
+    '--accent': '#8AB4F8',
     '--accent-hover': '#6aab8d',
     '--accent-muted': '#275d46',
     '--success': '#59C173',
@@ -75,8 +75,8 @@ function getDefaultColors(): Record<string, string> {
     '--font-primary': 'Inter',
     '--font-heading': 'Plus Jakarta Sans',
     '--radius': '16px',
-    '--email-header-bg': 'linear-gradient(135deg,#022B22,#275D46,#569578)',
-    '--email-button-color': '#569578',
+    '--email-header-bg': 'linear-gradient(135deg,#1A73E8,#4285F4,#8AB4F8)',
+    '--email-button-color': '#8AB4F8',
     '--email-text-color': '#B7C6BE',
   };
 }

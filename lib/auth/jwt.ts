@@ -22,8 +22,8 @@ export async function signToken(userId: string, sessionId: string, adminRole?: s
   return new SignJWT(payload)
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
-    .setExpirationTime('7d')
-    .sign(getSecret());
+     .setExpirationTime('15m')
+     .sign(getSecret());
 }
 
 export async function verifyToken(token: string): Promise<SessionPayload | null> {
@@ -109,6 +109,24 @@ export async function verifySuspiciousLoginToken(token: string): Promise<string 
 }
 
 export { COOKIE_NAME };
+
+export async function signSessionRevokeToken(sessionId: string): Promise<string> {
+  return new SignJWT({ sub: sessionId, purpose: 'session-revoke' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('24h')
+    .sign(getSecret());
+}
+
+export async function verifySessionRevokeToken(token: string): Promise<string | null> {
+  try {
+    const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
+    if (payload.sub && payload.purpose === 'session-revoke') return payload.sub as string;
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export async function signMagicLinkToken(userId: string): Promise<string> {
   return new SignJWT({ sub: userId, purpose: 'magic-link' })

@@ -140,24 +140,30 @@ model UserRole {
 }
 
 model Session {
-  id         String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String          @map("user_id")
-  token      String?
-  status     session_status? @default(active)
-  expiresAt  DateTime        @map("expires_at") @db.Timestamptz(6)
-  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  lastUsedAt DateTime?       @map("last_used_at") @db.Timestamptz(6)
-  userAgent  String?         @map("user_agent")
-  ipAddress  String?         @map("ip_address")
-  location   String?
-  deviceName String?         @map("device_name")
-  revokedAt  DateTime?       @map("revoked_at") @db.Timestamptz(6)
-  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id                     String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId                 String          @map("user_id")
+  token                  String?
+  status                 session_status? @default(active)
+  expiresAt              DateTime        @map("expires_at") @db.Timestamptz(6)
+  createdAt              DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt             DateTime?       @map("last_used_at") @db.Timestamptz(6)
+  userAgent              String?         @map("user_agent")
+  ipAddress              String?         @map("ip_address")
+  location               String?
+  deviceName             String?         @map("device_name")
+  revokedAt              DateTime?       @map("revoked_at") @db.Timestamptz(6)
+  refreshTokenHash       String?         @map("refresh_token_hash") @unique
+  previousRefreshTokenHash String?       @map("previous_refresh_token_hash")
+  refreshTokenIssuedAt   DateTime?       @map("refresh_token_issued_at") @db.Timestamptz(6)
+  refreshExpiresAt       DateTime?       @map("refresh_expires_at") @db.Timestamptz(6)
+  user                   User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([expiresAt], map: "idx_sessions_expires")
   @@index([status], map: "idx_sessions_status")
   @@index([token], map: "idx_sessions_token")
   @@index([userId], map: "idx_sessions_user")
+  @@index([refreshTokenHash], map: "idx_sessions_refresh_token")
+  @@index([refreshExpiresAt], map: "idx_sessions_refresh_expires")
   @@map("sessions")
 }
 

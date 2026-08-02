@@ -4,14 +4,66 @@ import { prisma } from './db/prisma';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail } from './auth/signup-otp';
 import { hashPassword, verifyPassword } from './auth/password';
-import { createSession, setSessionCookie, clearSessionCookie, revokeSession, COOKIE_DOMAIN } from './auth/session';
+import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, signRecoveryToken, verifyRecoveryToken, signSuspiciousLoginToken, verifySuspiciousLoginToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, signRecoveryToken, verifyRecoveryToken, signSuspiciousLoginToken, verifySuspiciousLoginToken, signSessionRevokeToken, verifySessionRevokeToken } from './auth/jwt';
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
 import { sanitizeInput } from './security';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, verifyPasswordReset, confirmPasswordReset } from './auth/password-reset';
 import { createAuditEvent } from './audit';
+import { enforceResendCooldown } from './auth/resend-cooldown';
+import { checkPasswordBreach } from './auth/breach';
+import { jsonUnauthorized } from './response';
+
+export async function sessionHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { id: true, email: true, name: true, photoUrl: true, is2FAEnabled: true, adminRole: true, roles: { include: { role: true } }, emailVerified: true, preferences: true },
+    });
+    if (!user) return jsonUnauthorized();
+    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
+    return NextResponse.json({ user: { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, preferences: user.preferences } });
+  } catch (err: any) {
+    console.error('[SESSION]', err?.message || err);
+    return new NextResponse('Failed to fetch session', { status: 500 });
+  }
+}
+
+export async function refreshHandler(request: NextRequest) {
+  try {
+    const refreshToken = request.cookies.get(REFRESH_COOKIE_NAME)?.value;
+    if (!refreshToken) {
+      const res = new NextResponse('Refresh token missing', { status: 401 });
+      clearSessionCookie(res);
+      return res;
+    }
+    const result = await rotateRefreshToken(refreshToken, getIp(request), request.headers.get('user-agent') || undefined);
+    if (!result) {
+      const res = new NextResponse('Session expired', { status: 401 });
+      clearSessionCookie(res);
+      return res;
+    }
+    const res = NextResponse.json({ token: result.token, sessionId: result.sessionId });
+    setSessionCookie(res, result.token, result.refreshToken);
+    return res;
+  } catch (err: any) {
+    console.error('[REFRESH]', err?.message || err);
+    const res = new NextResponse('Refresh failed', { status: 500 });
+    clearSessionCookie(res);
+    return res;
+  }
+}
+
+function getIp(request: NextRequest): string | null {
+  const xff = request.headers.get('x-forwarded-for');
+  if (xff) return xff.split(',')[0].trim();
+  return request.headers.get('x-real-ip') || null;
+}
+
 
 function isAllowedRedirect(url: string): boolean {
   try {
@@ -36,6 +88,36 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
   const host = request.headers.get('host') || 'api.tirbeo.app';
   const protocol = request.headers.get('x-forwarded-proto') || 'https';
   return `${protocol}://${host}${path}`;
+}
+
+interface OauthProviderConfig {
+  enabled: boolean;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+}
+
+const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }> = {
+  google: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', uri: 'GOOGLE_REDIRECT_URI' },
+  github: { id: 'GITHUB_CLIENT_ID', secret: 'GITHUB_CLIENT_SECRET', uri: 'GITHUB_REDIRECT_URI' },
+  discord: { id: 'DISCORD_CLIENT_ID', secret: 'DISCORD_CLIENT_SECRET', uri: 'DISCORD_REDIRECT_URI' },
+};
+
+async function getOauthProviderConfig(provider: string): Promise<OauthProviderConfig> {
+  const keys = OAUTH_ENV_KEYS[provider];
+  let configured: any = {};
+  try {
+    const record = await prisma.siteConfig.findUnique({ where: { app: 'accounts' } });
+    const cfgJson: any = record?.config || {};
+    configured = cfgJson?.oauth?.[provider] || {};
+  } catch {}
+  const envConfigured = !!process.env[keys?.id];
+  return {
+    enabled: configured.enabled !== undefined ? !!configured.enabled : envConfigured,
+    clientId: configured.clientId || process.env[keys?.id],
+    clientSecret: configured.clientSecret || process.env[keys?.secret],
+    redirectUri: configured.redirectUri || process.env[keys?.uri],
+  };
 }
 
 function getOauthCookieDomain(request: NextRequest): string | undefined {
@@ -113,6 +195,28 @@ export async function loginHandler(request: NextRequest) {
     if (!user.passwordHash) {
       return new NextResponse('Invalid email or password', { status: 401 });
     }
+
+    // Progressive friction: if this account/IP has prior failed-attempt history,
+    // require a CAPTCHA before revealing password validity — so automated
+    // password-spraying is challenged before the lockout threshold is reached.
+    const { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
+    const warnings = await getUserWarningCount(user.id, ip);
+    const forceCaptcha = warnings.recentBlocks > 0 || warnings.count >= 2;
+    if (forceCaptcha) {
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
+      const check = await assertCaptchaSatisfied({
+        rayId: captchaRayId,
+        sessionId,
+        ipAddress: ip,
+        userAgent,
+        fingerprint,
+        requiredDifficulty,
+      });
+      if (!check.ok) {
+        return new NextResponse(check.error, { status: 403 });
+      }
+    }
+
     if (!(await verifyPassword(user.passwordHash, password))) {
       const { logSecurityEvent } = await import('./security');
       const { recordRateLimitHit } = await import('./auth/suspicious-activity');
@@ -154,26 +258,29 @@ export async function loginHandler(request: NextRequest) {
     }
 
     const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    const { token } = await createSession(user.id, userAgent || undefined, ip, adminRole);
+    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
 
     const { recordDeviceSeen } = await import('./captcha/risk');
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
 
     const lastSession = await prisma.session.findFirst({
-      where: { userId: user.id, id: { not: token } },
+      where: { userId: user.id, id: { not: newSessionId }, status: { not: 'revoked' } },
       orderBy: { createdAt: 'desc' },
       select: { id: true, ipAddress: true },
     });
 
     const isNewIp = !lastSession || lastSession.ipAddress !== ip;
     if (isNewIp) {
+      const revokeToken = await signSessionRevokeToken(newSessionId);
+      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
       sendTemplateEmail(user.email, 'login_alert', {
         name: user.email.split('@')[0],
         location: 'Unknown',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
+        revokeUrl: `https://accounts.${appDomain}/session/revoke?t=${revokeToken}`,
       }).catch(() => {});
     }
 
@@ -223,6 +330,28 @@ export async function adminLoginHandler(request: NextRequest) {
     if (!user.passwordHash) {
       return new NextResponse('Invalid email or password', { status: 401 });
     }
+
+    // Progressive friction: if this account/IP has prior failed-attempt history,
+    // require a CAPTCHA before revealing password validity — so automated
+    // password-spraying is challenged before the lockout threshold is reached.
+    const { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
+    const warnings = await getUserWarningCount(user.id, ip);
+    const forceCaptcha = warnings.recentBlocks > 0 || warnings.count >= 2;
+    if (forceCaptcha) {
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
+      const check = await assertCaptchaSatisfied({
+        rayId: captchaRayId,
+        sessionId,
+        ipAddress: ip,
+        userAgent,
+        fingerprint,
+        requiredDifficulty,
+      });
+      if (!check.ok) {
+        return new NextResponse(check.error, { status: 403 });
+      }
+    }
+
     if (!(await verifyPassword(user.passwordHash, password))) {
       const { logSecurityEvent } = await import('./security');
       const { recordRateLimitHit } = await import('./auth/suspicious-activity');
@@ -276,26 +405,29 @@ export async function adminLoginHandler(request: NextRequest) {
     }
 
     const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    const { token } = await createSession(user.id, userAgent || undefined, ip, adminRole);
+    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
 
     const { recordDeviceSeen } = await import('./captcha/risk');
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
 
     const lastSession = await prisma.session.findFirst({
-      where: { userId: user.id, id: { not: token } },
+      where: { userId: user.id, id: { not: newSessionId }, status: { not: 'revoked' } },
       orderBy: { createdAt: 'desc' },
       select: { id: true, ipAddress: true },
     });
 
     const isNewIp = !lastSession || lastSession.ipAddress !== ip;
     if (isNewIp) {
+      const revokeToken = await signSessionRevokeToken(newSessionId);
+      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
       sendTemplateEmail(user.email, 'login_alert', {
         name: user.email.split('@')[0],
         location: 'Admin Panel',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
+        revokeUrl: `https://accounts.${appDomain}/session/revoke?t=${revokeToken}`,
       }).catch(() => {});
     }
 
@@ -337,9 +469,9 @@ export async function verify2faLoginHandler(request: NextRequest) {
       return new NextResponse('Invalid 2FA code', { status: 401 });
     }
 
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     return res;
   } catch {
     return new NextResponse('2FA verification failed', { status: 400 });
@@ -390,9 +522,9 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     });
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     return res;
   } catch {
     return new NextResponse('Recovery code verification failed', { status: 400 });
@@ -411,6 +543,27 @@ const signupSchema = z.object({
   captchaRayId: z.string().optional(),
   fingerprint: z.string().optional(),
 });
+
+export async function emailExistsHandler(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const email = (body?.email || '').toString().toLowerCase().trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return NextResponse.json({ exists: false, hasPassword: false }, { status: 200 });
+    }
+    const user = await prisma.user.findUnique({
+      where: { email },
+      select: { id: true, passwordHash: true },
+    });
+    return NextResponse.json({
+      exists: !!user,
+      hasPassword: !!user?.passwordHash,
+    }, { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL-EXISTS]', err?.message || err);
+    return NextResponse.json({ error: 'Could not check email' }, { status: 500 });
+  }
+}
 
 export async function signupHandler(request: NextRequest) {
   try {
@@ -470,6 +623,11 @@ export async function signupHandler(request: NextRequest) {
       }
     }
 
+    const breach = await checkPasswordBreach(password);
+    if (breach.breached) {
+      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
+    }
+
     const passwordHash = await hashPassword(password);
     const name = sanitizeInput(`${firstName} ${lastName}`.trim(), 200);
     const birthday = dob ? new Date(dob) : undefined;
@@ -477,9 +635,9 @@ export async function signupHandler(request: NextRequest) {
       data: { email: normalizedEmail, passwordHash, name, username, gender: gender ? sanitizeInput(gender, 100) : undefined, birthday, emailVerified: false },
     });
 
-    const { token } = await createSession(user.id, userAgent || undefined, ip);
+    const { token, refreshToken } = await createSession(user.id, userAgent || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token }, { status: 201 });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
 
     const { recordDeviceSeen } = await import('./captcha/risk');
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId: captchaSession }).catch(() => {});
@@ -525,6 +683,14 @@ export async function requestSignupOtpHandler(request: NextRequest) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
 
+    const cooldown = enforceResendCooldown(`signup-otp:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+
     const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
     if (existing) {
       return new NextResponse('Email already registered', { status: 409 });
@@ -560,6 +726,14 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     }
     if (!checkWindowLimit(`login-otp:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+    }
+
+    const cooldown = enforceResendCooldown(`login-otp:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
@@ -614,9 +788,9 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
       return new NextResponse('Invalid or expired verification code', { status: 400 });
     }
 
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     return res;
   } catch (err) {
     console.error('[LOGIN OTP VERIFY]', err);
@@ -627,7 +801,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
 export async function logoutHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (session) {
+    if (session && session.sessionId !== 'cli') {
       await revokeSession(session.sessionId);
     }
     const res = new NextResponse('Logged out', { status: 200 });
@@ -638,6 +812,19 @@ export async function logoutHandler(request: NextRequest) {
   }
 }
 
+export async function sessionRevokeByTokenHandler(request: NextRequest) {
+  try {
+    const { token } = await request.json();
+    if (!token || typeof token !== 'string') return new NextResponse('Token required', { status: 400 });
+    const sessionId = await verifySessionRevokeToken(token);
+    if (!sessionId) return new NextResponse('Invalid or expired token', { status: 401 });
+    await revokeSession(sessionId);
+    return new NextResponse('Session revoked', { status: 200 });
+  } catch {
+    return new NextResponse('Failed to revoke session', { status: 400 });
+  }
+}
+
 // Email OTP - request
 export async function requestEmailOtpHandler(request: NextRequest) {
   try {
@@ -645,6 +832,13 @@ export async function requestEmailOtpHandler(request: NextRequest) {
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
     if (!user || !user.email) return new NextResponse('User email missing', { status: 400 });
+    const cooldown = enforceResendCooldown(`email-otp:${user.id}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
     await sendEmailOtp(user.email, code);
@@ -693,6 +887,13 @@ export async function verifySignupEmailHandler(request: NextRequest) {
 
     // Resend request — generate a new OTP and email it again
     if (!code) {
+      const cooldown = enforceResendCooldown(`verify-email:${email.toLowerCase()}`);
+      if (!cooldown.allowed) {
+        return NextResponse.json(
+          { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+          { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+        );
+      }
       const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
       const otpHash = await hashPassword(otpCode);
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
@@ -757,9 +958,10 @@ export async function verifyPhoneOtpHandler(request: NextRequest) {
 // Google OAuth - start flow
 export async function googleAuthRedirectHandler(request: NextRequest) {
   try {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/google/callback');
-    if (!clientId || !redirectUri) {
+    const cfg = await getOauthProviderConfig('google');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
+    if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('Google OAuth not configured', { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
@@ -794,10 +996,11 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/google/callback');
-    if (!clientId || !clientSecret || !redirectUri) {
+    const cfg = await getOauthProviderConfig('google');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
       return new NextResponse('Google OAuth not configured', { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
@@ -874,11 +1077,11 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     });
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
     const target = redirectTo || fallback;
     const res = NextResponse.redirect(target);
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -890,9 +1093,10 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
 // GitHub OAuth - start flow
 export async function githubAuthRedirectHandler(request: NextRequest) {
   try {
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/github/callback');
-    if (!clientId || !redirectUri) {
+    const cfg = await getOauthProviderConfig('github');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
+    if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('GitHub OAuth not configured', { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
@@ -924,10 +1128,11 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    const clientSecret = process.env.GITHUB_CLIENT_SECRET;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/github/callback');
-    if (!clientId || !clientSecret || !redirectUri) {
+    const cfg = await getOauthProviderConfig('github');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
       return new NextResponse('GitHub OAuth not configured', { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
@@ -1012,10 +1217,10 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
 
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
     const res = NextResponse.redirect(redirectTo || fallback);
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -1027,9 +1232,10 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
 // Discord OAuth - start flow
 export async function discordAuthRedirectHandler(request: NextRequest) {
   try {
-    const clientId = process.env.DISCORD_CLIENT_ID;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/discord/callback');
-    if (!clientId || !redirectUri) {
+    const cfg = await getOauthProviderConfig('discord');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
+    if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('Discord OAuth not configured', { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
@@ -1062,10 +1268,11 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
-    const clientId = process.env.DISCORD_CLIENT_ID;
-    const clientSecret = process.env.DISCORD_CLIENT_SECRET;
-    const redirectUri = getDynamicRedirectUri(request, '/auth/discord/callback');
-    if (!clientId || !clientSecret || !redirectUri) {
+    const cfg = await getOauthProviderConfig('discord');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
       return new NextResponse('Discord OAuth not configured', { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
@@ -1142,10 +1349,10 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
 
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
     const res = NextResponse.redirect(redirectTo || fallback);
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -1424,6 +1631,12 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     }
     const resetMethod: 'otp' | 'magic_link' = method === 'magic_link' ? 'magic_link' : 'otp';
     const result = await requestPasswordReset(email, resetMethod);
+    if (!result.success && result.retryAfterMs) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(result.retryAfterMs / 1000)) } },
+      );
+    }
     // Always return success to prevent email enumeration.
     // If email fails, the resetUrl + code are logged to console as fallback.
     return NextResponse.json({ message: 'If an account exists, a reset link has been sent.' });
@@ -1563,9 +1776,9 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     }
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token: sessionToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ email: user.email, token: sessionToken });
-    setSessionCookie(res, sessionToken);
+    setSessionCookie(res, sessionToken, refreshToken);
 
     await createAuditEvent({
       actorId: user.id,
@@ -1682,9 +1895,9 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
     }
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token: sessionToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token: sessionToken });
-    setSessionCookie(res, sessionToken);
+    setSessionCookie(res, sessionToken, refreshToken);
     return res;
   } catch {
     return new NextResponse('Failed to confirm suspicious login', { status: 400 });

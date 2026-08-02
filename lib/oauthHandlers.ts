@@ -105,7 +105,7 @@ export async function oauthAuthorizeHandler(request: NextRequest) {
         code,
         redirectUri,
         scopes: validScopes,
-        expiresAt: new Date(Date.now() + 600000),
+        expiresAt: new Date(Date.now() + 60000),
       },
     });
 
@@ -158,7 +158,7 @@ const client = await prisma.app_oauth_clients.findUnique({ where: { clientId } }
       }
 
       const authCode = await prisma.authorization_codes.findUnique({ where: { code } });
-      if (!authCode || authCode.usedAt || authCode.expiresAt < new Date()) {
+      if (!authCode || authCode.expiresAt < new Date()) {
         return NextResponse.json({ error: 'Invalid or expired authorization code' }, { status: 400 });
       }
       if (authCode.clientId !== clientId) {
@@ -183,7 +183,14 @@ const client = await prisma.app_oauth_clients.findUnique({ where: { clientId } }
         }
       }
 
-      await prisma.authorization_codes.update({ where: { id: authCode.id }, data: { usedAt: new Date() } });
+      // Atomic single-use redemption: only succeed if the code is still unused.
+      const redemptions = await prisma.authorization_codes.updateMany({
+        where: { id: authCode.id, usedAt: null },
+        data: { usedAt: new Date() },
+      });
+      if (redemptions.count === 0) {
+        return NextResponse.json({ error: 'Authorization code already used' }, { status: 400 });
+      }
 
       const tokens = await generateTokens(clientId, authCode.userId, authCode.scopes as string[]);
       return NextResponse.json({

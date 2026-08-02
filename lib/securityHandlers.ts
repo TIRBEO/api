@@ -2,6 +2,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession } from './session';
+import { revokeSessionState } from './auth/redis';
+import { revokeSessionFamilyByUser } from './auth/session';
 import { jsonUnauthorized, jsonError } from './response';
 import { createAuditEvent } from './audit';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } from './auth/totp';
@@ -457,10 +459,17 @@ export async function sessionsRevokeAllHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
+    const toRevoke = await prisma.session.findMany({
+      where: { userId: session.userId, status: 'active', id: { not: session.sessionId } },
+      select: { id: true },
+    });
     await prisma.session.updateMany({
       where: { userId: session.userId, status: 'active', id: { not: session.sessionId } },
-      data: { status: 'revoked', revokedAt: new Date() },
+      data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
     });
+    for (const s of toRevoke) {
+      await revokeSessionState(s.id).catch(() => {});
+    }
     await createAuditEvent({
       actorId: session.userId,
       action: 'sessions.revoked_all',
@@ -483,8 +492,9 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
     if (!sessionId) return new NextResponse('Session ID required', { status: 400 });
     await prisma.session.updateMany({
       where: { id: sessionId, userId: session.userId },
-      data: { status: 'revoked', revokedAt: new Date() },
+      data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
     });
+    await revokeSessionState(sessionId).catch(() => {});
     await createAuditEvent({
       actorId: session.userId,
       action: 'session.revoked',

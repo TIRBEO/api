@@ -200,6 +200,7 @@ export async function proxy(request: NextRequest) {
   const publicPaths = [
     '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
     '/api/auth/verify-email',
+    '/api/auth/email-exists',
     '/api/auth/signup-otp/request', '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
     '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
     '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
@@ -207,6 +208,9 @@ export async function proxy(request: NextRequest) {
     '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
     '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
     '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
+    '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
+    '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
+    '/api/auth/verify',
     '/api/admin/login', '/api/admin/verify-2fa',
     '/api/public/', '/api/newsletter/',
     '/api/waitlist',

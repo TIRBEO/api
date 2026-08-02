@@ -48,9 +48,9 @@ export async function POST(request: NextRequest) {
     }
 
     const ip = request.headers.get('x-forwarded-for') || '';
-    const { token } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
-    setSessionCookie(res, token);
+    setSessionCookie(res, token, refreshToken);
     return res;
   } catch (err: any) {
     console.error('[ADMIN LOGIN] 2FA error:', err?.message || err);
