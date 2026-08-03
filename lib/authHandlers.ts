@@ -539,6 +539,13 @@ const signupSchema = z.object({
   username: z.string().min(3).optional().or(z.literal('')),
   dob: z.string().optional(),
   gender: z.string().optional(),
+  photoUrl: z.string().url().optional().or(z.literal('')),
+  occupation: z.string().min(1),
+  companyName: z.string().optional().or(z.literal('')),
+  policyAccepted: z.boolean(),
+  adminDataAccess: z.boolean().optional(),
+  signatureDataUrl: z.string().min(20),
+  signatureName: z.string().min(1),
   turnstileToken: z.string().optional(),
   captchaRayId: z.string().optional(),
   fingerprint: z.string().optional(),
@@ -571,12 +578,27 @@ export async function signupHandler(request: NextRequest) {
     if (!parsed.success) {
       return new NextResponse('Invalid request payload', { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, captchaRayId, fingerprint } = parsed.data;
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, signatureDataUrl, signatureName, captchaRayId, fingerprint } = parsed.data;
     const normalizedEmail = email.toLowerCase().trim();
+    const normalizedUsername = username ? username.toString().trim().toLowerCase() : undefined;
+    const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
+    const normalizedCompanyName = companyName ? companyName.toString().trim() : undefined;
+    const normalizedOccupation = sanitizeInput(occupation, 120).trim();
+    const normalizedSignatureName = sanitizeInput(signatureName, 200).trim();
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
+
+    if (!policyAccepted) {
+      return new NextResponse('Policy acceptance is required', { status: 400 });
+    }
+    if (!normalizedOccupation) {
+      return new NextResponse('Occupation is required', { status: 400 });
+    }
+    if (!signatureDataUrl || !normalizedSignatureName) {
+      return new NextResponse('Signature is required', { status: 400 });
+    }
 
     const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`signup:ip:${ip}`, 10, 60 * 60 * 1000)) {
@@ -591,8 +613,8 @@ export async function signupHandler(request: NextRequest) {
       return new NextResponse('Email already registered', { status: 409 });
     }
 
-    if (username) {
-      const existingUsername = await prisma.user.findUnique({ where: { username } });
+    if (normalizedUsername) {
+      const existingUsername = await prisma.user.findUnique({ where: { username: normalizedUsername } });
       if (existingUsername) {
         return new NextResponse('Username already taken', { status: 409 });
       }
@@ -632,7 +654,27 @@ export async function signupHandler(request: NextRequest) {
     const name = sanitizeInput(`${firstName} ${lastName}`.trim(), 200);
     const birthday = dob ? new Date(dob) : undefined;
     const user = await prisma.user.create({
-      data: { email: normalizedEmail, passwordHash, name, username, gender: gender ? sanitizeInput(gender, 100) : undefined, birthday, emailVerified: false },
+      data: {
+        email: normalizedEmail,
+        passwordHash,
+        name,
+        username: normalizedUsername,
+        photoUrl: normalizedPhotoUrl || undefined,
+        occupation: normalizedOccupation,
+        companyName: normalizedCompanyName ? sanitizeInput(normalizedCompanyName, 120) : undefined,
+        gender: gender ? sanitizeInput(gender, 100) : undefined,
+        birthday,
+        emailVerified: false,
+        preferences: {
+          signupConsent: {
+            acceptedAt: new Date().toISOString(),
+            policyAccepted: true,
+            adminDataAccess: !!adminDataAccess,
+            signatureName: normalizedSignatureName,
+            signatureDataUrl,
+          },
+        },
+      },
     });
 
     const { token, refreshToken } = await createSession(user.id, userAgent || undefined, ip);

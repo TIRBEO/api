@@ -34,6 +34,7 @@ export async function listUsers(request: NextRequest) {
         isBanned: true,
         isSuspended: true,
         createdAt: true,
+        preferences: true,
         roles: {
           select: { role: { select: { id: true, name: true } } },
         },
@@ -49,6 +50,7 @@ export async function listUsers(request: NextRequest) {
     ...u,
     status: u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
     roles: u.roles.map(a => a.role),
+    signupConsent: (u.preferences as Record<string, any> | null | undefined)?.signupConsent ?? null,
     roleAssignments: undefined,
   }));
 
@@ -73,6 +75,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       emailVerified: true,
       createdAt: true,
       updatedAt: true,
+      preferences: true,
       _count: { select: { sessions: true, memberships: true, notifications: true } },
       roles: {
         select: { role: { select: { id: true, name: true } } },
@@ -89,6 +92,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     ...user,
     status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
     roles: user.roles.map(a => a.role),
+    signupConsent: (user.preferences as Record<string, any> | null | undefined)?.signupConsent ?? null,
     roleAssignments: undefined,
   });
 }
