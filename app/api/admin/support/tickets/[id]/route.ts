@@ -9,13 +9,14 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 
     const { id } = await params;
 
-    const ticket = await prisma.supportTicket.findUnique({
+    const ticket = await prisma.ticket.findUnique({
       where: { id },
       include: {
-        user: { select: { id: true, email: true, name: true } },
-        replies: {
+        customer: { select: { id: true, email: true, name: true } },
+        assigned: { select: { id: true, email: true, name: true } },
+        messages: {
           include: {
-            user: { select: { id: true, email: true, name: true } },
+            author: { select: { id: true, email: true, name: true } },
           },
           orderBy: { createdAt: 'asc' },
         },
@@ -26,7 +27,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    return NextResponse.json(ticket);
+    const mappedReplies = ticket.messages.map(m => ({ ...m, message: m.content, isAdmin: m.isInternal, user: m.author }));
+    return NextResponse.json({ ...ticket, title: ticket.subject, message: ticket.description, customer: ticket.customer, user: ticket.customer, replies: mappedReplies });
   } catch (err: any) {
     console.error('[ADMIN SUPPORT] Get ticket error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch ticket' }, { status: 500 });
@@ -40,23 +42,31 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 
     const { id } = await params;
     const body = await request.json();
-    const { status, priority, assignedTo, category } = body;
+    const { status, priority, assignedId, assignedTo, category, subject, title, description } = body;
 
-    const ticket = await prisma.supportTicket.update({
+    const existing = await prisma.ticket.findUnique({ where: { id } });
+    if (!existing) {
+      return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+    }
+
+    const ticket = await prisma.ticket.update({
       where: { id },
       data: {
         ...(status && { status }),
         ...(priority && { priority }),
-        ...(assignedTo !== undefined && { assignedTo }),
+        ...((assignedId || assignedTo) && { assignedId: assignedId || assignedTo }),
         ...(category && { category }),
-        ...(status === 'resolved' || status === 'closed' ? { resolvedAt: new Date() } : {}),
+        ...((subject || title) && { subject: subject || title }),
+        ...(description !== undefined && { description }),
+        ...(status === 'resolved' || status === 'closed' ? { closedAt: new Date() } : status === 'open' ? { closedAt: null } : {}),
       },
       include: {
-        user: { select: { id: true, email: true, name: true } },
+        customer: { select: { id: true, email: true, name: true } },
+        assigned: { select: { id: true, email: true, name: true } },
       },
     });
 
-    return NextResponse.json(ticket);
+    return NextResponse.json({ ...ticket, title: ticket.subject, user: ticket.customer });
   } catch (err: any) {
     console.error('[ADMIN SUPPORT] Update ticket error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to update ticket' }, { status: 500 });

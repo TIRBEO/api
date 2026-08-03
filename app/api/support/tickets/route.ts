@@ -6,26 +6,25 @@ export async function POST(request: NextRequest) {
   try {
     const session = await getSession(request);
     const body = await request.json();
-    const { subject, message, category, rayId, email } = body;
+    const { subject, title, message, description, category, priority, rayId, email } = body;
 
-    if (!subject || !message) {
+    if (!(subject || title) || !(message || description)) {
       return NextResponse.json({ error: 'Subject and message are required' }, { status: 400 });
     }
 
-    const ticket = await prisma.supportTicket.create({
+    const ticket = await prisma.ticket.create({
       data: {
-        userId: session?.userId,
-        email: email || session?.email || 'anonymous',
-        subject,
-        message,
+        customerId: session?.userId,
+        subject: sanitizeInput(subject || title, 300),
+        description: message || description ? sanitizeInput(message || description, 20000) : undefined,
         category: category || 'general',
-        rayId,
+        priority: priority || 'normal',
         status: 'open',
-        priority: 'medium',
+        source: 'web',
       },
     });
 
-    return NextResponse.json(ticket);
+    return NextResponse.json({ ...ticket, title: ticket.subject });
   } catch (err: any) {
     console.error('[SUPPORT] Create ticket error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to create ticket' }, { status: 500 });
@@ -44,23 +43,32 @@ export async function GET(request: NextRequest) {
     const limit = parseInt(searchParams.get('limit') || '20');
     const skip = (page - 1) * limit;
 
-    const where: any = { userId: session.userId };
+    const where: any = { customerId: session.userId };
     const status = searchParams.get('status');
     if (status) where.status = status;
 
     const [tickets, total] = await Promise.all([
-      prisma.supportTicket.findMany({
+      prisma.ticket.findMany({
         where,
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
+        include: {
+          customer: { select: { id: true, name: true, email: true } },
+          messages: { orderBy: { createdAt: 'desc' }, take: 1 },
+        },
       }),
-      prisma.supportTicket.count({ where }),
+      prisma.ticket.count({ where }),
     ]);
 
-    return NextResponse.json({ tickets, total, page, limit });
+    const mapped = tickets.map(t => ({ ...t, title: t.subject }));
+    return NextResponse.json({ tickets: mapped, total, page, limit });
   } catch (err: any) {
     console.error('[SUPPORT] Get tickets error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch tickets' }, { status: 500 });
   }
+}
+
+function sanitizeInput(value: string, max: number): string {
+  return String(value || '').slice(0, max);
 }

@@ -10,18 +10,19 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
 
-    const ticket = await prisma.supportTicket.findFirst({
+    const ticket = await prisma.ticket.findFirst({
       where: {
         id: params.id,
         OR: [
-          { userId: session.userId },
-          { email: session.email },
+          { customerId: session.userId },
+          ...(session.email ? [{ customer: { email: session.email } }] : []),
         ],
       },
       include: {
-        replies: {
+        customer: { select: { id: true, name: true, email: true } },
+        messages: {
           include: {
-            user: { select: { id: true, email: true, name: true } },
+            author: { select: { id: true, name: true, email: true, photoUrl: true } },
           },
           orderBy: { createdAt: 'asc' },
         },
@@ -32,7 +33,7 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    return NextResponse.json(ticket);
+    return NextResponse.json({ ...ticket, title: ticket.subject });
   } catch (err: any) {
     console.error('[SUPPORT] Get ticket error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch ticket' }, { status: 500 });
@@ -50,16 +51,26 @@ export async function PUT(request: NextRequest, context: { params: Promise<{ id:
     const body = await request.json();
     const { status, priority } = body;
 
-    const ticket = await prisma.supportTicket.update({
+    const existing = await prisma.ticket.findFirst({
+      where: {
+        id: params.id,
+        OR: [{ customerId: session.userId }, ...(session.email ? [{ customer: { email: session.email } }] : [])],
+      },
+    });
+    if (!existing) {
+      return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
+    }
+
+    const ticket = await prisma.ticket.update({
       where: { id: params.id },
       data: {
         ...(status && { status }),
         ...(priority && { priority }),
-        ...(status === 'resolved' || status === 'closed' ? { resolvedAt: new Date() } : {}),
+        ...(status === 'resolved' || status === 'closed' ? { closedAt: new Date() } : {}),
       },
     });
 
-    return NextResponse.json(ticket);
+    return NextResponse.json({ ...ticket, title: ticket.subject });
   } catch (err: any) {
     console.error('[SUPPORT] Update ticket error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to update ticket' }, { status: 500 });

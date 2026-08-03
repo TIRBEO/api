@@ -17,7 +17,7 @@
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "7.9.1",
     "@simplewebauthn/server": "^13.3.2",
-    "@tirbeo/ui": "^1",
+    "@tirbeo/ui": "workspace:*",
     "argon2": "0.45.1",
     "date-fns": "4.4.0",
     "ioredis": "6.0.0",

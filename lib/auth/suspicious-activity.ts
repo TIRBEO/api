@@ -26,6 +26,6 @@ export function isSuspicious(ip: string): boolean {
 }
 
 export function shouldRequireCaptcha(ip: string): boolean {
-  if (!process.env.TURNSTILE_SECRET) return false;
+  if (!process.env.TURNSTILE_SECRET_KEY && !process.env.TURNSTILE_SECRET) return false;
   return isSuspicious(ip);
 }

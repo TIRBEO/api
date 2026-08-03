@@ -10,40 +10,39 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     const body = await request.json();
-    const { message } = body;
+    const { message, content } = body;
+    const text = message || content;
 
-    if (!message) {
+    if (!text) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 });
     }
 
     const { id } = await params;
 
-    const ticket = await prisma.supportTicket.findUnique({
-      where: { id },
+    const ticket = await prisma.ticket.findFirst({
+      where: {
+        id,
+        OR: [{ customerId: session.userId }, ...(session.email ? [{ customer: { email: session.email } }] : [])],
+      },
     });
 
     if (!ticket) {
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
-    const reply = await prisma.supportTicketReply.create({
+    const reply = await prisma.ticketMessage.create({
       data: {
         ticketId: id,
-        userId: session.userId,
-        message,
-        isAdmin: false,
+        authorId: session.userId,
+        content: String(text).slice(0, 20000),
+        isInternal: false,
       },
       include: {
-        user: { select: { id: true, email: true, name: true } },
+        author: { select: { id: true, name: true, email: true, photoUrl: true } },
       },
     });
 
-    await prisma.supportTicket.update({
-      where: { id },
-      data: { updatedAt: new Date() },
-    });
-
-    return NextResponse.json(reply);
+    return NextResponse.json({ ...reply, user: reply.author });
   } catch (err: any) {
     console.error('[SUPPORT] Reply error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to add reply' }, { status: 500 });
