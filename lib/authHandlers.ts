@@ -3,10 +3,10 @@ import { z } from 'zod';
 import { prisma } from './db/prisma';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail } from './auth/signup-otp';
-import { hashPassword, verifyPassword } from './auth/password';
+import { hashPassword, verifyPassword, hashOtpCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, signRecoveryToken, verifyRecoveryToken, signSuspiciousLoginToken, verifySuspiciousLoginToken, signSessionRevokeToken, verifySessionRevokeToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken } from './auth/jwt';
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
 import { sanitizeInput } from './security';
@@ -273,14 +273,13 @@ export async function loginHandler(request: NextRequest) {
 
     const isNewIp = !lastSession || lastSession.ipAddress !== ip;
     if (isNewIp) {
-      const revokeToken = await signSessionRevokeToken(newSessionId);
       const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
       sendTemplateEmail(user.email, 'login_alert', {
         name: user.email.split('@')[0],
         location: 'Unknown',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
-        revokeUrl: `https://accounts.${appDomain}/session/revoke?t=${revokeToken}`,
+        revokeUrl: `https://dashboard.${appDomain}/settings/sessions`,
       }).catch(() => {});
     }
 
@@ -420,14 +419,13 @@ export async function adminLoginHandler(request: NextRequest) {
 
     const isNewIp = !lastSession || lastSession.ipAddress !== ip;
     if (isNewIp) {
-      const revokeToken = await signSessionRevokeToken(newSessionId);
       const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
       sendTemplateEmail(user.email, 'login_alert', {
         name: user.email.split('@')[0],
         location: 'Admin Panel',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
-        revokeUrl: `https://accounts.${appDomain}/session/revoke?t=${revokeToken}`,
+        revokeUrl: `https://dashboard.${appDomain}/settings/sessions`,
       }).catch(() => {});
     }
 
@@ -503,10 +501,9 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       where: { userId, used: false },
       orderBy: { createdAt: 'asc' },
     });
-    const { hashRecoveryCode, normalizeRecoveryCode } = await import('./auth/password');
+    const { hashRecoveryCode } = await import('./auth/password');
     const inputHash = hashRecoveryCode(recoveryCode);
-    const inputNorm = normalizeRecoveryCode(recoveryCode);
-    const rc = codes.find(c => c.code === inputHash || c.code === inputNorm) || null;
+    const rc = codes.find(c => c.code === inputHash) || null;
     if (!rc) return new NextResponse('Invalid recovery code', { status: 401 });
 
     if (rc.code !== inputHash) {
@@ -692,7 +689,7 @@ export async function signupHandler(request: NextRequest) {
 
     // Send verification OTP
     const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
-    const otpHash = await hashPassword(otpCode);
+    const otpHash = hashOtpCode(otpCode);
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     await prisma.otp.create({
       data: { userId: user.id, type: 'email', otpHash, expiresAt },
@@ -937,7 +934,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
         );
       }
       const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
-      const otpHash = await hashPassword(otpCode);
+      const otpHash = hashOtpCode(otpCode);
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
       await prisma.otp.create({
         data: { userId: user.id, type: 'email', otpHash, expiresAt },
@@ -1895,9 +1892,10 @@ export async function accountRecoveryHandler(request: NextRequest) {
       return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
     }
 
-    const token = await signRecoveryToken(user.id);
     const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-    const recoveryUrl = `https://accounts.${appDomain}/recovery?token=${token}`;
+    // The standalone /recovery page was removed (accounts app is auth-only now);
+    // point users at /forgot-password which has the full OTP/magic-link reset flow.
+    const recoveryUrl = `https://accounts.${appDomain}/forgot-password`;
 
     await sendTemplateEmail(email, 'account_recovery', {
       recoveryUrl,
@@ -2152,15 +2150,35 @@ export async function waitlistHandler(request: NextRequest) {
 
 export async function feedbackHandler(request: NextRequest) {
   try {
-    const { message, email, lang, source } = await request.json();
+    const { message, email, lang, source, captchaRayId } = await request.json();
     if (!message || typeof message !== 'string' || !message.trim()) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
     const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`feedback:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return NextResponse.json({ error: 'Too many submissions. Please try again later.' }, { status: 429 });
+    }
+
+    // Human verification: public forms must present a solved captcha.
+    const { getCaptchaSettings, assertCaptchaSatisfied } = await import('./captcha/service');
+    const captchaSettings = await getCaptchaSettings();
+    if (captchaSettings.enabled) {
+      if (!captchaRayId) {
+        return NextResponse.json({ error: { code: 'CAPTCHA_REQUIRED', message: 'CAPTCHA verification is required' } }, { status: 403 });
+      }
+      const check = await assertCaptchaSatisfied({
+        rayId: captchaRayId,
+        sessionId: captchaSession,
+        ipAddress: clientIp,
+        userAgent: request.headers.get('user-agent') || '',
+        requiredDifficulty: 'easy',
+      });
+      if (!check.ok) {
+        return NextResponse.json({ error: { code: 'CAPTCHA_FAILED', message: check.error || 'CAPTCHA verification failed' } }, { status: 403 });
+      }
     }
 
     const finalSource = (source && ['widget', 'landing', 'footer', 'admin'].includes(source)) ? source : 'widget';

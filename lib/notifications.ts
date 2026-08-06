@@ -1,5 +1,5 @@
 import { prisma } from './db/prisma';
-import { sendTemplateEmail } from './email';
+import { sendTemplateEmail, escapeHtml } from './email';
 
 // WebSocket send - no-op in serverless (Vercel has no persistent connections)
 function sendToUser(_userId: string, _data: unknown) {
@@ -42,9 +42,9 @@ export async function createNotification(input: CreateNotifInput) {
       await sendTemplateEmail(user.email, 'notification_digest', {
         name: user.name || user.email,
         count: '1',
-        digestItems: `<div class="item"><strong>${input.title}</strong><br/>${input.body || ''}</div>`,
+        digestItems: `<div class="item"><strong>${escapeHtml(input.title)}</strong><br/>${escapeHtml(input.body || '')}</div>`,
         dashboardUrl: input.link || 'https://tirbeo.app',
-      }).catch(() => {});
+      }, { rawVars: ['digestItems'] }).catch(() => {});
     }
   }
 

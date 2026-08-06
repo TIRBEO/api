@@ -42,6 +42,10 @@ export async function ticketCreateHandler(req: NextRequest) {
       status: body.status,
       queueId: body.queueId,
       customerId: user.userId,
+      // Captcha appeal tickets are tagged with the source form's public ID
+      // (e.g. "captcha-appeal:<publicId>") so admins can review them from the
+      // security console and unblock by Ray ID directly.
+      application: body.appealRayId ? `captcha-appeal:${sanitizeInput(String(body.appealRayId), 64)}` : body.application,
     },
   });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_CREATED', targetType: 'ticket', targetId: ticket.id });
@@ -57,6 +61,46 @@ export async function ticketCreateHandler(req: NextRequest) {
   }
 
   return NextResponse.json(ticket, { status: 201 });
+}
+
+/** GET /api/support/tickets/appeals — list open captcha-appeal tickets for admins. */
+export async function ticketAppealsHandler(req: NextRequest) {
+  const user = await getSession(req);
+  if (!user) return jsonUnauthorized();
+  if (!isAdmin(user)) return jsonForbidden();
+
+  const tickets = await prisma.ticket.findMany({
+    where: { application: { startsWith: 'captcha-appeal:' }, status: { not: 'closed' } },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+    include: {
+      customer: { select: { id: true, email: true, name: true } },
+    },
+  });
+
+  return NextResponse.json({ appeals: tickets });
+}
+
+/** POST /api/support/tickets/appeals/[rayId]/unblock — unblock a captcha block referenced by an appeal. */
+export async function ticketAppealUnblockHandler(req: NextRequest, rayId: string) {
+  const user = await getSession(req);
+  if (!user) return jsonUnauthorized();
+  if (!isAdmin(user)) return jsonForbidden();
+
+  const decodedRayId = decodeURIComponent(rayId);
+  const { unblockUser } = await import('./captcha/service');
+  const ok = await unblockUser(decodedRayId, user.userId);
+  if (!ok) return jsonError('NOT_FOUND', 'Block not found for Ray ID', 404);
+
+  await createAuditEvent({
+    actorId: user.userId,
+    action: 'captcha.appeal_unblocked',
+    targetType: 'captchaBlock',
+    targetId: decodedRayId,
+    metadata: { source: 'appeal' },
+  });
+
+  return NextResponse.json({ success: true, rayId: decodedRayId });
 }
 
 export async function ticketDetailHandler(req: NextRequest, ticketId: string) {

@@ -215,6 +215,7 @@ export async function proxy(request: NextRequest) {
     '/api/public/', '/api/newsletter/',
     '/api/waitlist',
     '/api/feedback',
+    '/api/forms/public/',
     '/api/passkey/auth/options', '/api/passkey/auth/verify',
     '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
     '/auth/discord', '/auth/discord/callback',

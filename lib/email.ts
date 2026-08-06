@@ -68,16 +68,19 @@ export async function getEmailTemplate(name: string) {
   return prisma.emailTemplate.findUnique({ where: { name } });
 }
 
-import { buildTemplates } from '@tirbeo/ui/emails';
+// Vendored locally (packages/ui/src/emails/index.ts) so new templates (e.g. form_flagged)
+// ship without an @tirbeo/ui npm publish. Keep in sync with packages/ui/src/emails/index.ts.
+import { buildTemplates } from './email-templates';
 
 export function escapeHtml(str: string): string {
   return str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
 }
 
-export function renderTemplate(html: string, vars: Record<string, string>): string {
+export function renderTemplate(html: string, vars: Record<string, string>, rawKeys: Set<string> = new Set()): string {
   let result = html;
   for (const [key, val] of Object.entries(vars)) {
-    result = result.replace(new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi'), escapeHtml(val));
+    const replacement = rawKeys.has(key) ? val : escapeHtml(val);
+    result = result.replace(new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi'), replacement);
   }
   return result;
 }
@@ -245,8 +248,9 @@ export async function sendTemplateEmail(
   to: string,
   templateName: string,
   variables: Record<string, string>,
-  options?: { fromEmail?: string; fromName?: string }
+  options?: { fromEmail?: string; fromName?: string; rawVars?: string[] }
 ): Promise<EmailResult> {
+  const rawKeys = new Set(options?.rawVars || []);
   const themeColors = await getThemeColors();
   const branding = await getBranding();
   const logoUrl = branding.logoUrl;
@@ -306,8 +310,8 @@ export async function sendTemplateEmail(
 
   const template = await getEmailTemplate(templateName);
   if (template) {
-    const subject = renderTemplate(template.subject, mergedVars);
-    const htmlBody = renderTemplate(template.htmlBody, mergedVars);
+    const subject = renderTemplate(template.subject, mergedVars, rawKeys);
+    const htmlBody = renderTemplate(template.htmlBody, mergedVars, rawKeys);
     return sendEmail(to, subject, htmlBody, {
       fromEmail: finalOptions.fromEmail,
       fromName: finalOptions.fromName,
@@ -319,8 +323,8 @@ export async function sendTemplateEmail(
   const fallback = fallbacks[templateName];
   if (fallback) {
     console.log(`[EMAIL] Template '${templateName}' not in DB, using built-in fallback`);
-    let subject = renderTemplate(fallback.subject, mergedVars);
-    let htmlBody = renderTemplate(fallback.html, mergedVars);
+    let subject = renderTemplate(fallback.subject, mergedVars, rawKeys);
+    let htmlBody = renderTemplate(fallback.html, mergedVars, rawKeys);
     if (Object.keys(themeColors).length > 0) {
       htmlBody = applyThemeColors(htmlBody, themeColors);
       subject = applyThemeColors(subject, themeColors);

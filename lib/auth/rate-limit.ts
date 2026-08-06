@@ -53,6 +53,9 @@ const ROUTE_LIMITS: Record<string, number> = {
   'network/follow': 30,
   'network/following': 60,
   'profile-views/track': 60,
+  'forms/public/[publicId]/submit': 10,
+  'feedback': 5,
+  'waitlist': 5,
 };
 
 let redis: any = null;

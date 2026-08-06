@@ -151,7 +151,7 @@ export async function notifyAdmins(input: {
         dashboardUrl,
         brandName: branding.brandName,
         logoUrl: branding.logoUrl,
-      }, { fromName: branding.emailFromName }).catch(() => {})
+      }, { fromName: branding.emailFromName, rawVars: ['details'] }).catch(() => {})
     ));
   } catch (e) {
     console.error('[SECURITY] Failed to notify admins:', e instanceof Error ? e.message : e);

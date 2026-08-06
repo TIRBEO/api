@@ -63,14 +63,28 @@ export async function GET(request: NextRequest) {
       ? await computeRiskScore({ ip: ipAddress, ua: userAgent, userId, sessionId, fingerprint, authPath: true })
       : null;
 
-    const difficulty = await getRequiredDifficulty(userId, sessionId, ipAddress, risk);
+    // A caller may request a minimum difficulty (e.g. forms require medium).
+    // We take the stricter of the requested floor and the risk-derived difficulty.
+    const requestedFloor = (request.nextUrl.searchParams.get('difficulty') || '').toLowerCase();
+    let difficulty = await getRequiredDifficulty(userId, sessionId, ipAddress, risk);
+    const rank: Record<string, number> = { easy: 0, medium: 1, hard: 2 };
+    if (requestedFloor && rank[requestedFloor] !== undefined && rank[requestedFloor] > rank[difficulty]) {
+      difficulty = requestedFloor as 'easy' | 'medium' | 'hard';
+    }
 
+    // Reuse an unsolved, non-expired challenge for this session — but never one
+    // below the requested difficulty floor (a stale easy challenge must not be
+    // handed out when the caller requires medium, or the consuming handler would
+    // reject the solved challenge and falsely flag a legitimate user).
     const existingChallenge = await prisma.captchaChallenge.findFirst({
       where: {
         sessionId,
         solved: false,
         attempts: { lt: settings.maxAttemptsPerChallenge },
         expiresAt: { gte: new Date() },
+        ...(requestedFloor && rank[requestedFloor] !== undefined
+          ? { NOT: { difficulty: { in: ['easy', 'medium', 'hard'].filter(d => rank[d] < rank[requestedFloor]) } } }
+          : {}),
       },
       orderBy: { createdAt: 'desc' },
     });

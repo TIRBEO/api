@@ -50,6 +50,13 @@ import {
  } from '../../../lib/authHandlers';
 
 import {
+  captchaChallengeHandler,
+  captchaVerifyHandler,
+  captchaStatusHandler,
+  captchaImageHandler,
+} from '../../../lib/captcha/captcha-dispatch';
+
+import {
   oauthAuthorizeHandler,
   oauthTokenHandler,
   oauthRevokeHandler,
@@ -174,6 +181,7 @@ import {
 import {
   ticketListHandler, ticketCreateHandler, ticketDetailHandler, ticketUpdateHandler,
   ticketMessageHandler, ticketAssignHandler, ticketCloseHandler, ticketReopenHandler,
+  ticketAppealsHandler, ticketAppealUnblockHandler,
   queuesListHandler, queuesCreateHandler,
 } from '../../../lib/supportHandlers';
 
@@ -215,6 +223,7 @@ const INTERNAL_ROUTES = [
    'auth/refresh',
    'security/session-revoke',
    'auth/verify-email', 'auth/verify',
+  'captcha/challenge', 'captcha/verify', 'captcha/status', 'captcha/image/[id]',
   'users/me', 'activity', 'workspaces', 'workspaces/delete',
   'profile', 'security/password', 'security/sessions', 'security/set-password',
   'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
@@ -261,6 +270,7 @@ const INTERNAL_ROUTES = [
   'content/retry-job',
   // Support
   'support/tickets', 'support/tickets/create',
+  'support/tickets/appeals',
   'support/queues', 'support/queues/create',
   // Forms
   'forms', 'forms/create',
@@ -291,9 +301,12 @@ async function loadBlocked() {
 
 function matchRoute(slug: string[], method: string, routes: any[]) {
   const pathPart = slug.join('/');
-  const dbRoute = routes.find(
-    (r) => r.path === pathPart && r.method.toUpperCase() === method.toUpperCase()
-  );
+  // Internal/fixed routes take precedence over stale DB route rows: DB rows can
+  // carry restricted allowed_roles or proxy targets that would shadow the
+  // hard-coded auth handlers (e.g. a seeded 'auth/login' row → 403 for guests).
+  const dbRoute = !INTERNAL_ROUTES.includes(pathPart)
+    ? routes.find((r) => r.path === pathPart && r.method.toUpperCase() === method.toUpperCase())
+    : undefined;
   if (dbRoute) return dbRoute;
 
   // Handle email/templates/{name} dynamic route
@@ -410,6 +423,11 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
+  // Handle support/tickets/appeals/{rayId}/unblock
+  if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] === 'appeals' && slug[4] === 'unblock') {
+    return { path: 'support/tickets/appeals/[rayId]/unblock', method, internal: true, allowedRoles: ['guest'], meta: { appealRayId: slug[3] } };
+  }
+
   // Handle forms/{id} dynamic route
   if (slug.length === 2 && slug[0] === 'forms') {
     const formId = slug[1];
@@ -453,13 +471,24 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     return { path: 'forms/public/[publicId]/submit', method, internal: true, allowedRoles: ['guest'], meta: { publicId: slug[2] } };
   }
 
+  // Handle captcha/image/{id} dynamic route
+  if (slug.length === 3 && slug[0] === 'captcha' && slug[1] === 'image') {
+    const imageId = slug[2];
+    return { path: 'captcha/image/[id]', method, internal: true, allowedRoles: ['guest'], meta: { imageId } };
+  }
+
   if (INTERNAL_ROUTES.includes(pathPart)) {
     const methodMap: Record<string, string[]> = {
       'auth/login': ['POST'],
       'auth/signup': ['POST'],
       'auth/email-exists': ['POST'],
       'auth/verify-email': ['POST'],
+      'auth/verify': ['GET'],
       'auth/logout': ['POST'],
+      'captcha/challenge': ['GET', 'POST'],
+      'captcha/verify': ['POST'],
+      'captcha/status': ['GET'],
+      'captcha/image/[id]': ['GET'],
       'auth/email-otp/request': ['POST'],
       'auth/email-otp/verify': ['POST'],
       'auth/phone-otp/request': ['POST'],
@@ -583,6 +612,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       // Support
       'support/tickets': ['GET'],
       'support/tickets/create': ['POST'],
+      'support/tickets/appeals': ['GET'],
       'support/queues': ['GET'],
       'support/queues/create': ['POST'],
       // Forms
@@ -678,7 +708,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     return jsonError(`Route not configured: ${method} ${pathStr}`, 404);
   }
 
-  const routeLimit = ROUTE_LIMITS[pathStr];
+  const routeLimit = ROUTE_LIMITS[pathStr] ?? (route.path ? ROUTE_LIMITS[route.path] : undefined);
   if (routeLimit) {
     const isAuth = pathStr.startsWith('auth/');
     const allowed = await checkRateLimit(`${pathStr}:${ip}`, isAuth, routeLimit);
@@ -707,6 +737,18 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/logout':
         resp = await logoutHandler(request);
+        break;
+      case 'captcha/challenge':
+        resp = await captchaChallengeHandler(request);
+        break;
+      case 'captcha/verify':
+        resp = await captchaVerifyHandler(request);
+        break;
+      case 'captcha/status':
+        resp = await captchaStatusHandler(request);
+        break;
+      case 'captcha/image/[id]':
+        resp = await captchaImageHandler(request, (route as any).meta.imageId);
         break;
       case 'users/me':
         resp = await profileHandler(request);
@@ -1125,6 +1167,12 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/tickets/create':
         resp = await ticketCreateHandler(request);
+        break;
+      case 'support/tickets/appeals':
+        resp = await ticketAppealsHandler(request);
+        break;
+      case 'support/tickets/appeals/[rayId]/unblock':
+        resp = await ticketAppealUnblockHandler(request, (route as any).meta.appealRayId);
         break;
       case 'support/tickets/[id]':
         if (method === 'GET') resp = await ticketDetailHandler(request, (route as any).meta.ticketId);

@@ -1,5 +1,5 @@
 import { prisma } from '../db/prisma';
-import { hashPassword as hashOtp, verifyPassword as verifyOtp } from './password';
+import { hashOtpCode, verifyOtpCode } from './password';
 import { signPasswordResetToken, verifyPasswordResetToken } from './jwt';
 import { addMinutes } from 'date-fns';
 import { sendTemplateEmail } from '../email';
@@ -14,7 +14,7 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
   if (!user) return { success: true };
 
   const code = randomInt(100000, 1000000).toString();
-  const otpHash = await hashOtp(code);
+  const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
   await prisma.otp.create({
@@ -127,7 +127,7 @@ export async function requestPasswordReset(
   } else {
     // OTP method (default)
     const code = randomInt(100000, 1000000).toString();
-    const otpHash = await hashOtp(code);
+    const otpHash = hashOtpCode(code);
     const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
     await prisma.otp.create({
@@ -177,7 +177,7 @@ export async function verifyPasswordReset(
       orderBy: { createdAt: 'desc' },
     });
     if (otp && otp.expiresAt >= new Date()) {
-      const ok = await verifyOtp(otp.otpHash, params.code);
+      const ok = await verifyOtpCode(otp.otpHash, params.code);
       if (ok) {
         verified = true;
         // Delete ALL OTPs for this user (expires the other method)

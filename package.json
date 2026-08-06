@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "npx tsx server.ts",
+    "dev": "npx tsx --env-file=.env.local server.ts",
     "build": "prisma generate && next build",
     "start": "node server.js",
     "lint": "eslint .",
@@ -29,6 +29,7 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "uuid": "^14.0.1",
+    "web-push": "^3.6.7",
     "ws": "^8.21.1",
     "zod": "4.4.3"
   },
@@ -39,6 +40,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@types/uuid": "^11.0.0",
+    "@types/web-push": "^3.6.4",
     "date-fns": "4.4.0",
     "prisma": "7.9.1",
     "ts-node": "^10.9.1",

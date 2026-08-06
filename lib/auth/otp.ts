@@ -1,5 +1,5 @@
 import { prisma } from '../db/prisma';
-import { hashPassword as hashOtp, verifyPassword as verifyOtp } from './password'; // reuse argon2 helpers
+import { hashOtpCode, verifyOtpCode as verifyOtpHash } from './password';
 import { addMinutes } from 'date-fns';
 import { randomInt } from 'crypto';
 
@@ -12,7 +12,7 @@ export function generateOtpCode(): string {
 
 /** Store OTP hash for a user */
 export async function storeOtp(userId: string, type: 'email' | 'phone' | 'email_verify', code: string) {
-  const otpHash = await hashOtp(code);
+  const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), OTP_TTL_MINUTES);
   await prisma.otp.create({
     data: {
@@ -31,17 +31,14 @@ export async function verifyOtpCode(userId: string, type: 'email' | 'phone' | 'e
     orderBy: { createdAt: 'desc' },
   });
 
-  // Always run verification to prevent timing-based OTP enumeration
   if (!otp) {
-    await verifyOtp('$argon2id$v=19$m=65536,t=3,p=4$fakehash', code);
     return false;
   }
   if (otp.expiresAt < new Date()) {
     await prisma.otp.delete({ where: { id: otp.id } });
-    await verifyOtp('$argon2id$v=19$m=65536,t=3,p=4$fakehash', code);
     return false;
   }
-  const ok = await verifyOtp(otp.otpHash, code);
+  const ok = await verifyOtpHash(otp.otpHash, code);
   if (ok) {
     await prisma.otp.delete({ where: { id: otp.id } });
   }

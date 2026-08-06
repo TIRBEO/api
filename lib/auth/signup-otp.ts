@@ -1,5 +1,5 @@
 import { prisma } from '../db/prisma';
-import { hashPassword as hashOtp, verifyPassword as verifyOtp } from './password';
+import { hashOtpCode, verifyOtpCode } from './password';
 import { addMinutes } from 'date-fns';
 import { sendTemplateEmail } from '../email';
 import { randomInt } from 'crypto';
@@ -11,7 +11,7 @@ export function generateOtpCode(): string {
 }
 
 export async function storeSignupOtp(email: string, code: string) {
-  const otpHash = await hashOtp(code);
+  const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), OTP_TTL_MINUTES);
   await prisma.signupOtp.create({
     data: { email: email.toLowerCase(), otpHash, expiresAt },
@@ -28,7 +28,7 @@ export async function verifySignupOtp(email: string, code: string): Promise<bool
     await prisma.signupOtp.delete({ where: { id: otp.id } });
     return false;
   }
-  const ok = await verifyOtp(otp.otpHash, code);
+  const ok = await verifyOtpCode(otp.otpHash, code);
   if (ok) {
     await prisma.signupOtp.delete({ where: { id: otp.id } });
   }

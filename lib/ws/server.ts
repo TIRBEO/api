@@ -9,8 +9,14 @@ interface WsClient {
   alive: boolean;
 }
 
-const clients = new Map<string, WsClient>();
-const userConnections = new Map<string, Set<string>>();
+// Keep the connection registries on globalThis so the server entry and the
+// route-handler bundles share the same instance. Turbopack can instantiate a
+// module separately per bundle — split maps would make sendToUser silently miss.
+const g = globalThis as any;
+if (!g.__tirbeoWsClients) g.__tirbeoWsClients = new Map<string, WsClient>();
+if (!g.__tirbeoWsUserConns) g.__tirbeoWsUserConns = new Map<string, Set<string>>();
+const clients: Map<string, WsClient> = g.__tirbeoWsClients;
+const userConnections: Map<string, Set<string>> = g.__tirbeoWsUserConns;
 
 let wss: WebSocketServer | null = null;
 

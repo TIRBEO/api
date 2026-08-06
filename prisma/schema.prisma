@@ -72,6 +72,7 @@ model User {
   memberships Membership[]
   notificationPreferences NotificationPreference?
   notifications Notification[]
+  pushSubscriptions PushSubscription[]
   otps Otp[]
   passwordResetTokens PasswordResetToken[]
   paymentMethods payment_methods[]
@@ -287,11 +288,31 @@ model NotificationPreference {
   email Boolean? @default(true)
   push Boolean? @default(true)
   inApp Boolean? @map("in_app") @default(true)
+  security Boolean? @default(true)
+  forms Boolean? @default(true)
+  product Boolean? @default(true)
+  support Boolean? @default(true)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   user User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@map("notification_preferences")
+}
+
+model PushSubscription {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id")
+  endpoint String
+  p256dh String
+  auth String
+  userAgent String? @map("user_agent")
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, endpoint], map: "push_subscriptions_user_id_endpoint_key")
+  @@index([userId], map: "idx_push_subscriptions_user_id")
+  @@map("push_subscriptions")
 }
 
 model ApiKey {
@@ -514,6 +535,8 @@ model Route {
   enabled Boolean? @default(true)
   rateLimit Int? @map("rate_limit")
   cacheTtl Int? @map("cache_ttl")
+  handler String?
+  metadata Json?
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -1945,6 +1968,7 @@ model form {
   thankYouMessage      String?  @default("Thank you for your response!")
   allowCollaboratorEdits Boolean  @default(false)
   captchaEnabled       Boolean  @default(false)
+  settings             Json?    @default("{}")
   createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
   fields               formField[]

@@ -745,3 +745,100 @@ export async function getAdminResponseDetails(request: NextRequest, formId: stri
   if (!response) return new NextResponse('Response not found', { status: 404 });
   return NextResponse.json(response);
 }
+
+// ─── Admin form management (publish/unpublish/archive/delete) ─────
+// These send the owner the same per-form-themed lifecycle emails as the
+// regular forms flow (publish/archive/delete use each form's theme colors).
+
+const ADMIN_FORM_STATUSES = new Set(['draft', 'published', 'archived', 'closed']);
+
+/** PATCH /api/admin/forms/[id] — change form status (publish/unpublish/archive/close). */
+export async function updateAdminForm(request: NextRequest, formId: string) {
+  const admin = await requireRole(request, 'manager');
+  if (admin instanceof NextResponse) return admin;
+
+  const body = await request.json().catch(() => ({}));
+  const status = body?.status;
+  if (!status || !ADMIN_FORM_STATUSES.has(status)) {
+    return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
+  }
+
+  const form = await prisma.form.findUnique({ where: { id: formId } });
+  if (!form) return NextResponse.json({ error: 'Form not found' }, { status: 404 });
+
+  const updated = await prisma.form.update({
+    where: { id: formId },
+    data: { status, ...(status === 'published' ? { publishedAt: new Date() } : {}) },
+  });
+
+  // Notify the owner with the form's own theme colors.
+  const owner = await prisma.user.findUnique({ where: { id: form.ownerId }, select: { email: true } });
+  if (owner?.email) {
+    const { sendFormLifecycleEmail } = await import('./formHandlers');
+    const cfg = {
+      draft: { badge: 'Unpublished', title: 'Your form was unpublished', subtitle: 'Your form is no longer accepting responses', body: `Your form was set to draft by an administrator. It will not be visible to respondents until it is published again.`, cta: { url: `${process.env.FORMS_URL || 'https://forms.tirbeo.app'}/builder/${form.id}`, label: 'Open in editor' }, subject: `Your form "${form.title || 'Untitled Form'}" was unpublished`, template: 'form_closed' },
+      published: { badge: 'Published', title: 'Your form is now live', subtitle: 'Your form is now accepting responses', body: `Your form has been published. Anyone with the link can now view and fill it out.`, cta: { url: `${process.env.FORMS_URL || 'https://forms.tirbeo.app'}/f/${form.publicId}`, label: 'View form' }, subject: `Your form "${form.title || 'Untitled Form'}" is now live`, template: 'form_published' },
+      archived: { badge: 'Archived', title: 'Your form has been archived', subtitle: 'Your form is no longer visible to respondents', body: `Your form was archived by an administrator. Archived forms can be restored anytime.`, cta: { url: `${process.env.FORMS_URL || 'https://forms.tirbeo.app'}/builder/${form.id}`, label: 'Open in editor' }, subject: `Your form "${form.title || 'Untitled Form'}" has been archived`, template: 'form_archived' },
+      closed: { badge: 'Closed', title: 'Your form has been closed', subtitle: 'Your form is no longer accepting responses', body: `Your form was closed by an administrator. It is no longer accepting responses.`, cta: { url: `${process.env.FORMS_URL || 'https://forms.tirbeo.app'}/builder/${form.id}`, label: 'Open in editor' }, subject: `Your form "${form.title || 'Untitled Form'}" has been closed`, template: 'form_closed' },
+    } as const;
+    const c = cfg[status as keyof typeof cfg];
+    if (c && status !== 'draft') {
+      await sendFormLifecycleEmail(owner.email, form, {
+        badge: c.badge,
+        title: c.title,
+        subtitle: c.subtitle,
+        body: c.body,
+        details: [{ label: 'Updated', value: new Date().toLocaleString() }],
+        cta: c.cta,
+        subject: c.subject,
+      }, c.template);
+    }
+  }
+
+  await createAuditEvent({
+    actorId: admin.userId,
+    action: 'form.updated',
+    targetType: 'form',
+    targetId: formId,
+    metadata: { status, by: 'admin' },
+  });
+
+  return NextResponse.json(updated);
+}
+
+/** DELETE /api/admin/forms/[id] — permanently remove a form (+ themed deleted email to owner). */
+export async function deleteAdminForm(request: NextRequest, formId: string) {
+  const admin = await requireRole(request, 'manager');
+  if (admin instanceof NextResponse) return admin;
+
+  const form = await prisma.form.findUnique({ where: { id: formId } });
+  if (!form) return NextResponse.json({ error: 'Form not found' }, { status: 404 });
+
+  // Cascade responses/fields are handled by DB relations; delete the form last.
+  await prisma.response.deleteMany({ where: { formId } });
+  await prisma.form.delete({ where: { id: formId } });
+
+  const owner = await prisma.user.findUnique({ where: { id: form.ownerId }, select: { email: true } });
+  if (owner?.email) {
+    const { sendFormLifecycleEmail } = await import('./formHandlers');
+    await sendFormLifecycleEmail(owner.email, form, {
+      badge: 'Form deleted',
+      title: 'Your form was deleted',
+      subtitle: 'A form was permanently removed from your account',
+      body: `Your form was deleted by an administrator. This action cannot be undone. If you believe this was a mistake, please contact support.`,
+      details: [{ label: 'Deleted', value: new Date().toLocaleString() }],
+      cta: { url: `${process.env.FORMS_URL || 'https://forms.tirbeo.app'}/new`, label: 'Create a new form' },
+      subject: `Your form "${form.title || 'Untitled Form'}" was deleted`,
+    }, 'form_deleted');
+  }
+
+  await createAuditEvent({
+    actorId: admin.userId,
+    action: 'form.deleted',
+    targetType: 'form',
+    targetId: formId,
+    metadata: { by: 'admin' },
+  });
+
+  return NextResponse.json({ success: true });
+}

@@ -24,3 +24,20 @@ export function hashRecoveryCode(code: string): string {
   }
   return createHmac('sha256', pepper).update(normalizeRecoveryCode(code)).digest('hex');
 }
+
+export function hashOtpCode(code: string): string {
+  const pepper = process.env.OTP_PEPPER;
+  if (!pepper) {
+    throw new Error('OTP_PEPPER environment variable is required');
+  }
+  return createHmac('sha256', pepper).update(code).digest('hex');
+}
+
+export async function verifyOtpCode(hash: string, code: string): Promise<boolean> {
+  const pepper = process.env.OTP_PEPPER;
+  if (!pepper) {
+    throw new Error('OTP_PEPPER environment variable is required');
+  }
+  const expected = createHmac('sha256', pepper).update(code).digest('hex');
+  return expected === hash;
+}

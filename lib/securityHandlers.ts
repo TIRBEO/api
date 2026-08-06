@@ -226,11 +226,9 @@ export async function totpVerifyHandler(request: NextRequest) {
       return new NextResponse('Invalid code', { status: 400 });
     }
     const recoveryCodes = generateRecoveryCodes(8);
-    for (const rc of recoveryCodes) {
-      await prisma.recoveryCode.create({
-        data: { userId: session.userId, code: hashRecoveryCode(rc) },
-      });
-    }
+    await prisma.recoveryCode.createMany({
+      data: recoveryCodes.map(rc => ({ userId: session.userId, code: hashRecoveryCode(rc) })),
+    });
     await prisma.user.update({
       where: { id: session.userId },
       data: { is2FAEnabled: true },
@@ -333,11 +331,9 @@ export async function backupCodesRegenerateHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
     const codes = generateRecoveryCodes(8);
-    for (const code of codes) {
-      await prisma.recoveryCode.create({
-        data: { userId: session.userId, code: hashRecoveryCode(code) },
-      });
-    }
+    await prisma.recoveryCode.createMany({
+      data: codes.map(code => ({ userId: session.userId, code: hashRecoveryCode(code) })),
+    });
     await createAuditEvent({
       actorId: session.userId,
       action: 'backup_codes.regenerated',
