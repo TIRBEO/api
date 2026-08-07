@@ -159,7 +159,7 @@ export async function proxy(request: NextRequest) {
     addCorsHeaders(response, origin);
   }
 
-  const ip = request.headers.get('x-forwarded-for') || '' || 'unknown';
+  const ip = request.headers.get('x-forwarded-for') || 'unknown';
   const pathname = request.nextUrl.pathname;
 
   // ── XSS / malicious payload blocking ──
@@ -181,7 +181,7 @@ export async function proxy(request: NextRequest) {
   }
 
   // ── Turnstile captcha for suspicious IPs ──
-  if (isAuth && isTurnstileConfigured() && isSuspicious(ip)) {
+  if (!isDev && isAuth && isTurnstileConfigured() && isSuspicious(ip)) {
     const turnstileToken = request.headers.get('x-turnstile-token') || '';
     if (!turnstileToken) {
       return jsonResponse(allowedOrigin, {
@@ -201,7 +201,8 @@ export async function proxy(request: NextRequest) {
     '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
     '/api/auth/verify-email',
     '/api/auth/email-exists',
-    '/api/auth/signup-otp/request', '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
+    '/api/auth/signup-otp/request', '/api/auth/signup-otp/verify',
+    '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
     '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
     '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
     '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback',
@@ -245,46 +246,30 @@ if (hasAuthHeader) {
   }
 }
 
-// ── CAPTCHA check for suspicious users ──
-if (hasCookie && STATE_METHODS.has(request.method)) {
-  try {
-    const { verifyToken } = await import('./lib/auth/jwt');
-    const payload = await verifyToken(cookie!);
-    if (payload?.sub) {
-      const { isBlocked, getRequiredDifficulty, getCaptchaSettings } = await import('./lib/captcha/service');
-      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
-      const blockStatus = await isBlocked(payload.sub, payload.sid, ip);
-      
-      if (blockStatus.blocked) {
-        return jsonResponse(allowedOrigin, {
-          error: 'Access blocked due to suspicious activity',
-          blocked: true,
-          rayId: blockStatus.rayId,
-          reason: blockStatus.reason,
-          expiresAt: blockStatus.expiresAt,
-        }, 403);
-      }
+  // ── Block check for suspicious users (server-side, non-spoofable) ──
+  if (hasCookie && STATE_METHODS.has(request.method)) {
+    try {
+      const { verifyToken } = await import('./lib/auth/jwt');
+      const payload = await verifyToken(cookie!);
+      if (payload?.sub) {
+        const { isBlocked } = await import('./lib/captcha/service');
+        const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+        const blockStatus = await isBlocked(payload.sub, payload.sid, ip);
 
-      // For users with warnings, require CAPTCHA verification
-      const settings = await getCaptchaSettings();
-      if (settings.enabled && settings.autoEnforce) {
-        const difficulty = await getRequiredDifficulty(payload.sub, payload.sid, ip);
-        if (difficulty !== 'easy') {
-          const captchaHeader = request.headers.get('x-captcha-verified');
-          if (captchaHeader !== 'true') {
-            return jsonResponse(allowedOrigin, {
-              error: 'CAPTCHA verification required',
-              captchaRequired: true,
-              difficulty,
-            }, 403);
-          }
+        if (blockStatus.blocked) {
+          return jsonResponse(allowedOrigin, {
+            error: 'Access blocked due to suspicious activity',
+            blocked: true,
+            rayId: blockStatus.rayId,
+            reason: blockStatus.reason,
+            expiresAt: blockStatus.expiresAt,
+          }, 403);
         }
       }
+    } catch {
+      // Block check failed - allow request but log it
     }
-  } catch {
-    // CAPTCHA check failed - allow request but log it
   }
-}
 
   // ── CSRF validation for cookie-authed state-changing requests ──
   if (hasCookie && STATE_METHODS.has(request.method)) {

@@ -1,5 +1,5 @@
 import * as argon2 from 'argon2';
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 
 export async function hashPassword(password: string): Promise<string> {
   return argon2.hash(password, { type: argon2.argon2id, memoryCost: 2 ** 16, timeCost: 3, parallelism: 1 });
@@ -39,5 +39,7 @@ export async function verifyOtpCode(hash: string, code: string): Promise<boolean
     throw new Error('OTP_PEPPER environment variable is required');
   }
   const expected = createHmac('sha256', pepper).update(code).digest('hex');
-  return expected === hash;
+  const presented = Buffer.from(hash);
+  const want = Buffer.from(expected);
+  return presented.length === want.length && timingSafeEqual(presented, want);
 }

@@ -76,6 +76,12 @@ async function getRedis() {
   return redis;
 }
 
+function ipFromKey(key: string): string {
+  const slash = key.indexOf('/');
+  const head = slash > 0 ? key.slice(0, slash) : key;
+  return head.replace(/:$/, '');
+}
+
 export async function checkRateLimit(key: string, isAuth = false, routeLimit?: number): Promise<boolean> {
   const limits = await getApiLimits();
   if (!limits.rateLimitEnabled) return true;
@@ -91,7 +97,7 @@ export async function checkRateLimit(key: string, isAuth = false, routeLimit?: n
       const count = await r.incr(redisKey);
       if (count === 1) await r.pexpire(redisKey, WINDOW_MS);
       if (count > max) {
-        recordRateLimitHit(key.split(':')[0]);
+        recordRateLimitHit(ipFromKey(key));
       }
       return count <= max;
     } catch {
@@ -102,6 +108,11 @@ export async function checkRateLimit(key: string, isAuth = false, routeLimit?: n
   const counters = (globalThis as any).__rateLimitCounters ?? new Map<string, { count: number; expires: number }>();
   (globalThis as any).__rateLimitCounters = counters;
   const now = Date.now();
+  if (counters.size > 5000) {
+    for (const [k, v] of counters) {
+      if (now > v.expires) counters.delete(k);
+    }
+  }
   const entry = counters.get(key) ?? { count: 0, expires: now + WINDOW_MS };
   if (now > entry.expires) {
     entry.count = 0;
@@ -110,7 +121,7 @@ export async function checkRateLimit(key: string, isAuth = false, routeLimit?: n
   entry.count++;
   counters.set(key, entry);
   if (entry.count > max) {
-    recordRateLimitHit(key.split(':')[0]);
+    recordRateLimitHit(ipFromKey(key));
   }
   return entry.count <= max;
 }

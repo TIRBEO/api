@@ -10,8 +10,13 @@ const hitHistory = (globalThis as any).__suspiciousActivity ?? new Map<string, R
 
 export function recordRateLimitHit(ip: string): void {
   if (!ip) return;
-  const hits = hitHistory.get(ip) || [];
   const now = Date.now();
+  if (hitHistory.size > 5000) {
+    for (const [k, hits] of hitHistory) {
+      if (hits.filter(h => now - h.timestamp < WINDOW_MS).length === 0) hitHistory.delete(k);
+    }
+  }
+  const hits = hitHistory.get(ip) || [];
   const recent = hits.filter(h => now - h.timestamp < WINDOW_MS);
   recent.push({ timestamp: now });
   hitHistory.set(ip, recent);

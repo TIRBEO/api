@@ -29,6 +29,8 @@ import {
   createWorkspaceHandler,
   deleteWorkspaceHandler,
   requestSignupOtpHandler,
+  signupOtpVerifyHandler,
+  oauthConsentHandler,
   requestLoginOtpHandler,
   verifyLoginOtpHandler,
   requestMagicLinkHandler,
@@ -210,7 +212,8 @@ const INTERNAL_ROUTES = [
   'auth/login', 'auth/signup', 'auth/email-exists', 'auth/logout',
   'auth/email-otp/request', 'auth/email-otp/verify',
   'auth/phone-otp/request', 'auth/phone-otp/verify',
-  'auth/signup-otp/request',
+  'auth/signup-otp/request', 'auth/signup-otp/verify',
+  'auth/oauth-consent',
   'auth/login-otp/request', 'auth/login-otp/verify',
   'auth/magic-link/request', 'auth/magic-link/verify',
   'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
@@ -494,6 +497,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/phone-otp/request': ['POST'],
       'auth/phone-otp/verify': ['POST'],
       'auth/signup-otp/request': ['POST'],
+      'auth/signup-otp/verify': ['POST'],
+      'auth/oauth-consent': ['POST'],
       'auth/login-otp/request': ['POST'],
       'auth/login-otp/verify': ['POST'],
       'auth/magic-link/request': ['POST'],
@@ -767,6 +772,12 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/signup-otp/request':
         resp = await requestSignupOtpHandler(request);
+        break;
+      case 'auth/signup-otp/verify':
+        resp = await signupOtpVerifyHandler(request);
+        break;
+      case 'auth/oauth-consent':
+        resp = await oauthConsentHandler(request);
         break;
       case 'auth/login-otp/request':
         resp = await requestLoginOtpHandler(request);

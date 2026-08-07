@@ -129,6 +129,24 @@ function getOauthCookieDomain(request: NextRequest): string | undefined {
 
 const OAUTH_STATE_COOKIE = '__oauth_state';
 
+// A freshly-created OAuth account has no password and no recorded consent —
+// route it to the accounts app so the user can accept policy + optionally set
+// a password, instead of landing straight on the dashboard.
+function oauthPostLoginTarget(user: any, redirectTo: string | undefined, provider: string): string {
+  const prefs: any = user?.preferences || {};
+  const isNewOAuthUser = !user?.passwordHash && !prefs.signupConsent?.policyAccepted;
+  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+  const accountsBase = (process.env.ACCOUNTS_URL || `https://accounts.${appDomain}`).replace(/\/$/, '');
+  if (isNewOAuthUser) {
+    const url = new URL(`${accountsBase}/callback`);
+    url.searchParams.set('oauth', 'new');
+    url.searchParams.set('provider', provider);
+    if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
+    return url.toString();
+  }
+  return redirectTo || `https://dashboard.${appDomain}`;
+}
+
 function setOauthStateCookie(res: NextResponse, nonce: string, request: NextRequest) {
   res.cookies.set(OAUTH_STATE_COOKIE, nonce, {
     httpOnly: true,
@@ -546,6 +564,10 @@ const signupSchema = z.object({
   turnstileToken: z.string().optional(),
   captchaRayId: z.string().optional(),
   fingerprint: z.string().optional(),
+  // Optional pre-verified signup OTP (requested via auth/signup-otp/request,
+  // verified without consuming via auth/signup-otp/verify). When valid, the
+  // account is created with emailVerified=true and no verify email is sent.
+  otpCode: z.string().optional(),
 });
 
 export async function emailExistsHandler(request: NextRequest) {
@@ -575,7 +597,7 @@ export async function signupHandler(request: NextRequest) {
     if (!parsed.success) {
       return new NextResponse('Invalid request payload', { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, signatureDataUrl, signatureName, captchaRayId, fingerprint } = parsed.data;
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, signatureDataUrl, signatureName, captchaRayId, fingerprint, otpCode } = parsed.data;
     const normalizedEmail = email.toLowerCase().trim();
     const normalizedUsername = username ? username.toString().trim().toLowerCase() : undefined;
     const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
@@ -642,6 +664,17 @@ export async function signupHandler(request: NextRequest) {
       }
     }
 
+    // If the user pre-verified their email via signup-otp, validate the code
+    // (this consumes it) and create the account already email-verified.
+    let preVerifiedEmail = false;
+    if (otpCode) {
+      const { verifySignupOtp: verifyOtp } = await import('./auth/signup-otp');
+      preVerifiedEmail = await verifyOtp(normalizedEmail, otpCode);
+      if (!preVerifiedEmail) {
+        return new NextResponse('Invalid or expired verification code', { status: 400 });
+      }
+    }
+
     const breach = await checkPasswordBreach(password);
     if (breach.breached) {
       return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
@@ -661,7 +694,7 @@ export async function signupHandler(request: NextRequest) {
         companyName: normalizedCompanyName ? sanitizeInput(normalizedCompanyName, 120) : undefined,
         gender: gender ? sanitizeInput(gender, 100) : undefined,
         birthday,
-        emailVerified: false,
+        emailVerified: preVerifiedEmail,
         preferences: {
           signupConsent: {
             acceptedAt: new Date().toISOString(),
@@ -681,23 +714,25 @@ export async function signupHandler(request: NextRequest) {
     const { recordDeviceSeen } = await import('./captcha/risk');
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId: captchaSession }).catch(() => {});
 
-    // Send welcome + verification email (non-blocking)
+    // Send welcome email (non-blocking)
     sendTemplateEmail(email, 'welcome', { name: name || email.split('@')[0] }, {
       fromEmail: 'noreply@send.tirbeo.app',
       fromName: 'Tirbeo',
     }).catch(err => console.error('[SIGNUP] Welcome email failed:', err?.message));
 
-    // Send verification OTP
-    const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
-    const otpHash = hashOtpCode(otpCode);
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    await prisma.otp.create({
-      data: { userId: user.id, type: 'email', otpHash, expiresAt },
-    });
-    sendTemplateEmail(email, 'verify_email', { otp: otpCode, name: name || email.split('@')[0] }, {
-      fromEmail: 'noreply@send.tirbeo.app',
-      fromName: 'Tirbeo',
-    }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
+    // Send verification OTP — unless the user already verified via signup-otp
+    if (!preVerifiedEmail) {
+      const verifyCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
+      const otpHash = hashOtpCode(verifyCode);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await prisma.otp.create({
+        data: { userId: user.id, type: 'email', otpHash, expiresAt },
+      });
+      sendTemplateEmail(email, 'verify_email', { otp: verifyCode, name: name || email.split('@')[0] }, {
+        fromEmail: 'noreply@send.tirbeo.app',
+        fromName: 'Tirbeo',
+      }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
+    }
 
     return res;
   } catch (err: any) {
@@ -748,6 +783,63 @@ export async function requestSignupOtpHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[SIGNUP OTP REQUEST]', err?.message || err, err?.stack);
     return new NextResponse('Failed to process request', { status: 500 });
+  }
+}
+
+// Verify a pre-signup OTP without consuming it (final consumption happens at auth/signup)
+export async function signupOtpVerifyHandler(request: NextRequest) {
+  try {
+    const { email, code } = await request.json();
+    if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
+      return new NextResponse('Email and code are required', { status: 400 });
+    }
+
+    const { checkSignupOtp } = await import('./auth/signup-otp');
+    const ok = await checkSignupOtp(email, code);
+    if (!ok) {
+      return new NextResponse('Invalid or expired verification code', { status: 400 });
+    }
+    return NextResponse.json({ verified: true });
+  } catch (err: any) {
+    console.error('[SIGNUP OTP VERIFY]', err?.message || err);
+    return new NextResponse('Verification failed', { status: 500 });
+  }
+}
+
+// Record policy consent for an OAuth-created account (no password yet) so the
+// user can be routed to the dashboard afterwards.
+export async function oauthConsentHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json();
+    const { policyAccepted, adminDataAccess, signatureName } = body;
+    if (!policyAccepted) {
+      return new NextResponse('Policy acceptance is required', { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, preferences: true } });
+    if (!user) return new NextResponse('User not found', { status: 404 });
+
+    const prefs: any = (user.preferences as any) || {};
+    prefs.signupConsent = {
+      acceptedAt: new Date().toISOString(),
+      policyAccepted: true,
+      adminDataAccess: !!adminDataAccess,
+      signatureName: signatureName ? sanitizeInput(signatureName, 200).trim() : (user.email ? user.email.split('@')[0] : ''),
+      oauth: true,
+    };
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { preferences: prefs, emailVerified: true },
+    });
+
+    return NextResponse.json({ ok: true, message: 'Consent recorded' });
+  } catch (err: any) {
+    console.error('[OAUTH CONSENT]', err?.message || err);
+    return new NextResponse('Failed to record consent', { status: 500 });
   }
 }
 
@@ -1117,8 +1209,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-    const target = redirectTo || fallback;
+    const target = oauthPostLoginTarget(user, redirectTo, 'google');
     const res = NextResponse.redirect(target);
     setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
@@ -1257,8 +1348,8 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-    const res = NextResponse.redirect(redirectTo || fallback);
+    const target = oauthPostLoginTarget(user, redirectTo, 'github');
+    const res = NextResponse.redirect(target);
     setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
     return res;
@@ -1389,8 +1480,8 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const fallback = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-    const res = NextResponse.redirect(redirectTo || fallback);
+    const target = oauthPostLoginTarget(user, redirectTo, 'discord');
+    const res = NextResponse.redirect(target);
     setSessionCookie(res, token, refreshToken);
     clearOauthStateCookie(res, request);
     return res;

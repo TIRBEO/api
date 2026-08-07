@@ -35,6 +35,24 @@ export async function verifySignupOtp(email: string, code: string): Promise<bool
   return ok;
 }
 
+/**
+ * Check a signup OTP WITHOUT consuming it. Used by the pre-signup
+ * verification step so the same code can still be presented at
+ * `auth/signup` (which consumes it via verifySignupOtp).
+ */
+export async function checkSignupOtp(email: string, code: string): Promise<boolean> {
+  const otp = await prisma.signupOtp.findFirst({
+    where: { email: email.toLowerCase() },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!otp) return false;
+  if (otp.expiresAt < new Date()) {
+    await prisma.signupOtp.delete({ where: { id: otp.id } });
+    return false;
+  }
+  return verifyOtpCode(otp.otpHash, code);
+}
+
 export async function sendSignupOtpEmail(email: string, code: string, templateName: string = 'signup_otp') {
   const result = await sendTemplateEmail(email, templateName, { otp: code });
   if (!result.success) {
