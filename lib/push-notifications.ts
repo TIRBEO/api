@@ -1,11 +1,43 @@
 import { prisma } from './db/prisma';
 import webPush from 'web-push';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 // ─── VAPID Configuration ───
 
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:support@tirbeo.app';
+
+function loadVapidKeys(): { publicKey: string; privateKey: string } {
+  const envPublic = process.env.VAPID_PUBLIC_KEY || '';
+  const envPrivate = process.env.VAPID_PRIVATE_KEY || '';
+  if (envPublic && envPrivate) {
+    return { publicKey: envPublic, privateKey: envPrivate };
+  }
+
+  // Fallback: generate once and persist so keys stay stable across restarts.
+  const keyFile = join(process.cwd(), 'vapid-keys.json');
+  try {
+    if (existsSync(keyFile)) {
+      const parsed = JSON.parse(readFileSync(keyFile, 'utf8'));
+      if (parsed.publicKey && parsed.privateKey) {
+        return { publicKey: parsed.publicKey, privateKey: parsed.privateKey };
+      }
+    }
+  } catch {}
+
+  const keys = webPush.generateVAPIDKeys();
+  try {
+    writeFileSync(keyFile, JSON.stringify(keys, null, 2));
+    console.warn('[PUSH] VAPID keys generated and saved to vapid-keys.json');
+  } catch (err: any) {
+    console.error('[PUSH] Failed to persist VAPID keys:', err?.message);
+  }
+  return keys;
+}
+
+const VAPID_KEYS = loadVapidKeys();
+const VAPID_PUBLIC_KEY = VAPID_KEYS.publicKey;
+const VAPID_PRIVATE_KEY = VAPID_KEYS.privateKey;
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);

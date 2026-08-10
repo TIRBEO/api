@@ -17,7 +17,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
   if (session instanceof NextResponse) return session;
 
   const { id } = await params;
-  const body = await request.json();
+  const body: any = await request.json();
   const tpl = await prisma.emailTemplate.update({
     where: { id },
     data: {

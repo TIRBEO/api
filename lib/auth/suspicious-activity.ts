@@ -30,6 +30,11 @@ export function isSuspicious(ip: string): boolean {
   return recent.length >= THRESHOLD;
 }
 
+export function clearRateLimitHits(ip: string): void {
+  if (!ip) return;
+  hitHistory.delete(ip);
+}
+
 export function shouldRequireCaptcha(ip: string): boolean {
   if (!process.env.TURNSTILE_SECRET_KEY && !process.env.TURNSTILE_SECRET) return false;
   return isSuspicious(ip);

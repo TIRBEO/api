@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from './db/prisma';
 import { requireAdmin, requireRole, canManageRole, getAdminRole } from './session';
+import { hashPassword } from './auth/password';
 import { cachedJson, jsonUnauthorized, jsonForbidden } from './response';
 import { createAuditEvent } from './audit';
-import { invalidateReservedCache } from './reservedCache';
 
 export async function listUsers(request: NextRequest) {
   const session = await requireRole(request, 'manager');
@@ -34,12 +34,14 @@ export async function listUsers(request: NextRequest) {
         isBanned: true,
         isSuspended: true,
         createdAt: true,
+        lastActiveAt: true,
+        lastLoginAt: true,
         preferences: true,
         roles: {
           select: { role: { select: { id: true, name: true } } },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { lastActiveAt: 'desc' },
       skip: (page - 1) * limit,
       take: limit,
     }),
@@ -51,6 +53,8 @@ export async function listUsers(request: NextRequest) {
     status: u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
     roles: u.roles.map(a => a.role),
     signupConsent: (u.preferences as Record<string, any> | null | undefined)?.signupConsent ?? null,
+    lastActiveAt: u.lastActiveAt?.toISOString() || null,
+    lastLoginAt: u.lastLoginAt?.toISOString() || null,
     roleAssignments: undefined,
   }));
 
@@ -103,6 +107,92 @@ const updateUserSchema = z.object({
   status: z.enum(['ACTIVE', 'SUSPENDED', 'BANNED']).optional(),
 });
 
+const createUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(120).optional(),
+  adminRole: z.enum(['super_admin', 'admin', 'manager', 'editor']).nullable().optional(),
+  sendEmail: z.boolean().optional(),
+});
+
+function generateTemporaryPassword(length = 16): string {
+  const alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*';
+  const arr = new Uint32Array(length);
+  const rnd = typeof crypto !== 'undefined' && 'getRandomValues' in crypto
+    ? crypto.getRandomValues(arr)
+    : Array.from({ length }, () => Math.floor(Math.random() * 0xffffffff));
+  return Array.from({ length }, (_, i) => alphabet[Number(rnd[i]) % alphabet.length]).join('');
+}
+
+export async function createUser(request: NextRequest) {
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
+
+  const body: any = await request.json();
+  const parsed = createUserSchema.safeParse(body);
+  if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+
+  const { email, name, adminRole, sendEmail = true } = parsed.data;
+  const normalizedEmail = email.toLowerCase();
+
+  const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+  if (existing) return new NextResponse('A user with this email already exists', { status: 409 });
+
+  if (adminRole === 'super_admin' && session.adminRole !== 'super_admin') {
+    return jsonForbidden();
+  }
+  if (adminRole && !canManageRole(session.adminRole, adminRole)) {
+    return jsonForbidden();
+  }
+
+  const temporaryPassword = generateTemporaryPassword();
+  const passwordHash = await hashPassword(temporaryPassword);
+
+  const user = await prisma.user.create({
+    data: {
+      email: normalizedEmail,
+      name: name || null,
+      adminRole: adminRole || null,
+      passwordHash,
+      emailVerified: true,
+      mustChangePassword: true,
+    },
+    select: { id: true, email: true, name: true, adminRole: true, createdAt: true },
+  });
+
+  await createAuditEvent({
+    actorId: session.userId,
+    action: 'user.created',
+    targetType: 'user',
+    targetId: user.id,
+    metadata: { email: normalizedEmail, adminRole: adminRole || null, temporaryPasswordIssued: true },
+  });
+
+  if (sendEmail) {
+    const { sendTemplateEmail } = await import('./email');
+    const res = await sendTemplateEmail(normalizedEmail, 'admin_account_created', {
+      name: name || normalizedEmail.split('@')[0],
+      temporaryPassword,
+      adminRole: adminRole || 'member',
+      loginUrl: 'https://admin.tirbeo.app',
+    });
+    if (!res.success) {
+      console.error(`[ADMIN CREATE USER] Email failed for ${normalizedEmail}: ${res.error}`);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[ADMIN CREATE USER] FALLBACK TEMP PASSWORD for ${normalizedEmail}: ${temporaryPassword}`);
+      }
+    }
+  }
+
+  // Only echo the temporary password in non-production (email may not be configured).
+  const echoPassword = sendEmail && process.env.NODE_ENV !== 'production';
+  return NextResponse.json({
+    user: { ...user, mustChangePassword: true },
+    ...(echoPassword ? { temporaryPassword } : {}),
+    emailSent: sendEmail,
+    note: 'The user must set a new password on first login.',
+  }, { status: 201 });
+}
+
 export async function updateUser(request: NextRequest, userId: string) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
@@ -110,7 +200,7 @@ export async function updateUser(request: NextRequest, userId: string) {
   const existing = await prisma.user.findUnique({ where: { id: userId } });
   if (!existing) return new NextResponse('User not found', { status: 404 });
 
-  const body = await request.json();
+  const body: any = await request.json();
   const parsed = updateUserSchema.safeParse(body);
   if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
 
@@ -186,53 +276,7 @@ export async function deleteUser(request: NextRequest, userId: string) {
   return new NextResponse('User deleted', { status: 200 });
 }
 
-export async function listOrganizations(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
-  if (session instanceof NextResponse) return session;
 
-  const page = Number(request.nextUrl.searchParams.get('page')) || 1;
-  const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 100, 500);
-
-  const [organizations, total] = await Promise.all([
-    prisma.workspace.findMany({
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        ownerId: true,
-        createdAt: true,
-        users: { select: { id: true, email: true, name: true } },
-        _count: { select: { memberships: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
-    }),
-    prisma.workspace.count(),
-  ]);
-
-  return NextResponse.json({ organizations, total, page, limit });
-}
-
-export async function deleteOrganization(request: NextRequest, orgId: string) {
-  const session = await requireRole(request, 'super_admin');
-  if (session instanceof NextResponse) return session;
-
-  const existing = await prisma.workspace.findUnique({ where: { id: orgId } });
-  if (!existing) return new NextResponse('Organization not found', { status: 404 });
-
-  await prisma.workspace.delete({ where: { id: orgId } });
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'workspace.deleted',
-    targetType: 'workspace',
-    targetId: orgId,
-    metadata: { name: existing.name, slug: existing.slug },
-  });
-
-  return new NextResponse('Organization deleted', { status: 200 });
-}
 
 export async function banUser(request: NextRequest, userId: string) {
   const session = await requireRole(request, 'super_admin');
@@ -242,7 +286,7 @@ export async function banUser(request: NextRequest, userId: string) {
   if (!existing) return new NextResponse('User not found', { status: 404 });
   if (existing.adminRole === 'super_admin') return new NextResponse('Cannot ban a super admin', { status: 403 });
 
-  const { reason } = await request.json().catch(() => ({}));
+  const { reason } = (await request.json().catch(() => ({}))) as any;
 
   await prisma.user.update({ where: { id: userId }, data: { isBanned: true, isSuspended: false, suspendReason: reason || 'No reason provided', suspendedUntil: null } });
   await prisma.session.deleteMany({ where: { userId } });
@@ -286,7 +330,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
   if (!existing) return new NextResponse('User not found', { status: 404 });
   if (existing.adminRole === 'super_admin') return new NextResponse('Cannot suspend a super admin', { status: 403 });
 
-  const { reason } = await request.json().catch(() => ({}));
+  const { reason } = (await request.json().catch(() => ({}))) as any;
 
   await prisma.user.update({ where: { id: userId }, data: { isSuspended: true, isBanned: false, suspendReason: reason || 'No reason provided' } });
   await prisma.session.deleteMany({ where: { userId } });
@@ -322,107 +366,15 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
   return NextResponse.json({ message: 'User unsuspended' });
 }
 
-export async function listOrganizationMembers(request: NextRequest, orgId: string) {
-  const session = await requireRole(request, 'admin');
-  if (session instanceof NextResponse) return session;
 
-  const org = await prisma.workspace.findUnique({ where: { id: orgId } });
-  if (!org) return new NextResponse('Organization not found', { status: 404 });
 
-  const members = await prisma.membership.findMany({
-    where: { workspaceId: orgId },
-    include: { users: { select: { id: true, email: true, name: true, photoUrl: true } } },
-    orderBy: { createdAt: 'asc' },
-  });
 
-  return NextResponse.json({ members, organization: { id: org.id, name: org.name, slug: org.slug } });
-}
-
-export async function addOrganizationMember(request: NextRequest, orgId: string) {
-  const session = await requireRole(request, 'admin');
-  if (session instanceof NextResponse) return session;
-
-  const body = await request.json();
-  const { email, role } = body;
-  if (!email) return new NextResponse('email required', { status: 400 });
-
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-  if (!user) return new NextResponse('User not found', { status: 404 });
-
-  const existing = await prisma.membership.findUnique({
-    where: { userId_workspaceId: { userId: user.id, workspaceId: orgId } },
-  });
-  if (existing) return new NextResponse('User is already a member', { status: 409 });
-
-  const membership = await prisma.membership.create({
-    data: { userId: user.id, workspaceId: orgId, role: role === 'ADMIN' ? 'ADMIN' : 'MEMBER' },
-  });
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'workspace.member_added',
-    targetType: 'workspace',
-    targetId: orgId,
-    metadata: { addedUserId: user.id, addedEmail: email, role: membership.role },
-  });
-
-  return NextResponse.json(membership, { status: 201 });
-}
-
-export async function removeOrganizationMember(request: NextRequest, orgId: string) {
-  const session = await requireRole(request, 'admin');
-  if (session instanceof NextResponse) return session;
-
-  const body = await request.json();
-  const { userId } = body;
-  if (!userId) return new NextResponse('userId required', { status: 400 });
-
-  const membership = await prisma.membership.findUnique({
-    where: { userId_workspaceId: { userId, workspaceId: orgId } },
-  });
-  if (!membership) return new NextResponse('Member not found', { status: 404 });
-
-  await prisma.membership.delete({ where: { id: membership.id } });
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'workspace.member_removed',
-    targetType: 'workspace',
-    targetId: orgId,
-    metadata: { removedUserId: userId },
-  });
-
-  return new NextResponse('Member removed', { status: 200 });
-}
-
-export async function getStats(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
-
-  const [userCount, orgCount, routeCount, auditCount, blocklistCount] = await Promise.all([
-    prisma.user.count(),
-    prisma.workspace.count(),
-    prisma.route.count(),
-    prisma.auditEvent.count(),
-    prisma.blocklist.count(),
-  ]);
-
-  const adminUsers = await prisma.user.findMany({
-    where: { adminRole: { not: null } },
-    select: { id: true, email: true, name: true, adminRole: true },
-  });
-
-  return cachedJson({
-    counts: { users: userCount, organizations: orgCount, routes: routeCount, auditEvents: auditCount, blocked: blocklistCount },
-    adminUsers,
-  }, { ttl: 15, swr: 120 });
-}
 
 export async function updateUserRoles(request: NextRequest, userId: string) {
   const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { roleIds } = body;
   if (!Array.isArray(roleIds)) {
     return new NextResponse('roleIds array required', { status: 400 });
@@ -472,7 +424,7 @@ export async function seedAdminHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { email, adminRole, password } = body;
 
   if (!email || !adminRole) {
@@ -508,7 +460,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
   const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { password } = body;
   if (!password || typeof password !== 'string' || password.length < 8) {
     return new NextResponse('Password must be at least 8 characters', { status: 400 });
@@ -535,118 +487,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
   return NextResponse.json({ message: 'Password reset successfully' });
 }
 
-export async function reservedAddressesHandler(request: NextRequest) {
-  try {
-    const admin = await requireAdmin(request);
-    if (admin instanceof NextResponse) return admin;
 
-    if (request.method === 'GET') {
-      const { searchParams } = request.nextUrl;
-      const page = Math.max(1, parseInt(searchParams.get('page') || '1'));
-      const limit = Math.min(100, Math.max(1, parseInt(searchParams.get('limit') || '50')));
-      const search = searchParams.get('search') || '';
-      const category = searchParams.get('category') || '';
-      const level = searchParams.get('level') || '';
-
-      const where: any = {};
-      if (search) where.address = { contains: search.toLowerCase() };
-      if (category) where.category = category;
-      if (level) where.level = level;
-
-      const items = await prisma.reservedAddress.findMany({
-        where,
-        orderBy: [{ category: 'asc' }, { address: 'asc' }],
-        skip: (page - 1) * limit,
-        take: limit,
-        select: { id: true, address: true, reason: true, level: true, category: true, createdAt: true },
-      });
-      const total = await prisma.reservedAddress.count({ where });
-
-      return NextResponse.json({ items, total, page, limit });
-    }
-
-    if (request.method === 'POST') {
-      if (admin.adminRole !== 'super_admin') {
-        return new NextResponse('Only super_admin can manage reserved addresses', { status: 403 });
-      }
-
-      const body = await request.json();
-      const { address, reason, level, category } = body;
-
-      if (!address || typeof address !== 'string') {
-        return new NextResponse('Address is required', { status: 400 });
-      }
-
-      const clean = address.toLowerCase().trim().replace(/[#@\s]/g, '');
-      if (!/^[a-z0-9][a-z0-9._-]{0,30}[a-z0-9]$/.test(clean) && clean.length >= 2) {
-        return new NextResponse('Invalid address format', { status: 400 });
-      }
-
-      const exists = await prisma.reservedAddress.findUnique({ where: { address: clean } });
-      if (exists) return new NextResponse('Already reserved', { status: 409 });
-
-      await prisma.reservedAddress.create({
-        data: {
-          address: clean,
-          reason: reason || 'reserved',
-          level: level || 'hard',
-          category: category || 'custom',
-          addedById: admin.userId,
-        },
-      });
-
-      await createAuditEvent({
-        actorId: admin.userId,
-        action: 'reserved_address.added',
-        targetType: 'reserved_address',
-        targetId: clean,
-        metadata: { reason, level, category },
-      });
-
-      invalidateReservedCache();
-      return NextResponse.json({ ok: true, address: clean });
-    }
-
-    return new NextResponse('Method not allowed', { status: 405 });
-  } catch (err: any) {
-    console.error('[RESERVED ADDRESSES]', err?.message || err);
-    return new NextResponse('Failed to manage reserved addresses', { status: 500 });
-  }
-}
-
-export async function reservedAddressDeleteHandler(request: NextRequest, addressId: string) {
-  try {
-    const admin = await requireAdmin(request);
-    if (admin instanceof NextResponse) return admin;
-
-    if (admin.adminRole !== 'super_admin') {
-      return new NextResponse('Only super_admin can remove reserved addresses', { status: 403 });
-    }
-
-    const item = await prisma.reservedAddress.findUnique({ where: { id: addressId } });
-    if (!item) return new NextResponse('Not found', { status: 404 });
-
-    if (item.category === 'system') {
-      return new NextResponse('System reserved addresses cannot be removed', { status: 403 });
-    }
-
-    await prisma.reservedAddress.delete({ where: { id: addressId } });
-
-    await createAuditEvent({
-      actorId: admin.userId,
-      action: 'reserved_address.removed',
-      targetType: 'reserved_address',
-      targetId: item.address,
-      metadata: { category: item.category, level: item.level },
-    });
-
-    invalidateReservedCache();
-    return NextResponse.json({ ok: true });
-  } catch (err: any) {
-    console.error('[RESERVED ADDRESS DELETE]', err?.message || err);
-    return new NextResponse('Failed to delete reserved address', { status: 500 });
-  }
-}
 
 // ─── Admin Forms Supervision ──────────────────────────────────
 
@@ -738,7 +579,7 @@ export async function getAdminResponseDetails(request: NextRequest, formId: stri
     include: {
       form: { select: { id: true, title: true, publicId: true, user: { select: { email: true, name: true } } } },
       answers: { include: { field: { select: { id: true, label: true, type: true, options: true } } } },
-      notes: { orderBy: { createdAt: 'desc' }, include: { user: { select: { id: true, email: true, name: true } } } },
+      notes: { orderBy: { createdAt: 'desc' }, include: { author: { select: { id: true, email: true, name: true } } } },
     },
   });
 
@@ -757,7 +598,7 @@ export async function updateAdminForm(request: NextRequest, formId: string) {
   const admin = await requireRole(request, 'manager');
   if (admin instanceof NextResponse) return admin;
 
-  const body = await request.json().catch(() => ({}));
+  const body: any = await request.json().catch(() => ({}));
   const status = body?.status;
   if (!status || !ADMIN_FORM_STATUSES.has(status)) {
     return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
@@ -841,4 +682,25 @@ export async function deleteAdminForm(request: NextRequest, formId: string) {
   });
 
   return NextResponse.json({ success: true });
+}
+
+export async function getStats(request: NextRequest) {
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
+
+  const [userCount, auditCount, blocklistCount] = await Promise.all([
+    prisma.user.count(),
+    prisma.auditEvent.count(),
+    prisma.blocklist.count(),
+  ]);
+
+  const adminUsers = await prisma.user.findMany({
+    where: { adminRole: { not: null } },
+    select: { id: true, email: true, name: true, adminRole: true },
+  });
+
+  return cachedJson({
+    counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
+    adminUsers,
+  }, { ttl: 15, swr: 120 });
 }

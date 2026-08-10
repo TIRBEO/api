@@ -7,7 +7,7 @@ const OTP_TTL_MINUTES = 10;
 
 /** Generate a 6‑digit numeric OTP */
 export function generateOtpCode(): string {
-  return randomInt(100000, 1000000).toString();
+  return (randomInt as Function)(100000, 1000000).toString();
 }
 
 /** Store OTP hash for a user */

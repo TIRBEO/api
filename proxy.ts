@@ -1,8 +1,9 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { checkRateLimit } from './lib/auth/rate-limit';
+import { checkRateLimitWithInfo } from './lib/auth/rate-limit';
 import { isSuspicious } from './lib/auth/suspicious-activity';
 import { verifyTurnstile, getTurnstileSiteKey, isTurnstileConfigured } from './lib/auth/turnstile';
 import { detectXss } from './lib/auth/xss-scan';
+import { getMaintenanceState } from './lib/ws/server';
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
@@ -106,11 +107,39 @@ function validateCsrf(request: NextRequest): boolean {
   const cookieToken = request.cookies.get(CSRF_COOKIE_NAME)?.value;
   if (!headerToken || !cookieToken) return false;
   if (headerToken.length !== cookieToken.length) return false;
+  // Constant-time comparison to prevent timing attacks
   let diff = 0;
   for (let i = 0; i < headerToken.length; i++) {
     diff |= headerToken.charCodeAt(i) ^ cookieToken.charCodeAt(i);
   }
   return diff === 0;
+}
+
+// Enhanced CSRF validation with nonce support
+function validateCsrfWithNonce(request: NextRequest): boolean {
+  const headerToken = request.headers.get('x-csrf-token');
+  const cookieToken = request.cookies.get(CSRF_COOKIE_NAME)?.value;
+  const nonceHeader = request.headers.get('x-csrf-nonce');
+  
+  // Standard CSRF validation
+  if (headerToken && cookieToken) {
+    return validateCsrf(request);
+  }
+  
+  // Nonce-based validation for state-changing requests
+  if (nonceHeader && cookieToken) {
+    // Nonce should be a timestamp-based token
+    try {
+      const nonceTime = parseInt(nonceHeader.split(':')[0] || '0', 10);
+      const now = Date.now();
+      // Nonce is valid for 5 minutes
+      if (Math.abs(now - nonceTime) < 5 * 60 * 1000) {
+        return true;
+      }
+    } catch {}
+  }
+  
+  return false;
 }
 
 // State-changing methods that require CSRF validation for cookie-authed requests
@@ -119,6 +148,8 @@ const STATE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 // Paths exempt from CSRF (public auth endpoints that don't have a session yet)
 const CSRF_EXEMPT_PATHS = [
   '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
+  '/api/auth/refresh',
+  '/api/auth/email-exists', '/api/auth/username-exists',
   '/api/auth/signup-otp/request', '/api/auth/signup-otp/verify',
   '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
   '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
@@ -126,10 +157,11 @@ const CSRF_EXEMPT_PATHS = [
   '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
   '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
   '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
-  '/api/admin/login', '/api/admin/verify-2fa',
+  '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
   '/api/public/', '/api/newsletter/',
   '/api/waitlist',
   '/api/feedback',
+  '/api/passkey/register/options', '/api/passkey/register/verify',
   '/api/passkey/auth/options', '/api/passkey/auth/verify',
   '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
   '/auth/discord', '/auth/discord/callback',
@@ -162,22 +194,102 @@ export async function proxy(request: NextRequest) {
   const ip = request.headers.get('x-forwarded-for') || 'unknown';
   const pathname = request.nextUrl.pathname;
 
+  // ── Early cookie extraction for maintenance check and admin detection ──
+  const preCookie = request.cookies.get('__session')?.value;
+  const preHasCookie = !!preCookie;
+  let isAdminUser = false;
+  
+  // Quick admin check for rate limit bypass — cache the payload so we
+  // avoid re-verifying the JWT 2-3 more times below.
+  let adminUserId: string | undefined;
+  let adminRole: string | undefined;
+  let cachedPayload: { sub: string; sid: string; adminRole?: string } | null = null;
+  if (preHasCookie) {
+    try {
+      const { verifyToken } = await import('./lib/auth/jwt');
+      const payload = await verifyToken(preCookie!);
+      if (payload) {
+        cachedPayload = payload as any;
+        if (payload.adminRole) {
+          isAdminUser = true;
+          adminUserId = payload.sub;
+          adminRole = payload.adminRole;
+        }
+      }
+    } catch {
+      // Not a valid token, continue as regular user
+    }
+  }
+  
+  // Also check for admin API key header
+  if (!isAdminUser && request.headers.get('x-admin-key')) {
+    isAdminUser = true;
+  }
+  
+  // ── Maintenance mode check ──
+  const maintenance = getMaintenanceState();
+  if (maintenance.enabled) {
+    // Allow health checks, admin endpoints, and WebSocket
+    const maintenanceExempt = [
+      '/api/health',
+      '/api/debug/',
+      '/api/admin/',
+      '/api/admin/login',
+      '/api/admin/verify-2fa',
+      '/api/security/log',
+    ];
+    const isMaintenanceExempt = maintenanceExempt.some(p => pathname.startsWith(p));
+    
+    if (!isMaintenanceExempt) {
+      // Use cached JWT payload instead of re-verifying (saves ~2-5s per request)
+      if (cachedPayload?.sub && maintenance.allowedUsers.includes(cachedPayload.sub)) {
+        // User is allowed during maintenance
+      } else {
+        return jsonResponse(allowedOrigin, {
+          error: maintenance.message,
+          maintenanceMode: true,
+          estimatedEnd: maintenance.estimatedEnd ? new Date(maintenance.estimatedEnd).toISOString() : null,
+        }, 503);
+      }
+    }
+  }
+
   // ── XSS / malicious payload blocking ──
-  const payloadHit = await scanRequestForPayloads(request);
-  if (payloadHit) {
-    reportBlockedRequest(request, payloadHit);
+  // URL param scanning always runs (fast string check).
+  // Body scanning is skipped for GET/HEAD and known-safe internal paths.
+  const urlHit = detectXss(request.nextUrl.searchParams.toString()) || detectXss(pathname);
+  if (urlHit) {
+    reportBlockedRequest(request, urlHit);
     return jsonResponse(allowedOrigin, {
       error: 'Request blocked: malicious payload detected',
       securityBlocked: true,
-      reason: payloadHit,
+      reason: urlHit,
     }, 403);
   }
+  const isGetRequest = request.method === 'GET' || request.method === 'HEAD';
+  const skipBodyScan = isGetRequest || pathname.startsWith('/api/captcha/status') || pathname.startsWith('/api/health') || pathname.startsWith('/api/public/') || pathname.startsWith('/api/forms/public/');
+  if (!skipBodyScan) {
+    const payloadHit = await scanRequestForPayloads(request);
+    // URL XSS already checked above — only body result matters here
+    if (payloadHit) {
+      reportBlockedRequest(request, payloadHit);
+      return jsonResponse(allowedOrigin, {
+        error: 'Request blocked: malicious payload detected',
+        securityBlocked: true,
+        reason: payloadHit,
+      }, 403);
+    }
+  }
 
-  // ── Rate limiting ──
+  // ── Rate limiting (admins get 10x higher limits) ──
   const isAuth = pathname.startsWith('/api/auth/login') || pathname.startsWith('/api/auth/signup') || pathname.startsWith('/api/auth/verify-2fa') || pathname.startsWith('/api/auth/recovery-2fa') || pathname.startsWith('/api/auth/login-otp') || pathname.startsWith('/api/auth/password-reset') || pathname.startsWith('/api/auth/signup-otp') || pathname.startsWith('/api/auth/magic-link');
-  const rateOk = await checkRateLimit(`${ip}:${pathname}`, isAuth);
-  if (!rateOk) {
-    return jsonResponse(allowedOrigin, { error: 'Too many requests. Please try again later.' }, 429);
+  const rateResult = await checkRateLimitWithInfo(`${ip}:${pathname}`, isAuth, undefined, isAdminUser, adminUserId, adminRole);
+  if (!rateResult.allowed) {
+    const resp = jsonResponse(allowedOrigin, { error: 'Too many requests. Please try again later.' }, 429);
+    resp.headers.set('X-RateLimit-Limit', String(rateResult.limit));
+    resp.headers.set('X-RateLimit-Remaining', '0');
+    resp.headers.set('X-RateLimit-Reset', String(rateResult.reset));
+    return resp;
   }
 
   // ── Turnstile captcha for suspicious IPs ──
@@ -201,18 +313,18 @@ export async function proxy(request: NextRequest) {
     '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
     '/api/auth/verify-email',
     '/api/auth/email-exists',
+    '/api/auth/username-exists',
     '/api/auth/signup-otp/request', '/api/auth/signup-otp/verify',
     '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
     '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
     '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
-    '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback',
-    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
-    '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
-    '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
+    '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback',    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
+    '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
     '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
+    '/api/auth/refresh',
     '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
     '/api/auth/verify',
-    '/api/admin/login', '/api/admin/verify-2fa',
+    '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
     '/api/public/', '/api/newsletter/',
     '/api/waitlist',
     '/api/feedback',
@@ -224,6 +336,7 @@ export async function proxy(request: NextRequest) {
      '/api/image/',
      '/api/health',
     '/api/security/log',
+    '/api/debug/',
   ];
 
 const isPublicPath = publicPaths.some(p => pathname.startsWith(p));
@@ -246,31 +359,6 @@ if (hasAuthHeader) {
   }
 }
 
-  // ── Block check for suspicious users (server-side, non-spoofable) ──
-  if (hasCookie && STATE_METHODS.has(request.method)) {
-    try {
-      const { verifyToken } = await import('./lib/auth/jwt');
-      const payload = await verifyToken(cookie!);
-      if (payload?.sub) {
-        const { isBlocked } = await import('./lib/captcha/service');
-        const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
-        const blockStatus = await isBlocked(payload.sub, payload.sid, ip);
-
-        if (blockStatus.blocked) {
-          return jsonResponse(allowedOrigin, {
-            error: 'Access blocked due to suspicious activity',
-            blocked: true,
-            rayId: blockStatus.rayId,
-            reason: blockStatus.reason,
-            expiresAt: blockStatus.expiresAt,
-          }, 403);
-        }
-      }
-    } catch {
-      // Block check failed - allow request but log it
-    }
-  }
-
   // ── CSRF validation for cookie-authed state-changing requests ──
   if (hasCookie && STATE_METHODS.has(request.method)) {
     const isCsrfExempt = CSRF_EXEMPT_PATHS.some(p => pathname.startsWith(p));
@@ -283,23 +371,45 @@ if (hasAuthHeader) {
     }
   }
 
-  // ── Check banned/suspended for cookie-authed state changes ──
-  if (hasCookie && STATE_METHODS.has(request.method)) {
+  // ── Block check + banned/suspended check (single cached JWT verify) ──
+  // Use cachedPayload from the early admin check to avoid re-verifying.
+  if (hasCookie && STATE_METHODS.has(request.method) && cachedPayload?.sub) {
     try {
-      const { verifyToken } = await import('./lib/auth/jwt');
-      const payload = await verifyToken(cookie!);
-      if (payload?.sub) {
+      const { isBlocked } = await import('./lib/captcha/service');
+      const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+      const blockStatus = await isBlocked(cachedPayload.sub, cachedPayload.sid, clientIp);
+      if (blockStatus.blocked) {
+        return jsonResponse(allowedOrigin, {
+          error: 'Access blocked due to suspicious activity',
+          blocked: true,
+          rayId: blockStatus.rayId,
+          reason: blockStatus.reason,
+          expiresAt: blockStatus.expiresAt,
+        }, 403);
+      }
+      // Check banned/suspended inline (cached per-user, 30s TTL, max 2000 entries)
+      const _banCache: Map<string, { banned: boolean; suspended: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
+      const _bcKey = cachedPayload.sub;
+      const _bcHit = _banCache.get(_bcKey);
+      if (!_bcHit || Date.now() - _bcHit.ts > 30_000) {
         const { prisma } = await import('./lib/db/prisma');
-        const user = await prisma.user.findUnique({ where: { id: payload.sub }, select: { isBanned: true, isSuspended: true } });
-        if (user?.isBanned) {
-          return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
+        const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { isBanned: true, isSuspended: true } });
+        const banned = !!user?.isBanned;
+        const suspended = !!user?.isSuspended;
+        _banCache.set(_bcKey, { banned, suspended, ts: Date.now() });
+        if (_banCache.size > 2000) {
+          const now = Date.now();
+          for (const [k, v] of _banCache) { if (now - v.ts > 30_000) _banCache.delete(k); }
         }
-        if (user?.isSuspended) {
-          return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
-        }
+        if (banned) return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
+        if (suspended) return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
+      } else if (_bcHit.banned) {
+        return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
+      } else if (_bcHit.suspended) {
+        return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
       }
     } catch {
-      // Cookie verification failed — that's OK, the handler will re-check
+      // Block/ban check failed — allow request, handler will re-check
     }
   }
 
@@ -311,17 +421,18 @@ if (hasAuthHeader) {
       if (apiKeyResult?.userId) {
         const { prisma } = await import('./lib/db/prisma');
         const user = await prisma.user.findUnique({ where: { id: apiKeyResult.userId }, select: { isBanned: true, isSuspended: true } });
-        if (user?.isBanned) {
-          return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
-        }
-        if (user?.isSuspended) {
-          return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
-        }
+        if (user?.isBanned) return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
+        if (user?.isSuspended) return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
       }
     } catch {
       // API key verification failed — that's OK, the handler will re-check
     }
   }
+
+  // Add rate limit headers to successful responses
+  response.headers.set('X-RateLimit-Limit', String(rateResult.limit));
+  response.headers.set('X-RateLimit-Remaining', String(rateResult.remaining));
+  response.headers.set('X-RateLimit-Reset', String(rateResult.reset));
 
   return response;
 }

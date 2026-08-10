@@ -1,5 +1,6 @@
 import { prisma } from './db/prisma';
 import type { Prisma } from '@prisma/client';
+import { sendToUser } from './ws/server';
 
 type Severity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -13,7 +14,7 @@ interface AuditInput {
 }
 
 export async function createAuditEvent(input: AuditInput) {
-  await prisma.auditEvent.create({
+  const event = await prisma.auditEvent.create({
     data: {
       actorId: input.actorId || null,
       action: input.action,
@@ -23,6 +24,24 @@ export async function createAuditEvent(input: AuditInput) {
       severity: input.severity || 'info',
     },
   });
+
+  // Send real-time WebSocket notification to the user
+  if (input.actorId) {
+    try {
+      sendToUser(input.actorId, {
+        type: 'activity',
+        event: {
+          id: event.id,
+          action: event.action,
+          targetType: event.targetType,
+          targetId: event.targetId,
+          metadata: event.metadata,
+          severity: event.severity,
+          createdAt: event.createdAt.toISOString(),
+        },
+      });
+    } catch {}
+  }
 }
 
 export async function listAuditEvents(options: {

@@ -110,29 +110,12 @@ export async function uploadMediaHandler(request: NextRequest) {
     return new NextResponse('Invalid file format', { status: 400 });
   }
 
-  let url: string;
-
-  const r2Endpoint = process.env.R2_ENDPOINT;
-  const r2AccessKey = process.env.R2_ACCESS_KEY;
-  const r2SecretKey = process.env.R2_SECRET_KEY;
-  const r2Bucket = process.env.R2_BUCKET;
-  const r2PublicUrl = process.env.R2_PUBLIC_URL;
-
-  if (r2Endpoint && r2AccessKey && r2SecretKey && r2Bucket && r2PublicUrl) {
-    const { putObject } = await import('./storage');
-    await putObject({
-      endpoint: r2Endpoint,
-      accessKey: r2AccessKey,
-      secretKey: r2SecretKey,
-      bucket: r2Bucket,
-      key: r2Key,
-      body: buffer,
-      contentType: file.type,
-    });
-    url = `${r2PublicUrl}/${r2Key}`;
-  } else {
-    return new NextResponse('File storage not configured. Contact admin.', { status: 503 });
-  }
+  const { storeMediaFile } = await import('./mediaStorage');
+  const { url } = await storeMediaFile({
+    key: r2Key,
+    body: buffer,
+    contentType: file.type,
+  });
   let width: number | null = null;
   let height: number | null = null;
 
@@ -169,23 +152,23 @@ export async function uploadMediaHandler(request: NextRequest) {
 async function getImageSize(buffer: Buffer, mimeType: string): Promise<{ width: number; height: number }> {
   // Use a simple approach for common formats
   if (mimeType === 'image/png') {
-    return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+    return { width: (buffer as any).readUInt32BE(16), height: (buffer as any).readUInt32BE(20) };
   }
   if (mimeType === 'image/jpeg') {
     let offset = 0;
     while (offset < buffer.length - 1) {
       if (buffer[offset] === 0xFF && buffer[offset + 1] === 0xC0) {
-        return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+        return { height: (buffer as any).readUInt16BE(offset + 5), width: (buffer as any).readUInt16BE(offset + 7) };
       }
       offset++;
     }
   }
   if (mimeType === 'image/gif') {
-    return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+    return { width: (buffer as any).readUInt16LE(6), height: (buffer as any).readUInt16LE(8) };
   }
   if (mimeType === 'image/webp') {
     if (buffer[12] === 0x56 && buffer[13] === 0x50) {
-      return { width: buffer.readUInt16LE(26) & 0x3fff, height: buffer.readUInt16LE(28) & 0x3fff };
+      return { width: (buffer as any).readUInt16LE(26) & 0x3fff, height: (buffer as any).readUInt16LE(28) & 0x3fff };
     }
   }
   return { width: 0, height: 0 };
@@ -208,7 +191,7 @@ export async function updateMediaHandler(request: NextRequest, id: string) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { altText, folder, tags } = body;
 
   const existing = await prisma.media.findUnique({ where: { id } });

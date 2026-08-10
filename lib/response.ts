@@ -70,3 +70,13 @@ export function jsonInternalError(detail?: string, request?: NextRequest) {
     : `Internal server error: ${detail || 'unknown'}`;
   return addCorsToResponse(NextResponse.json({ error: message }, { status: 500 }), request);
 }
+
+export function jsonTooManyRequests(reason?: string, request?: NextRequest) {
+  return addCorsToResponse(
+    NextResponse.json(
+      { error: reason || 'Too many requests. Please try again later.' },
+      { status: 429 }
+    ),
+    request
+  );
+}

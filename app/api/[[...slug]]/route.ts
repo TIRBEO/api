@@ -1,19 +1,22 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { prisma } from '../../../lib/db/prisma';
+import { prisma, isDbHealthy, dbErrorResponse } from '../../../lib/db/prisma';
 import { getSession, isAdmin } from '@/lib/session';
 import { logRequest } from '../../../lib/logger';
 import { jsonError, jsonForbidden, jsonUnauthorized } from '../../../lib/response';
-import { checkRateLimit, ROUTE_LIMITS } from '../../../lib/auth/rate-limit';
+import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '../../../lib/auth/rate-limit';
 
 import {
   loginHandler,
   signupHandler,
   emailExistsHandler,
+  usernameExistsHandler,
   verifySignupEmailHandler,
   logoutHandler,
   profileHandler,
   requestEmailOtpHandler,
   verifyEmailOtpHandler,
+  changeEmailRequestHandler,
+  changeEmailVerifyHandler,
   requestPhoneOtpHandler,
   verifyPhoneOtpHandler,
   googleAuthRedirectHandler,
@@ -24,10 +27,8 @@ import {
   discordAuthCallbackHandler,
   verify2faLoginHandler,
   recovery2faLoginHandler,
-  activityHandler,
-  listWorkspacesHandler,
-  createWorkspaceHandler,
-  deleteWorkspaceHandler,
+  recoveryLoginRequestHandler,
+  recoveryLoginVerifyHandler,
   requestSignupOtpHandler,
   signupOtpVerifyHandler,
   oauthConsentHandler,
@@ -42,7 +43,6 @@ import {
   suspiciousLoginConfirmHandler,
   suspiciousLoginDenyHandler,
   verifyHandler,
-  deleteWorkspaceByIdHandler,
    helpConfigHandler,
    faqHandler,
    cliTokenHandler,
@@ -63,6 +63,7 @@ import {
   oauthTokenHandler,
   oauthRevokeHandler,
   oidcUserInfoHandler,
+  oauthConsentInfoHandler,
 } from '../../../lib/oauthHandlers';
 
 import {
@@ -70,6 +71,9 @@ import {
   changePasswordHandler,
   sessionsHandler,
   notificationsHandler,
+  pushSubscriptionHandler,
+  sendTestPushHandler,
+  oauthUnlinkHandler,
   integrationsHandler,
   userActivityHandler,
   preferencesHandler,
@@ -79,7 +83,6 @@ import {
   avatarUploadHandler,
   heartbeatHandler,
   notificationPrefsHandler,
-  districtsHandler,
   exportDataHandler,
   deleteAccountRequestHandler,
   publicProfileHandler,
@@ -94,6 +97,14 @@ import {
   adminEmailReplyHandler,
   adminEmailDetailHandler,
 } from '../../../lib/emailAdminHandlers';
+
+import {
+  helpArticlesListHandler,
+  helpArticlesCreateHandler,
+  helpArticlesUpdateHandler,
+  helpArticlesDeleteHandler,
+  helpArticleDetailHandler,
+} from '../../../lib/helpHandlers';
 
 import {
   securityEventsHandler,
@@ -119,45 +130,30 @@ import {
   apiKeyDeleteHandler,
 } from '../../../lib/developerHandlers';
 
-import {
-  reservedAddressesHandler,
-  reservedAddressDeleteHandler,
-} from '../../../lib/adminHandlers';
+
 
 import {
-  waitlistHandler,
-  feedbackHandler,
-  adminSubscribersHandler,
-  adminFeedbackHandler,
   chatHandler,
 } from '../../../lib/authHandlers';
 
 import {
-  mailboxGetHandler,
-  mailboxCreateHandler,
-  mailboxUpdateHandler,
-  mailboxDeleteHandler,
-  mailboxCheckHandler,
-  mailboxDnsHandler,
-} from '../../../lib/mailboxHandlers';
-
-import { userAppsHandler } from '../../../lib/userAppsHandlers';
-
-import {
-  followHandler,
-  followingHandler,
-  followersHandler,
-  connectionsHandler,
-  profileViewTrackHandler,
-  profileViewsHandler,
-  analyticsHandler,
-} from '../../../lib/networkHandlers';
+  oauthAdminAppsListHandler,
+  oauthAdminAppsCreateHandler,
+  oauthAdminAppsUpdateHandler,
+  oauthAdminAppsDeleteHandler,
+  oauthAdminClientsCreateHandler,
+  oauthAdminClientsUpdateHandler,
+  oauthAdminClientsRegenerateSecretHandler,
+  oauthAdminClientsDeleteHandler,
+} from '../../../lib/oauthAdminHandlers';
 
 import {
-  connectedAccountsListHandler,
-  connectedAccountsLinkHandler,
-  connectedAccountsDeleteHandler,
-} from '../../../lib/connectedAccountsHandler';
+  knownAccountsHandler,
+  switchAccountHandler,
+  removeKnownAccountHandler,
+} from '../../../lib/accountSwitchHandlers';
+
+// connectedAccountsHandler removed (LinkedAccount model removed)
 
 import {
   passkeyRegisterOptionsHandler,
@@ -170,13 +166,10 @@ import {
 } from '../../../lib/passkeyHandlers';
 
 import {
-  blogListHandler, blogCreateHandler, blogDetailHandler, blogUpdateHandler, blogDeleteHandler, blogPublishHandler,
-  pageListHandler, pageCreateHandler, pageDetailHandler, pageUpdateHandler, pagePublishHandler,
   settingsListHandler, settingsUpdateHandler,
   featureFlagsListHandler, featureFlagsUpdateHandler,
-  plansListHandler, plansAdminListHandler, plansCreateHandler,
   appsListHandler, appsAdminListHandler, appsCreateHandler,
-  systemHealthHandler, incidentsListHandler, incidentsCreateHandler,
+  incidentsListHandler, incidentsCreateHandler,
   jobsListHandler,
 } from '../../../lib/contentHandlers';
 
@@ -184,24 +177,46 @@ import {
   ticketListHandler, ticketCreateHandler, ticketDetailHandler, ticketUpdateHandler,
   ticketMessageHandler, ticketAssignHandler, ticketCloseHandler, ticketReopenHandler,
   ticketAppealsHandler, ticketAppealUnblockHandler,
+  ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
   queuesListHandler, queuesCreateHandler,
 } from '../../../lib/supportHandlers';
 
 import {
-  listForms, createForm, getForm, updateForm, deleteForm,
+  listForms, createForm, getForm, updateForm, deleteForm, importForm,
+  listMyResponses,
   publishForm, archiveForm,
   getPublicForm, submitResponse,
   listResponses, getResponse, deleteResponse, updateResponse,
   getFormAnalytics,
   listCollaborators, addCollaborator, removeCollaborator,
   listVersions, restoreVersion,
-  getFormSettings, updateFormSettings,
+  getFormSettings, updateFormSettings, testFormWebhook,
   publicDirectory, exportResponses,
+  listTemplates, createTemplate, deleteTemplate, useTemplate,
+  getFormOverview,
 } from '../../../lib/formHandlers';
 
 import {
-  publicHealthHandler, detailedHealthHandler,
+  loginHistoryHandler,
+} from '../../../lib/securityHandlers';
+
+import {
+  incidentEventsListHandler, incidentEventsCreateHandler,
+} from '../../../lib/contentHandlers';
+
+import {
+  formPagesListHandler, formPagesCreateHandler,
+  responseAnswersListHandler,
+  responseNotesListHandler, responseNotesCreateHandler,
+  getFormSettingsHandler, updateFormSettingsHandler,
+} from '../../../lib/formHandlers';
+
+import {
+  publicHealthHandler, detailedHealthHandler, poolHealthHandler,
 } from '../../../lib/health';
+import {
+  cacheDebugHandler, cacheResetDebugHandler,
+} from '../../../lib/debugHandlers';
 
 import { createJob, retryJob } from '../../../lib/jobs';
 
@@ -209,31 +224,34 @@ const appUrl = (subdomain: string, path: string) =>
   `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
 
 const INTERNAL_ROUTES = [
-  'auth/login', 'auth/signup', 'auth/email-exists', 'auth/logout',
+  'auth/login', 'auth/signup', 'auth/email-exists', 'auth/username-exists', 'auth/logout',
   'auth/email-otp/request', 'auth/email-otp/verify',
   'auth/phone-otp/request', 'auth/phone-otp/verify',
-  'auth/signup-otp/request', 'auth/signup-otp/verify',
+    'auth/signup-otp/request', 'auth/signup-otp/verify',
+    'auth/change-email/request', 'auth/change-email/verify',
   'auth/oauth-consent',
   'auth/login-otp/request', 'auth/login-otp/verify',
   'auth/magic-link/request', 'auth/magic-link/verify',
   'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
   'auth/discord', 'auth/discord/callback',
   'auth/verify-2fa', 'auth/recovery-2fa',
+  'auth/recovery-login/request', 'auth/recovery-login/verify',
   'auth/password-reset/request', 'auth/password-reset/verify', 'auth/password-reset/confirm',
    'auth/account-recovery',
    'auth/suspicious-login/confirm', 'auth/suspicious-login/deny',
    'auth/session',
    'auth/refresh',
+   'auth/accounts', 'auth/switch-account', 'auth/accounts/remove',
    'security/session-revoke',
    'auth/verify-email', 'auth/verify',
   'captcha/challenge', 'captcha/verify', 'captcha/status', 'captcha/image/[id]',
-  'users/me', 'activity', 'workspaces', 'workspaces/delete',
+  'users/me',
   'profile', 'security/password', 'security/sessions', 'security/set-password',
   'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
   'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
-  'security/password-check', 'security/sessions/revoke-all',
+  'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'notifications/prefs', 'integrations', 'user/activity', 'preferences',
+  'notifications', 'notifications/prefs', 'notifications/push', 'notifications/push/subscribe', 'integrations', 'user/activity', 'preferences',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'admin/emails', 'admin/emails/reply',
   'public/help-config', 'public/faq',
@@ -242,6 +260,8 @@ const INTERNAL_ROUTES = [
   'user/mailbox', 'user/mailbox/check', 'user/mailbox/dns',
   'user/apps',
   'admin/reserved-addresses',
+  'admin/oauth/apps', 'admin/oauth/clients',
+  'admin/help-articles',
   'admin/groups',
   'admin/ous',
   'admin/integrations',
@@ -256,50 +276,48 @@ const INTERNAL_ROUTES = [
    'feedback',
    'chat',
    'admin/subscribers',
-   'admin/feedback',
-   'health',
-  'network/follow', 'network/following', 'network/followers', 'network/connections',
-  'profile-views', 'profile-views/track',
-  'analytics',
-  // Content
-  'content/blogs', 'content/blogs/create',
-  'content/pages', 'content/pages/create',
-  'content/settings', 'content/settings/update',
-  'content/feature-flags', 'content/feature-flags/update',
-  'content/plans', 'content/plans/admin', 'content/plans/create',
-  'content/apps', 'content/apps/admin', 'content/apps/create',
-  'content/health', 'content/incidents', 'content/incidents/create',
-  'content/jobs', 'content/jobs/create',
-  'content/retry-job',
+   'admin/feedback',    'health',
+    'health/pool',
+    'debug/cache',
+    'debug/cache/reset',
+    'debug/rate-limits/reset',
   // Support
-  'support/tickets', 'support/tickets/create',
-  'support/tickets/appeals',
+  'support/tickets', 'support/tickets/create',  'support/tickets/appeals',
   'support/queues', 'support/queues/create',
   // Forms
   'forms', 'forms/create',
+  'forms/import',
   'forms/public',
-  'forms/directory',
+  'forms/directory',      'forms/my-responses',
+  'form-settings',
+  'templates',
   // OAuth / OIDC
-  'auth/oauth/authorize', 'auth/oauth/token', 'auth/oauth/revoke',
+  'auth/oauth/authorize', 'auth/oauth/token', 'auth/oauth/revoke', 'auth/oauth/consent',
   'oidc/userinfo',
 ];
 
 let routeCache: { data: any[]; ts: number } | null = null;
 let blockCache: { data: any[]; ts: number } | null = null;
-const CACHE_TTL = 30000;
+const CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
+const STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
 
 async function loadRoutes() {
-  if (routeCache && Date.now() - routeCache.ts < CACHE_TTL) return routeCache.data;
-  const data = await prisma.route.findMany({ where: { enabled: true } });
-  routeCache = { data, ts: Date.now() };
-  return data;
+  // Route model removed - all routes handled by INTERNAL_ROUTES and dynamic route matching
+  return [];
 }
 
 async function loadBlocked() {
   if (blockCache && Date.now() - blockCache.ts < CACHE_TTL) return blockCache.data;
-  const data = await prisma.blocklist.findMany();
-  blockCache = { data, ts: Date.now() };
-  return data;
+  try {
+    const data = await prisma.blocklist.findMany();
+    blockCache = { data, ts: Date.now() };
+    return data;
+  } catch (e: any) {
+    console.error('[BLOCKLIST] DB query failed, serving stale cache:', e?.message);
+    // Serve stale cache if available instead of failing
+    if (blockCache && Date.now() - blockCache.ts < STALE_TTL) return blockCache.data;
+    return [];
+  }
 }
 
 function matchRoute(slug: string[], method: string, routes: any[]) {
@@ -337,14 +355,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
-  // Handle workspaces/{id} dynamic route
-  if (slug.length === 2 && slug[0] === 'workspaces' && slug[1] !== 'delete') {
-    const workspaceId = slug[1];
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'workspaces/[id]', method, internal: true, allowedRoles: ['guest'], meta: { workspaceId } };
-    }
-  }
-
   // Handle developer/api-keys/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'developer' && slug[1] === 'api-keys') {
     const keyId = slug[2];
@@ -361,11 +371,47 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
-  // Handle connected-accounts/{id} dynamic route
-  if (slug.length === 2 && slug[0] === 'connected-accounts') {
-    const accountId = slug[1];
+  // Handle admin/oauth/apps/{id} dynamic route
+  if (slug.length === 4 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'apps') {
+    const oauthAppId = slug[3];
+    if (method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
+      return { path: 'admin/oauth/apps/[id]', method, internal: true, allowedRoles: ['guest'], meta: { oauthAppId } };
+    }
+  }
+
+  // Handle admin/oauth/clients/{id} dynamic route
+  if (slug.length === 4 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'clients') {
+    const oauthClientId = slug[3];
+    if (method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
+      return { path: 'admin/oauth/clients/[id]', method, internal: true, allowedRoles: ['guest'], meta: { oauthClientId } };
+    }
+  }
+
+  // Handle admin/help-articles/{id} dynamic route
+  if (slug.length === 3 && slug[0] === 'admin' && slug[1] === 'help-articles') {
+    const helpArticleId = slug[2];
+    if (method.toUpperCase() === 'GET' || method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
+      return { path: 'admin/help-articles/[id]', method, internal: true, allowedRoles: ['guest'], meta: { helpArticleId } };
+    }
+  }
+
+  // Handle admin/oauth/clients/{id}/secret dynamic route
+  if (slug.length === 5 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'clients' && slug[4] === 'secret') {
+    if (method.toUpperCase() === 'POST') {
+      return { path: 'admin/oauth/clients/[id]/secret', method, internal: true, allowedRoles: ['guest'], meta: { oauthClientId: slug[3] } };
+    }
+  }
+
+// connected-accounts routes removed (LinkedAccount model removed)
+
+  // Handle templates/{id} dynamic route (use or delete)
+  if (slug.length === 2 && slug[0] === 'templates') {
+    const templateId = slug[1];
+    if (method.toUpperCase() === 'POST') {
+      return { path: 'templates/[id]/use', method, internal: true, allowedRoles: ['guest'], meta: { templateId } };
+    }
     if (method.toUpperCase() === 'DELETE') {
-      return { path: 'connected-accounts/[id]', method: 'DELETE', internal: true, allowedRoles: ['guest'], meta: { accountId } };
+      return { path: 'templates/[id]', method, internal: true, allowedRoles: ['guest'], meta: { templateId } };
     }
   }
 
@@ -380,33 +426,18 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
-  // Handle content/blogs/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'blogs') {
-    const blogId = slug[2];
-    const allowed: Record<string, string[]> = { 'GET': ['GET'], 'PATCH': ['PATCH'], 'DELETE': ['DELETE'] };
-    if (allowed[method.toUpperCase()]) {
-      return { path: 'content/blogs/[id]', method, internal: true, allowedRoles: ['guest'], meta: { blogId } };
-    }
-  }
 
-  // Handle content/blogs/{id}/publish dynamic route
-  if (slug.length === 4 && slug[0] === 'content' && slug[1] === 'blogs' && slug[3] === 'publish') {
-    return { path: 'content/blogs/[id]/publish', method, internal: true, allowedRoles: ['guest'], meta: { blogId: slug[2] } };
-  }
 
-  // Handle content/pages/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'pages') {
-    return { path: 'content/pages/[id]', method, internal: true, allowedRoles: ['guest'], meta: { pageId: slug[2] } };
-  }
 
-  // Handle content/pages/{id}/publish dynamic route
-  if (slug.length === 4 && slug[0] === 'content' && slug[1] === 'pages' && slug[3] === 'publish') {
-    return { path: 'content/pages/[id]/publish', method, internal: true, allowedRoles: ['guest'], meta: { pageId: slug[2] } };
-  }
 
   // Handle content/retry-job/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'retry-job') {
     return { path: 'content/retry-job/[id]', method: 'POST', internal: true, allowedRoles: ['guest'], meta: { retryJobId: slug[2] } };
+  }
+
+  // Handle content/incidents/{id}/events dynamic route
+  if (slug.length === 4 && slug[0] === 'content' && slug[1] === 'incidents' && slug[3] === 'events') {
+    return { path: 'content/incidents/[id]/events', method, internal: true, allowedRoles: ['guest'], meta: { incidentId: slug[2] } };
   }
 
   // Handle support/tickets/{id} dynamic route
@@ -421,7 +452,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   // Handle support/tickets/{id}/messages, assign, close, reopen
   if (slug.length === 4 && slug[0] === 'support' && slug[1] === 'tickets') {
     const action = slug[3];
-    if (['messages', 'assign', 'close', 'reopen'].includes(action)) {
+    if (['messages', 'assign', 'close', 'reopen', 'attachments'].includes(action)) {
       return { path: `support/tickets/[id]/${action}`, method, internal: true, allowedRoles: ['guest'], meta: { ticketId: slug[2] } };
     }
   }
@@ -429,6 +460,41 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   // Handle support/tickets/appeals/{rayId}/unblock
   if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] === 'appeals' && slug[4] === 'unblock') {
     return { path: 'support/tickets/appeals/[rayId]/unblock', method, internal: true, allowedRoles: ['guest'], meta: { appealRayId: slug[3] } };
+  }
+
+  // Handle forms/my-responses (user's submitted responses) before the forms/{id} catch-all
+  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'my-responses') {
+    if (method.toUpperCase() === 'GET') {
+      return { path: 'forms/my-responses', method, internal: true, allowedRoles: ['guest'] };
+    }
+  }
+
+  // Handle forms/create (create form) — must be before forms/{id} catch-all
+  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'create') {
+    if (method.toUpperCase() === 'POST') {
+      return { path: 'forms/create', method, internal: true, allowedRoles: ['guest'] };
+    }
+  }
+
+  // Handle forms/import (import form) — must be before forms/{id} catch-all
+  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'import') {
+    if (method.toUpperCase() === 'POST') {
+      return { path: 'forms/import', method, internal: true, allowedRoles: ['guest'] };
+    }
+  }
+
+  // Handle forms/public (public directory listing) — must be before forms/{id} catch-all
+  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'public') {
+    if (method.toUpperCase() === 'GET') {
+      return { path: 'forms/public', method, internal: true, allowedRoles: ['guest'] };
+    }
+  }
+
+  // Handle forms/directory (public directory listing alias)
+  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'directory') {
+    if (method.toUpperCase() === 'GET') {
+      return { path: 'forms/directory', method, internal: true, allowedRoles: ['guest'] };
+    }
   }
 
   // Handle forms/{id} dynamic route
@@ -444,14 +510,32 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   if (slug.length >= 3 && slug[0] === 'forms') {
     const formId = slug[1];
     const action = slug[2];
-    if (['publish', 'archive', 'responses', 'analytics', 'collaborators', 'versions', 'settings', 'export'].includes(action)) {
+    if (['publish', 'archive', 'responses', 'analytics', 'collaborators', 'versions', 'settings', 'export', 'pages', 'overview'].includes(action)) {
       return { path: `forms/[id]/${action}`, method, internal: true, allowedRoles: ['guest'], meta: { formId } };
+    }
+    // Handle forms/{id}/webhook/test
+    if (action === 'webhook' && slug.length === 4 && slug[3] === 'test') {
+      return { path: 'forms/[id]/webhook/test', method, internal: true, allowedRoles: ['guest'], meta: { formId } };
+    }
+    // Handle forms/{id}/pages dynamic route
+    if (action === 'pages' && slug.length >= 4) {
+      return { path: 'forms/[id]/pages/[pageId]', method, internal: true, allowedRoles: ['guest'], meta: { formId, pageId: slug[3] } };
     }
   }
 
   // Handle forms/{id}/responses/{responseId}
   if (slug.length === 4 && slug[0] === 'forms' && slug[2] === 'responses') {
     return { path: 'forms/[id]/responses/[responseId]', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
+  }
+
+  // Handle forms/{id}/responses/{responseId}/answers
+  if (slug.length === 5 && slug[0] === 'forms' && slug[2] === 'responses' && slug[4] === 'answers') {
+    return { path: 'forms/[id]/responses/[responseId]/answers', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
+  }
+
+  // Handle forms/{id}/responses/{responseId}/notes
+  if (slug.length === 5 && slug[0] === 'forms' && slug[2] === 'responses' && slug[4] === 'notes') {
+    return { path: 'forms/[id]/responses/[responseId]/notes', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
   }
 
   // Handle forms/{id}/collaborators/{collaboratorId}
@@ -480,11 +564,19 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     return { path: 'captcha/image/[id]', method, internal: true, allowedRoles: ['guest'], meta: { imageId } };
   }
 
+  // Handle profile/oauth/{provider} dynamic route (unlink OAuth account)
+  if (slug.length === 3 && slug[0] === 'profile' && slug[1] === 'oauth') {
+    if (method.toUpperCase() === 'DELETE') {
+      return { path: 'profile/oauth/[provider]', method, internal: true, allowedRoles: ['guest'], meta: { provider: slug[2] } };
+    }
+  }
+
   if (INTERNAL_ROUTES.includes(pathPart)) {
     const methodMap: Record<string, string[]> = {
       'auth/login': ['POST'],
       'auth/signup': ['POST'],
       'auth/email-exists': ['POST'],
+      'auth/username-exists': ['POST'],
       'auth/verify-email': ['POST'],
       'auth/verify': ['GET'],
       'auth/logout': ['POST'],
@@ -496,8 +588,10 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/email-otp/verify': ['POST'],
       'auth/phone-otp/request': ['POST'],
       'auth/phone-otp/verify': ['POST'],
-      'auth/signup-otp/request': ['POST'],
-      'auth/signup-otp/verify': ['POST'],
+       'auth/signup-otp/request': ['POST'],
+       'auth/signup-otp/verify': ['POST'],
+       'auth/change-email/request': ['POST'],
+       'auth/change-email/verify': ['POST'],
       'auth/oauth-consent': ['POST'],
       'auth/login-otp/request': ['POST'],
       'auth/login-otp/verify': ['POST'],
@@ -511,6 +605,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/discord/callback': ['GET'],
       'auth/verify-2fa': ['POST'],
       'auth/recovery-2fa': ['POST'],
+      'auth/recovery-login/request': ['POST'],
+      'auth/recovery-login/verify': ['POST'],
       'auth/password-reset/request': ['POST'],
       'auth/password-reset/verify': ['POST'],
       'auth/password-reset/confirm': ['POST'],
@@ -519,11 +615,11 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
        'auth/suspicious-login/deny': ['POST'],
        'auth/session': ['GET'],
        'auth/refresh': ['POST'],
+       'auth/accounts': ['GET'],
+       'auth/switch-account': ['POST'],
+       'auth/accounts/remove': ['POST'],
         'security/session-revoke': ['POST'],
        'users/me': ['GET', 'PATCH'],
-      'activity': ['GET'],
-      'workspaces': ['GET', 'POST'],
-      'workspaces/delete': ['POST'],
       'profile': ['GET', 'PATCH'],
       'security/password': ['POST'],
       'security/sessions': ['GET', 'DELETE'],
@@ -540,6 +636,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'security/recovery-email': ['PUT'],
       'security/recovery-email/send-code': ['POST'],
       'security/recovery-email/verify': ['POST'],
+      'security/login-history': ['GET'],
       'security/password-check': ['POST'],
       'security/sessions/revoke-all': ['DELETE'],
       'profile/request-edit-otp': ['POST'],
@@ -547,6 +644,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'profile/avatar': ['POST'],
       'notifications': ['GET', 'PATCH', 'DELETE'],
       'notifications/prefs': ['GET', 'PUT'],
+      'notifications/push': ['POST'],
+      'notifications/push/subscribe': ['GET', 'POST', 'DELETE'],
       'integrations': ['GET', 'POST', 'DELETE'],
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
@@ -565,6 +664,9 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'user/mailbox/dns': ['GET'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'admin/reserved-addresses': ['GET', 'POST'],
+      'admin/oauth/apps': ['GET', 'POST'],
+      'admin/oauth/clients': ['POST'],
+      'admin/help-articles': ['GET', 'POST'],
       'admin/groups': ['GET', 'POST'],
       'admin/ous': ['GET', 'POST'],
       'admin/integrations': ['GET', 'POST', 'DELETE'],
@@ -585,50 +687,50 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'chat': ['POST'],
       'admin/subscribers': ['GET'],
       'admin/feedback': ['GET'],
-      'network/follow': ['POST', 'DELETE'],
-      'network/following': ['GET'],
-      'network/followers': ['GET'],
-      'network/connections': ['GET'],
-      'profile-views': ['GET'],
-      'profile-views/track': ['POST'],
-      'analytics': ['GET'],
       'health': ['GET'],
+      'health/pool': ['GET'],
+      'debug/cache': ['GET'],
+      'debug/cache/reset': ['POST'],
+      'debug/rate-limits/reset': ['GET'],
       // Content
-      'content/blogs': ['GET'],
-      'content/blogs/create': ['POST'],
-      'content/pages': ['GET'],
-      'content/pages/create': ['POST'],
       'content/settings': ['GET'],
       'content/settings/update': ['PATCH'],
       'content/feature-flags': ['GET'],
       'content/feature-flags/update': ['PATCH'],
-      'content/plans': ['GET'],
-      'content/plans/admin': ['GET'],
-      'content/plans/create': ['POST'],
       'content/apps': ['GET'],
       'content/apps/admin': ['GET'],
       'content/apps/create': ['POST'],
       'content/health': ['GET'],
       'content/incidents': ['GET'],
       'content/incidents/create': ['POST'],
+      'content/incidents/[id]/events': ['GET', 'POST'],
       'content/jobs': ['GET'],
       'content/jobs/create': ['POST'],
       'content/retry-job': ['POST'],
       // Support
       'support/tickets': ['GET'],
       'support/tickets/create': ['POST'],
+      'support/tickets/[id]/attachments': ['GET', 'POST'],
       'support/tickets/appeals': ['GET'],
       'support/queues': ['GET'],
       'support/queues/create': ['POST'],
       // Forms
-      'forms': ['GET'],
+      'forms': ['GET', 'POST'],
       'forms/create': ['POST'],
+      'forms/import': ['POST'],
+      'forms/[id]/pages': ['GET', 'POST'],
+      'forms/[id]/pages/[pageId]': ['GET', 'PATCH', 'DELETE'],
+      'forms/[id]/responses/[responseId]/answers': ['GET'],
+      'forms/[id]/responses/[responseId]/notes': ['GET', 'POST'],
       'forms/public': ['GET'],
       'forms/directory': ['GET'],
+      'form-settings': ['GET', 'PATCH'],
+      'templates': ['GET', 'POST'],
       // OAuth / OIDC
       'auth/oauth/authorize': ['POST'],
       'auth/oauth/token': ['POST'],
       'auth/oauth/revoke': ['POST'],
+      'auth/oauth/consent': ['GET'],
       'oidc/userinfo': ['GET'],
     };
     const allowed = methodMap[pathPart];
@@ -713,14 +815,38 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     return jsonError(`Route not configured: ${method} ${pathStr}`, 404);
   }
 
+  let rateLimitInfo: RateLimitResult | null = null;
   const routeLimit = ROUTE_LIMITS[pathStr] ?? (route.path ? ROUTE_LIMITS[route.path] : undefined);
-  if (routeLimit) {
-    const isAuth = pathStr.startsWith('auth/');
-    const allowed = await checkRateLimit(`${pathStr}:${ip}`, isAuth, routeLimit);
-    if (!allowed) {
-      console.warn(`[RATE LIMIT] Exceeded — path: ${pathStr}, ip: ${ip}`);
-      await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 429 });
-      return NextResponse.json({ error: 'Too many requests. Please slow down.' }, { status: 429, headers: { 'Retry-After': '60' } });
+  const isAuth = pathStr.startsWith('auth/');
+  rateLimitInfo = await checkRateLimitWithInfo(`${pathStr}:${ip}`, isAuth, routeLimit);
+  if (!rateLimitInfo.allowed) {
+    console.warn(`[RATE LIMIT] Exceeded — path: ${pathStr}, ip: ${ip}`);
+    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 429 });
+    return NextResponse.json({ error: 'Too many requests. Please slow down.' }, { status: 429, headers: { 'Retry-After': String(rateLimitInfo.reset), 'X-RateLimit-Limit': String(rateLimitInfo.limit), 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': String(rateLimitInfo.reset) } });
+  }
+
+  // Helper to add rate limit headers to a response
+  function addRateLimitHeaders(response: NextResponse): NextResponse {
+    if (rateLimitInfo) {
+      response.headers.set('X-RateLimit-Limit', String(rateLimitInfo.limit));
+      response.headers.set('X-RateLimit-Remaining', String(rateLimitInfo.remaining));
+      response.headers.set('X-RateLimit-Reset', String(rateLimitInfo.reset));
+    }
+    return response;
+  }
+
+  // ── DB Health Check ──
+  // Quick cached check — if DB is confirmed down, return 503 immediately
+  // without waiting for the query to timeout. Health and auth routes bypass
+  // this check since they handle their own DB errors gracefully.
+  const SKIP_DB_CHECK = ['health', 'health/pool', 'captcha/status', 'captcha/challenge',
+    'public/app-config', 'public/help-config', 'public/faq', 'public/theme', 'public/branding',
+    'public/landing', 'public/landing-config', 'admin/check-setup'];
+  if (!SKIP_DB_CHECK.includes(pathStr) && !pathStr.startsWith('forms/public/')) {
+    const dbOk = await isDbHealthy();
+    if (!dbOk) {
+      console.warn(`[DB-HEALTH] Rejecting request — DB is down: ${method} ${pathStr}`);
+      return dbErrorResponse() as any;
     }
   }
 
@@ -736,6 +862,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/email-exists':
         resp = await emailExistsHandler(request);
+        break;
+      case 'auth/username-exists':
+        resp = await usernameExistsHandler(request);
         break;
       case 'auth/verify-email':
         resp = await verifySignupEmailHandler(request);
@@ -776,6 +905,12 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/signup-otp/verify':
         resp = await signupOtpVerifyHandler(request);
         break;
+      case 'auth/change-email/request':
+        resp = await changeEmailRequestHandler(request);
+        break;
+      case 'auth/change-email/verify':
+        resp = await changeEmailVerifyHandler(request);
+        break;
       case 'auth/oauth-consent':
         resp = await oauthConsentHandler(request);
         break;
@@ -815,6 +950,15 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/refresh':
         resp = await refreshHandler(request);
         break;
+      case 'auth/accounts':
+        resp = await knownAccountsHandler(request);
+        break;
+      case 'auth/switch-account':
+        resp = await switchAccountHandler(request);
+        break;
+      case 'auth/accounts/remove':
+        resp = await removeKnownAccountHandler(request);
+        break;
       case 'security/session-revoke':
         resp = await sessionRevokeByTokenHandler(request);
         break;
@@ -833,6 +977,12 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/recovery-2fa':
         resp = await recovery2faLoginHandler(request);
         break;
+      case 'auth/recovery-login/request':
+        resp = await recoveryLoginRequestHandler(request);
+        break;
+      case 'auth/recovery-login/verify':
+        resp = await recoveryLoginVerifyHandler(request);
+        break;
       case 'auth/password-reset/request':
         resp = await requestPasswordResetHandler(request);
         break;
@@ -841,20 +991,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/password-reset/confirm':
         resp = await confirmPasswordResetHandler(request);
-        break;
-      case 'activity':
-        resp = await activityHandler(request);
-        break;
-      case 'workspaces':
-        if (method === 'GET') resp = await listWorkspacesHandler(request);
-        else if (method === 'POST') resp = await createWorkspaceHandler(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'workspaces/delete':
-        resp = await deleteWorkspaceHandler(request);
-        break;
-      case 'workspaces/[id]':
-        resp = await deleteWorkspaceByIdHandler(request, (route as any).meta.workspaceId);
         break;
       case 'profile':
         resp = await extendedProfileHandler(request);
@@ -870,6 +1006,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'security/events':
         resp = await securityEventsHandler(request);
+        break;
+      case 'security/login-history':
+        resp = await loginHistoryHandler(request);
         break;
       case 'security/totp/setup':
         resp = await totpSetupHandler(request);
@@ -922,11 +1061,20 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'profile/avatar':
         resp = await avatarUploadHandler(request);
         break;
+      case 'profile/oauth/[provider]':
+        resp = await oauthUnlinkHandler(request, (route as any).meta.provider);
+        break;
       case 'notifications':
         resp = await notificationsHandler(request);
         break;
       case 'notifications/prefs':
         resp = await notificationPrefsHandler(request);
+        break;
+      case 'notifications/push':
+        resp = await sendTestPushHandler(request);
+        break;
+      case 'notifications/push/subscribe':
+        resp = await pushSubscriptionHandler(request);
         break;
       case 'integrations':
         resp = await integrationsHandler(request);
@@ -962,7 +1110,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await faqHandler(request);
         break;
       case 'districts':
-        resp = await districtsHandler(request);
+
         break;
       case 'developer/api-keys':
         resp = await apiKeysHandler(request);
@@ -970,40 +1118,50 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'developer/api-keys/[id]':
         resp = await apiKeyDeleteHandler(request, (route as any).meta.keyId);
         break;
-      case 'admin/reserved-addresses':
-        resp = await reservedAddressesHandler(request);
+
+      case 'admin/oauth/apps':
+        if (method === 'GET') resp = await oauthAdminAppsListHandler(request);
+        else resp = await oauthAdminAppsCreateHandler(request);
         break;
-      case 'admin/reserved-addresses/[id]':
-        resp = await reservedAddressDeleteHandler(request, (route as any).meta.addressId);
+      case 'admin/oauth/apps/[id]':
+        if (method === 'PATCH') resp = await oauthAdminAppsUpdateHandler(request, (route as any).meta.oauthAppId);
+        else if (method === 'DELETE') resp = await oauthAdminAppsDeleteHandler(request, (route as any).meta.oauthAppId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
+      case 'admin/oauth/clients':
+        resp = await oauthAdminClientsCreateHandler(request);
+        break;
+      case 'admin/oauth/clients/[id]':
+        if (method === 'PATCH') resp = await oauthAdminClientsUpdateHandler(request, (route as any).meta.oauthClientId);
+        else if (method === 'DELETE') resp = await oauthAdminClientsDeleteHandler(request, (route as any).meta.oauthClientId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
+      case 'admin/oauth/clients/[id]/secret':
+        resp = await oauthAdminClientsRegenerateSecretHandler(request, (route as any).meta.oauthClientId);
+        break;
+
+      case 'admin/help-articles':
+        if (method === 'GET') resp = await helpArticlesListHandler(request);
+        else resp = await helpArticlesCreateHandler(request);
+        break;
+      case 'admin/help-articles/[id]':
+        if (method === 'GET') resp = await helpArticleDetailHandler(request, (route as any).meta.helpArticleId);
+        else if (method === 'PATCH') resp = await helpArticlesUpdateHandler(request, (route as any).meta.helpArticleId);
+        else if (method === 'DELETE') resp = await helpArticlesDeleteHandler(request, (route as any).meta.helpArticleId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
+
       case 'admin/groups':
         resp = new NextResponse('Handled by standalone route', { status: 200 });
         break;
-      case 'admin/ous':
-        resp = new NextResponse('Handled by standalone route', { status: 200 });
-        break;
+
       case 'admin/integrations':
         resp = new NextResponse('Handled by standalone route', { status: 200 });
         break;
       case 'admin/security/score':
         resp = new NextResponse('Handled by standalone route', { status: 200 });
         break;
-      case 'user/mailbox':
-        if (method === 'GET') resp = await mailboxGetHandler(request);
-        else if (method === 'POST') resp = await mailboxCreateHandler(request);
-        else if (method === 'PUT') resp = await mailboxUpdateHandler(request);
-        else if (method === 'DELETE') resp = await mailboxDeleteHandler(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'user/mailbox/check':
-        resp = await mailboxCheckHandler(request);
-        break;
-      case 'user/mailbox/dns':
-        resp = await mailboxDnsHandler(request);
-        break;
-      case 'user/apps':
-        resp = await userAppsHandler(request);
-        break;
+
       case 'passkey/register/options':
         resp = await passkeyRegisterOptionsHandler(request);
         break;
@@ -1024,16 +1182,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         else if (method === 'PATCH') resp = await passkeyUpdateHandler(request, (route as any).meta.passkeyId);
         else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
-      case 'connected-accounts':
-        if (method === 'GET') resp = await connectedAccountsListHandler(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'connected-accounts/link':
-        resp = await connectedAccountsLinkHandler(request);
-        break;
-      case 'connected-accounts/[id]':
-        resp = await connectedAccountsDeleteHandler(request, (route as any).meta.accountId);
-        break;
+// connected-accounts routes removed (LinkedAccount model removed)
       case 'user/export-data':
         resp = await exportDataHandler(request);
         break;
@@ -1046,23 +1195,16 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/cli-token':
         resp = await cliTokenHandler(request);
         break;
-      case 'waitlist':
-        resp = await waitlistHandler(request);
-        break;
-      case 'feedback':
-        resp = method === 'GET' ? await adminFeedbackHandler(request) : await feedbackHandler(request);
-        break;
+
       case 'chat':
         resp = await chatHandler(request);
         break;
-      case 'admin/subscribers':
-        resp = await adminSubscribersHandler(request);
-        break;
-      case 'admin/feedback':
-        resp = await adminFeedbackHandler(request);
-        break;
+
       case 'auth/oauth/authorize':
         resp = await oauthAuthorizeHandler(request);
+        break;
+      case 'auth/oauth/consent':
+        resp = await oauthConsentInfoHandler(request);
         break;
       case 'auth/oauth/token':
         resp = await oauthTokenHandler(request);
@@ -1073,27 +1215,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'oidc/userinfo':
         resp = await oidcUserInfoHandler(request);
         break;
-      case 'network/follow':
-        resp = await followHandler(request);
-        break;
-      case 'network/following':
-        resp = await followingHandler(request);
-        break;
-      case 'network/followers':
-        resp = await followersHandler(request);
-        break;
-      case 'network/connections':
-        resp = await connectionsHandler(request);
-        break;
-      case 'profile-views':
-        resp = await profileViewsHandler(request);
-        break;
-      case 'profile-views/track':
-        resp = await profileViewTrackHandler(request);
-        break;
-      case 'analytics':
-        resp = await analyticsHandler(request);
-        break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
         break;
@@ -1101,35 +1222,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await adminEmailDetailHandler(request, (route as any).meta.emailId);
         break;
       // Content routes
-      case 'content/blogs':
-        resp = await blogListHandler(request);
-        break;
-      case 'content/blogs/create':
-        resp = await blogCreateHandler(request);
-        break;
-      case 'content/blogs/[id]':
-        if (method === 'GET') resp = await blogDetailHandler(request, (route as any).meta.blogId);
-        else if (method === 'PATCH') resp = await blogUpdateHandler(request, (route as any).meta.blogId);
-        else if (method === 'DELETE') resp = await blogDeleteHandler(request, (route as any).meta.blogId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'content/blogs/[id]/publish':
-        resp = await blogPublishHandler(request, (route as any).meta.blogId);
-        break;
-      case 'content/pages':
-        resp = await pageListHandler(request);
-        break;
-      case 'content/pages/create':
-        resp = await pageCreateHandler(request);
-        break;
-      case 'content/pages/[id]':
-        if (method === 'GET') resp = await pageDetailHandler(request, (route as any).meta.pageId);
-        else if (method === 'PATCH') resp = await pageUpdateHandler(request, (route as any).meta.pageId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'content/pages/[id]/publish':
-        resp = await pagePublishHandler(request, (route as any).meta.pageId);
-        break;
       case 'content/settings':
         resp = await settingsListHandler(request);
         break;
@@ -1142,15 +1234,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'content/feature-flags/update':
         resp = await featureFlagsUpdateHandler(request);
         break;
-      case 'content/plans':
-        resp = await plansListHandler(request);
-        break;
-      case 'content/plans/admin':
-        resp = await plansAdminListHandler(request);
-        break;
-      case 'content/plans/create':
-        resp = await plansCreateHandler(request);
-        break;
       case 'content/apps':
         resp = await appsListHandler(request);
         break;
@@ -1161,13 +1244,18 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await appsCreateHandler(request);
         break;
       case 'content/health':
-        resp = await systemHealthHandler(request);
+
         break;
       case 'content/incidents':
         resp = await incidentsListHandler(request);
         break;
       case 'content/incidents/create':
         resp = await incidentsCreateHandler(request);
+        break;
+      case 'content/incidents/[id]/events':
+        if (method === 'GET') resp = await incidentEventsListHandler(request, (route as any).meta.incidentId);
+        else if (method === 'POST') resp = await incidentEventsCreateHandler(request, (route as any).meta.incidentId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'content/jobs':
         resp = await jobsListHandler(request);
@@ -1202,6 +1290,11 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'support/tickets/[id]/reopen':
         resp = await ticketReopenHandler(request, (route as any).meta.ticketId);
         break;
+      case 'support/tickets/[id]/attachments':
+        if (method === 'GET') resp = await ticketAttachmentsListHandler(request, (route as any).meta.ticketId);
+        else if (method === 'POST') resp = await ticketAttachmentsUploadHandler(request, (route as any).meta.ticketId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
       case 'support/queues':
         resp = await queuesListHandler(request);
         break;
@@ -1211,6 +1304,21 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'health':
         resp = await publicHealthHandler();
         break;
+      case 'health/pool':
+        resp = await poolHealthHandler(request);
+        break;
+      case 'debug/cache':
+        resp = await cacheDebugHandler(request);
+        break;
+      case 'debug/cache/reset':
+        resp = await cacheResetDebugHandler(request);
+        break;
+      case 'debug/rate-limits/reset': {
+        const { clearRateLimits } = await import('../../../lib/captcha/risk');
+        clearRateLimits();
+        resp = NextResponse.json({ success: true, message: 'Rate limits cleared' });
+        break;
+      }
       case 'content/health':
         resp = await detailedHealthHandler(request);
         break;
@@ -1221,7 +1329,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           resp = jsonForbidden();
           break;
         }
-        const jobBody = await request.json();
+        const jobBody: any = await request.json();
         const job = await createJob(jobBody.type, jobBody.payload || {}, jobBody.queue || 'default', jobBody.maxAttempts || 3);
         resp = NextResponse.json(job, { status: 201 });
         break;
@@ -1239,10 +1347,17 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       }
       // Form routes
       case 'forms':
-        resp = await listForms(request);
+        if (method === 'POST') resp = await createForm(request);
+        else resp = await listForms(request);
+        break;
+      case 'forms/my-responses':
+        resp = await listMyResponses(request);
         break;
       case 'forms/create':
         resp = await createForm(request);
+        break;
+      case 'forms/import':
+        resp = await importForm(request);
         break;
       case 'forms/[id]':
         if (method === 'GET') resp = await getForm(request, (route as any).meta.formId);
@@ -1259,16 +1374,28 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'forms/[id]/responses':
         resp = await listResponses(request, (route as any).meta.formId);
         break;
+      case 'forms/[id]/overview':
+        resp = await getFormOverview(request, (route as any).meta.formId);
+        break;
       case 'forms/[id]/analytics':
         resp = await getFormAnalytics(request, (route as any).meta.formId);
         break;
+      case 'forms/[id]/pages':
+        if (method === 'GET') resp = await formPagesListHandler(request, (route as any).meta.formId);
+        else if (method === 'POST') resp = await formPagesCreateHandler(request, (route as any).meta.formId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
       case 'forms/[id]/settings':
         if (method === 'GET') resp = await getFormSettings(request, (route as any).meta.formId);
-        else if (method === 'PATCH') resp = await updateFormSettings(request, (route as any).meta.formId);
+        else if (method === 'PATCH' || method === 'PUT') resp = await updateFormSettings(request, (route as any).meta.formId);
         else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'forms/[id]/export':
         resp = await exportResponses(request, (route as any).meta.formId);
+        break;
+      case 'forms/[id]/webhook/test':
+        if (method === 'POST') resp = await testFormWebhook(request, (route as any).meta.formId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'forms/[id]/collaborators':
         if (method === 'GET') resp = await listCollaborators(request, (route as any).meta.formId);
@@ -1290,11 +1417,37 @@ case 'forms/[id]/responses/[responseId]':
          else if (method === 'DELETE') resp = await deleteResponse(request, (route as any).meta.formId, (route as any).meta.responseId);
          else resp = new NextResponse('Method not allowed', { status: 405 });
          break;
+      case 'forms/[id]/responses/[responseId]/answers':
+         if (method === 'GET') resp = await responseAnswersListHandler(request, (route as any).meta.responseId);
+         else resp = new NextResponse('Method not allowed', { status: 405 });
+         break;
+      case 'forms/[id]/responses/[responseId]/notes':
+         if (method === 'GET') resp = await responseNotesListHandler(request, (route as any).meta.responseId);
+         else if (method === 'POST') resp = await responseNotesCreateHandler(request, (route as any).meta.responseId);
+         else resp = new NextResponse('Method not allowed', { status: 405 });
+         break;
       case 'forms/public':
         resp = await publicDirectory(request);
         break;
       case 'forms/directory':
         resp = await publicDirectory(request);
+        break;
+      case 'form-settings':
+        if (method === 'GET') resp = await getFormSettingsHandler(request);
+        else if (method === 'PATCH') resp = await updateFormSettingsHandler(request);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
+      case 'templates':
+        if (method === 'GET') resp = await listTemplates(request);
+        else if (method === 'POST') resp = await createTemplate(request);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
+      case 'templates/[id]/use':
+        resp = await useTemplate(request, (route as any).meta.templateId);
+        break;
+      case 'templates/[id]':
+        if (method === 'DELETE') resp = await deleteTemplate(request, (route as any).meta.templateId);
+        else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'forms/public/[publicId]':
         resp = await getPublicForm(request, (route as any).meta.publicId);
@@ -1310,17 +1463,22 @@ case 'forms/[id]/responses/[responseId]':
       resp = NextResponse.json({ error: 'Internal server error' }, { status: 500 });
     }
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: resp.status });
-    return resp;
+    return addRateLimitHeaders(resp);
   }
 
   let userRole = 'guest';
   if (session?.userId) {
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      include: { roles: { include: { role: true } } },
-    });
-    const firstRole = user?.roles?.[0]?.role;
-    userRole = firstRole?.name?.toLowerCase() || 'member';
+    try {
+      const user = await prisma.user.findUnique({
+        where: { id: session.userId },
+        include: { roles: { include: { role: true } } },
+      });
+      const firstRole = user?.roles?.[0]?.role;
+      userRole = firstRole?.name?.toLowerCase() || 'member';
+    } catch (e: any) {
+      console.error('[HANDLER] DB query failed during role lookup:', e?.message);
+      userRole = 'guest';
+    }
   }
   if (!route.allowedRoles.includes(userRole)) {
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
@@ -1391,5 +1549,5 @@ case 'forms/[id]/responses/[responseId]':
   });
 
   await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: upstreamResponse.status });
-  return response;
+  return addRateLimitHeaders(response);
 }

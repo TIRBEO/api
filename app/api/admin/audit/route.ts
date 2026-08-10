@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/session';
+import { withAdmin } from '@/lib/role-guard';
 import { listAuditEvents, createAuditEvent } from '../../../../lib/audit';
 
-export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const GET = withAdmin(async (request, session) => {
 
   const sp = request.nextUrl.searchParams;
   const result = await listAuditEvents({
@@ -18,13 +16,11 @@ export async function GET(request: NextRequest) {
     to: sp.get('to') || undefined,
   });
   return NextResponse.json(result);
-}
+});
 
-export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const POST = withAdmin(async (request, session) => {
 
-  const body = await request.json();
+  const body: any = await request.json();
   await createAuditEvent({
     actorId: session.userId,
     action: body.action,
@@ -34,4 +30,4 @@ export async function POST(request: NextRequest) {
     severity: body.severity,
   });
   return NextResponse.json({ ok: true });
-}
+});

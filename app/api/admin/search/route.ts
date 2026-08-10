@@ -29,27 +29,18 @@ export async function GET(request: NextRequest) {
   const q = (request.nextUrl.searchParams.get('q') || '').trim().toLowerCase();
   if (!q) return NextResponse.json({ pages: [], users: [], routes: [] });
 
-  const [users, routes] = await Promise.all([
-    prisma.user.findMany({
-      where: {
-        OR: [
-          { email: { contains: q, mode: 'insensitive' } },
-          { name: { contains: q, mode: 'insensitive' } },
-        ],
-      },
-      select: { id: true, email: true, name: true, roles: { include: { role: true } } },
-      take: 5,
-    }),
-    prisma.route.findMany({
-      where: {
-        OR: [
-          { path: { contains: q, mode: 'insensitive' } },
-        ],
-      },
-      select: { id: true, path: true, method: true },
-      take: 5,
-    }),
-  ]);
+  const users = await prisma.user.findMany({
+    where: {
+      OR: [
+        { email: { contains: q, mode: 'insensitive' } },
+        { name: { contains: q, mode: 'insensitive' } },
+      ],
+    },
+    select: { id: true, email: true, name: true, roles: { include: { role: true } } },
+    take: 5,
+  });
+
+  const routes: any[] = []; // Route model removed
 
   const pages = SEARCHABLE_PAGES.filter(p =>
     p.label.toLowerCase().includes(q) || p.url.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)

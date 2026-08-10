@@ -21,7 +21,7 @@ export async function PUT(request: Request) {
   const session = await requireAdmin(request as any);
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const existing = await prisma.setting.findUnique({
     where: { key: PREFERENCES_KEY(session.userId) },
     select: { value: true },

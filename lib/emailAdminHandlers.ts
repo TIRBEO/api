@@ -22,7 +22,7 @@ export async function emailConfigHandler(request: NextRequest) {
     }
 
     if (request.method === 'PATCH') {
-      const body = await request.json();
+      const body: any = await request.json();
       const schema = z.object({
         provider: z.enum(['resend', 'smtp']).optional(),
         resendApiKey: z.string().optional(),
@@ -79,7 +79,7 @@ export async function emailTemplatesHandler(request: NextRequest) {
     }
 
     if (request.method === 'POST') {
-      const body = await request.json();
+      const body: any = await request.json();
       const schema = z.object({
         name: z.string().min(1),
         label: z.string().min(1),
@@ -122,7 +122,7 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
     }
 
     if (request.method === 'PATCH') {
-      const body = await request.json();
+      const body: any = await request.json();
       const schema = z.object({
         label: z.string().min(1).optional(),
         subject: z.string().min(1).optional(),
@@ -156,7 +156,7 @@ export async function emailTestHandler(request: NextRequest) {
     const session = await requireAdmin(request);
     if (session instanceof NextResponse) return session;
 
-    const body = await request.json();
+    const body: any = await request.json();
     const schema = z.object({
       to: z.string().email(),
       templateName: z.string().optional(),
@@ -239,7 +239,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'POST') {
-      const body = await request.json();
+      const body: any = await request.json();
       const schema = z.object({
         to: z.string().email(),
         subject: z.string().min(1),

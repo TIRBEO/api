@@ -5,18 +5,28 @@ import { prisma } from '@/lib/db/prisma';
 export async function POST(request: NextRequest) {
   try {
     const session = await getSession(request);
-    const body = await request.json();
-    const { subject, title, message, description, category, priority, rayId, email } = body;
+    const body: any = await request.json();
+    const { subject, title, message, description, category, priority, rayId, email, imageUrls } = body;
 
-    if (!(subject || title) || !(message || description)) {
+    const images = Array.isArray(imageUrls)
+      ? imageUrls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\/\S+$/i.test(u)).slice(0, 6)
+      : [];
+
+    if (!(subject || title) || (!(message || description) && images.length === 0)) {
       return NextResponse.json({ error: 'Subject and message are required' }, { status: 400 });
     }
+
+    const baseDescription = message || description ? sanitizeInput(message || description, 20000) : '';
+    const fullDescription = [baseDescription, ...images.map((u: string) => `![tirbeo-img](${u})`)]
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 20000);
 
     const ticket = await prisma.ticket.create({
       data: {
         customerId: session?.userId,
         subject: sanitizeInput(subject || title, 300),
-        description: message || description ? sanitizeInput(message || description, 20000) : undefined,
+        description: fullDescription || undefined,
         category: category || 'general',
         priority: priority || 'normal',
         status: 'open',

@@ -7,7 +7,7 @@ import { randomInt } from 'crypto';
 const OTP_TTL_MINUTES = 10;
 
 export function generateOtpCode(): string {
-  return randomInt(100000, 1000000).toString();
+  return (randomInt as Function)(100000, 1000000).toString();
 }
 
 export async function storeSignupOtp(email: string, code: string) {

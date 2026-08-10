@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
   if (session instanceof NextResponse) return session;
 
   try {
-    const body = await request.json();
+    const body: any = await request.json();
     const allowed: Record<string, unknown> = {};
     if (typeof body.enabled === 'boolean') allowed.enabled = body.enabled;
     if (typeof body.riskEnabled === 'boolean') allowed.riskEnabled = body.riskEnabled;

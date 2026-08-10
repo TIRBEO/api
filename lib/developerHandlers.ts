@@ -9,7 +9,7 @@ function hashKey(key: string): string {
 
 function generateKey(): string {
   const bytes = randomBytes(32);
-  return 'tb_' + bytes.toString('base64url');
+  return 'tb_' + Buffer.from(bytes).toString('base64url');
 }
 
 export async function apiKeysHandler(request: NextRequest) {
@@ -27,7 +27,7 @@ export async function apiKeysHandler(request: NextRequest) {
     }
 
     if (request.method === 'POST') {
-      const body = await request.json();
+      const body: any = await request.json();
       const name = (body.name || '').trim();
       if (!name || name.length > 100) {
         return NextResponse.json({ error: 'Invalid key name' }, { status: 400 });

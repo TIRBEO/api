@@ -1,23 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/session';
+import { withAdmin } from '@/lib/role-guard';
 import { prisma } from '../../../../lib/db/prisma';
 
-export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const GET = withAdmin(async (request, session) => {
 
   const theme = await prisma.themeConfig.findFirst({ where: { isActive: true } });
   if (!theme) {
     return NextResponse.json(getDefaultTheme());
   }
   return NextResponse.json(theme);
-}
+});
 
-export async function PUT(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const PUT = withAdmin(async (request, session) => {
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { id, ...data } = body;
 
   if (id) {
@@ -28,22 +24,18 @@ export async function PUT(request: NextRequest) {
     const created = await prisma.themeConfig.create({ data: { ...data, isActive: true } });
     return NextResponse.json(created);
   }
-}
+});
 
-export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const POST = withAdmin(async (request, session) => {
 
-  const body = await request.json();
+  const body: any = await request.json();
 
   await prisma.themeConfig.updateMany({ where: { isActive: true }, data: { isActive: false } });
   const theme = await prisma.themeConfig.create({ data: { ...body, isActive: true } });
   return NextResponse.json(theme);
-}
+});
 
-export async function DELETE(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const DELETE = withAdmin(async (request, session) => {
 
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
@@ -61,7 +53,7 @@ export async function DELETE(request: NextRequest) {
 
   await prisma.themeConfig.delete({ where: { id } });
   return NextResponse.json({ success: true });
-}
+});
 
 function getDefaultTheme() {
   return {

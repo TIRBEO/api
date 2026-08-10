@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/db/prisma';
-import { requireAdmin } from '../../../../lib/session';
+import { withAdmin } from '@/lib/role-guard';
 import { getBranding, clearBrandingCache, normalizeLogoUrl, getApiOrigin } from '../../../../lib/branding';
 import { createAuditEvent } from '../../../../lib/audit';
 import { v4 as uuidv4 } from 'uuid';
@@ -43,22 +43,15 @@ function allowedLogoFields(body: Record<string, unknown>) {
   return out;
 }
 
-export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
-
-  const branding = await getBranding(true);
-  return NextResponse.json({
-    branding,
+export const GET = withAdmin(async (request, session) => {  const branding = await getBranding(true);
+  return NextResponse.json({ branding,
     imageOrigin: branding.logoUrl ? undefined : '',
   });
-}
+});
 
-export async function PUT(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const PUT = withAdmin(async (request, session) => {
 
-  const body = await request.json();
+  const body: any = await request.json();
   const fields = allowedLogoFields(body as Record<string, unknown>);
   if (Object.keys(fields).length === 0) {
     return NextResponse.json({ error: 'No valid branding fields provided' }, { status: 400 });
@@ -97,11 +90,9 @@ export async function PUT(request: NextRequest) {
 
   const branding = await getBranding(true);
   return NextResponse.json({ config, branding });
-}
+});
 
-export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const POST = withAdmin(async (request, session) => {
 
   const formData = await request.formData();
   const file = formData.get('file') as File | null;
@@ -181,4 +172,4 @@ export async function POST(request: NextRequest) {
 
   const branding = await getBranding(true);
   return NextResponse.json({ config, branding, url }, { status: 201 });
-}
+});

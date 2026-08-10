@@ -311,14 +311,17 @@ export async function getEffectivePermissions(userId: string): Promise<Permissio
   });
   if (!user) return {};
 
+  // Normalize legacy/underscore variants (e.g. "superadmin" -> "super_admin")
+  const role = (user.adminRole || '').replace(/^superadmin$/, 'super_admin');
+
   // super_admin gets ALL
-  if (user.adminRole === 'super_admin') {
+  if (role === 'super_admin') {
     return { ...ALL_PERMISSIONS };
   }
 
   // Legacy admin/manager/editor get mapped permissions
-  if (user.adminRole && user.adminRole in LEGACY_ROLE_PERMISSIONS) {
-    return { ...LEGACY_ROLE_PERMISSIONS[user.adminRole] };
+  if (role && role in LEGACY_ROLE_PERMISSIONS) {
+    return { ...LEGACY_ROLE_PERMISSIONS[role] };
   }
 
   // Check assigned roles

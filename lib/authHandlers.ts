@@ -2,31 +2,61 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from './db/prisma';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
-import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail } from './auth/signup-otp';
-import { hashPassword, verifyPassword, hashOtpCode } from './auth/password';
+import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from './auth/signup-otp';
+import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken } from './auth/jwt';
+
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
-import { sanitizeInput } from './security';
+import { sanitizeInput, logSecurityEvent } from './security';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, verifyPasswordReset, confirmPasswordReset } from './auth/password-reset';
 import { createAuditEvent } from './audit';
 import { enforceResendCooldown } from './auth/resend-cooldown';
 import { checkPasswordBreach } from './auth/breach';
 import { jsonUnauthorized } from './response';
+import { createNotification } from './notifications';
+import { createTtlCache } from './cache';
+import { logPerformance } from './perf';
+import { SignJWT } from 'jose';
+import { checkWindowLimit, computeRiskScore, recordDeviceSeen } from './captcha/risk';
+import { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied, hasRecentLoginSuccess, getCaptchaSettings } from './captcha/service';
+import { recordRateLimitHit, clearRateLimitHits } from './auth/suspicious-activity';
+
+// Cache email existence lookups (login/signup fire these on every debounced
+// keystroke). Results are almost never changed mid-session, so a 30s TTL is
+// safe and removes a DB round-trip per keystroke.
+const emailExistsCache = createTtlCache<{ exists: boolean; hasPassword: boolean; photoUrl: string | null; name: string | null }>(30_000, 5000, 'emailExists');
+
+// Cache for GET /api/users/me — dashboard polls this frequently.
+// 10s TTL: stale data is acceptable for profile display, and bust on PATCH.
+const profileCache = createTtlCache<any>(10_000, 2000, 'profile');
+function bustProfileCache(userId: string) { profileCache.delete(userId); }
 
 export async function sessionHandler(request: NextRequest) {
+  const startTime = performance.now();
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
+    
+    // Check cache first — dashboard polls this frequently
+    const cached = profileCache.get(session.userId);
+    if (cached) {
+      logPerformance('auth/session/cache', startTime);
+      return NextResponse.json({ user: cached });
+    }
+    
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { id: true, email: true, name: true, photoUrl: true, is2FAEnabled: true, adminRole: true, roles: { include: { role: true } }, emailVerified: true, preferences: true },
     });
     if (!user) return jsonUnauthorized();
     const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    return NextResponse.json({ user: { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, preferences: user.preferences } });
+    const userData = { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, preferences: user.preferences };
+    profileCache.set(session.userId, userData);
+    logPerformance('auth/session', startTime);
+    return NextResponse.json({ user: userData });
   } catch (err: any) {
     console.error('[SESSION]', err?.message || err);
     return new NextResponse('Failed to fetch session', { status: 500 });
@@ -34,28 +64,83 @@ export async function sessionHandler(request: NextRequest) {
 }
 
 export async function refreshHandler(request: NextRequest) {
+  const startTime = performance.now();
+  const ip = getIp(request);
+  const userAgent = request.headers.get('user-agent') || undefined;
+  
   try {
     const refreshToken = request.cookies.get(REFRESH_COOKIE_NAME)?.value;
     if (!refreshToken) {
+      console.log('[REFRESH] No refresh token in cookie');
       const res = new NextResponse('Refresh token missing', { status: 401 });
-      clearSessionCookie(res);
+      clearSessionCookie(res, request);
       return res;
     }
-    const result = await rotateRefreshToken(refreshToken, getIp(request), request.headers.get('user-agent') || undefined);
+
+    // Attempt token rotation with retry for transient failures
+    let result = null;
+    let lastError: any = null;
+    
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        result = await rotateRefreshToken(refreshToken, ip, userAgent);
+        if (result) break; // Success
+      } catch (err: any) {
+        lastError = err;
+        console.error(`[REFRESH] Attempt ${attempt} failed:`, err?.message);
+        // Only retry on transient errors (network, timeout)
+        if (attempt < 2 && isTransientError(err)) {
+          await new Promise(r => setTimeout(r, 100 * attempt));
+          continue;
+        }
+        break;
+      }
+    }
+
     if (!result) {
-      const res = new NextResponse('Session expired', { status: 401 });
-      clearSessionCookie(res);
+      console.log('[REFRESH] Token rotation failed, clearing session');
+      const res = new NextResponse(
+        lastError?.message || 'Session expired', 
+        { status: 401 }
+      );
+      clearSessionCookie(res, request);
       return res;
     }
-    const res = NextResponse.json({ token: result.token, sessionId: result.sessionId });
-    setSessionCookie(res, result.token, result.refreshToken);
+
+    // Create response with new tokens
+    const res = NextResponse.json({ 
+      token: result.token, 
+      sessionId: result.sessionId 
+    });
+    
+    // Always set cookies, even if there was a previous error
+    setSessionCookie(res, result.token, result.refreshToken, request);
+    
+    logPerformance('auth/refresh', startTime);
     return res;
+    
   } catch (err: any) {
-    console.error('[REFRESH]', err?.message || err);
+    console.error('[REFRESH] Unhandled error:', err?.message || err);
     const res = new NextResponse('Refresh failed', { status: 500 });
-    clearSessionCookie(res);
+    // On error, try to preserve existing cookies if possible
+    // Only clear if we're sure the session is invalid
+    if (!isTransientError(err)) {
+      clearSessionCookie(res, request);
+    }
     return res;
   }
+}
+
+/** Check if an error is transient (worth retrying) */
+function isTransientError(err: any): boolean {
+  if (!err) return false;
+  const msg = err.message?.toLowerCase() || '';
+  // Network errors, timeouts, rate limits are transient
+  return msg.includes('timeout') || 
+         msg.includes('network') || 
+         msg.includes('econnreset') ||
+         msg.includes('rate limit') ||
+         msg.includes('too many');
 }
 
 function getIp(request: NextRequest): string | null {
@@ -174,23 +259,29 @@ const loginSchema = z.object({
   password: z.string().min(1),
   turnstileToken: z.string().optional(),
   captchaRayId: z.string().optional(),
+  emailVerified: z.boolean().optional(),
   fingerprint: z.string().optional(),
 });
 
 export async function loginHandler(request: NextRequest) {
+  const loginStartTime = performance.now();
   try {
     const parsed = loginSchema.safeParse(await request.json());
     if (!parsed.success) {
       return new NextResponse('Invalid email or password', { status: 400 });
     }
-    const { email, password, captchaRayId, fingerprint } = parsed.data;
+    const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
+
+    const fingerprint = bodyFingerprint
+      || request.cookies.get('__dfp')?.value
+      || request.headers.get('x-device-fingerprint')
+      || '';
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
     const sessionId = captchaSession;
 
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
     }
@@ -200,7 +291,6 @@ export async function loginHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, roles: { include: { role: true } } } });
     if (!user) {
-      const { logSecurityEvent } = await import('./security');
       logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
     }
@@ -217,9 +307,17 @@ export async function loginHandler(request: NextRequest) {
     // Progressive friction: if this account/IP has prior failed-attempt history,
     // require a CAPTCHA before revealing password validity — so automated
     // password-spraying is challenged before the lockout threshold is reached.
-    const { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
-    const warnings = await getUserWarningCount(user.id, ip);
-    const forceCaptcha = warnings.recentBlocks > 0 || warnings.count >= 2;
+    // A recent successful login from this IP clears the friction (risk resets
+    // when traffic normalizes).
+
+    // Parallelize DB queries for speed
+    const [warnings, provenIdentity, passwordValid] = await Promise.all([
+      getUserWarningCount(user.id, ip),
+      hasRecentLoginSuccess(ip),
+      verifyPassword(user.passwordHash, password),
+    ]);
+    
+    const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
     if (forceCaptcha) {
       const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
       const check = await assertCaptchaSatisfied({
@@ -235,20 +333,26 @@ export async function loginHandler(request: NextRequest) {
       }
     }
 
-    if (!(await verifyPassword(user.passwordHash, password))) {
-      const { logSecurityEvent } = await import('./security');
-      const { recordRateLimitHit } = await import('./auth/suspicious-activity');
+    if (!passwordValid) {
       recordRateLimitHit(ip);
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'wrong_password' } }).catch(() => {});
+      // Record failed login attempt
+      prisma.login_history.create({
+        data: {
+          userId: user.id,
+          email: user.email,
+          ipAddress: ip,
+          userAgent: userAgent || null,
+          success: false,
+          method: 'password',
+        },
+      }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
     }
 
-    const captchaSettings = (await import('./captcha/service')).getCaptchaSettings;
-    const settings = await captchaSettings();
+    const settings = await getCaptchaSettings();
 
     if (settings.enabled) {
-      const { computeRiskScore } = await import('./captcha/risk');
-      const { getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
       const risk = settings.riskEnabled
         ? await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true })
         : null;
@@ -275,32 +379,57 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ needs2FA: true, tempToken });
     }
 
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
-    const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token, refreshToken);
-
-    const { recordDeviceSeen } = await import('./captcha/risk');
-    recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
-
+    // Suspicious sign-in from a new IP / location (no 2FA configured): challenge
+    // with an email OTP before issuing a session instead of logging in directly.
     const lastSession = await prisma.session.findFirst({
-      where: { userId: user.id, id: { not: newSessionId }, status: { not: 'revoked' } },
+      where: { userId: user.id, status: { not: 'revoked' } },
       orderBy: { createdAt: 'desc' },
       select: { id: true, ipAddress: true },
     });
-
     const isNewIp = !lastSession || lastSession.ipAddress !== ip;
     if (isNewIp) {
-      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-      sendTemplateEmail(user.email, 'login_alert', {
+      return NextResponse.json({ needsOtp: true });
+    }
+
+    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
+    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    // Fire-and-forget: clear rate limits, log security event, create notification, record device
+    // These should NOT block the login response
+    Promise.allSettled([
+      Promise.resolve(clearRateLimitHits(ip)),
+      Promise.resolve(logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_success', details: { reason: 'password' } })),
+      Promise.resolve(createNotification({
+        userId: user.id,
+        type: 'system',
+        title: 'Signed in to your account',
+        body: `New login from ${userAgent || 'Unknown device'}`,
+        link: '/dashboard/settings/security',
+      })),
+      Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
+      // Record login history for the Login History section
+      prisma.login_history.create({
+        data: {
+          userId: user.id,
+          email: user.email,
+          ipAddress: ip,
+          userAgent: userAgent || null,
+          success: true,
+          method: 'password',
+        },
+      }).catch(() => {}),
+      ...(isNewIp ? [sendTemplateEmail(user.email, 'login_alert', {
         name: user.email.split('@')[0],
         location: 'Unknown',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
-        revokeUrl: `https://dashboard.${appDomain}/settings/sessions`,
-      }).catch(() => {});
-    }
+        revokeUrl: `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}/settings/sessions`,
+      })] : []),
+    ]).catch(() => {});
 
+    logPerformance('auth/login', loginStartTime, { userId: user.id, isNewIp });
     return res;
   } catch (err: any) {
     console.error('[LOGIN]', err?.message || err);
@@ -308,20 +437,27 @@ export async function loginHandler(request: NextRequest) {
   }
 }
 
-export async function adminLoginHandler(request: NextRequest) {
+export async function adminLoginHandler(request: NextRequest, preParsed?: z.infer<typeof loginSchema>) {
   try {
-    const parsed = loginSchema.safeParse(await request.json());
+    const parsed = preParsed ? { success: true as const, data: preParsed } : loginSchema.safeParse(await request.json());
     if (!parsed.success) {
       return new NextResponse('Invalid email or password', { status: 400 });
     }
-    const { email, password, captchaRayId, fingerprint } = parsed.data;
+    const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
+
+    // The CaptchaWidget stores the device fingerprint in the __dfp cookie — fall
+    // back to it (and the x-device-fingerprint header) so the risk score and
+    // required difficulty match the challenge the user actually solved.
+    const fingerprint = bodyFingerprint
+      || request.cookies.get('__dfp')?.value
+      || request.headers.get('x-device-fingerprint')
+      || '';
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
     const sessionId = captchaSession;
 
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`admin:login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
     }
@@ -331,10 +467,9 @@ export async function adminLoginHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { email: email.toLowerCase() },
-      select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, roles: { include: { role: true } } },
+      select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, mustChangePassword: true, roles: { include: { role: true } } },
     });
     if (!user) {
-      const { logSecurityEvent } = await import('./security');
       logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
     }
@@ -351,9 +486,11 @@ export async function adminLoginHandler(request: NextRequest) {
     // Progressive friction: if this account/IP has prior failed-attempt history,
     // require a CAPTCHA before revealing password validity — so automated
     // password-spraying is challenged before the lockout threshold is reached.
-    const { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
+    // A recent successful login from this IP clears the friction.
+
     const warnings = await getUserWarningCount(user.id, ip);
-    const forceCaptcha = warnings.recentBlocks > 0 || warnings.count >= 2;
+    const provenIdentity = await hasRecentLoginSuccess(ip);
+    const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
     if (forceCaptcha) {
       const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
       const check = await assertCaptchaSatisfied({
@@ -370,15 +507,12 @@ export async function adminLoginHandler(request: NextRequest) {
     }
 
     if (!(await verifyPassword(user.passwordHash, password))) {
-      const { logSecurityEvent } = await import('./security');
-      const { recordRateLimitHit } = await import('./auth/suspicious-activity');
       recordRateLimitHit(ip);
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'wrong_password' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
     }
 
     if (!user.adminRole && !user.roles?.[0]?.role) {
-      const { logSecurityEvent } = await import('./security');
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'not_admin' } }).catch(() => {});
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',
@@ -389,12 +523,9 @@ export async function adminLoginHandler(request: NextRequest) {
       return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
     }
 
-    const captchaSettings = (await import('./captcha/service')).getCaptchaSettings;
-    const settings = await captchaSettings();
+    const settings = await getCaptchaSettings();
 
     if (settings.enabled) {
-      const { computeRiskScore } = await import('./captcha/risk');
-      const { getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
       const risk = settings.riskEnabled
         ? await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true })
         : null;
@@ -421,12 +552,21 @@ export async function adminLoginHandler(request: NextRequest) {
       return NextResponse.json({ needs2FA: true, tempToken });
     }
 
+    // First-time admins (created with a temporary password) must set their own
+    // password before any admin session is issued.
+    if (user.mustChangePassword) {
+      const tempToken = await signTempPasswordChangeToken(user.id);
+      return NextResponse.json({ needsPasswordChange: true, tempToken });
+    }
+
     const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
     const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
 
-    const { recordDeviceSeen } = await import('./captcha/risk');
+    clearRateLimitHits(ip);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_success', details: { reason: 'password' } }).catch(() => {});
+
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
 
     const lastSession = await prisma.session.findFirst({
@@ -456,13 +596,13 @@ export async function adminLoginHandler(request: NextRequest) {
 
 export async function verify2faLoginHandler(request: NextRequest) {
   try {
-    const { tempToken, token: totpCode } = await request.json();
-    if (typeof tempToken !== 'string' || typeof totpCode !== 'string') {
+    const { tempToken, token: totpToken, code } = (await request.json()) as any;
+    const totpCode = (typeof totpToken === 'string' && totpToken) || (typeof code === 'string' && code) || '';
+    if (typeof tempToken !== 'string' || totpCode.length === 0) {
       return new NextResponse('Invalid payload', { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`2fa:ip:${clientIp}`, 15, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -480,14 +620,16 @@ export async function verify2faLoginHandler(request: NextRequest) {
     }
 
     if (!await verifyTotp(totpCode, user.totpSecret)) {
-      const { logSecurityEvent } = await import('./security');
       logSecurityEvent({ request, userId, eventType: 'auth.2fa_failed', details: { reason: 'invalid_code' } }).catch(() => {});
       return new NextResponse('Invalid 2FA code', { status: 401 });
     }
 
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
+
+    clearRateLimitHits(clientIp);
+    logSecurityEvent({ request, userId, eventType: 'auth.login_2fa_success', details: { reason: 'totp' } }).catch(() => {});
     return res;
   } catch {
     return new NextResponse('2FA verification failed', { status: 400 });
@@ -496,13 +638,12 @@ export async function verify2faLoginHandler(request: NextRequest) {
 
 export async function recovery2faLoginHandler(request: NextRequest) {
   try {
-    const { tempToken, recoveryCode } = await request.json();
+    const { tempToken, recoveryCode } = (await request.json()) as any;
     if (typeof tempToken !== 'string' || typeof recoveryCode !== 'string') {
       return new NextResponse('Invalid payload', { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`2fa-recovery:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -519,7 +660,6 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       where: { userId, used: false },
       orderBy: { createdAt: 'asc' },
     });
-    const { hashRecoveryCode } = await import('./auth/password');
     const inputHash = hashRecoveryCode(recoveryCode);
     const rc = codes.find(c => c.code === inputHash) || null;
     if (!rc) return new NextResponse('Invalid recovery code', { status: 401 });
@@ -539,7 +679,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
     return res;
   } catch {
     return new NextResponse('Recovery code verification failed', { status: 400 });
@@ -551,18 +691,19 @@ const signupSchema = z.object({
   password: z.string().min(8),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
-  username: z.string().min(3).optional().or(z.literal('')),
+  username: z.string().min(3).max(30),
   dob: z.string().optional(),
   gender: z.string().optional(),
   photoUrl: z.string().url().optional().or(z.literal('')),
-  occupation: z.string().min(1),
+  occupation: z.string().optional(),
   companyName: z.string().optional().or(z.literal('')),
   policyAccepted: z.boolean(),
   adminDataAccess: z.boolean().optional(),
-  signatureDataUrl: z.string().min(20),
-  signatureName: z.string().min(1),
+  
+  
   turnstileToken: z.string().optional(),
   captchaRayId: z.string().optional(),
+  emailVerified: z.boolean().optional(),
   fingerprint: z.string().optional(),
   // Optional pre-verified signup OTP (requested via auth/signup-otp/request,
   // verified without consuming via auth/signup-otp/verify). When valid, the
@@ -572,22 +713,63 @@ const signupSchema = z.object({
 
 export async function emailExistsHandler(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body: any = await request.json();
     const email = (body?.email || '').toString().toLowerCase().trim();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return NextResponse.json({ exists: false, hasPassword: false }, { status: 200 });
     }
+    const cached = emailExistsCache.get(email);
+    if (cached) return NextResponse.json(cached, { status: 200 });
+
     const user = await prisma.user.findUnique({
       where: { email },
-      select: { id: true, passwordHash: true },
+      select: { id: true, passwordHash: true, photoUrl: true, name: true },
     });
-    return NextResponse.json({
+    const result = {
       exists: !!user,
       hasPassword: !!user?.passwordHash,
-    }, { status: 200 });
+      photoUrl: user?.photoUrl || null,
+      name: user?.name || null,
+    };
+    emailExistsCache.set(email, result);
+    return NextResponse.json(result, { status: 200 });
   } catch (err: any) {
     console.error('[EMAIL-EXISTS]', err?.message || err);
     return NextResponse.json({ error: 'Could not check email' }, { status: 500 });
+  }
+}
+
+export async function usernameExistsHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    const username = (body?.username || '').toString().toLowerCase().trim();
+    
+    // Validate username format: lowercase alphanumeric with hyphens, 3-30 chars
+    if (!username || username.length < 3 || username.length > 30) {
+      return NextResponse.json({ exists: false, valid: false }, { status: 200 });
+    }
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(username)) {
+      return NextResponse.json({ exists: false, valid: false }, { status: 200 });
+    }
+    
+    // Check for reserved words
+    const reserved = ['admin', 'api', 'www', 'mail', 'support', 'help', 'info', 'blog', 'docs', 'status', 'app', 'web', 'dev', 'test', 'null', 'undefined', 'true', 'false', 'root', 'system', 'settings', 'config', 'auth', 'login', 'signup', 'dashboard'];
+    if (reserved.includes(username)) {
+      return NextResponse.json({ exists: true, valid: true, reserved: true }, { status: 200 });
+    }
+    
+    const user = await prisma.user.findUnique({
+      where: { username },
+      select: { id: true },
+    });
+    return NextResponse.json({
+      exists: !!user,
+      valid: true,
+      reserved: false,
+    }, { status: 200 });
+  } catch (err: any) {
+    console.error('[USERNAME-EXISTS]', err?.message || err);
+    return NextResponse.json({ error: 'Could not check username' }, { status: 500 });
   }
 }
 
@@ -595,15 +777,16 @@ export async function signupHandler(request: NextRequest) {
   try {
     const parsed = signupSchema.safeParse(await request.json());
     if (!parsed.success) {
+      console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
       return new NextResponse('Invalid request payload', { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, signatureDataUrl, signatureName, captchaRayId, fingerprint, otpCode } = parsed.data;
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, captchaRayId, emailVerified: emailVerifiedFlag, fingerprint, otpCode } = parsed.data;
     const normalizedEmail = email.toLowerCase().trim();
-    const normalizedUsername = username ? username.toString().trim().toLowerCase() : undefined;
+    const normalizedUsername = username.toString().trim().toLowerCase();
     const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
     const normalizedCompanyName = companyName ? companyName.toString().trim() : undefined;
-    const normalizedOccupation = sanitizeInput(occupation, 120).trim();
-    const normalizedSignatureName = sanitizeInput(signatureName, 200).trim();
+    const normalizedOccupation = occupation ? sanitizeInput(occupation, 120).trim() : undefined;
+    
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
@@ -612,18 +795,12 @@ export async function signupHandler(request: NextRequest) {
     if (!policyAccepted) {
       return new NextResponse('Policy acceptance is required', { status: 400 });
     }
-    if (!normalizedOccupation) {
-      return new NextResponse('Occupation is required', { status: 400 });
-    }
-    if (!signatureDataUrl || !normalizedSignatureName) {
-      return new NextResponse('Signature is required', { status: 400 });
-    }
 
-    const { checkWindowLimit } = await import('./captcha/risk');
-    if (!checkWindowLimit(`signup:ip:${ip}`, 10, 60 * 60 * 1000)) {
+    // Relaxed rate limits for signup - 20 per hour per IP, 10 per hour per email
+    if (!checkWindowLimit(`signup:ip:${ip}`, 20, 60 * 60 * 1000)) {
       return new NextResponse('Too many sign-up attempts. Please try again later.', { status: 429 });
     }
-    if (!checkWindowLimit(`signup:email:${email.toLowerCase()}`, 3, 60 * 60 * 1000)) {
+    if (!checkWindowLimit(`signup:email:${email.toLowerCase()}`, 10, 60 * 60 * 1000)) {
       return new NextResponse('Too many sign-up attempts. Please try again later.', { status: 429 });
     }
 
@@ -639,11 +816,8 @@ export async function signupHandler(request: NextRequest) {
       }
     }
 
-    const captchaSettings = (await import('./captcha/service')).getCaptchaSettings;
-    const settings = await captchaSettings();
+    const settings = await getCaptchaSettings();
     if (settings.enabled) {
-      const { computeRiskScore } = await import('./captcha/risk');
-      const { getRequiredDifficulty, assertCaptchaSatisfied } = await import('./captcha/service');
       const risk = settings.riskEnabled
         ? await computeRiskScore({ ip, ua: userAgent, sessionId: captchaSession, fingerprint, authPath: true })
         : null;
@@ -668,8 +842,7 @@ export async function signupHandler(request: NextRequest) {
     // (this consumes it) and create the account already email-verified.
     let preVerifiedEmail = false;
     if (otpCode) {
-      const { verifySignupOtp: verifyOtp } = await import('./auth/signup-otp');
-      preVerifiedEmail = await verifyOtp(normalizedEmail, otpCode);
+      preVerifiedEmail = await verifySignupOtp(normalizedEmail, otpCode);
       if (!preVerifiedEmail) {
         return new NextResponse('Invalid or expired verification code', { status: 400 });
       }
@@ -694,14 +867,12 @@ export async function signupHandler(request: NextRequest) {
         companyName: normalizedCompanyName ? sanitizeInput(normalizedCompanyName, 120) : undefined,
         gender: gender ? sanitizeInput(gender, 100) : undefined,
         birthday,
-        emailVerified: preVerifiedEmail,
+        emailVerified: preVerifiedEmail || emailVerifiedFlag || false,
         preferences: {
           signupConsent: {
             acceptedAt: new Date().toISOString(),
             policyAccepted: true,
             adminDataAccess: !!adminDataAccess,
-            signatureName: normalizedSignatureName,
-            signatureDataUrl,
           },
         },
       },
@@ -709,9 +880,8 @@ export async function signupHandler(request: NextRequest) {
 
     const { token, refreshToken } = await createSession(user.id, userAgent || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token }, { status: 201 });
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
 
-    const { recordDeviceSeen } = await import('./captcha/risk');
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId: captchaSession }).catch(() => {});
 
     // Send welcome email (non-blocking)
@@ -719,6 +889,15 @@ export async function signupHandler(request: NextRequest) {
       fromEmail: 'noreply@send.tirbeo.app',
       fromName: 'Tirbeo',
     }).catch(err => console.error('[SIGNUP] Welcome email failed:', err?.message));
+
+    // Create welcome notification
+    createNotification({
+      userId: user.id,
+      type: 'system',
+      title: 'Welcome to Tirbeo!',
+      body: 'Your account has been created successfully. Start by exploring the dashboard.',
+      link: '/dashboard',
+    }).catch(() => {});
 
     // Send verification OTP — unless the user already verified via signup-otp
     if (!preVerifiedEmail) {
@@ -743,17 +922,17 @@ export async function signupHandler(request: NextRequest) {
 
 export async function requestSignupOtpHandler(request: NextRequest) {
   try {
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
-    if (!checkWindowLimit(`signup-otp:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+    // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
+    if (!checkWindowLimit(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
-    if (!checkWindowLimit(`signup-otp:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
+    if (!checkWindowLimit(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
 
@@ -789,12 +968,11 @@ export async function requestSignupOtpHandler(request: NextRequest) {
 // Verify a pre-signup OTP without consuming it (final consumption happens at auth/signup)
 export async function signupOtpVerifyHandler(request: NextRequest) {
   try {
-    const { email, code } = await request.json();
+    const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
       return new NextResponse('Email and code are required', { status: 400 });
     }
 
-    const { checkSignupOtp } = await import('./auth/signup-otp');
     const ok = await checkSignupOtp(email, code);
     if (!ok) {
       return new NextResponse('Invalid or expired verification code', { status: 400 });
@@ -813,7 +991,7 @@ export async function oauthConsentHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { policyAccepted, adminDataAccess, signatureName } = body;
     if (!policyAccepted) {
       return new NextResponse('Policy acceptance is required', { status: 400 });
@@ -845,17 +1023,17 @@ export async function oauthConsentHandler(request: NextRequest) {
 
 export async function requestLoginOtpHandler(request: NextRequest) {
   try {
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
-    if (!checkWindowLimit(`login-otp:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+    // Relaxed login OTP rate limits - 10 per hour per IP, 5 per hour per email
+    if (!checkWindowLimit(`login-otp:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
-    if (!checkWindowLimit(`login-otp:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
+    if (!checkWindowLimit(`login-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
 
@@ -890,12 +1068,12 @@ export async function requestLoginOtpHandler(request: NextRequest) {
 
 export async function verifyLoginOtpHandler(request: NextRequest) {
   try {
-    const { email, otpCode } = await request.json();
+    const { email, otpCode } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !otpCode || typeof otpCode !== 'string') {
       return new NextResponse('Email and code are required', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true } });
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true } });
     if (!user) {
       return new NextResponse('Invalid email or code', { status: 401 });
     }
@@ -907,21 +1085,29 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
 
     const otpOk = await verifySignupOtp(email, otpCode);
     if (!otpOk) {
-      const { logSecurityEvent } = await import('./security');
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'invalid_otp' } }).catch(() => {});
       return new NextResponse('Invalid or expired verification code', { status: 400 });
     }
 
+    // If 2FA is enabled, always require the authenticator code before issuing
+    // a session — even after a successful email OTP (suspicious login).
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ requiresMfa: true, tempToken });
+    }
+
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
+
+    clearRateLimitHits(clientIp);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_otp_success', details: { reason: 'suspicious_login_otp' } }).catch(() => {});
     return res;
   } catch (err) {
     console.error('[LOGIN OTP VERIFY]', err);
@@ -945,7 +1131,7 @@ export async function logoutHandler(request: NextRequest) {
 
 export async function sessionRevokeByTokenHandler(request: NextRequest) {
   try {
-    const { token } = await request.json();
+    const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') return new NextResponse('Token required', { status: 400 });
     const sessionId = await verifySessionRevokeToken(token);
     if (!sessionId) return new NextResponse('Invalid or expired token', { status: 401 });
@@ -985,7 +1171,7 @@ export async function verifyEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-    const { code, email } = await request.json();
+    const { code, email } = (await request.json()) as any;
     if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
     const ok = await verifyOtpCode(session.userId, 'email', code);
     if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
@@ -1002,10 +1188,95 @@ export async function verifyEmailOtpHandler(request: NextRequest) {
   }
 }
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Email change / verification - send code to the target email
+export async function changeEmailRequestHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const body: any = await request.json();
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return new NextResponse('Enter a valid email address', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
+    if (!user) return new NextResponse('User not found', { status: 404 });
+
+    const isCurrent = user.email?.toLowerCase() === email;
+    if (isCurrent && user.emailVerified) {
+      return new NextResponse('Your email is already verified', { status: 400 });
+    }
+    if (!isCurrent) {
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing) return new NextResponse('That email is already in use', { status: 400 });
+    }
+
+    const cooldown = enforceResendCooldown(`change-email:${user.id}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+    const code = generateOtpCode();
+    await storeOtp(user.id, 'email_verify', code);
+    await sendEmailOtp(email, code);
+    return new NextResponse('Verification code sent', { status: 200 });
+  } catch (err: any) {
+    console.error('[CHANGE EMAIL REQUEST]', err?.message || err);
+    return new NextResponse('Failed to send verification code', { status: 500 });
+  }
+}
+
+// Email change / verification - verify code and update the primary email
+export async function changeEmailVerifyHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    const body: any = await request.json();
+    const code = typeof body?.code === 'string' ? body.code.trim() : '';
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    if (!code) return new NextResponse('Enter the verification code', { status: 400 });
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return new NextResponse('Enter a valid email address', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
+    if (!user) return new NextResponse('User not found', { status: 404 });
+
+    const ok = await verifyOtpCode(user.id, 'email_verify', code);
+    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+
+    const currentEmail = user.email?.toLowerCase();
+    if (currentEmail !== email) {
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing && existing.id !== user.id) {
+        return new NextResponse('That email is already in use', { status: 400 });
+      }
+      await prisma.user.update({ where: { id: user.id }, data: { email, emailVerified: true } });
+    } else if (!user.emailVerified) {
+      await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } });
+    }
+
+    createNotification({
+      userId: user.id,
+      type: 'security',
+      title: 'Email updated',
+      body: currentEmail === email ? 'Your email was verified.' : `Your email was updated to ${email}.`,
+      link: '/dashboard/settings/account-profile',
+    }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
+
+    return new NextResponse('Email verified', { status: 200 });
+  } catch (err: any) {
+    console.error('[CHANGE EMAIL VERIFY]', err?.message || err);
+    return new NextResponse('Verification failed', { status: 500 });
+  }
+}
+
 // Signup email verification (no session required)
 export async function verifySignupEmailHandler(request: NextRequest) {
   try {
-    const { email, code } = await request.json();
+    const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
@@ -1075,7 +1346,7 @@ export async function verifyPhoneOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-    const { code } = await request.json();
+    const { code } = (await request.json()) as any;
     if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
     const ok = await verifyOtpCode(session.userId, 'phone', code);
     if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
@@ -1123,7 +1394,6 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
 export async function googleAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -1162,7 +1432,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       console.error('[GOOGLE TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri, 'client_id:', clientId?.slice(0, 20));
       return new NextResponse('Failed to exchange token', { status: 500 });
     }
-    const tokenData = await tokenRes.json();
+    const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
 
     const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
@@ -1171,7 +1441,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (!userInfoRes.ok) {
       return new NextResponse('Failed to fetch user info', { status: 500 });
     }
-    const profile = await userInfoRes.json();
+    const profile: any = await userInfoRes.json();
     const googleId = profile.id as string;
     const email = profile.email as string;
     const name = profile.name as string;
@@ -1211,7 +1481,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const target = oauthPostLoginTarget(user, redirectTo, 'google');
     const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -1254,7 +1524,6 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
 export async function githubAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -1286,7 +1555,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
       return new NextResponse('Failed to exchange token', { status: 500 });
     }
-    const tokenData = await tokenRes.json();
+    const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
 
     const userInfoRes = await fetch('https://api.github.com/user', {
@@ -1295,7 +1564,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (!userInfoRes.ok) {
       return new NextResponse('Failed to fetch user info', { status: 500 });
     }
-    const profile = await userInfoRes.json();
+    const profile: any = await userInfoRes.json();
     const githubId = String(profile.id);
     let email = profile.email;
     const name = profile.name || profile.login;
@@ -1306,7 +1575,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
       if (emailsRes.ok) {
-        const emails = await emailsRes.json();
+        const emails: any = await emailsRes.json();
         const primary = emails.find((e: any) => e.primary) || emails[0];
         if (primary) email = primary.email;
       }
@@ -1350,7 +1619,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const target = oauthPostLoginTarget(user, redirectTo, 'github');
     const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -1394,7 +1663,6 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
 export async function discordAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -1432,7 +1700,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
        console.error('[DISCORD TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
        return new NextResponse('Failed to exchange token', { status: 500 });
      }
-    const tokenData = await tokenRes.json();
+    const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
 
     const userInfoRes = await fetch('https://discord.com/api/users/@me', {
@@ -1441,7 +1709,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     if (!userInfoRes.ok) {
       return new NextResponse('Failed to fetch user info', { status: 500 });
     }
-    const profile = await userInfoRes.json();
+    const profile: any = await userInfoRes.json();
     const discordId = profile.id as string;
     const email = profile.email as string | undefined;
     const name = profile.global_name || profile.username as string;
@@ -1482,7 +1750,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const target = oauthPostLoginTarget(user, redirectTo, 'discord');
     const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken);
+    setSessionCookie(res, token, refreshToken, request);
     clearOauthStateCookie(res, request);
     return res;
   } catch (err: any) {
@@ -1492,90 +1760,10 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
 }
 
 // Activity feed
-export async function activityHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-
-    const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 20, 100);
-    const logs = await prisma.log.findMany({
-      where: { userId: session.userId },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: { id: true, method: true, path: true, status: true, createdAt: true },
-    });
-
-    return NextResponse.json(logs);
-  } catch (err: any) {
-    console.error('[ACTIVITY]', err?.message || err);
-    return new NextResponse('Failed to fetch activity', { status: 500 });
-  }
-}
 
 // Workspace list
-export async function listWorkspacesHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-
-    const workspaces = await prisma.workspace.findMany({
-      where: {
-        OR: [
-          { ownerId: session.userId },
-          { memberships: { some: { userId: session.userId } } },
-        ],
-      },
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        createdAt: true,
-        users: { select: { id: true, email: true, name: true } },
-        _count: { select: { memberships: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    return NextResponse.json(workspaces);
-  } catch (err: any) {
-    console.error('[LIST WORKSPACES]', err?.message || err);
-    return new NextResponse('Failed to fetch workspaces', { status: 500 });
-  }
-}
 
 // Workspace create
-export async function createWorkspaceHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-
-    const body = await request.json();
-    const { name, slug } = body;
-    if (!name || !slug) return new NextResponse('name and slug required', { status: 400 });
-    if (typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 64) {
-      return new NextResponse('Name must be 2-64 characters', { status: 400 });
-    }
-    if (typeof slug !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || slug.length < 2 || slug.length > 48) {
-      return new NextResponse('Slug must be 2-48 lowercase alphanumeric characters (dashes allowed)', { status: 400 });
-    }
-
-    const existing = await prisma.workspace.findUnique({ where: { slug } });
-    if (existing) return new NextResponse('Slug already taken', { status: 409 });
-
-    const workspace = await prisma.workspace.create({
-      data: { name: name.trim(), slug: slug.trim(), ownerId: session.userId },
-    });
-
-    await prisma.membership.create({
-      data: { userId: session.userId, workspaceId: workspace.id, role: 'ADMIN' },
-    });
-
-    return NextResponse.json(workspace, { status: 201 });
-  } catch (err: any) {
-    console.error('[CREATE WORKSPACE]', err?.message || err);
-    return new NextResponse('Failed to create workspace', { status: 500 });
-  }
-}
 
 export async function profileHandler(request: NextRequest) {
   try {
@@ -1585,17 +1773,23 @@ export async function profileHandler(request: NextRequest) {
     }
 
     if (request.method === 'GET') {
-      // Update lastActiveAt so user shows as "online"
+      // Update lastActiveAt so user shows as "online" (fire-and-forget)
       prisma.user.update({ where: { id: session.userId }, data: { lastActiveAt: new Date() } }).catch(() => {});
+
+      // Check in-memory cache first (avoids DB round-trip on dashboard poll)
+      const cached = profileCache.get(session.userId);
+      if (cached) return NextResponse.json(cached);
 
       const user = await prisma.user.findUnique({
         where: { id: session.userId },
         select: {
           id: true,
           email: true,
+          username: true,
           name: true,
           photoUrl: true,
           secondaryEmail: true,
+          secondaryEmailVerified: true,
           phoneNumber: true,
           occupation: true,
           gender: true,
@@ -1616,6 +1810,9 @@ export async function profileHandler(request: NextRequest) {
           is2FAEnabled: true,
           isVerified: true,
           karmaPoints: true,
+          lastLoginAt: true,
+          lastLoginIp: true,
+          loginCount: true,
           createdAt: true,
           updatedAt: true,
           lastActiveAt: true,
@@ -1626,9 +1823,6 @@ export async function profileHandler(request: NextRequest) {
           theme: true,
           dateFormat: true,
           timeFormat: true,
-          fontSize: true,
-          reduceMotion: true,
-          highContrast: true,
           isBanned: true,
           isSuspended: true,
         },
@@ -1637,13 +1831,16 @@ export async function profileHandler(request: NextRequest) {
       const { passwordHash, ...safeUser } = user as any;
 
       const backupCodeCount = await prisma.recoveryCode.count({ where: { userId: session.userId } });
-      return NextResponse.json({ ...safeUser, hasPassword: !!passwordHash, hasBackupCodes: backupCodeCount > 0 });
+      const result = { ...safeUser, hasPassword: !!passwordHash, hasBackupCodes: backupCodeCount > 0 };
+      profileCache.set(session.userId, result);
+      return NextResponse.json(result);
     }
 
     if (request.method === 'PATCH') {
-      const body = await request.json();
+      const body: any = await request.json();
       const schema = z.object({
         name: z.string().min(1).optional(),
+        username: z.string().min(3).max(30).regex(/^[a-zA-Z0-9_.-]+$/, 'Username may only contain letters, numbers, dots, dashes and underscores.').optional().nullable(),
         photoUrl: z.string().optional().nullable(),
         secondaryEmail: z.string().email().optional(),
         phoneNumber: z.string().optional().nullable(),
@@ -1656,12 +1853,14 @@ export async function profileHandler(request: NextRequest) {
         timezone: z.string().optional().nullable(),
         website: z.string().optional().nullable(),
         linkedIn: z.string().optional().nullable(),
+        linkedin: z.string().optional().nullable(),
         github: z.string().optional().nullable(),
         twitter: z.string().optional().nullable(),
         companyName: z.string().optional().nullable(),
         companyRole: z.string().optional().nullable(),
         industry: z.string().optional().nullable(),
         companySize: z.string().optional().nullable(),
+        preferences: z.record(z.string(), z.unknown()).optional(),
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
@@ -1673,20 +1872,39 @@ export async function profileHandler(request: NextRequest) {
       }
       // Map camelCase to Prisma field names
       if ('linkedIn' in data) { data.linkedin = data.linkedIn; delete data.linkedIn; }
-      if ('companyName' in data) { data.companyName = data.companyName; }
-      const updated = await prisma.user.update({
-        where: { id: session.userId },
-        data,
-        select: {
-          id: true, email: true, name: true, photoUrl: true,
-          phoneNumber: true, occupation: true, bio: true,
-          website: true, linkedin: true, githubUsername: true, twitter: true,
-          country: true, timezone: true, language: true,
-          companyName: true, companyRole: true, industry: true, companySize: true,
-          gender: true, birthday: true, secondaryEmail: true,
-          createdAt: true, updatedAt: true,
-        },
-      });
+      if ('linkedin' in data) { data.linkedin = data.linkedin ?? null; }
+      if ('github' in data) { data.githubUsername = data.github; delete data.github; }
+      let updated;
+      try {
+        updated = await prisma.user.update({
+          where: { id: session.userId },
+          data,
+          select: {
+            id: true, email: true, username: true, name: true, photoUrl: true,
+            phoneNumber: true, occupation: true, bio: true,
+            website: true, linkedin: true, githubUsername: true, twitter: true,
+            country: true, timezone: true, language: true,
+            companyName: true, companyRole: true, industry: true, companySize: true,
+            gender: true, birthday: true, secondaryEmail: true,
+            preferences: true, karmaPoints: true,
+            emailVerified: true, createdAt: true, updatedAt: true,
+          },
+        });
+      } catch (err: any) {
+        const meta = err?.meta || {};
+        const adapterFields = meta?.driverAdapterError?.cause?.constraint?.fields;
+        const targets: string[] = Array.isArray(meta?.target)
+          ? meta.target
+          : typeof meta?.target === 'string'
+            ? [meta.target]
+            : Array.isArray(adapterFields)
+              ? adapterFields
+              : [];
+        if (err?.code === 'P2002' && targets.includes('username')) {
+          return new NextResponse('That username is already taken. Please choose another one.', { status: 409 });
+        }
+        throw err;
+      }
 
       prisma.auditEvent.create({
         data: {
@@ -1699,25 +1917,43 @@ export async function profileHandler(request: NextRequest) {
         },
       }).catch(() => {});
 
+      bustProfileCache(session.userId);
       return NextResponse.json(updated);
     }
 
     return new NextResponse('Method not allowed', { status: 405 });
   } catch (err: any) {
-    console.error('[PROFILE]', err?.message || err);
+    const detail = err?.message || (err?.meta ? JSON.stringify(err.meta) : '') || String(err);
+    console.error('[PROFILE]', detail);
     return new NextResponse('Failed to fetch or update profile', { status: 500 });
   }
 }
 
 // Password reset — request OTP only
-export async function requestPasswordResetOtpHandler(request: NextRequest) {
-  try {
-    const { email } = await request.json();
+// Only users with actual admin panel access (adminRole set — the same field the
+// admin proxy /authorize gate checks) may use the admin reset flow. Custom
+// end-user roles do NOT grant admin panel access, so they are rejected here.
+export async function isAdminUser(email: string): Promise<boolean> {
+  const user = await prisma.user.findUnique({
+    where: { email: email.toLowerCase() },
+    select: { adminRole: true },
+  });
+  return !!user && !!user.adminRole;
+}
+
+export async function requestPasswordResetOtpHandler(request: NextRequest) {  try {
+    const { email, adminOnly } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
+    if (adminOnly) {
+      const ok = await isAdminUser(email);
+      if (!ok) {
+        return new NextResponse('This email is not registered with admin access. Please reset your password from your account dashboard.', { status: 403 });
+      }
+    }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
+
     if (!checkWindowLimit(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
@@ -1734,12 +1970,12 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {
 // Password reset — request magic link only
 export async function requestPasswordResetMagicLinkHandler(request: NextRequest) {
   try {
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
+
     if (!checkWindowLimit(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
@@ -1755,9 +1991,15 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
 // Password reset — request (legacy — sends both OTP and link for backward compatibility)
 export async function requestPasswordResetHandler(request: NextRequest) {
   try {
-    const { email, method } = await request.json();
+    const { email, method, adminOnly } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
+    }
+    if (adminOnly) {
+      const ok = await isAdminUser(email);
+      if (!ok) {
+        return new NextResponse('This email is not registered with admin access. Please reset your password from your account dashboard.', { status: 403 });
+      }
     }
     const resetMethod: 'otp' | 'magic_link' = method === 'magic_link' ? 'magic_link' : 'otp';
     const result = await requestPasswordReset(email, resetMethod);
@@ -1779,7 +2021,7 @@ export async function requestPasswordResetHandler(request: NextRequest) {
 // Password reset — verify (code or token)
 export async function verifyPasswordResetHandler(request: NextRequest) {
   try {
-    const { email, code, token } = await request.json();
+    const { email, code, token } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
@@ -1787,7 +2029,7 @@ export async function verifyPasswordResetHandler(request: NextRequest) {
       return new NextResponse('Code or token required', { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
+
     if (!checkWindowLimit(`pw-reset-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -1805,7 +2047,7 @@ export async function verifyPasswordResetHandler(request: NextRequest) {
 // Password reset — confirm (set new password)
 export async function confirmPasswordResetHandler(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body: any = await request.json();
     const resetToken = body.resetToken || body.token;
     const newPassword = body.newPassword || body.password;
     if (!resetToken || !newPassword) {
@@ -1815,7 +2057,7 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
       return new NextResponse('Password must be at least 8 characters', { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
+
     if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
     }
@@ -1834,13 +2076,13 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
 
 export async function requestMagicLinkHandler(request: NextRequest) {
   try {
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
+
     if (!checkWindowLimit(`magic-link:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return new NextResponse('Too many requests. Please try again later.', { status: 429 });
     }
@@ -1854,7 +2096,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
       return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
     }
 
-    const { signMagicLinkToken } = await import('./auth/jwt');
+
     const token = await signMagicLinkToken(user.id);
     const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
     const callbackUrl = `https://accounts.${appDomain}/callback?magic_token=${token}`;
@@ -1883,12 +2125,12 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
 export async function verifyMagicLinkHandler(request: NextRequest) {
   try {
-    const { token } = await request.json();
+    const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
       return new NextResponse('Token required', { status: 400 });
     }
 
-    const { verifyMagicLinkToken } = await import('./auth/jwt');
+
     const userId = await verifyMagicLinkToken(token);
     if (!userId) {
       return new NextResponse('Invalid or expired magic link', { status: 401 });
@@ -1908,7 +2150,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ email: user.email, token: sessionToken });
-    setSessionCookie(res, sessionToken, refreshToken);
+    setSessionCookie(res, sessionToken, refreshToken, request);
 
     await createAuditEvent({
       actorId: user.id,
@@ -1927,52 +2169,13 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
 
 // ─── Workspace Delete (user-facing) ───
 
-export async function deleteWorkspaceHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
 
-    const { workspaceId } = await request.json();
-    if (!workspaceId) return new NextResponse('workspaceId required', { status: 400 });
-
-    const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId } });
-    if (!workspace) return new NextResponse('Workspace not found', { status: 404 });
-    if (workspace.ownerId !== session.userId) {
-      return new NextResponse('Only the owner can delete a workspace', { status: 403 });
-    }
-
-    await prisma.workspace.delete({ where: { id: workspaceId } });
-    return new NextResponse('Workspace deleted', { status: 200 });
-  } catch (err: any) {
-    console.error('[DELETE WORKSPACE]', err?.message || err);
-    return new NextResponse('Failed to delete workspace', { status: 500 });
-  }
-}
-
-export async function deleteWorkspaceByIdHandler(request: NextRequest, workspaceId: string) {
-  try {
-    const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
-
-    const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId } });
-    if (!workspace) return new NextResponse('Workspace not found', { status: 404 });
-    if (workspace.ownerId !== session.userId) {
-      return new NextResponse('Only the owner can delete a workspace', { status: 403 });
-    }
-
-    await prisma.workspace.delete({ where: { id: workspaceId } });
-    return new NextResponse('Workspace deleted', { status: 200 });
-  } catch (err: any) {
-    console.error('[DELETE WORKSPACE BY ID]', err?.message || err);
-    return new NextResponse('Failed to delete workspace', { status: 500 });
-  }
-}
 
 // ─── Account Recovery ───────────────────────────────────────
 
 export async function accountRecoveryHandler(request: NextRequest) {
   try {
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return new NextResponse('Email is required', { status: 400 });
     }
@@ -2000,11 +2203,116 @@ export async function accountRecoveryHandler(request: NextRequest) {
   }
 }
 
+// ─── Recovery Email Login ───────────────────────────────────
+// Sign in using a verified recovery (secondary) email. A code is sent to the
+// recovery email and, once verified, the user is logged into their primary
+// account (chained through 2FA when enabled).
+
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!domain) return email;
+  const keep = Math.min(local.length, 2);
+  return `${local.slice(0, keep)}${'*'.repeat(Math.max(local.length - keep, 1))}@${domain}`;
+}
+
+export async function recoveryLoginRequestHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return new NextResponse('Email is required', { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    if (!checkWindowLimit(`recovery-login:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+    }
+    if (!checkWindowLimit(`recovery-login:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
+      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+    }
+
+    const cooldown = enforceResendCooldown(`recovery-login:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      select: { id: true, email: true, secondaryEmail: true, isBanned: true, isSuspended: true },
+    });
+    if (!user || !user.secondaryEmail) {
+      return new NextResponse('No verified recovery email is set for this account', { status: 400 });
+    }
+    if (user.isBanned || user.isSuspended) {
+      return new NextResponse('Account suspended', { status: 403 });
+    }
+
+    const code = generateOtpCode();
+    await storeOtp(user.id, 'email', code);
+    try {
+      const result = await sendSignupOtpEmail(user.secondaryEmail, code, 'login_otp');
+      if (!result.success) {
+        console.error('[RECOVERY LOGIN] Email send returned failure');
+        return new NextResponse('Could not send a code to your recovery email. Try again later.', { status: 502 });
+      }
+    } catch (err: any) {
+      console.error('[RECOVERY LOGIN] Email send error:', err?.message || err);
+      return new NextResponse('Could not send a code to your recovery email. Try again later.', { status: 502 });
+    }
+
+    return NextResponse.json({ ok: true, masked: maskEmail(user.secondaryEmail) });
+  } catch (err: any) {
+    console.error('[RECOVERY LOGIN REQUEST]', err?.message || err);
+    return new NextResponse('Failed to send recovery code', { status: 500 });
+  }
+}
+
+export async function recoveryLoginVerifyHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
+      return new NextResponse('Email and code are required', { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true },
+    });
+    if (!user) return new NextResponse('Invalid email or code', { status: 401 });
+    if (user.isBanned || user.isSuspended) return new NextResponse('Account suspended', { status: 403 });
+    if (!user.emailVerified) return new NextResponse('Please verify your email before signing in', { status: 403 });
+
+    const ok = await verifyOtpCode(user.id, 'email', code);
+    if (!ok) {
+      return new NextResponse('Invalid or expired verification code', { status: 400 });
+    }
+
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ requiresMfa: true, tempToken });
+    }
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_email_success' }).catch(() => {});
+    return res;
+  } catch (err: any) {
+    console.error('[RECOVERY LOGIN VERIFY]', err?.message || err);
+    return new NextResponse('Verification failed', { status: 500 });
+  }
+}
+
 // ─── Suspicious Login ───────────────────────────────────────
 
 export async function suspiciousLoginConfirmHandler(request: NextRequest) {
   try {
-    const { token } = await request.json();
+    const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
       return new NextResponse('Invalid token', { status: 400 });
     }
@@ -2028,7 +2336,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token: sessionToken });
-    setSessionCookie(res, sessionToken, refreshToken);
+    setSessionCookie(res, sessionToken, refreshToken, request);
     return res;
   } catch {
     return new NextResponse('Failed to confirm suspicious login', { status: 400 });
@@ -2037,7 +2345,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
 
 export async function suspiciousLoginDenyHandler(request: NextRequest) {
   try {
-    const { token } = await request.json();
+    const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
       return new NextResponse('Invalid token', { status: 400 });
     }
@@ -2069,72 +2377,105 @@ export async function verifyHandler(request: NextRequest) {
 
 // ─── Public Help Config ───
 
+const DEFAULT_HELP_ARTICLES = [
+  { id: "1", title: "Getting Started with Tirbeo", content: "Welcome to Tirbeo! This guide will help you set up your account, configure your profile, and explore the platform.", category: "Getting Started", icon: "zap" },
+  { id: "2", title: "How to Change Your Password", content: "Go to Security → Change Password. Enter your current password, then your new password (minimum 8 characters).", category: "Security", icon: "shield" },
+  { id: "3", title: "Setting Up Two-Factor Authentication", content: "Navigate to Security → Two-Factor Authentication. You can use an authenticator app or SMS verification.", category: "Security", icon: "shield" },
+  { id: "4", title: "Managing Your Notifications", content: "Go to Preferences → Notifications to configure what alerts you receive.", category: "Account", icon: "bell" },
+  { id: "5", title: "Customizing Your Dashboard", content: "Open Preferences to personalize your experience. Change themes, adjust fonts, modify colors.", category: "Account", icon: "settings" },
+  { id: "6", title: "Connecting Third-Party Accounts", content: "Visit Integrations to connect Google, GitHub, and other services.", category: "Account", icon: "link" },
+  { id: "7", title: "Understanding Your Activity Log", content: "The Activity page shows a complete history of everything that happened on your account.", category: "Account", icon: "activity" },
+  { id: "8", title: "Managing Active Sessions", content: "In Security → Active Sessions, you can see all devices currently signed into your account.", category: "Security", icon: "shield" },
+  { id: "9", title: "Recovery Options", content: "Set up recovery email and phone in Security → Recovery Options.", category: "Security", icon: "shield" },
+  { id: "10", title: "Backup Codes", content: "In Security → Backup Codes, you can generate one-time codes for emergency access.", category: "Security", icon: "shield" },
+  { id: "11", title: "Reporting a Bug", content: "Found a bug? Report it through our GitHub issues page or contact support directly.", category: "Support", icon: "bug" },
+  { id: "12", title: "Privacy & Data", content: "Your privacy matters. You can export all your data from Preferences → Data & Privacy.", category: "Account", icon: "globe" },
+  { id: "13", title: "How to Create a Form", content: "Navigate to Forms → Create Form. Choose a template or start from scratch, add fields, and publish.", category: "Forms", icon: "book" },
+  { id: "14", title: "Form Field Types", content: "Tirbeo supports text, email, number, dropdown, radio, checkbox, file upload, rating, and more.", category: "Forms", icon: "book" },
+  { id: "15", title: "Sharing Your Form", content: "Use the Share button to get a link, embed code, or QR code. You can also set visibility to public or private.", category: "Forms", icon: "link" },
+  { id: "16", title: "Viewing Form Responses", content: "Go to Forms → Responses to see all submissions. You can filter by date, export to CSV, or view individual responses.", category: "Forms", icon: "activity" },
+  { id: "17", title: "Form Analytics", content: "The Analytics tab shows completion rates, drop-off points, device breakdown, and geographic data.", category: "Forms", icon: "activity" },
+  { id: "18", title: "Form Security Settings", content: "Enable CAPTCHA, set response limits, require login, or add expiration dates in Form Settings → Security.", category: "Forms", icon: "shield" },
+  { id: "19", title: "Collaborating on Forms", content: "Invite team members via Settings → Collaborators. They can edit or view based on permissions.", category: "Forms", icon: "link" },
+  { id: "20", title: "Form Templates", content: "Browse pre-built templates in the Templates gallery. Customize any template to match your brand.", category: "Forms", icon: "book" },
+  { id: "21", title: "Managing Your Subscription", content: "View your plan, usage, and billing history in Settings → Billing. Upgrade or downgrade anytime.", category: "Billing", icon: "settings" },
+  { id: "22", title: "Payment Methods", content: "Add or update payment cards in Settings → Billing → Payment Methods. We accept Visa, Mastercard, and Amex.", category: "Billing", icon: "globe" },
+  { id: "23", title: "Invoice & Receipts", content: "Download invoices from Settings → Billing → Invoices. They are also emailed after each payment.", category: "Billing", icon: "book" },
+  { id: "24", title: "Cancel Subscription", content: "Go to Settings → Billing → Cancel Plan. Your access continues until the end of the billing period.", category: "Billing", icon: "settings" },
+  { id: "25", title: "API Keys", content: "Generate API keys in Settings → API. Keys are shown once; store them securely. Rotate keys regularly.", category: "Integrations", icon: "link" },
+  { id: "26", title: "Webhooks", content: "Configure webhooks in Settings → Integrations to receive real-time events for forms, tickets, and users.", category: "Integrations", icon: "link" },
+  { id: "27", title: "SSO & SAML", content: "Enterprise plans support SAML 2.0 SSO. Configure in Settings → Security → Single Sign-On.", category: "Integrations", icon: "shield" },
+  { id: "28", title: "Zapier Integration", content: "Connect Tirbeo to 5,000+ apps via Zapier. Find Tirbeo in the Zapier app directory.", category: "Integrations", icon: "link" },
+  { id: "29", title: "Custom Domains", content: "Add a custom domain in Settings → Domains. Update your DNS CNAME to point to Tirbeo.", category: "Account", icon: "globe" },
+  { id: "30", title: "Team Roles & Permissions", content: "Manage roles in Settings → Roles. Assign admin, editor, or viewer access to team members.", category: "Account", icon: "shield" },
+  { id: "31", title: "Organization Settings", content: "Configure workspace name, logo, and default settings in Settings → Organization.", category: "Account", icon: "settings" },
+  { id: "32", title: "Data Export", content: "Export all your data as JSON or CSV from Settings → Data & Privacy → Export.", category: "Account", icon: "activity" },
+  { id: "33", title: "Account Deletion", content: "Permanently delete your account in Settings → Account → Delete Account. This action cannot be undone.", category: "Account", icon: "shield" },
+  { id: "34", title: "Email Configuration", content: "Set up custom email providers, DKIM, and sending domains in Settings → Email.", category: "Account", icon: "bell" },
+  { id: "35", title: "Rate Limits", content: "Free plans have API rate limits. View current usage in Settings → API → Rate Limits.", category: "Account", icon: "activity" },
+  { id: "36", title: "Troubleshooting Login Issues", content: "Clear cookies, disable VPN, or use incognito mode. If issues persist, contact support.", category: "Troubleshooting", icon: "bug" },
+  { id: "37", title: "Form Not Publishing", content: "Check that all required fields are filled and your plan allows form publishing.", category: "Troubleshooting", icon: "bug" },
+  { id: "38", title: "Emails Not Sending", content: "Verify your email configuration in Settings → Email. Check spam folders and sender reputation.", category: "Troubleshooting", icon: "bug" },
+  { id: "39", title: "Slow Dashboard Performance", content: "Try disabling browser extensions, clearing cache, or switching to a supported browser.", category: "Troubleshooting", icon: "bug" },
+  { id: "40", title: "Mobile App Support", content: "Tirbeo is fully responsive on mobile browsers. A native app is coming soon.", category: "Troubleshooting", icon: "bug" },
+  { id: "41", title: "Browser Compatibility", content: "We support Chrome, Firefox, Safari, and Edge (latest 2 versions). IE is not supported.", category: "Troubleshooting", icon: "bug" },
+  { id: "42", title: "Contacting Support", content: "Email support@tirbeo.app or use the Contact Us page. Premium users get priority support.", category: "Support", icon: "lifebuoy" },
+  { id: "43", title: "Support Response Times", content: "Free: 48 hours, Pro: 24 hours, Enterprise: 4 hours. Check status at support.tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "44", title: "Feature Requests", content: "Submit feature requests via the Feedback button in-app or email ideas@tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "45", title: "Service Status", content: "Check real-time status at status.tirbeo.app. Subscribe to updates for incident notifications.", category: "Support", icon: "lifebuoy" },
+  { id: "46", title: "Community Forum", content: "Join discussions, share tips, and connect with other users at community.tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "47", title: "Video Tutorials", content: "Watch step-by-step guides on our YouTube channel at youtube.com/@tirbeo.", category: "Getting Started", icon: "zap" },
+  { id: "48", title: "Onboarding Walkthrough", content: "New users see an interactive tour on first login. Replay it from Settings → Help → Tour.", category: "Getting Started", icon: "zap" },
+  { id: "49", title: "Keyboard Shortcuts", content: "Press Cmd/Ctrl + K for command palette. See all shortcuts in Help → Keyboard Shortcuts.", category: "Getting Started", icon: "zap" },
+  { id: "50", title: "Dark Mode", content: "Toggle dark mode from the user menu or Settings → Theme. Your preference syncs across devices.", category: "Account", icon: "settings" },
+  { id: "51", title: "Language & Region", content: "Change language in Settings → Preferences. We support English, Spanish, French, and German.", category: "Account", icon: "globe" },
+  { id: "52", title: "Accessibility", content: "Tirbeo follows WCAG 2.1 AA standards. Report accessibility issues to a11y@tirbeo.app.", category: "Account", icon: "globe" },
+  { id: "53", title: "GDPR Compliance", content: "We are GDPR compliant. Request data deletion or export from Settings → Privacy.", category: "Security", icon: "shield" },
+  { id: "54", title: "SOC 2 Certification", content: "Tirbeo is SOC 2 Type II certified. View our security whitepaper at tirbeo.app/security.", category: "Security", icon: "shield" },
+  { id: "55", title: "Data Residency", content: "Choose your data region in Settings → Privacy → Data Residency. Available: US, EU, APAC.", category: "Security", icon: "globe" },
+  { id: "56", title: "OAuth Apps", content: "Manage connected OAuth apps in Settings → Security → Connected Apps. Revoke access anytime.", category: "Security", icon: "shield" },
+  { id: "57", title: "Passkeys", content: "Set up passkeys for passwordless login in Settings → Security → Passkeys.", category: "Security", icon: "shield" },
+  { id: "58", title: "Audit Logs", content: "View detailed audit logs in Admin → Security → Audit. Enterprise plans retain logs for 1 year.", category: "Security", icon: "activity" },
+  { id: "59", title: "IP Allowlisting", content: "Restrict access to specific IPs in Settings → Security → IP Allowlist.", category: "Security", icon: "shield" },
+  { id: "60", title: "Custom SMTP", content: "Configure custom SMTP in Settings → Email → SMTP. Supports SendGrid, Mailgun, AWS SES.", category: "Integrations", icon: "link" },
+];
+
 export async function helpConfigHandler(request: NextRequest) {
+  try {
+    const dbArticles = await prisma.helpArticle.findMany({
+      where: { published: true },
+      orderBy: [{ ord: 'asc' }, { title: 'asc' }],
+      select: { id: true, title: true, content: true, category: true, icon: true },
+    });
+
+    if (dbArticles.length > 0) {
+      // Merge: DB articles override the in-code defaults by title, and any
+      // new articles are appended. This way adding a doc in the support app
+      // never wipes out the built-in article set.
+      const byTitle = new Map(dbArticles.map((a) => [a.title.toLowerCase(), a]));
+      const merged = DEFAULT_HELP_ARTICLES.map((def) => byTitle.get(def.title.toLowerCase()) || def);
+      for (const db of dbArticles) {
+        if (!merged.some((m) => m.title.toLowerCase() === db.title.toLowerCase())) {
+          merged.push(db);
+        }
+      }
+      return NextResponse.json({
+        articles: merged,
+        contactEmail: "support@tirbeo.app",
+        faqEnabled: true,
+        syncedFromDb: true,
+      });
+    }
+  } catch (err: any) {
+    console.error('[HELP CONFIG] DB fallback', err?.message || err);
+  }
+
+  // Fallback: in-code defaults when no published articles exist in the DB yet.
   return NextResponse.json({
-    articles: [
-      { id: "1", title: "Getting Started with Tirbeo", content: "Welcome to Tirbeo! This guide will help you set up your account, configure your profile, and explore the platform.", category: "Getting Started", icon: "zap" },
-      { id: "2", title: "How to Change Your Password", content: "Go to Security → Change Password. Enter your current password, then your new password (minimum 8 characters).", category: "Security", icon: "shield" },
-      { id: "3", title: "Setting Up Two-Factor Authentication", content: "Navigate to Security → Two-Factor Authentication. You can use an authenticator app or SMS verification.", category: "Security", icon: "shield" },
-      { id: "4", title: "Managing Your Notifications", content: "Go to Preferences → Notifications to configure what alerts you receive.", category: "Account", icon: "bell" },
-      { id: "5", title: "Customizing Your Dashboard", content: "Open Preferences to personalize your experience. Change themes, adjust fonts, modify colors.", category: "Account", icon: "settings" },
-      { id: "6", title: "Connecting Third-Party Accounts", content: "Visit Integrations to connect Google, GitHub, and other services.", category: "Account", icon: "link" },
-      { id: "7", title: "Understanding Your Activity Log", content: "The Activity page shows a complete history of everything that happened on your account.", category: "Account", icon: "activity" },
-      { id: "8", title: "Managing Active Sessions", content: "In Security → Active Sessions, you can see all devices currently signed into your account.", category: "Security", icon: "shield" },
-      { id: "9", title: "Recovery Options", content: "Set up recovery email and phone in Security → Recovery Options.", category: "Security", icon: "shield" },
-      { id: "10", title: "Backup Codes", content: "In Security → Backup Codes, you can generate one-time codes for emergency access.", category: "Security", icon: "shield" },
-      { id: "11", title: "Reporting a Bug", content: "Found a bug? Report it through our GitHub issues page or contact support directly.", category: "Support", icon: "bug" },
-      { id: "12", title: "Privacy & Data", content: "Your privacy matters. You can export all your data from Preferences → Data & Privacy.", category: "Account", icon: "globe" },
-      { id: "13", title: "How to Create a Form", content: "Navigate to Forms → Create Form. Choose a template or start from scratch, add fields, and publish.", category: "Forms", icon: "book" },
-      { id: "14", title: "Form Field Types", content: "Tirbeo supports text, email, number, dropdown, radio, checkbox, file upload, rating, and more.", category: "Forms", icon: "book" },
-      { id: "15", title: "Sharing Your Form", content: "Use the Share button to get a link, embed code, or QR code. You can also set visibility to public or private.", category: "Forms", icon: "link" },
-      { id: "16", title: "Viewing Form Responses", content: "Go to Forms → Responses to see all submissions. You can filter by date, export to CSV, or view individual responses.", category: "Forms", icon: "activity" },
-      { id: "17", title: "Form Analytics", content: "The Analytics tab shows completion rates, drop-off points, device breakdown, and geographic data.", category: "Forms", icon: "activity" },
-      { id: "18", title: "Form Security Settings", content: "Enable CAPTCHA, set response limits, require login, or add expiration dates in Form Settings → Security.", category: "Forms", icon: "shield" },
-      { id: "19", title: "Collaborating on Forms", content: "Invite team members via Settings → Collaborators. They can edit or view based on permissions.", category: "Forms", icon: "link" },
-      { id: "20", title: "Form Templates", content: "Browse pre-built templates in the Templates gallery. Customize any template to match your brand.", category: "Forms", icon: "book" },
-      { id: "21", title: "Managing Your Subscription", content: "View your plan, usage, and billing history in Settings → Billing. Upgrade or downgrade anytime.", category: "Billing", icon: "settings" },
-      { id: "22", title: "Payment Methods", content: "Add or update payment cards in Settings → Billing → Payment Methods. We accept Visa, Mastercard, and Amex.", category: "Billing", icon: "globe" },
-      { id: "23", title: "Invoice & Receipts", content: "Download invoices from Settings → Billing → Invoices. They are also emailed after each payment.", category: "Billing", icon: "book" },
-      { id: "24", title: "Cancel Subscription", content: "Go to Settings → Billing → Cancel Plan. Your access continues until the end of the billing period.", category: "Billing", icon: "settings" },
-      { id: "25", title: "API Keys", content: "Generate API keys in Settings → API. Keys are shown once; store them securely. Rotate keys regularly.", category: "Integrations", icon: "link" },
-      { id: "26", title: "Webhooks", content: "Configure webhooks in Settings → Integrations to receive real-time events for forms, tickets, and users.", category: "Integrations", icon: "link" },
-      { id: "27", title: "SSO & SAML", content: "Enterprise plans support SAML 2.0 SSO. Configure in Settings → Security → Single Sign-On.", category: "Integrations", icon: "shield" },
-      { id: "28", title: "Zapier Integration", content: "Connect Tirbeo to 5,000+ apps via Zapier. Find Tirbeo in the Zapier app directory.", category: "Integrations", icon: "link" },
-      { id: "29", title: "Custom Domains", content: "Add a custom domain in Settings → Domains. Update your DNS CNAME to point to Tirbeo.", category: "Account", icon: "globe" },
-      { id: "30", title: "Team Roles & Permissions", content: "Manage roles in Settings → Roles. Assign admin, editor, or viewer access to team members.", category: "Account", icon: "shield" },
-      { id: "31", title: "Organization Settings", content: "Configure workspace name, logo, and default settings in Settings → Organization.", category: "Account", icon: "settings" },
-      { id: "32", title: "Data Export", content: "Export all your data as JSON or CSV from Settings → Data & Privacy → Export.", category: "Account", icon: "activity" },
-      { id: "33", title: "Account Deletion", content: "Permanently delete your account in Settings → Account → Delete Account. This action cannot be undone.", category: "Account", icon: "shield" },
-      { id: "34", title: "Email Configuration", content: "Set up custom email providers, DKIM, and sending domains in Settings → Email.", category: "Account", icon: "bell" },
-      { id: "35", title: "Rate Limits", content: "Free plans have API rate limits. View current usage in Settings → API → Rate Limits.", category: "Account", icon: "activity" },
-      { id: "36", title: "Troubleshooting Login Issues", content: "Clear cookies, disable VPN, or use incognito mode. If issues persist, contact support.", category: "Troubleshooting", icon: "bug" },
-      { id: "37", title: "Form Not Publishing", content: "Check that all required fields are filled and your plan allows form publishing.", category: "Troubleshooting", icon: "bug" },
-      { id: "38", title: "Emails Not Sending", content: "Verify your email configuration in Settings → Email. Check spam folders and sender reputation.", category: "Troubleshooting", icon: "bug" },
-      { id: "39", title: "Slow Dashboard Performance", content: "Try disabling browser extensions, clearing cache, or switching to a supported browser.", category: "Troubleshooting", icon: "bug" },
-      { id: "40", title: "Mobile App Support", content: "Tirbeo is fully responsive on mobile browsers. A native app is coming soon.", category: "Troubleshooting", icon: "bug" },
-      { id: "41", title: "Browser Compatibility", content: "We support Chrome, Firefox, Safari, and Edge (latest 2 versions). IE is not supported.", category: "Troubleshooting", icon: "bug" },
-      { id: "42", title: "Contacting Support", content: "Email support@tirbeo.app or use the Contact Us page. Premium users get priority support.", category: "Support", icon: "lifebuoy" },
-      { id: "43", title: "Support Response Times", content: "Free: 48 hours, Pro: 24 hours, Enterprise: 4 hours. Check status at support.tirbeo.app.", category: "Support", icon: "lifebuoy" },
-      { id: "44", title: "Feature Requests", content: "Submit feature requests via the Feedback button in-app or email ideas@tirbeo.app.", category: "Support", icon: "lifebuoy" },
-      { id: "45", title: "Service Status", content: "Check real-time status at status.tirbeo.app. Subscribe to updates for incident notifications.", category: "Support", icon: "lifebuoy" },
-      { id: "46", title: "Community Forum", content: "Join discussions, share tips, and connect with other users at community.tirbeo.app.", category: "Support", icon: "lifebuoy" },
-      { id: "47", title: "Video Tutorials", content: "Watch step-by-step guides on our YouTube channel at youtube.com/@tirbeo.", category: "Getting Started", icon: "zap" },
-      { id: "48", title: "Onboarding Walkthrough", content: "New users see an interactive tour on first login. Replay it from Settings → Help → Tour.", category: "Getting Started", icon: "zap" },
-      { id: "49", title: "Keyboard Shortcuts", content: "Press Cmd/Ctrl + K for command palette. See all shortcuts in Help → Keyboard Shortcuts.", category: "Getting Started", icon: "zap" },
-      { id: "50", title: "Dark Mode", content: "Toggle dark mode from the user menu or Settings → Theme. Your preference syncs across devices.", category: "Account", icon: "settings" },
-      { id: "51", title: "Language & Region", content: "Change language in Settings → Preferences. We support English, Spanish, French, and German.", category: "Account", icon: "globe" },
-      { id: "52", title: "Accessibility", content: "Tirbeo follows WCAG 2.1 AA standards. Report accessibility issues to a11y@tirbeo.app.", category: "Account", icon: "globe" },
-      { id: "53", title: "GDPR Compliance", content: "We are GDPR compliant. Request data deletion or export from Settings → Privacy.", category: "Security", icon: "shield" },
-      { id: "54", title: "SOC 2 Certification", content: "Tirbeo is SOC 2 Type II certified. View our security whitepaper at tirbeo.app/security.", category: "Security", icon: "shield" },
-      { id: "55", title: "Data Residency", content: "Choose your data region in Settings → Privacy → Data Residency. Available: US, EU, APAC.", category: "Security", icon: "globe" },
-      { id: "56", title: "OAuth Apps", content: "Manage connected OAuth apps in Settings → Security → Connected Apps. Revoke access anytime.", category: "Security", icon: "shield" },
-      { id: "57", title: "Passkeys", content: "Set up passkeys for passwordless login in Settings → Security → Passkeys.", category: "Security", icon: "shield" },
-      { id: "58", title: "Audit Logs", content: "View detailed audit logs in Admin → Security → Audit. Enterprise plans retain logs for 1 year.", category: "Security", icon: "activity" },
-      { id: "59", title: "IP Allowlisting", content: "Restrict access to specific IPs in Settings → Security → IP Allowlist.", category: "Security", icon: "shield" },
-      { id: "60", title: "Custom SMTP", content: "Configure custom SMTP in Settings → Email → SMTP. Supports SendGrid, Mailgun, AWS SES.", category: "Integrations", icon: "link" },
-    ],
+    articles: DEFAULT_HELP_ARTICLES,
     contactEmail: "support@tirbeo.app",
     faqEnabled: true,
+    syncedFromDb: false,
   });
 }
 
@@ -2142,7 +2483,7 @@ export async function faqHandler(request: NextRequest) {
   const category = request.nextUrl.searchParams.get('category') || '';
   const search = request.nextUrl.searchParams.get('search') || '';
   const help = await helpConfigHandler(request);
-  const articles = (await help.json()).articles;
+  const articles = (await help.json() as any).articles;
   let filtered = articles;
   if (category) filtered = filtered.filter(a => a.category === category);
   if (search) filtered = filtered.filter(a => a.title.toLowerCase().includes(search.toLowerCase()) || a.content.toLowerCase().includes(search.toLowerCase()));
@@ -2166,7 +2507,6 @@ export async function cliTokenHandler(request: NextRequest) {
       return new NextResponse('Account suspended', { status: 403 });
     }
 
-    const { SignJWT } = await import('jose');
     const secret = new TextEncoder().encode(process.env.JWT_SECRET!);
     const cliToken = await new SignJWT({ sub: user.id, purpose: 'cli' })
       .setProtectedHeader({ alg: 'HS256' })
@@ -2194,171 +2534,15 @@ export async function cliTokenHandler(request: NextRequest) {
 
 // ─── Waitlist ───────────────────────────────────────────────
 
-export async function waitlistHandler(request: NextRequest) {
-  try {
-    const { email, lang, source, name } = await request.json();
-    if (!email || typeof email !== 'string') {
-      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
-    }
-
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const { checkWindowLimit } = await import('./captcha/risk');
-    if (!checkWindowLimit(`waitlist:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many submissions. Please try again later.' }, { status: 429 });
-    }
-
-    const emailLower = email.toLowerCase().trim();
-    const cleanName = name ? sanitizeInput(String(name), 100) : undefined;
-    const finalSource = (source && ['hero', 'newsletter', 'navbar', 'waitlist', 'landing'].includes(source)) ? source : 'waitlist';
-
-    const existing = await prisma.subscriber.findUnique({ where: { email: emailLower } });
-    if (existing) {
-      const updateData: Record<string, unknown> = {};
-      if (cleanName && !existing.name) updateData.name = cleanName;
-      if (lang) updateData.metadata = { ...(existing.metadata as Record<string, unknown> || {}), lang };
-
-      await prisma.subscriber.update({ where: { email: emailLower }, data: updateData });
-      return NextResponse.json({ message: 'You are already on the list!' }, { status: 200 });
-    }
-
-    await prisma.subscriber.create({
-      data: {
-        email: emailLower,
-        name: cleanName,
-        source: finalSource,
-        metadata: lang ? { lang } : undefined,
-      },
-    });
-
-    return NextResponse.json({ message: 'Successfully joined! We will be in touch.' }, { status: 201 });
-  } catch (err: any) {
-    console.error('[WAITLIST]', err?.message || err);
-    return NextResponse.json({ error: 'Submission failed. Please try again.' }, { status: 500 });
-  }
-}
 
 // ─── Feedback ───────────────────────────────────────────────
 
-export async function feedbackHandler(request: NextRequest) {
-  try {
-    const { message, email, lang, source, captchaRayId } = await request.json();
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      return NextResponse.json({ error: 'Message is required' }, { status: 400 });
-    }
-
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
-    const { checkWindowLimit } = await import('./captcha/risk');
-    if (!checkWindowLimit(`feedback:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many submissions. Please try again later.' }, { status: 429 });
-    }
-
-    // Human verification: public forms must present a solved captcha.
-    const { getCaptchaSettings, assertCaptchaSatisfied } = await import('./captcha/service');
-    const captchaSettings = await getCaptchaSettings();
-    if (captchaSettings.enabled) {
-      if (!captchaRayId) {
-        return NextResponse.json({ error: { code: 'CAPTCHA_REQUIRED', message: 'CAPTCHA verification is required' } }, { status: 403 });
-      }
-      const check = await assertCaptchaSatisfied({
-        rayId: captchaRayId,
-        sessionId: captchaSession,
-        ipAddress: clientIp,
-        userAgent: request.headers.get('user-agent') || '',
-        requiredDifficulty: 'easy',
-      });
-      if (!check.ok) {
-        return NextResponse.json({ error: { code: 'CAPTCHA_FAILED', message: check.error || 'CAPTCHA verification failed' } }, { status: 403 });
-      }
-    }
-
-    const finalSource = (source && ['widget', 'landing', 'footer', 'admin'].includes(source)) ? source : 'widget';
-
-    const feedback = await prisma.feedback.create({
-      data: {
-        message: sanitizeInput(message.trim(), 20000),
-        email: email ? sanitizeInput(String(email), 254) : undefined,
-        lang: lang || undefined,
-        source: finalSource,
-      },
-    });
-
-    return NextResponse.json({ message: 'Thank you for your feedback!', id: feedback.id }, { status: 201 });
-  } catch (err: any) {
-    console.error('[FEEDBACK]', err?.message || err);
-    return NextResponse.json({ error: 'Failed to submit feedback. Please try again.' }, { status: 500 });
-  }
-}
 
 // ─── Admin: Subscribers ─────────────────────────────────────
 
-export async function adminSubscribersHandler(request: NextRequest) {
-  try {
-    const session = await requireAdmin(request);
-    if (session instanceof NextResponse) return session;
-
-    const { searchParams } = new URL(request.url);
-    const source = searchParams.get('source');
-    const status = searchParams.get('status');
-    const search = searchParams.get('search');
-    const limit = Math.min(parseInt(searchParams.get('limit') || '100', 10), 200);
-
-    const where: Record<string, unknown> = {};
-    if (source) where.source = source;
-    if (status) where.status = status;
-    if (search) {
-      where.OR = [
-        { email: { contains: search, mode: 'insensitive' } },
-        { name: { contains: search, mode: 'insensitive' } },
-      ];
-    }
-
-    const [subscribers, total] = await Promise.all([
-      prisma.subscriber.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit }),
-      prisma.subscriber.count({ where }),
-    ]);
-
-    return NextResponse.json({ subscribers, total });
-  } catch (err: any) {
-    console.error('[ADMIN SUBSCRIBERS]', err?.message || err);
-    return NextResponse.json({ error: 'Failed to fetch subscribers' }, { status: 500 });
-  }
-}
 
 // ─── Admin: Feedback ────────────────────────────────────────
 
-export async function adminFeedbackHandler(request: NextRequest) {
-  try {
-    const session = await requireAdmin(request);
-    if (session instanceof NextResponse) return session;
-
-    const { searchParams } = new URL(request.url);
-    const source = searchParams.get('source');
-    const status = searchParams.get('status');
-    const search = searchParams.get('search');
-    const limit = Math.min(parseInt(searchParams.get('limit') || '50', 10), 100);
-
-    const where: Record<string, unknown> = {};
-    if (source) where.source = source;
-    if (status) where.status = status;
-    if (search) {
-      where.OR = [
-        { message: { contains: search, mode: 'insensitive' } },
-        { email: { contains: search, mode: 'insensitive' } },
-      ];
-    }
-
-    const [feedback, total] = await Promise.all([
-      prisma.feedback.findMany({ where, orderBy: { createdAt: 'desc' }, take: limit }),
-      prisma.feedback.count({ where }),
-    ]);
-
-    return NextResponse.json({ feedback, total });
-  } catch (err: any) {
-    console.error('[ADMIN FEEDBACK]', err?.message || err);
-    return NextResponse.json({ error: 'Failed to fetch feedback' }, { status: 500 });
-  }
-}
 
 // ─── Chat (OpenRouter LLM proxy for landing demo) ────────────
 
@@ -2394,7 +2578,7 @@ export async function chatHandler(request: NextRequest) {
       return NextResponse.json({ error: 'OPENROUTER_API_KEY not set' }, { status: 500 });
     }
 
-    const body = await request.json().catch(() => ({}));
+    const body: any = await request.json().catch(() => ({}));
     const model = body.model || 'tencent/hy3:free';
     if (!ALLOWED_CHAT_MODELS.has(model)) {
       return NextResponse.json(

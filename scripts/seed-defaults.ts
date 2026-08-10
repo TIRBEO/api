@@ -6,33 +6,11 @@ const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: proc
 async function main() {
   console.log('Seeding defaults...');
 
-  // Free Plan
-  const freePlan = await prisma.plans.upsert({
-    where: { slug: 'free' },
-    update: {},
-    create: {
-      name: 'Free',
-      slug: 'free',
-      description: 'Free tier with basic features',
-      price: 0,
-      isFree: true,
-      isPublic: true,
-      sortOrder: 0,
-      features: ['basic-profiles', 'basic-support'],
-      limits: { users: 1, storage: 100, apiRequests: 1000 },
-    },
-  });
-  console.log(`Plan: ${freePlan.name}`);
-
   // Feature Flags
   const flags = [
-    { key: 'messaging.enabled', name: 'Messaging', description: 'Enable messaging features' },
-    { key: 'social.enabled', name: 'Social', description: 'Enable social features' },
-    { key: 'communities.enabled', name: 'Communities', description: 'Enable communities' },
-    { key: 'billing.enabled', name: 'Billing', description: 'Enable billing features' },
     { key: 'support.enabled', name: 'Support', description: 'Enable support ticket system' },
-    { key: 'blogs.enabled', name: 'Blogs', description: 'Enable blog system' },
     { key: 'forms.userCreation.enabled', name: 'User Form Creation', description: 'Enable user-created forms' },
+    { key: 'captcha.enabled', name: 'Captcha', description: 'Enable progressive captcha on auth flows' },
   ];
   for (const flag of flags) {
     await prisma.featureFlag.upsert({
@@ -44,21 +22,6 @@ async function main() {
   console.log(`Feature flags: ${flags.length}`);
 
   // System Services
-  const services = [
-    { name: 'API', slug: 'api', type: 'api', status: 'operational', updatedAt: new Date() },
-    { name: 'Database', slug: 'database', type: 'database', status: 'operational', updatedAt: new Date() },
-    { name: 'Authentication', slug: 'auth', type: 'service', status: 'operational', updatedAt: new Date() },
-    { name: 'Storage', slug: 'storage', type: 'service', status: 'operational', updatedAt: new Date() },
-    { name: 'Email', slug: 'email', type: 'service', status: 'operational', updatedAt: new Date() },
-  ];
-  for (const svc of services) {
-    await prisma.system_services.upsert({
-      where: { slug: svc.slug },
-      update: {},
-      create: svc,
-    });
-  }
-  console.log(`System services: ${services.length}`);
 
   // Default Settings
   const settings = [
@@ -68,8 +31,6 @@ async function main() {
     { key: 'auth.passwordMinLength', value: 8, type: 'number', group: 'auth', label: 'Min Password Length' },
     { key: 'auth.maxLoginAttempts', value: 5, type: 'number', group: 'auth', label: 'Max Login Attempts' },
     { key: 'auth.sessionDuration', value: 604800, type: 'number', group: 'auth', label: 'Session Duration (seconds)' },
-    { key: 'billing.currency', value: 'usd', type: 'string', group: 'billing', label: 'Currency' },
-    { key: 'storage.maxFileSize', value: 10485760, type: 'number', group: 'storage', label: 'Max File Size (bytes)' },
     { key: 'support.defaultQueue', value: 'general', type: 'string', group: 'support', label: 'Default Support Queue' },
   ];
   for (const s of settings) {
@@ -116,7 +77,6 @@ async function main() {
         'access.dashboard': true,
         'accounts.view': true,
         'settings.dashboard.view': true,
-        'domains.view': true,
         'system.notifications': true,
         'system.notifications.prefs': true,
       },
@@ -131,8 +91,6 @@ async function main() {
     'system.users': true,
     'system.users.manage': true,
     'system.users.delete': true,
-    'system.workspaces': true,
-    'system.workspaces.delete': true,
     'landing.view': true,
     'landing.edit': true,
     'accounts.view': true,
@@ -147,7 +105,6 @@ async function main() {
     'roles.create': true,
     'roles.edit': true,
     'roles.delete': true,
-    'domains.view': true,
     'system.email': true,
     'system.email.templates': true,
     'system.audit': true,
@@ -173,7 +130,6 @@ async function main() {
   const queues = [
     { name: 'General', slug: 'general', description: 'General support inquiries', updatedAt: new Date() },
     { name: 'Technical', slug: 'technical', description: 'Technical support', updatedAt: new Date() },
-    { name: 'Billing', slug: 'billing', description: 'Billing and subscription inquiries', updatedAt: new Date() },
   ];
   for (const q of queues) {
     await prisma.support_queues.upsert({

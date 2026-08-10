@@ -72,6 +72,8 @@ export async function getEmailTemplate(name: string) {
 // ship without an @tirbeo/ui npm publish. Keep in sync with packages/ui/src/emails/index.ts.
 import { buildTemplates } from './email-templates';
 
+const fallbackLoggedTemplates = new Set<string>();
+
 export function escapeHtml(str: string): string {
   return str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
 }
@@ -185,7 +187,7 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
       const err = await res.text();
       return { success: false, error: `Resend error ${res.status}: ${err}` };
     }
-    const data = await res.json();
+    const data: any = await res.json();
     return { success: true, messageId: data.id };
   } catch (err: unknown) {
     return { success: false, error: String(err) };
@@ -322,7 +324,10 @@ export async function sendTemplateEmail(
   const fallbacks = await buildFallbackTemplates();
   const fallback = fallbacks[templateName];
   if (fallback) {
-    console.log(`[EMAIL] Template '${templateName}' not in DB, using built-in fallback`);
+    if (!fallbackLoggedTemplates.has(templateName)) {
+      fallbackLoggedTemplates.add(templateName);
+      console.warn(`[EMAIL] Template '${templateName}' not in DB, using built-in fallback`);
+    }
     let subject = renderTemplate(fallback.subject, mergedVars, rawKeys);
     let htmlBody = renderTemplate(fallback.html, mergedVars, rawKeys);
     if (Object.keys(themeColors).length > 0) {

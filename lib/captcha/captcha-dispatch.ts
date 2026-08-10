@@ -137,7 +137,7 @@ export async function captchaChallengeHandler(request: NextRequest) {
 export async function captchaVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    const body = await request.json();
+    const body: any = await request.json();
     const { challengeId, answer, token } = body;
     const ipAddress = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
@@ -213,26 +213,49 @@ export async function captchaVerifyHandler(request: NextRequest) {
   }
 }
 
+// Cache captcha status per IP for 30s to avoid hammering DB on every page load
+const captchaStatusCache = new Map<string, { data: any; ts: number }>();
+const CAPTCHA_STATUS_TTL = 30_000;
+
 export async function captchaStatusHandler(request: NextRequest) {
   try {
+    const ipAddress = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    
+    // Fast path: return cached result if fresh
+    const cached = captchaStatusCache.get(ipAddress);
+    if (cached && Date.now() - cached.ts < CAPTCHA_STATUS_TTL) {
+      return NextResponse.json(cached.data);
+    }
+
     const session = await getSession(request);
     const captchaSessionId = request.cookies.get('__captcha_session')?.value;
     const sessionId = session?.sessionId || captchaSessionId || 'anonymous';
-    const ipAddress = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
     const userAgent = request.headers.get('user-agent') || '';
     const fingerprint = request.cookies.get('__dfp')?.value || '';
     const userId = session?.userId;
 
     const risk = await computeRiskScore({ ip: ipAddress, ua: userAgent, userId, sessionId, fingerprint, authPath: true });
 
-    return NextResponse.json({
+    const result = {
       blocked: false,
       requiredDifficulty: risk.score > 70 ? 'hard' : risk.score > 40 ? 'medium' : 'easy',
       level: risk.level,
       score: risk.score,
       requireCaptcha: risk.requireCaptcha,
       captchaEnabled: true,
-    });
+    };
+    
+    // Cache the result
+    captchaStatusCache.set(ipAddress, { data: result, ts: Date.now() });
+    // Prune old entries periodically
+    if (captchaStatusCache.size > 2000) {
+      const now = Date.now();
+      for (const [k, v] of captchaStatusCache) {
+        if (now - v.ts > CAPTCHA_STATUS_TTL) captchaStatusCache.delete(k);
+      }
+    }
+    
+    return NextResponse.json(result);
   } catch (err: any) {
     return NextResponse.json({ error: 'Failed to check status' }, { status: 500 });
   }
@@ -308,7 +331,7 @@ export async function captchaBlocksHandler(request: NextRequest) {
 
 export async function captchaUnblockHandler(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body: any = await request.json();
     const { rayId } = body;
     await prisma.captchaBlock.updateMany({ where: { rayId }, data: { unblockedAt: new Date() } });
     return NextResponse.json({ success: true, rayId });

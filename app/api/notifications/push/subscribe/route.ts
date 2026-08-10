@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Push notifications not configured' }, { status: 503 });
     }
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { endpoint, p256dh, auth } = body;
 
     if (!endpoint || !p256dh || !auth) {
@@ -51,7 +51,7 @@ export async function DELETE(request: NextRequest) {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
 
-    const { endpoint } = await request.json();
+    const { endpoint } = (await request.json()) as any;
     if (!endpoint) {
       return NextResponse.json({ error: 'Missing endpoint' }, { status: 400 });
     }

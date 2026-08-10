@@ -12,7 +12,7 @@ export async function GET(request: Request) {
     where: { id: session.userId },
     include: { roles: { include: { role: true } } },
   });
-  if (!user || !user.roles?.[0]?.role) return new NextResponse('Forbidden', { status: 403 });
+  if (!user || (!user.adminRole && !user.roles?.[0]?.role)) return new NextResponse('Forbidden', { status: 403 });
 
   const permissions = await getEffectivePermissions(user.id);
   const roleAssignments = await prisma.userRole.findMany({
@@ -24,7 +24,7 @@ export async function GET(request: Request) {
     id: user.id,
     email: user.email,
     name: user.name,
-    adminRole: user.roles[0].role.name,
+    adminRole: user.adminRole || user.roles[0].role.name,
     permissions,
     roles: roleAssignments.map(a => a.role),
   });

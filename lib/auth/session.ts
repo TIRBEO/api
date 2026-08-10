@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '../db/prisma';
 import { signToken, verifyToken, COOKIE_NAME } from './jwt';
+import { DEVICE_COOKIE_NAME, ensureDeviceId, rememberDeviceAccount, wasRecentlyRemoved } from './device-accounts';
 import {
   hashRefreshToken,
   generateRefreshToken,
@@ -9,7 +10,17 @@ import {
   saveSessionState,
   getSessionState,
   revokeSessionState,
+  getCachedSessionIdentity,
+  setCachedSessionIdentity,
+  deleteCachedSessionIdentity,
 } from './redis';
+import { createTtlCache } from '../cache';
+
+// Short-TTL in-memory cache for session lookups. Authenticated requests hit
+// this instead of the DB on every call (the DB lookup is the dominant cost,
+// especially on cold connections). Busted on revoke. A few seconds of grace
+// after revocation is acceptable for a large per-request latency win.
+const sessionCache = createTtlCache<{ userId: string; email: string; sessionId: string; adminRole: string | null } | null>(20_000, 10_000, 'session');
 
 export const COOKIE_DOMAIN = process.env.NEXT_PUBLIC_COOKIE_DOMAIN || '.tirbeo.app';
 
@@ -20,47 +31,52 @@ export const REFRESH_COOKIE_NAME = '__refresh';
 
 const IS_PROD = process.env.NODE_ENV !== 'development';
 
-const ACCESS_COOKIE_OPTIONS: {
-  httpOnly: boolean;
-  secure: boolean;
-  sameSite: 'lax' | 'none';
-  path: string;
-  maxAge: number;
-  domain?: string;
-} = {
-  httpOnly: true,
-  secure: IS_PROD,
-  sameSite: 'lax',
-  path: '/',
-  maxAge: ACCESS_COOKIE_MAX_AGE,
-  ...(IS_PROD ? { domain: COOKIE_DOMAIN } : {}),
-};
+/**
+ * Determine the correct cookie domain for the current request.
+ * In production with a real domain, use COOKIE_DOMAIN (e.g. .tirbeo.app).
+ * On localhost, always use 'localhost' so cookies are shared across ports.
+ */
+function getCookieDomain(request?: NextRequest): string | undefined {
+  const host = request?.headers?.get('host') || '';
+  const isLocalhost = host.startsWith('localhost') || host.startsWith('127.0.0.1');
+  if (isLocalhost) return 'localhost';
+  if (IS_PROD) return COOKIE_DOMAIN;
+  return 'localhost';
+}
 
-const REFRESH_COOKIE_OPTIONS: {
-  httpOnly: boolean;
-  secure: boolean;
-  sameSite: 'lax' | 'none';
-  path: string;
-  maxAge: number;
-  domain?: string;
-} = {
-  httpOnly: true,
-  secure: IS_PROD,
-  sameSite: 'lax',
-  path: '/api/auth/refresh',
-  maxAge: REFRESH_COOKIE_MAX_AGE,
-  ...(IS_PROD ? { domain: COOKIE_DOMAIN } : {}),
-};
+function getAccessCookieOptions(request?: NextRequest) {
+  return {
+    httpOnly: true,
+    secure: IS_PROD && !getCookieDomain(request)?.includes('localhost'),
+    sameSite: 'lax' as const,
+    path: '/',
+    maxAge: ACCESS_COOKIE_MAX_AGE,
+    domain: getCookieDomain(request),
+  };
+}
+
+function getRefreshCookieOptions(request?: NextRequest) {
+  return {
+    httpOnly: true,
+    secure: IS_PROD && !getCookieDomain(request)?.includes('localhost'),
+    sameSite: 'lax' as const,
+    path: '/api/auth/refresh',
+    maxAge: REFRESH_COOKIE_MAX_AGE,
+    domain: getCookieDomain(request),
+  };
+}
 
 const CSRF_COOKIE_NAME = '__csrf';
-const CSRF_COOKIE_OPTIONS = {
-  httpOnly: false,
-  secure: IS_PROD,
-  sameSite: 'strict' as const,
-  path: '/',
-  maxAge: ACCESS_COOKIE_MAX_AGE,
-  ...(IS_PROD ? { domain: COOKIE_DOMAIN } : {}),
-};
+function getCsrfCookieOptions(request?: NextRequest) {
+  return {
+    httpOnly: false,
+    secure: IS_PROD && !getCookieDomain(request)?.includes('localhost'),
+    sameSite: 'strict' as const,
+    path: '/',
+    maxAge: ACCESS_COOKIE_MAX_AGE,
+    domain: getCookieDomain(request),
+  };
+}
 
 export function generateCsrfToken(): string {
   const bytes = new Uint8Array(32);
@@ -68,12 +84,12 @@ export function generateCsrfToken(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function setCsrfCookie(response: NextResponse, token: string) {
-  response.cookies.set(CSRF_COOKIE_NAME, token, CSRF_COOKIE_OPTIONS);
+export function setCsrfCookie(response: NextResponse, token: string, request?: NextRequest) {
+  response.cookies.set(CSRF_COOKIE_NAME, token, getCsrfCookieOptions(request));
 }
 
-export function clearCsrfCookie(response: NextResponse) {
-  response.cookies.set(CSRF_COOKIE_NAME, '', { ...CSRF_COOKIE_OPTIONS, maxAge: 0 });
+export function clearCsrfCookie(response: NextResponse, request?: NextRequest) {
+  response.cookies.set(CSRF_COOKIE_NAME, '', { ...getCsrfCookieOptions(request), maxAge: 0 });
 }
 
 export function validateCsrf(request: NextRequest): boolean {
@@ -121,6 +137,17 @@ export async function createSession(
   });
 
   await seedSessionState(session.id, userId, ipAddress || null, userAgent || null);
+
+  // Update last login tracking fields on User
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      lastLoginAt: now,
+      lastLoginIp: ipAddress || null,
+      loginCount: { increment: 1 },
+      lastActiveAt: now,
+    },
+  }).catch(() => {});
 
   return { token, sessionId: session.id, refreshToken };
 }
@@ -197,7 +224,13 @@ async function revokeSessionFamily(sessionId: string): Promise<void> {
   await revokeSession(session.id);
 }
 
+export function bustSessionCache(sessionId: string) {
+  sessionCache.delete(sessionId);
+}
+
 export async function revokeSession(sessionId: string): Promise<void> {
+  sessionCache.delete(sessionId);
+  void deleteCachedSessionIdentity(sessionId);
   await prisma.session
     .updateMany({
       where: { id: sessionId, status: { not: 'revoked' } },
@@ -218,6 +251,8 @@ export async function revokeSessionFamilyByUser(userId: string): Promise<void> {
     .catch(() => {});
   const sessions = await prisma.session.findMany({ where: { userId }, select: { id: true } });
   for (const s of sessions) {
+    sessionCache.delete(s.id);
+    void deleteCachedSessionIdentity(s.id);
     await revokeSessionState(s.id).catch(() => {});
   }
 }
@@ -230,49 +265,131 @@ export async function getSessionFromToken(token: string) {
     if ((payload as any).purpose === 'cli' && payload.sub) {
       const user = await prisma.user.findUnique({ where: { id: payload.sub } });
       if (!user || user.isBanned || user.isSuspended) return null;
-      return { userId: user.id, email: user.email, sessionId: 'cli' };
+      return { userId: user.id, email: user.email, sessionId: 'cli', adminRole: user.adminRole };
     }
 
-    const session = await prisma.session.findUnique({ where: { id: payload.sid } });
-    if (!session) return null;
+    const sid = (payload as any).sid as string | undefined;
+    if (sid) {
+      const cached = sessionCache.get(sid);
+      if (cached !== undefined) return cached;
+      // Distributed cache (survives cold starts) — consult before hitting the DB.
+      const distributed = await getCachedSessionIdentity(sid);
+      if (distributed) {
+        sessionCache.set(sid, distributed);
+        return distributed;
+      }
+    }
 
-    if (session.status === 'revoked' || session.revokedAt) return null;
+    let session: any = null;
+    try {
+      session = await prisma.session.findUnique({
+        where: { id: payload.sid },
+        include: { user: { select: { id: true, email: true, adminRole: true, isBanned: true, isSuspended: true } } },
+      });
+    } catch (e: any) {
+      console.error('[SESSION] DB query failed during session lookup:', e?.message);
+      // When DB is down, fail closed — reject the session rather than
+      // allowing unauthenticated access. The cached identity may still
+      // serve stale data, which is acceptable for read-heavy paths.
+      return null;
+    }
+    if (!session) {
+      sessionCache.set(payload.sid, null);
+      return null;
+    }
+
+    if (session.status === 'revoked' || session.revokedAt) {
+      sessionCache.set(payload.sid, null);
+      await deleteCachedSessionIdentity(payload.sid);
+      return null;
+    }
     if (session.expiresAt < new Date()) {
       await revokeSession(session.id);
+      sessionCache.delete(payload.sid);
+      await deleteCachedSessionIdentity(payload.sid);
       return null;
+    }
+
+    // Refresh the access token when it is close to expiring (proactive).
+    // Track last-active lazily (max once per 5 minutes per session) so the
+    // sessions list shows real "last active" data without a DB write per
+    // request. Do NOT create new sessions here — this is not an auth boundary.
+    if (!session.lastUsedAt || Date.now() - session.lastUsedAt.getTime() > 5 * 60 * 1000) {
+      prisma.session
+        .updateMany({ where: { id: session.id }, data: { lastUsedAt: new Date() } })
+        .catch(() => {});
     }
 
     // Fast revocation check via Redis when available.
     const state = await getSessionState(session.id);
-    if (state && state.revoked) return null;
+    if (state && state.revoked) {
+      sessionCache.set(payload.sid, null);
+      await deleteCachedSessionIdentity(payload.sid);
+      return null;
+    }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
-    if (!user) return null;
+    const user = session.user;
+    if (!user || user.isBanned || user.isSuspended) {
+      sessionCache.set(payload.sid, null);
+      return null;
+    }
 
-    return { userId: user.id, email: user.email, sessionId: session.id };
+    const result = { userId: user.id, email: user.email, sessionId: session.id, adminRole: user.adminRole };
+    sessionCache.set(payload.sid, result);
+    void setCachedSessionIdentity(payload.sid, result);
+    return result;
   } catch (e: any) {
     console.error('[SESSION] getSessionFromToken error:', e?.message || e);
     return null;
   }
 }
 
+// Throttle the lazy device-account upsert (max once per 5 min per device+user)
+// so authenticated traffic doesn't turn into a DB write per request.
+const rememberedRecently = new Set<string>();
+
+function markRemembered(deviceId: string, userId: string) {
+  const key = `${deviceId}:${userId}`;
+  rememberedRecently.add(key);
+  setTimeout(() => rememberedRecently.delete(key), 5 * 60 * 1000).unref?.();
+}
+
 export async function getSessionFromRequest(request: NextRequest) {
   const token = request.cookies.get(COOKIE_NAME)?.value;
   if (!token) return null;
-  return getSessionFromToken(token);
+  const session = await getSessionFromToken(token);
+  if (session && session.userId && session.sessionId !== 'cli') {
+    // Lazy "remember this account on this device": any authenticated request
+    // from a browser with a __device cookie registers the signed-in account in
+    // the account switcher (covers every login path — OAuth, OTP, passkey…).
+    const deviceId = request.cookies.get(DEVICE_COOKIE_NAME)?.value;
+    if (deviceId && /^[a-f0-9]{64}$/.test(deviceId) && !wasRecentlyRemoved(deviceId, session.userId)) {
+      const key = `${deviceId}:${session.userId}`;
+      if (!rememberedRecently.has(key)) {
+        markRemembered(deviceId, session.userId);
+        rememberDeviceAccount(deviceId, session.userId).catch(() => {});
+      }
+    }
+  }
+  return session;
 }
 
-export function setSessionCookie(response: NextResponse, token: string, refreshToken?: string) {
-  response.cookies.set(COOKIE_NAME, token, ACCESS_COOKIE_OPTIONS);
+export function setSessionCookie(response: NextResponse, token: string, refreshToken?: string, request?: NextRequest) {
+  response.cookies.set(COOKIE_NAME, token, getAccessCookieOptions(request));
   const csrfToken = generateCsrfToken();
-  setCsrfCookie(response, csrfToken);
+  setCsrfCookie(response, csrfToken, request);
   if (refreshToken) {
-    response.cookies.set(REFRESH_COOKIE_NAME, refreshToken, REFRESH_COOKIE_OPTIONS);
+    response.cookies.set(REFRESH_COOKIE_NAME, refreshToken, getRefreshCookieOptions(request));
+  }
+  // Ensure the device cookie exists so multi-account switching can remember
+  // this account on this device. Pass `request` from login/refresh handlers.
+  if (request) {
+    ensureDeviceId(request, response);
   }
 }
 
-export function clearSessionCookie(response: NextResponse) {
-  response.cookies.set(COOKIE_NAME, '', { ...ACCESS_COOKIE_OPTIONS, maxAge: 0 });
-  response.cookies.set(REFRESH_COOKIE_NAME, '', { ...REFRESH_COOKIE_OPTIONS, maxAge: 0 });
-  clearCsrfCookie(response);
+export function clearSessionCookie(response: NextResponse, request?: NextRequest) {
+  response.cookies.set(COOKIE_NAME, '', { ...getAccessCookieOptions(request), maxAge: 0 });
+  response.cookies.set(REFRESH_COOKIE_NAME, '', { ...getRefreshCookieOptions(request), maxAge: 0 });
+  clearCsrfCookie(response, request);
 }

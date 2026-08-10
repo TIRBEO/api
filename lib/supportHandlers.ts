@@ -4,6 +4,7 @@ import { getSession } from './session';
 import { jsonError, jsonForbidden, jsonUnauthorized, jsonSuccess } from './response';
 import { createAuditEvent } from './audit';
 import { sendTemplateEmail } from './email';
+import { sendToUser } from './ws/server';
 import { sanitizeInput } from './security';
 
 function isAdmin(user: any): boolean {
@@ -33,11 +34,14 @@ export async function ticketListHandler(req: NextRequest) {
 export async function ticketCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
-  const body = await req.json();
+  const body: any = await req.json();
+  let description = body.description ? sanitizeInput(String(body.description), 20000) : undefined;
+  const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
+  for (const url of imageUrls) description = `${description || ''}![tirbeo-img](${url})`;
   const ticket = await prisma.ticket.create({
     data: {
       subject: sanitizeInput(String(body.title || ''), 300),
-      description: body.description ? sanitizeInput(String(body.description), 20000) : undefined,
+      description,
       priority: body.priority,
       status: body.status,
       queueId: body.queueId,
@@ -118,7 +122,7 @@ export async function ticketDetailHandler(req: NextRequest, ticketId: string) {
 export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
-  const body = await req.json();
+  const body: any = await req.json();
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
   if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
@@ -172,16 +176,41 @@ export async function ticketMessageHandler(req: NextRequest, ticketId: string) {
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
   if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
-  const body = await req.json();
-  const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content: sanitizeInput(String(body.content || ''), 20000), isInternal: body.isInternal || false } });
+  if (ticket.status === 'resolved' || ticket.status === 'closed') {
+    return jsonError('TICKET_CLOSED', 'This ticket is resolved and no longer accepts messages. Open a new ticket if you need more help.', 400);
+  }
+  const body: any = await req.json();
+  let content = sanitizeInput(String(body.content || ''), 20000);
+  const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
+  for (const url of imageUrls) content = `${content}![tirbeo-img](${url})`;
+  const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: body.isInternal || false } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_REPLIED', targetType: 'ticket', targetId: ticketId });
+
+  // Send real-time WebSocket notification to ticket customer
+  try {
+    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true } });
+    if (ticket?.customerId && ticket.customerId !== user.userId) {
+      sendToUser(ticket.customerId, {
+        type: 'ticket_message',
+        ticketId,
+        message: {
+          id: message.id,
+          content: message.content,
+          authorId: user.userId,
+          isInternal: message.isInternal,
+          createdAt: message.createdAt.toISOString(),
+        },
+      });
+    }
+  } catch {}
+
   return NextResponse.json(message, { status: 201 });
 }
 
 export async function ticketAssignHandler(req: NextRequest, ticketId: string) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  const body = await req.json();
+  const body: any = await req.json();
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { assignedId: body.agentId } });
   await prisma.ticket_assignments.create({ data: { ticketId, agentId: body.agentId, assignedBy: user.userId } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_ASSIGNED', targetType: 'ticket', targetId: ticketId, metadata: { agentId: body.agentId } });
@@ -222,14 +251,75 @@ export async function ticketReopenHandler(req: NextRequest, ticketId: string) {
 export async function queuesListHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  const queues = await prisma.support_queues.findMany({ include: { agents: { include: { user: { select: { id: true, name: true } } } } } });
+  const queues = await prisma.support_queues.findMany();
   return NextResponse.json(queues);
 }
 
 export async function queuesCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  const body = await req.json();
+  const body: any = await req.json();
   const queue = await prisma.support_queues.create({ data: { name: body.name, slug: body.slug, description: body.description } });
   return NextResponse.json(queue, { status: 201 });
+}
+
+// ─── GET /api/support/tickets/[id]/attachments ──────────────────────
+export async function ticketAttachmentsListHandler(req: NextRequest, ticketId: string) {
+  try {
+    const session = await getSession(req);
+    if (!session) return jsonUnauthorized();
+    const attachments = await prisma.ticket_attachments.findMany({
+      where: { ticketId },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        fileName: true,
+        fileUrl: true,
+        fileSize: true,
+        mimeType: true,
+        createdAt: true,
+      },
+    });
+    return NextResponse.json({ attachments });
+  } catch (err: any) {
+    console.error('[TICKET ATTACHMENTS LIST]', err?.message || err);
+    return new NextResponse('Failed to fetch attachments', { status: 500 });
+  }
+}
+
+// ─── POST /api/support/tickets/[id]/attachments ──────────────────────
+export async function ticketAttachmentsUploadHandler(req: NextRequest, ticketId: string) {
+  try {
+    const session = await getSession(req);
+    if (!session) return jsonUnauthorized();
+    const formData = await req.formData();
+    const file = formData.get('file') as File | null;
+    if (!file) return new NextResponse('No file provided', { status: 400 });
+    const maxSize = 10 * 1024 * 1024; // 10MB
+    if (file.size > maxSize) return new NextResponse('File too large (max 10MB)', { status: 400 });
+    const bytes = await file.arrayBuffer();
+    const base64 = Buffer.from(bytes).toString('base64');
+    const dataUrl = `data:${file.type};base64,${base64}`;
+    const attachment = await prisma.ticket_attachments.create({
+      data: {
+        ticketId,
+        fileName: file.name,
+        fileUrl: dataUrl,
+        fileSize: file.size,
+        mimeType: file.type,
+      },
+      select: {
+        id: true,
+        fileName: true,
+        fileUrl: true,
+        fileSize: true,
+        mimeType: true,
+        createdAt: true,
+      },
+    });
+    return NextResponse.json({ attachment }, { status: 201 });
+  } catch (err: any) {
+    console.error('[TICKET ATTACHMENTS UPLOAD]', err?.message || err);
+    return new NextResponse('Failed to upload attachment', { status: 500 });
+  }
 }

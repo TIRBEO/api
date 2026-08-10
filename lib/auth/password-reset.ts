@@ -13,7 +13,7 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
   const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
   if (!user) return { success: true };
 
-  const code = randomInt(100000, 1000000).toString();
+  const code = (randomInt as Function)(100000, 1000000).toString();
   const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
@@ -126,7 +126,7 @@ export async function requestPasswordReset(
     return { success: true, resetUrl };
   } else {
     // OTP method (default)
-    const code = randomInt(100000, 1000000).toString();
+    const code = (randomInt as Function)(100000, 1000000).toString();
     const otpHash = hashOtpCode(code);
     const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
@@ -219,7 +219,7 @@ export async function confirmPasswordReset(
   const hash = await hashPassword(newPassword);
   await prisma.user.update({
     where: { id: user.id },
-    data: { passwordHash: hash },
+    data: { passwordHash: hash, mustChangePassword: false },
   });
 
   // Clean up any remaining OTPs

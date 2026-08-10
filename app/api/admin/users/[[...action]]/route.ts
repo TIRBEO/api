@@ -1,11 +1,18 @@
 import { NextRequest } from 'next/server';
-import { listUsers, getUserDetail, updateUser, deleteUser, updateUserRoles, banUser, unbanUser, suspendUser, unsuspendUser } from '../../../../../lib/adminHandlers';
+import { listUsers, getUserDetail, createUser, updateUser, deleteUser, updateUserRoles, banUser, unbanUser, suspendUser, unsuspendUser } from '../../../../../lib/adminHandlers';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
   const { action } = await params;
   const [userId] = action || [];
   if (userId) return getUserDetail(request, userId);
   return listUsers(request);
+}
+
+export async function POST(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
+  const { action } = await params;
+  const [userId] = action || [];
+  if (userId) return new Response('Invalid route', { status: 400 });
+  return createUser(request);
 }
 
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {

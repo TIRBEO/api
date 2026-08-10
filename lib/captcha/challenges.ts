@@ -49,29 +49,29 @@ export function generateMathChallenge(difficulty: string): ChallengeData {
   let a: number, b: number, answer: number, question: string;
   
   if (difficulty === 'easy') {
-    a = randomInt(1, 10);
-    b = randomInt(1, 10);
+    a = (randomInt as Function)(1, 10);
+    b = (randomInt as Function)(1, 10);
     answer = a + b;
     question = `What is ${a} + ${b}?`;
   } else if (difficulty === 'medium') {
-    a = randomInt(10, 50);
-    b = randomInt(5, 20);
+    a = (randomInt as Function)(10, 50);
+    b = (randomInt as Function)(5, 20);
     answer = a - b;
     question = `What is ${a} − ${b}?`;
   } else {
-    a = randomInt(2, 12);
-    b = randomInt(2, 12);
+    a = (randomInt as Function)(2, 12);
+    b = (randomInt as Function)(2, 12);
     answer = a * b;
     question = `What is ${a} × ${b}?`;
   }
 
   const options = shuffleArray([
     answer.toString(),
-    (answer + randomInt(1, 9)).toString(),
-    (answer - randomInt(1, 9)).toString(),
-    (answer + randomInt(-4, 4)).toString(),
+    (answer + (randomInt as Function)(1, 9)).toString(),
+    (answer - (randomInt as Function)(1, 9)).toString(),
+    (answer + (randomInt as Function)(-4, 4)).toString(),
   ].filter((v, i, arr) => arr.indexOf(v) === i));
-  while (options.length < 2) options.push(String(randomInt(1, 50)));
+  while (options.length < 2) options.push(String((randomInt as Function)(1, 50)));
 
   return {
     question,
@@ -100,7 +100,7 @@ function buildImagePool(
 
 export function generateImageSelectChallenge(difficulty: string): ChallengeData {
   const categories = Object.keys(IMAGE_CATEGORIES);
-  const targetCategory = categories[randomInt(0, categories.length)];
+  const targetCategory = categories[(randomInt as Function)(0, categories.length)];
   const numTargets = difficulty === 'easy' ? 2 : difficulty === 'medium' ? 3 : 4;
   const numDistractors = difficulty === 'easy' ? 4 : difficulty === 'medium' ? 5 : 6;
   const pool = buildImagePool(targetCategory, numTargets, numDistractors);
@@ -116,7 +116,7 @@ export function generateImageSelectChallenge(difficulty: string): ChallengeData 
 // 2b. Image Single Challenge — click the ONE image of a category
 export function generateImageSingleChallenge(difficulty: string): ChallengeData {
   const categories = Object.keys(IMAGE_CATEGORIES);
-  const targetCategory = categories[randomInt(0, categories.length)];
+  const targetCategory = categories[(randomInt as Function)(0, categories.length)];
   const numTargets = 1;
   const numDistractors = difficulty === 'easy' ? 3 : difficulty === 'medium' ? 4 : 5;
   const pool = buildImagePool(targetCategory, numTargets, numDistractors);
@@ -132,8 +132,8 @@ export function generateImageSingleChallenge(difficulty: string): ChallengeData 
 // 2c. Image Odd-One-Out Challenge — click the image that doesn't belong
 export function generateImageOddChallenge(difficulty: string): ChallengeData {
   const categories = Object.keys(IMAGE_CATEGORIES);
-  const oddIdx = randomInt(0, categories.length);
-  let sameIdx = randomInt(0, categories.length - 1);
+  const oddIdx = (randomInt as Function)(0, categories.length);
+  let sameIdx = (randomInt as Function)(0, categories.length - 1);
   if (sameIdx >= oddIdx) sameIdx += 1;
   const oddCategory = categories[oddIdx];
   const sameCategory = categories[sameIdx];
@@ -156,16 +156,16 @@ export function generateImageOddChallenge(difficulty: string): ChallengeData {
 // 3. Emoji Challenge
 export function generateEmojiChallenge(difficulty: string): ChallengeData {
   const emojis = ['😀', '❤️', '🌟', '🎉', '🔥', '💎', '🎯', '🚀', '🌈', '⚡', '🎨', '🌸'];
-  const target = emojis[randomInt(0, emojis.length)];
-  const count = randomInt(2, 5);
+  const target = emojis[(randomInt as Function)(0, emojis.length)];
+  const count = (randomInt as Function)(2, 5);
   
   // Create a grid with the target emoji
   const grid: string[] = [];
   for (let i = 0; i < count; i++) grid.push(target);
   // Add distractors
   const distractors = emojis.filter(e => e !== target);
-  for (let i = 0; i < randomInt(3, 6); i++) {
-    grid.push(distractors[randomInt(0, distractors.length)]);
+  for (let i = 0; i < (randomInt as Function)(3, 6); i++) {
+    grid.push(distractors[(randomInt as Function)(0, distractors.length)]);
   }
   const shuffled = shuffleArray(grid);
   const options = shuffleArray(['1', '2', '3', '4', '5', '6']);
@@ -180,7 +180,7 @@ export function generateEmojiChallenge(difficulty: string): ChallengeData {
 // 4. Word Challenge
 export function generateWordChallenge(difficulty: string): ChallengeData {
   const words = ['apple', 'brave', 'cloud', 'dream', 'eagle', 'flame', 'grace', 'heart', 'ivory', 'jewel'];
-  const word = words[randomInt(0, words.length)];
+  const word = words[(randomInt as Function)(0, words.length)];
   const scrambled = shuffleArray(word.split('')).join('');
   const options = shuffleArray([word, ...shuffleArray(words.filter(w => w !== word)).slice(0, 3)]);
 
@@ -199,7 +199,7 @@ export function generateLogicChallenge(difficulty: string): ChallengeData {
     { seq: ['A', 'C', 'E', 'G', '?'], answer: 'I', question: 'What comes next?' },
     { seq: ['🔴', '🔵', '🔴', '🔵', '?'], answer: '🔴', question: 'What comes next?' },
   ];
-  const seq = sequences[randomInt(0, sequences.length)];
+  const seq = sequences[(randomInt as Function)(0, sequences.length)];
 
   return {
     question: seq.question,
@@ -212,7 +212,7 @@ export function generateLogicChallenge(difficulty: string): ChallengeData {
 export function generateColorChallenge(difficulty: string): ChallengeData {
   const colors = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899'];
   const colorNames = ['red', 'blue', 'green', 'yellow', 'purple', 'pink'];
-  const targetIdx = randomInt(0, colors.length);
+  const targetIdx = (randomInt as Function)(0, colors.length);
   const shuffled = shuffleArray(colors.map((c, i) => ({ color: c, name: colorNames[i] })));
 
   return {
@@ -226,7 +226,7 @@ export function generateColorChallenge(difficulty: string): ChallengeData {
 export function generateShapeChallenge(difficulty: string): ChallengeData {
   const shapes = ['⬛', '🔺', '🔵', '⭐', '💠', '🔶'];
   const shapeNames = ['square', 'triangle', 'circle', 'star', 'diamond', 'hexagon'];
-  const targetIdx = randomInt(0, shapes.length);
+  const targetIdx = (randomInt as Function)(0, shapes.length);
   const shuffled = shuffleArray(shapes.map((s, i) => ({ shape: s, name: shapeNames[i] })));
 
   return {
@@ -258,12 +258,12 @@ export function generateTextChallenge(difficulty: string): ChallengeData {
   const length = difficulty === 'easy' ? 4 : difficulty === 'medium' ? 5 : 6;
   let text = '';
   for (let i = 0; i < length; i++) {
-    text += chars[randomInt(0, chars.length)];
+    text += chars[(randomInt as Function)(0, chars.length)];
   }
 
   return {
     question: 'Type the text you see',
-    data: { text, rotation: randomInt(-15, 15), color: `hsl(${randomInt(0, 360)}, 70%, 40%)`, render: 'text' },
+    data: { text, rotation: (randomInt as Function)(-15, 15), color: `hsl(${(randomInt as Function)(0, 360)}, 70%, 40%)`, render: 'text' },
     answerHash: hashAnswer(text.toLowerCase()),
   };
 }
@@ -272,7 +272,7 @@ export function generateTextChallenge(difficulty: string): ChallengeData {
 function shuffleArray<T>(arr: T[]): T[] {
   const shuffled = [...arr];
   for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = randomInt(0, i + 1);
+    const j = (randomInt as Function)(0, i + 1);
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   return shuffled;
@@ -281,7 +281,7 @@ function shuffleArray<T>(arr: T[]): T[] {
 function generateOptions(correct: string): string[] {
   const options = [correct];
   while (options.length < 4) {
-    const fake = (parseInt(correct) + randomInt(-5, 5) + 1).toString();
+    const fake = (parseInt(correct) + (randomInt as Function)(-5, 5) + 1).toString();
     if (!options.includes(fake) && fake !== correct) options.push(fake);
   }
   return shuffleArray(options);

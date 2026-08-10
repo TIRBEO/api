@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
     const session = await requireRole(request, 'admin');
     if (session instanceof NextResponse) return session;
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { rayId, action } = body;
     
     if (action === 'unblock') {

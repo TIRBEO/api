@@ -15,9 +15,7 @@ export async function analyticsHandler(request: NextRequest) {
     adminUsers,
     newToday,
     totalMedia,
-    totalReports,
     totalNotifications,
-    reportsByStatus,
     totalAuditEvents,
     topActions,
     recentAudit,
@@ -28,15 +26,7 @@ export async function analyticsHandler(request: NextRequest) {
     prisma.user.count({ where: { adminRole: { not: null } } }),
     prisma.user.count({ where: { createdAt: { gte: todayStart } } }),
     prisma.media.count(),
-    prisma.contentReport.count(),
     prisma.notification.count(),
-    // Reports by status
-    Promise.all([
-      prisma.contentReport.count({ where: { status: 'pending' } }),
-      prisma.contentReport.count({ where: { status: 'reviewed' } }),
-      prisma.contentReport.count({ where: { status: 'dismissed' } }),
-      prisma.contentReport.count({ where: { status: 'actioned' } }),
-    ]),
     // Audit events (last 30 days)
     prisma.auditEvent.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
     // Top 10 actions (last 30 days)
@@ -73,14 +63,7 @@ export async function analyticsHandler(request: NextRequest) {
     adminUsers,
     newToday,
     totalMedia,
-    totalReports,
     totalNotifications,
-    reportsByStatus: {
-      pending: reportsByStatus[0],
-      reviewing: reportsByStatus[1],
-      dismissed: reportsByStatus[2],
-      actioned: reportsByStatus[3],
-    },
     auditByResult: {
       success: totalAuditEvents,
       failure: 0,

@@ -45,7 +45,7 @@ export async function POST(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const parsed = integrationSchema.safeParse(body);
   if (!parsed.success) {
     return new NextResponse('Invalid payload: ' + JSON.stringify(parsed.error.flatten()), { status: 400 });
@@ -87,7 +87,7 @@ export async function DELETE(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { userId, provider } = body;
   if (!userId || !provider) {
     return new NextResponse('userId and provider are required', { status: 400 });

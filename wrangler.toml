@@ -1,0 +1,31 @@
+name = "tirbeo-ws"
+main = "workers/websocket-handler.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── Delete old Durable Object ───
+[[migrations]]
+tag = "v2"
+deleted_classes = ["WebSocketHibernation"]
+
+# ─── Production Environment ───
+[env.production]
+name = "tirbeo-ws-production"
+
+[env.production.vars]
+ENVIRONMENT = "production"
+
+[[env.production.migrations]]
+tag = "v2"
+deleted_classes = ["WebSocketHibernation"]
+
+# ─── Development Environment ───
+[env.development]
+name = "tirbeo-ws-development"
+
+[env.development.vars]
+ENVIRONMENT = "development"
+
+[[env.development.migrations]]
+tag = "v2"
+deleted_classes = ["WebSocketHibernation"]

@@ -1,13 +1,17 @@
 import { prisma } from './db/prisma';
 import { sendTemplateEmail, escapeHtml } from './email';
 
-// WebSocket send - no-op in serverless (Vercel has no persistent connections)
-function sendToUser(_userId: string, _data: unknown) {
-  // In serverless, WebSocket connections don't persist between invocations.
-  // This is handled by the client polling or using Server-Sent Events.
+// WebSocket send - dynamically import to avoid circular deps and work in serverless
+async function sendToUserWs(userId: string, data: unknown) {
+  try {
+    const { sendToUser } = await import('./ws/server');
+    sendToUser(userId, data);
+  } catch {
+    // WS server not available (serverless or not started)
+  }
 }
 
-type NotifType = 'mention' | 'comment' | 'report' | 'system' | 'digest' | 'admin_alert';
+export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert';
 
 interface CreateNotifInput {
   userId: string;
@@ -30,10 +34,9 @@ export async function createNotification(input: CreateNotifInput) {
     },
   });
 
-  sendToUser(input.userId, {
-    type: 'notification',
-    data: { id: notif.id, userId: notif.userId, type: notif.type, title: notif.title, body: notif.body, link: notif.link, icon: notif.icon, read: false, createdAt: notif.createdAt.toISOString() },
-  });
+  // Send real-time notification via WebSocket
+  const notifData = { id: notif.id, userId: notif.userId, type: notif.type, title: notif.title, body: notif.body, link: notif.link, icon: notif.icon, read: false, createdAt: notif.createdAt.toISOString() };
+  await sendToUserWs(input.userId, { type: 'notification', data: notifData });
 
   const prefs = await prisma.notificationPreference.findUnique({ where: { userId: input.userId } });
   if (prefs?.email) {
@@ -92,4 +95,47 @@ export async function updatePrefs(userId: string, data: Record<string, unknown>)
     where: { userId },
     data: data as any,
   });
+}
+
+// Send real-time notification to a specific user via WebSocket
+export async function sendRealtimeNotification(userId: string, notification: {
+  id: string;
+  type: string;
+  title: string;
+  body?: string;
+  link?: string;
+  icon?: string;
+  read?: boolean;
+  createdAt: string;
+}) {
+  await sendToUserWs(userId, { type: 'notification', data: notification });
+}
+
+// Broadcast notification to all online users
+export async function broadcastNotification(notification: {
+  id: string;
+  type: string;
+  title: string;
+  body?: string;
+  link?: string;
+  icon?: string;
+  read?: boolean;
+  createdAt: string;
+}) {
+  try {
+    const { broadcast } = await import('./ws/server');
+    broadcast({ type: 'notification', data: notification });
+  } catch {
+    // WS server not available
+  }
+}
+
+// Get list of online user IDs
+export async function getOnlineUsers(): Promise<string[]> {
+  try {
+    const { getOnlineUserIds } = await import('./ws/server');
+    return getOnlineUserIds();
+  } catch {
+    return [];
+  }
 }

@@ -46,7 +46,7 @@ export async function cfCreateForwardRule(
       }),
     });
 
-    const data = await res.json();
+    const data: any = await res.json();
     if (data.success) {
       return { ok: true, ruleId: data.result?.id };
     }
@@ -70,7 +70,7 @@ export async function cfDeleteForwardRule(
     const listRes = await fetch(`${CF_API}/zones/${zoneId}/email/routing/rules`, {
       headers: headers(token),
     });
-    const listData = await listRes.json();
+    const listData: any = await listRes.json();
     if (!listData.success) return { ok: false, error: 'Failed to list rules' };
 
     const targetValue = `${address}@${domain}`;
@@ -84,7 +84,7 @@ export async function cfDeleteForwardRule(
       method: 'DELETE',
       headers: headers(token),
     });
-    const delData = await delRes.json();
+    const delData: any = await delRes.json();
     return { ok: delData.success, error: delData.errors?.[0]?.message };
   } catch (err: any) {
     console.error('[CF] Delete rule failed:', err?.message || err);
@@ -104,7 +104,7 @@ export async function cfUpdateForwardRule(
     const listRes = await fetch(`${CF_API}/zones/${zoneId}/email/routing/rules`, {
       headers: headers(token),
     });
-    const listData = await listRes.json();
+    const listData: any = await listRes.json();
     if (!listData.success) return { ok: false, error: 'Failed to list rules' };
 
     const targetValue = `${address}@${domain}`;
@@ -124,7 +124,7 @@ export async function cfUpdateForwardRule(
         actions: [{ type: 'forward', value: [newForwardTo] }],
       }),
     });
-    const updData = await updRes.json();
+    const updData: any = await updRes.json();
     return { ok: updData.success, error: updData.errors?.[0]?.message };
   } catch (err: any) {
     console.error('[CF] Update rule failed:', err?.message || err);
@@ -144,7 +144,7 @@ export async function cfVerifyDestination(
       headers: headers(token),
       body: JSON.stringify({ email }),
     });
-    const data = await res.json();
+    const data: any = await res.json();
     return { ok: data.success, error: data.errors?.[0]?.message };
   } catch (err: any) {
     return { ok: false, error: 'Failed to verify destination' };

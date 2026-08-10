@@ -7,6 +7,7 @@ import {
   computeDeviceFingerprint,
   recordDeviceSeen,
   riskLevelFromScore,
+  hasRecentLoginSuccess,
 } from './risk';
 
 export type CaptchaDifficulty = 'easy' | 'medium' | 'hard';
@@ -66,11 +67,21 @@ const DEFAULT_SETTINGS: CaptchaSettings = {
 
 // ─── Signed challenge tokens (forgery + replay protection) ───
 
-function getRedis(): any {
-  const Redis = require('ioredis');
+import { getCachedRedisClient } from '../db/redis';
+import type Redis from 'ioredis';
+
+let _redis: Redis | null = null;
+
+function getRedis(): Redis | null {
   const url = process.env.REDIS_URL;
   if (!url) return null;
-  return new Redis(url, { maxRetriesPerRequest: 1, retryStrategy: () => null, lazyConnect: true });
+  if (!_redis) {
+    _redis = getCachedRedisClient('captcha', {
+      url,
+      enableKeepAlive: false, // Captcha doesn't need keep-alive
+    });
+  }
+  return _redis;
 }
 
 async function checkAndMarkNonce(nonce: string): Promise<boolean> {
@@ -84,7 +95,7 @@ async function checkAndMarkNonce(nonce: string): Promise<boolean> {
     return true;
   }
   const key = `captcha:nonce:${nonce}`;
-  const exists = await redis.set(key, '1', 'NX', 'EX', 3600);
+  const exists = await redis.set(key, '1', 'EX', 3600, 'NX');
   return exists === 'OK';
 }
 
@@ -299,11 +310,19 @@ export function renderCaptchaSvg(challengeType: CaptchaType, id: string, seed?: 
 }
 
 // ─── Settings ───
+let cachedCaptchaSettings: CaptchaSettings | null = null;
+let cachedCaptchaSettingsAt = 0;
+const CAPTCHA_SETTINGS_TTL = 15_000;
+
 export async function getCaptchaSettings(): Promise<CaptchaSettings> {
+  if (cachedCaptchaSettings && Date.now() - cachedCaptchaSettingsAt < CAPTCHA_SETTINGS_TTL) {
+    return cachedCaptchaSettings;
+  }
   try {
     const record = await prisma.captchaSettings.findFirst({ where: { key: 'global', isActive: true } });
-    if (record) return { ...DEFAULT_SETTINGS, ...record.value as any };
-    return DEFAULT_SETTINGS;
+    cachedCaptchaSettings = record ? { ...DEFAULT_SETTINGS, ...record.value as any } : DEFAULT_SETTINGS;
+    cachedCaptchaSettingsAt = Date.now();
+    return cachedCaptchaSettings;
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -317,22 +336,50 @@ export async function updateCaptchaSettings(settings: Partial<CaptchaSettings>):
     update: { value: updated as any, updatedAt: new Date() },
     create: { key: 'global', value: updated as any, description: 'Global CAPTCHA settings' },
   });
+  cachedCaptchaSettings = updated;
+  cachedCaptchaSettingsAt = Date.now();
   return updated;
 }
 
 // ─── Warning counts / blocks (existing behavior preserved) ───
+// Cache for getUserWarningCount — DB counts are expensive and this is called on every login.
+const warningCountCache = new Map<string, { count: number; recentBlocks: number; at: number }>();
+const WARNING_CACHE_TTL = 30_000; // 30s TTL — stale data acceptable for security checks
+
 export async function getUserWarningCount(userId: string, ipAddress?: string): Promise<{ count: number; recentBlocks: number }> {
+  const cacheKey = `${userId}:${ipAddress || ''}`;
+  const cached = warningCountCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < WARNING_CACHE_TTL) {
+    return { count: cached.count, recentBlocks: cached.recentBlocks };
+  }
   try {
     const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const warningCount = await prisma.captchaLog.count({
-      where: { userId, eventType: { in: ['attempt_failed', 'blocked'] }, createdAt: { gte: dayAgo } },
-    });
-    const recentBlocks = await prisma.captchaBlock.count({
-      where: { userId, blockedAt: { gte: dayAgo }, unblockedAt: null },
-    });
+    const [warningCount, recentBlocks] = await Promise.all([
+      prisma.captchaLog.count({
+        where: { userId, eventType: { in: ['attempt_failed', 'blocked'] }, createdAt: { gte: dayAgo } },
+      }),
+      prisma.captchaBlock.count({
+        where: { userId, blockedAt: { gte: dayAgo }, unblockedAt: null },
+      }),
+    ]);
+    warningCountCache.set(cacheKey, { count: warningCount, recentBlocks, at: Date.now() });
+    // Evict old entries
+    if (warningCountCache.size > 5000) {
+      const cutoff = Date.now() - WARNING_CACHE_TTL;
+      for (const [k, v] of warningCountCache) {
+        if (v.at < cutoff) warningCountCache.delete(k);
+      }
+    }
     return { count: warningCount, recentBlocks };
   } catch {
     return { count: 0, recentBlocks: 0 };
+  }
+}
+
+export function bustWarningCountCache(userId: string) {
+  // Evict all entries for this user (different IPs)
+  for (const [k] of warningCountCache) {
+    if (k.startsWith(userId + ':')) warningCountCache.delete(k);
   }
 }
 
@@ -351,10 +398,29 @@ export async function getSessionWarningCount(sessionId: string): Promise<{ count
   }
 }
 
+const blockedCache = new Map<string, { blocked: boolean; rayId?: string; reason?: string; expiresAt?: Date; at: number }>();
+const BLOCKED_CACHE_TTL = 5_000;
+
+function blockedCacheKey(userId?: string, sessionId?: string, ipAddress?: string): string {
+  return [userId || '', sessionId || '', ipAddress || ''].join('|');
+}
+
+function invalidateBlockedCache(identifiers: Array<string | undefined>) {
+  const key = blockedCacheKey(identifiers[0], identifiers[1], identifiers[2]);
+  blockedCache.delete(key);
+}
+
 export async function isBlocked(userId?: string, sessionId?: string, ipAddress?: string): Promise<{ blocked: boolean; rayId?: string; reason?: string; expiresAt?: Date }> {
   try {
     const settings = await getCaptchaSettings();
     if (!settings.enabled) return { blocked: false };
+
+    const cacheKey = blockedCacheKey(userId, sessionId, ipAddress);
+    const hit = blockedCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < BLOCKED_CACHE_TTL) {
+      return { blocked: hit.blocked, rayId: hit.rayId, reason: hit.reason, expiresAt: hit.expiresAt };
+    }
+
     const now = new Date();
 
     for (const where of [
@@ -372,7 +438,15 @@ export async function isBlocked(userId?: string, sessionId?: string, ipAddress?:
         orderBy: { blockedAt: 'desc' },
       });
       if (block) {
+        blockedCache.set(cacheKey, { blocked: true, rayId: block.rayId, reason: block.reason, expiresAt: block.expiresAt || undefined, at: Date.now() });
         return { blocked: true, rayId: block.rayId, reason: block.reason, expiresAt: block.expiresAt || undefined };
+      }
+    }
+    blockedCache.set(cacheKey, { blocked: false, at: Date.now() });
+    if (blockedCache.size > 5000) {
+      const cutoff = Date.now() - BLOCKED_CACHE_TTL;
+      for (const [k, v] of blockedCache) {
+        if (v.at < cutoff) blockedCache.delete(k);
       }
     }
     return { blocked: false };
@@ -418,9 +492,9 @@ export async function generateChallenge(difficulty: CaptchaDifficulty, sessionId
   const expiresAt = new Date(Date.now() + settings.challengeExpiry * 60 * 1000);
 
   const typePool: CaptchaType[] = difficulty === 'easy' ? ['math', 'word'] : ['count', 'shape', 'direction', 'math'];
-  const challengeType = typePool[randomInt(0, typePool.length)];
-  const id = randomBytes(16).toString('hex');
-  const rayId = randomBytes(8).toString('hex');
+  const challengeType = typePool[(randomInt as Function)(0, typePool.length)];
+  const id = Buffer.from(randomBytes(16)).toString('hex');
+  const rayId = Buffer.from(randomBytes(8)).toString('hex');
 
   let question: string;
   let answerHash: string;
@@ -434,15 +508,15 @@ export async function generateChallenge(difficulty: CaptchaDifficulty, sessionId
     options = derived.options;
     imageUrl = `/api/captcha/image/${id}?token=${signImageToken(id)}`;
   } else if (challengeType === 'math') {
-    const a = randomInt(1, 10);
-    const b = randomInt(1, 10);
+    const a = (randomInt as Function)(1, 10);
+    const b = (randomInt as Function)(1, 10);
     const answer = (a + b).toString();
     question = `What is ${a} + ${b}?`;
     answerHash = await hashAnswer(answer);
-    options = shuffleArray([answer, randomInt(1, 20).toString(), randomInt(1, 20).toString(), randomInt(1, 20).toString()]);
+    options = shuffleArray([answer, (randomInt as Function)(1, 20).toString(), (randomInt as Function)(1, 20).toString(), (randomInt as Function)(1, 20).toString()]);
   } else {
     const words = ['apple', 'banana', 'cherry', 'grape', 'lemon', 'peach', 'plum', 'melon'];
-    const target = words[randomInt(0, words.length)];
+    const target = words[(randomInt as Function)(0, words.length)];
     question = `Select the word: ${target.charAt(0).toUpperCase() + target.slice(1)}`;
     answerHash = await hashAnswer(target);
     const distractors = words.filter(w => w !== target).slice(0, 3);
@@ -472,7 +546,7 @@ export function issueChallengeToken(challenge: { id: string; expiresAt: Date }, 
   return signToken({
     id: challenge.id,
     exp: Math.floor(challenge.expiresAt.getTime() / 1000),
-    nonce: randomBytes(8).toString('hex'),
+    nonce: Buffer.from(randomBytes(8)).toString('hex'),
     ipHash,
     uaHash,
     fpHash,
@@ -593,13 +667,14 @@ export async function verifyChallenge(input: {
 
 // ─── Blocks ───
 export async function recordBlock(userId: string | undefined, sessionId: string | undefined, ipAddress: string | undefined, reason: string, metadata?: any): Promise<string> {
-  const rayId = randomBytes(16).toString('hex');
+  const rayId = Buffer.from(randomBytes(16)).toString('hex');
   const settings = await getCaptchaSettings();
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   await prisma.captchaBlock.create({
     data: { userId, sessionId, ipAddress: ipAddress || 'unknown', reason, rayId, expiresAt, metadata },
   });
+  invalidateBlockedCache([userId, sessionId, ipAddress || 'unknown']);
   await logCaptchaEvent(userId, sessionId, ipAddress, 'blocked', 'hard', rayId, metadata);
 
   const warningCount = userId ? (await getUserWarningCount(userId, ipAddress)).count : 0;
@@ -616,6 +691,7 @@ export async function unblockUser(rayId: string, adminId?: string): Promise<bool
     where: { rayId },
     data: { unblockedAt: new Date(), unblockedBy: adminId },
   });
+  invalidateBlockedCache([block.userId, block.sessionId, block.ipAddress]);
   await logCaptchaEvent(block.userId, block.sessionId, block.ipAddress, 'unblocked', undefined, rayId);
   return true;
 }
@@ -761,7 +837,7 @@ function hashAnswer(answer: string): Promise<string> {
 function shuffleArray<T>(array: T[]): T[] {
   const shuffled = [...array];
   for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = randomInt(0, i + 1);
+    const j = (randomInt as Function)(0, i + 1);
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   return shuffled;
@@ -794,4 +870,4 @@ export async function cleanupExpiredChallenges(): Promise<void> {
   });
 }
 
-export { computeDeviceFingerprint };
+export { computeDeviceFingerprint, hasRecentLoginSuccess };

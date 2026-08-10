@@ -1,4 +1,4 @@
-import { prisma } from './db/prisma';
+// Log model removed - logging is done via AuditEvent
 
 export async function logRequest(info: {
   ip: string | undefined;
@@ -7,17 +7,9 @@ export async function logRequest(info: {
   userId?: string;
   status?: number;
 }) {
-  await prisma.log.create({
-    data: {
-      ip: info.ip || null,
-      method: info.method,
-      path: info.path,
-      userId: info.userId || null,
-      status: info.status ?? null,
-    },
-  }).catch(() => {});
+  // No-op - Log model removed
 }
 
 export async function getLogs(limit = 100) {
-  return prisma.log.findMany({ orderBy: { createdAt: 'desc' }, take: limit });
+  return [];
 }

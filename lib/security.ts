@@ -89,6 +89,64 @@ export function sanitizeInput(value: string, maxLength = 5000): string {
     .slice(0, maxLength);
 }
 
+/**
+ * Sanitize user-authored custom CSS for a form's <style> tag. Strips anything
+ * that could escape the stylesheet (HTML/JS) while keeping valid CSS rules.
+ */
+export function sanitizeCss(value: string, maxLength = 20000): string {
+  let css = String(value || '').slice(0, maxLength);
+  // No HTML or tag-closing tokens — CSS must never be able to break out.
+  css = css.replace(/[<>]/g, '');
+  // Block script-y constructs and dangerous url() based beacons (data:).
+  css = css.replace(/expression\s*\(/gi, 'none(');
+  css = css.replace(/(javascript|vbscript)\s*:/gi, 'blocked:');
+  css = css.replace(/@import\b/gi, '@noimport');
+  css = css.replace(/url\s*\(\s*['"]?(data|javascript|vbscript)\s*:/gi, 'url(blocked:');
+  return css;
+}
+
+/**
+ * Sanitize user-authored custom HTML (the `custom-html` field type) to a safe
+ * subset. Strips script-bearing tags and event handlers, blocks dangerous URL
+ * schemes and only keeps an allow-list of tags/attributes. Never trusted on its
+ * own — the renderer still escapes through React's dangerouslySetInnerHTML.
+ */
+const SAFE_HTML_TAGS = new Set([
+  'p', 'br', 'strong', 'em', 'b', 'i', 'u', 's', 'a', 'ul', 'ol', 'li', 'h1', 'h2', 'h3',
+  'h4', 'h5', 'h6', 'blockquote', 'code', 'pre', 'span', 'img', 'hr', 'div', 'small',
+  'sub', 'sup', 'mark', 'del', 'ins', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+]);
+const SAFE_HTML_ATTRS = new Set(['href', 'title', 'target', 'rel', 'src', 'alt', 'width', 'height', 'class', 'style', 'colspan', 'rowspan']);
+const SAFE_HTML_SCHEMES = new Set(['http', 'https', 'mailto', 'tel']);
+
+export function sanitizeHtml(value: string, maxLength = 50000): string {
+  let html = String(value || '').slice(0, maxLength);
+  // Remove script-bearing containers and anything that can leak JS entirely.
+  html = html.replace(/<\s*\/*\s*(script|iframe|frame|object|embed|style|link|meta|form|template|svg|math|noscript|base|input|button|textarea|select|option|source)[^>]*>/gi, ' ');
+  // Drop event handlers and null/obvious hooks.
+  html = html.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  html = html.replace(/\s(style)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
+  html = html.replace(/(javascript|vbscript|data:text\/html|data:image\/svg\+xml)\s*:/gi, 'blocked:');
+  // Re-tokenize tags and drop anything not on the allow-list.
+  html = html.replace(/<\s*(\/?)\s*([a-zA-Z][a-zA-Z0-9]*)([^>]*)>/g, (match, close, tag, attrs) => {
+    const name = tag.toLowerCase();
+    if (!SAFE_HTML_TAGS.has(name)) return '';
+    const cleaned = String(attrs).replace(/([a-zA-Z-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/g, (am, attrName, rawVal) => {
+      const n = attrName.toLowerCase();
+      if (!SAFE_HTML_ATTRS.has(n)) return '';
+      const v = String(rawVal).replace(/^["']|["']$/g, '');
+      if ((n === 'href' || n === 'src') && v) {
+        const scheme = v.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+        if (scheme && !SAFE_HTML_SCHEMES.has(scheme[1].toLowerCase()) && !v.startsWith('/') && !v.startsWith('#')) return '';
+        if (n === 'src' && scheme && scheme[1].toLowerCase() !== 'https' && !v.startsWith('/')) return '';
+      }
+      return ` ${n}="${v.replace(/"/g, '&quot;')}"`;
+    });
+    return `<${close}${name}${cleaned}>`;
+  });
+  return html;
+}
+
 export function sanitizeJsonStrings<T>(value: T, maxLength = 5000): T {
   if (typeof value === 'string') return sanitizeInput(value, maxLength) as unknown as T;
   if (Array.isArray(value)) return value.map(v => sanitizeJsonStrings(v, maxLength)) as unknown as T;
@@ -214,15 +272,26 @@ function buildDetailsString(parts: Record<string, unknown>): string {
 
 // ─── Blocklist management (IP / user / target blocks) ───
 
+const ipBlockCache = new Map<string, { blocked: boolean; expires: number }>();
+const IP_BLOCK_CACHE_TTL = 15_000;
+
 export async function isIpBlocked(ip: string): Promise<boolean> {
   if (!ip || ip === 'unknown') return false;
+  const cached = ipBlockCache.get(ip);
+  if (cached && cached.expires > Date.now()) return cached.blocked;
   try {
     const entry = await prisma.blocklist.findUnique({
       where: { targetType_targetId: { targetType: 'ip', targetId: ip } },
     });
-    if (!entry || entry.isActive === false) return false;
-    if (entry.expiresAt && entry.expiresAt < new Date()) return false;
-    return true;
+    const blocked = !!entry && entry.isActive !== false && (!entry.expiresAt || entry.expiresAt >= new Date());
+    ipBlockCache.set(ip, { blocked, expires: Date.now() + IP_BLOCK_CACHE_TTL });
+    if (ipBlockCache.size > 1000) {
+      const now = Date.now();
+      for (const [k, v] of ipBlockCache) {
+        if (v.expires <= now) ipBlockCache.delete(k);
+      }
+    }
+    return blocked;
   } catch {
     return false;
   }
@@ -253,6 +322,7 @@ export async function blockTarget(input: {
       expiresAt: input.expiresAt || null,
     },
   });
+  if (input.targetType === 'ip') ipBlockCache.delete(input.targetId);
 }
 
 export async function unblockTarget(targetType: string, targetId: string): Promise<void> {
@@ -260,6 +330,7 @@ export async function unblockTarget(targetType: string, targetId: string): Promi
     where: { targetType, targetId },
     data: { isActive: false, updatedAt: new Date() },
   });
+  if (targetType === 'ip') ipBlockCache.delete(targetId);
 }
 
 export async function listBlocks(options: {

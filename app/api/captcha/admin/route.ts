@@ -23,7 +23,7 @@ export async function POST(request: NextRequest) {
     const session = await requireRole(request, 'manager');
     if (session instanceof NextResponse) return session;
 
-    const body = await request.json();
+    const body: any = await request.json();
     const settings = await updateCaptchaSettings(body);
     
     await prisma.captchaLog.create({

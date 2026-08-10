@@ -17,7 +17,7 @@ export async function POST(request: NextRequest) {
     }
 
     const { email, password, captchaRayId, fingerprint } = parsed.data;
-    return adminLoginHandler(request);
+    return adminLoginHandler(request, parsed.data);
   } catch (err: any) {
     console.error('[ADMIN LOGIN] Authentication error:', err?.message || err);
     return new NextResponse('Login failed', { status: 500 });
@@ -46,7 +46,7 @@ async function handleVerify(request: NextRequest) {
     const { prisma } = await import('../../../../lib/db/prisma');
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, roles: { include: { role: true } } },
+      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, mustChangePassword: true, roles: { include: { role: true } } },
     });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
       return new NextResponse('2FA not enabled', { status: 400 });
@@ -66,6 +66,14 @@ async function handleVerify(request: NextRequest) {
         dashboardUrl: 'https://admin.tirbeo.app',
       }).catch(() => {});
       return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
+    }
+
+    // 2FA satisfied but the account was provisioned with a temporary password —
+    // force a password change before issuing any admin session.
+    if (user.mustChangePassword) {
+      const { signTempPasswordChangeToken } = await import('../../../../lib/auth/jwt');
+      const pwToken = await signTempPasswordChangeToken(user.id);
+      return NextResponse.json({ needsPasswordChange: true, tempToken: pwToken });
     }
 
     const ip = request.headers.get('x-forwarded-for') || '';

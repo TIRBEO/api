@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '../../../../../lib/db/prisma';
-import { requireAdmin } from '../../../../../lib/session';
+import { requireRole } from '@/lib/session';
 import { PERMISSION_RESOURCES, normalizePermissions } from '../../../../../lib/roles';
 
 const roleSchema = z.object({
@@ -12,19 +12,9 @@ const roleSchema = z.object({
   permissions: z.record(z.string(), z.boolean()).optional(),
 });
 
-function requireSuperAdmin(session: unknown): NextResponse | null {
-  const s = session as { adminRole?: string } | null;
-  if (!s || s.adminRole !== 'super_admin') {
-    return new NextResponse('Forbidden — super_admin only', { status: 403 });
-  }
-  return null;
-}
-
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const session = await requireAdmin(request);
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
-  const forbidden = requireSuperAdmin(session);
-  if (forbidden) return forbidden;
 
   const { action } = await params;
   const roleId = action?.[0];
@@ -54,12 +44,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 }
 
 export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
-  const forbidden = requireSuperAdmin(session);
-  if (forbidden) return forbidden;
 
-  const body = await request.json();
+  const body: any = await request.json();
   const parsed = roleSchema.safeParse(body);
   if (!parsed.success) {
     return new NextResponse('Invalid payload: ' + JSON.stringify(parsed.error.flatten()), { status: 400 });
@@ -82,10 +70,8 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const session = await requireAdmin(request);
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
-  const forbidden = requireSuperAdmin(session);
-  if (forbidden) return forbidden;
 
   const { action } = await params;
   const roleId = action?.[0];
@@ -94,7 +80,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   const existing = await prisma.app_roles.findUnique({ where: { id: roleId } });
   if (!existing) return new NextResponse('Role not found', { status: 404 });
 
-  const body = await request.json();
+  const body: any = await request.json();
   const { permissions } = body;
   if (permissions === undefined) {
     return new NextResponse('Invalid payload', { status: 400 });
@@ -108,10 +94,8 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 }
 
 export async function PUT(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const session = await requireAdmin(request);
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
-  const forbidden = requireSuperAdmin(session);
-  if (forbidden) return forbidden;
 
   const { action } = await params;
   const roleId = action?.[0];
@@ -121,7 +105,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
   if (!existing) return new NextResponse('Role not found', { status: 404 });
   if (existing.isSystem) return new NextResponse('Cannot edit system roles', { status: 400 });
 
-  const body = await request.json();
+  const body: any = await request.json();
   const parsed = roleSchema.partial().safeParse(body);
   if (!parsed.success) {
     return new NextResponse('Invalid payload', { status: 400 });
@@ -143,10 +127,8 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 }
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const session = await requireAdmin(request);
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
-  const forbidden = requireSuperAdmin(session);
-  if (forbidden) return forbidden;
 
   const { action } = await params;
   const roleId = action?.[0];

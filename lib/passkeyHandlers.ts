@@ -12,32 +12,68 @@ import { createAuditEvent } from './audit';
 import { jsonError, jsonUnauthorized } from './response';
 
 const RP_NAME = 'Tirbeo';
-const RP_ID = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function isLocalhost(host: string): boolean {
+  return host.startsWith('localhost') || host.startsWith('127.0.0.1');
+}
+
+// WebAuthn rpID must be a registrable-domain suffix of the page's origin.
+// In local dev the dashboard is served from localhost, so use "localhost";
+// in production the API and dashboard share the .tirbeo.app registrable domain.
+function getRpID(request: NextRequest): string {
+  const host = request.headers.get('host') || '';
+  const origin = request.headers.get('origin') || '';
+  
+  // If the origin is from localhost, use localhost as RP ID
+  if (origin) {
+    try {
+      const originUrl = new URL(origin);
+      if (isLocalhost(originUrl.hostname)) return 'localhost';
+    } catch {}
+  }
+  
+  // Fallback to host-based detection
+  if (isLocalhost(host)) return 'localhost';
+  
+  // Production: use the configured domain
+  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+}
 
 function getOrigin(request: NextRequest): string {
   const origin = request.headers.get('origin');
   if (origin) return origin;
-  const host = request.headers.get('host') || RP_ID;
+  const host = request.headers.get('host') || '';
+  if (isLocalhost(host)) return `http://${host}`;
   return `https://${host}`;
 }
 
 // ─── DB-backed challenge helpers ────────────────────────
 
 async function storeChallenge(nonce: string, challenge: string, type: 'register' | 'auth', userId?: string) {
-  // Lazy cleanup: delete expired challenges on each write (no cron needed for serverless)
-  await prisma.passkeyChallenge.deleteMany({
-    where: { expiresAt: { lt: new Date() } },
-  });
-  await prisma.passkeyChallenge.create({
-    data: {
-      nonce,
-      challenge,
-      type,
-      userId: userId || null,
-      expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
-    },
-  });
+  try {
+    // Lazy cleanup: delete expired challenges on each write (no cron needed for serverless)
+    const deleted = await prisma.passkeyChallenge.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    if (deleted.count > 0) {
+      console.log(`[PASSKEY] Cleaned up ${deleted.count} expired challenges`);
+    }
+    
+    await prisma.passkeyChallenge.create({
+      data: {
+        nonce,
+        challenge,
+        type,
+        userId: userId || null,
+        expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
+      },
+    });
+    console.log(`[PASSKEY] Stored ${type} challenge with nonce: ${nonce}`);
+  } catch (err: any) {
+    console.error('[PASSKEY] Error storing challenge:', err?.message || err);
+    throw err;
+  }
 }
 
 async function getAndDeleteChallenge(nonce: string) {
@@ -54,22 +90,31 @@ async function getAndDeleteChallenge(nonce: string) {
 export async function passkeyRegisterOptionsHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return jsonUnauthorized(undefined, request);
+    if (!session) {
+      console.warn('[PASSKEY REGISTER OPTIONS] No session found');
+      return jsonUnauthorized(undefined, request);
+    }
 
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { id: true, email: true, name: true },
     });
-    if (!user) return jsonError('User not found', 404, request);
+    if (!user) {
+      console.warn(`[PASSKEY REGISTER OPTIONS] User not found: ${session.userId}`);
+      return jsonError('User not found', 404, request);
+    }
 
     const existingPasskeys = await prisma.passkey.findMany({
       where: { userId: user.id },
       select: { credentialId: true },
     });
 
+    const rpID = getRpID(request);
+    console.log(`[PASSKEY REGISTER OPTIONS] Generating options for user ${user.email}, rpID: ${rpID}`);
+
     const options = await generateRegistrationOptions({
       rpName: RP_NAME,
-      rpID: RP_ID,
+      rpID,
       userName: user.email,
       userDisplayName: user.name || user.email,
       attestationType: 'none',
@@ -82,12 +127,13 @@ export async function passkeyRegisterOptionsHandler(request: NextRequest) {
 
     const nonce = crypto.randomUUID();
     await storeChallenge(nonce, options.challenge, 'register', user.id);
+    console.log(`[PASSKEY REGISTER OPTIONS] Challenge stored with nonce: ${nonce}`);
 
     const res = NextResponse.json({ publicKey: options, challengeNonce: nonce });
     return res;
   } catch (err: any) {
-    console.error('[PASSKEY REGISTER OPTIONS]', err?.message || err);
-    return jsonError('Failed to generate registration options', 500, request);
+    console.error('[PASSKEY REGISTER OPTIONS] Error:', err?.message || err, err?.stack);
+    return jsonError('Failed to generate registration options: ' + (err?.message || 'unknown error'), 500, request);
   }
 }
 
@@ -96,38 +142,56 @@ export async function passkeyRegisterOptionsHandler(request: NextRequest) {
 export async function passkeyRegisterVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return jsonUnauthorized(undefined, request);
+    if (!session) {
+      console.warn('[PASSKEY REGISTER VERIFY] No session found');
+      return jsonUnauthorized(undefined, request);
+    }
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { credential, deviceName, challengeNonce } = body as {
       credential: RegistrationResponseJSON;
       deviceName?: string;
       challengeNonce?: string;
     };
 
-    if (!credential) return jsonError('Missing credential', 400, request);
-    if (!challengeNonce) return jsonError('Missing challengeNonce', 400, request);
+    if (!credential) {
+      console.warn('[PASSKEY REGISTER VERIFY] Missing credential in request body');
+      return jsonError('Missing credential', 400, request);
+    }
+    if (!challengeNonce) {
+      console.warn('[PASSKEY REGISTER VERIFY] Missing challengeNonce in request body');
+      return jsonError('Missing challengeNonce', 400, request);
+    }
+
+    console.log(`[PASSKEY REGISTER VERIFY] Verifying registration for user ${session.userId}, nonce: ${challengeNonce}`);
 
     const stored = await getAndDeleteChallenge(challengeNonce);
     if (!stored) {
+      console.warn(`[PASSKEY REGISTER VERIFY] Challenge not found or expired: ${challengeNonce}`);
       return jsonError('Challenge expired or not found. Please try again.', 400, request);
     }
 
     const origin = getOrigin(request);
+    const rpID = getRpID(request);
+    console.log(`[PASSKEY REGISTER VERIFY] Using origin: ${origin}, rpID: ${rpID}`);
 
     const verification = await verifyRegistrationResponse({
       response: credential,
       expectedChallenge: stored.challenge,
       expectedOrigin: origin,
-      expectedRPID: RP_ID,
+      expectedRPID: rpID,
     });
 
     if (!verification.verified || !verification.registrationInfo) {
+      console.warn('[PASSKEY REGISTER VERIFY] Verification failed - not verified or no registrationInfo');
       return jsonError('Registration verification failed', 400, request);
     }
 
     const { credential: regCredential } = verification.registrationInfo;
     const transports = credential.response?.transports || [];
+    const deviceNameStr = deviceName || parseDeviceName(request.headers.get('user-agent') || '');
+
+    console.log(`[PASSKEY REGISTER VERIFY] Creating passkey with credentialId: ${regCredential.id}`);
 
     await prisma.passkey.create({
       data: {
@@ -136,22 +200,24 @@ export async function passkeyRegisterVerifyHandler(request: NextRequest) {
         credentialPublicKey: Buffer.from(regCredential.publicKey),
         counter: BigInt(regCredential.counter),
         transports: transports.join(','),
-        deviceName: deviceName || parseDeviceName(request.headers.get('user-agent') || ''),
+        deviceName: deviceNameStr,
       },
     });
+
+    console.log(`[PASSKEY REGISTER VERIFY] Passkey created successfully for user ${session.userId}`);
 
     await createAuditEvent({
       actorId: session.userId,
       action: 'passkey.registered',
       targetType: 'user',
       targetId: session.userId,
-      metadata: { deviceName: deviceName || undefined },
+      metadata: { deviceName: deviceNameStr },
       severity: 'info',
     });
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
-    console.error('[PASSKEY REGISTER VERIFY]', err?.message || err);
+    console.error('[PASSKEY REGISTER VERIFY] Error:', err?.message || err, err?.stack);
     return jsonError('Failed to verify registration: ' + (err?.message || 'unknown error'), 500, request);
   }
 }
@@ -160,7 +226,7 @@ export async function passkeyRegisterVerifyHandler(request: NextRequest) {
 
 export async function passkeyAuthOptionsHandler(request: NextRequest) {
   try {
-    const body = await request.json().catch(() => ({}));
+    const body: any = await request.json().catch(() => ({}));
     const { email } = body as { email?: string };
 
     let allowCredentials: { id: string; transports?: AuthenticatorTransport[] }[] = [];
@@ -185,7 +251,7 @@ export async function passkeyAuthOptionsHandler(request: NextRequest) {
     }
 
     const options = await generateAuthenticationOptions({
-      rpID: RP_ID,
+      rpID: getRpID(request),
       allowCredentials: allowCredentials.length > 0 ? allowCredentials : undefined,
       userVerification: 'preferred',
     });
@@ -205,7 +271,7 @@ export async function passkeyAuthOptionsHandler(request: NextRequest) {
 
 export async function passkeyAuthVerifyHandler(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body: any = await request.json();
     const { credential, challengeNonce } = body as {
       credential: AuthenticationResponseJSON;
       challengeNonce: string;
@@ -233,7 +299,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       response: credential,
       expectedChallenge: stored.challenge,
       expectedOrigin: origin,
-      expectedRPID: RP_ID,
+      expectedRPID: getRpID(request),
       requireUserVerification: false,
       credential: {
         id: passkey.credentialId,
@@ -276,7 +342,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       id: passkey.user.id,
       email: passkey.user.email,
     });
-     setSessionCookie(res, token, refreshToken);
+     setSessionCookie(res, token, refreshToken, request);
     return res;
   } catch (err: any) {
     console.error('[PASSKEY AUTH VERIFY]', err?.message || err);
@@ -350,7 +416,7 @@ export async function passkeyUpdateHandler(request: NextRequest, passkeyId: stri
     const session = await getSession(request);
     if (!session) return jsonUnauthorized(undefined, request);
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { deviceName } = body as { deviceName?: string };
 
     if (typeof deviceName !== 'string') return jsonError('Invalid device name', 400, request);

@@ -48,7 +48,7 @@ export async function PUT(request: NextRequest, context: { params: Promise<{ id:
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
 
-    const body = await request.json();
+    const body: any = await request.json();
     const { status, priority } = body;
 
     const existing = await prisma.ticket.findFirst({

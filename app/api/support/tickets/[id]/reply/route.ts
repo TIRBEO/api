@@ -9,11 +9,15 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
 
-    const body = await request.json();
-    const { message, content } = body;
-    const text = message || content;
+    const body: any = await request.json();
+    const { message, content, imageUrls } = body;
+    const text = String(message || content || '');
 
-    if (!text) {
+    const images = Array.isArray(imageUrls)
+      ? imageUrls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\/\S+$/i.test(u)).slice(0, 6)
+      : [];
+
+    if (!text.trim() && images.length === 0) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 });
     }
 
@@ -30,11 +34,22 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json({ error: 'Ticket not found' }, { status: 404 });
     }
 
+    if (ticket.status === 'resolved' || ticket.status === 'closed') {
+      return NextResponse.json(
+        { error: 'This ticket is resolved and no longer accepts replies. Open a new ticket if you need more help.' },
+        { status: 400 }
+      );
+    }
+
+    const contentText = [text.trim(), ...images.map((u: string) => `![tirbeo-img](${u})`)]
+      .filter(Boolean)
+      .join('\n');
+
     const reply = await prisma.ticketMessage.create({
       data: {
         ticketId: id,
         authorId: session.userId,
-        content: String(text).slice(0, 20000),
+        content: contentText.slice(0, 20000),
         isInternal: false,
       },
       include: {

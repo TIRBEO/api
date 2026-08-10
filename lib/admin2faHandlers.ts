@@ -43,7 +43,7 @@ export async function verify2faSetupHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const { token } = await request.json();
+  const { token } = (await request.json()) as any;
   if (typeof token !== 'string') return new NextResponse('Invalid token', { status: 400 });
 
   const user = await prisma.user.findUnique({ where: { id: session.userId } });
@@ -73,7 +73,7 @@ export async function disable2faHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const { token, password } = await request.json();
+  const { token, password } = (await request.json()) as any;
 
   const user = await prisma.user.findUnique({ where: { id: session.userId } });
   if (!user) return new NextResponse('User not found', { status: 404 });

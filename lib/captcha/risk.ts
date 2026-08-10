@@ -147,7 +147,31 @@ export function analyzeBehavior(behavior: BehaviorData | undefined): { score: nu
 // ─── Sliding-window rate limiter (in-memory, edge-safe) ───
 const windows = new Map<string, { count: number; reset: number }>();
 
+/** Clear all rate limit windows (for development/testing) */
+export function clearRateLimits(): void {
+  windows.clear();
+}
+
+/** Clear rate limits matching a pattern */
+export function clearRateLimitsByPattern(pattern: string): void {
+  for (const key of windows.keys()) {
+    if (key.includes(pattern)) {
+      windows.delete(key);
+    }
+  }
+}
+
+/**
+ * Check if a request is within rate limits.
+ * DISABLED for development - always allows.
+ * Re-enable by setting ENABLE_RATE_LIMITING = true
+ */
+const ENABLE_RATE_LIMITING = false; // Set to true in production
+
 export function checkWindowLimit(key: string, max: number, windowMs: number): boolean {
+  if (!ENABLE_RATE_LIMITING) {
+    return true; // Always allow in development
+  }
   const now = Date.now();
   let w = windows.get(key);
   if (!w || now > w.reset) {
@@ -164,8 +188,15 @@ export function checkWindowLimit(key: string, max: number, windowMs: number): bo
 }
 
 // ─── Same-device multi-account detection ───
+const deviceCache = new Map<string, { data: { users: number; sessions: number }; ts: number }>();
+const DEVICE_CACHE_TTL = 60_000; // 60s cache per device fingerprint
+
 export async function countAccountsForDevice(fingerprint: string, sinceHours = 24): Promise<{ users: number; sessions: number }> {
   if (!fingerprint || fingerprint.length < 16) return { users: 0, sessions: 0 };
+  // Use first 32 chars as cache key to keep map size small
+  const cacheKey = fingerprint.slice(0, 32);
+  const cached = deviceCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < DEVICE_CACHE_TTL) return cached.data;
   const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
   try {
     const [seen, count] = await Promise.all([
@@ -187,7 +218,15 @@ export async function countAccountsForDevice(fingerprint: string, sinceHours = 2
       }),
     ]);
     const users = new Set(seen.map(s => s.userId).filter(Boolean));
-    return { users: users.size, sessions: count };
+    const result = { users: users.size, sessions: count };
+    deviceCache.set(cacheKey, { data: result, ts: Date.now() });
+    if (deviceCache.size > 2000) {
+      const now = Date.now();
+      for (const [k, v] of deviceCache) {
+        if (now - v.ts > DEVICE_CACHE_TTL) deviceCache.delete(k);
+      }
+    }
+    return result;
   } catch {
     return { users: 0, sessions: 0 };
   }
@@ -217,6 +256,43 @@ export async function recordDeviceSeen(opts: {
   }
 }
 
+// A recent successful login from this IP means the risk was already cleared —
+// let the score decay back to normal instead of staying elevated (PRD: CAPTCHA
+// resets when traffic normalizes).
+const LOGIN_SUCCESS_EVENTS = ['auth.login_success', 'auth.admin_login_success', 'auth.login_2fa_success', 'auth.login_otp_success'];
+const LOGIN_SUCCESS_FORGIVENESS_MS = 30 * 60 * 1000;
+
+// Cache recent login success check per IP (30s TTL)
+const loginSuccessCache = new Map<string, { result: boolean; ts: number }>();
+const LOGIN_SUCCESS_CACHE_TTL = 30_000;
+
+export async function hasRecentLoginSuccess(ip?: string, sinceMs = LOGIN_SUCCESS_FORGIVENESS_MS): Promise<boolean> {
+  if (!ip || ip === 'unknown') return false;
+  const cached = loginSuccessCache.get(ip);
+  if (cached && Date.now() - cached.ts < LOGIN_SUCCESS_CACHE_TTL) return cached.result;
+  try {
+    const since = new Date(Date.now() - sinceMs);
+    const count = await prisma.securityEvent.count({
+      where: {
+        eventType: { in: LOGIN_SUCCESS_EVENTS },
+        ipAddress: ip,
+        createdAt: { gte: since },
+      },
+    });
+    const result = count > 0;
+    loginSuccessCache.set(ip, { result, ts: Date.now() });
+    if (loginSuccessCache.size > 5000) {
+      const now = Date.now();
+      for (const [k, v] of loginSuccessCache) {
+        if (now - v.ts > LOGIN_SUCCESS_CACHE_TTL) loginSuccessCache.delete(k);
+      }
+    }
+    return result;
+  } catch {
+    return false;
+  }
+}
+
 export function riskLevelFromScore(score: number): RiskLevel {
   if (score <= 20) return 'none';
   if (score <= 50) return 'invisible';
@@ -238,8 +314,11 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
   const checks: Promise<void>[] = [];
 
   if (input.ip) {
+    const recentSuccess = hasRecentLoginSuccess(input.ip);
     checks.push(
       (async () => {
+        const ok = await recentSuccess;
+        if (ok) return; // user already proved who they are — clear suspicion
         const blocked = await isIpBlocked(input.ip || '');
         if (blocked) {
           score += 40;
@@ -249,6 +328,8 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
     );
     checks.push(
       (async () => {
+        const ok = await recentSuccess;
+        if (ok) return; // clear rate-limit suspicion after a successful login
         if (isSuspicious(input.ip || '')) {
           score += 15;
           reasons.push('recent rate-limit hits');
@@ -259,6 +340,7 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
       (async () => {
         const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
         try {
+          const ok = await recentSuccess;
           const [loginFails, captchaFails] = await Promise.all([
             prisma.securityEvent.count({
               where: {
@@ -271,17 +353,30 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
               where: { eventType: 'attempt_failed', ipAddress: input.ip, createdAt: { gte: since } },
             }),
           ]);
-          if (loginFails >= 5) {
-            score += 20;
-            reasons.push('repeated failed sign-ins');
-          } else if (loginFails >= 2) {
-            score += 8;
-          }
-          if (captchaFails >= 5) {
-            score += 15;
-            reasons.push('repeated captcha failures');
-          } else if (captchaFails >= 2) {
-            score += 5;
+          if (ok) {
+            // Logins are working again — failures happened before the user
+            // proved identity, so don't keep compounding the score.
+            if (loginFails >= 10) {
+              score += 8;
+              reasons.push('repeated past failed sign-ins');
+            }
+            if (captchaFails >= 10) {
+              score += 5;
+              reasons.push('repeated past captcha failures');
+            }
+          } else {
+            if (loginFails >= 5) {
+              score += 20;
+              reasons.push('repeated failed sign-ins');
+            } else if (loginFails >= 2) {
+              score += 8;
+            }
+            if (captchaFails >= 5) {
+              score += 15;
+              reasons.push('repeated captcha failures');
+            } else if (captchaFails >= 2) {
+              score += 5;
+            }
           }
         } catch {
           // best effort

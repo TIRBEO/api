@@ -2,6 +2,7 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { startWsServer } from './lib/ws/server';
+import { getPoolStatus } from './lib/db/prisma';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
@@ -19,6 +20,14 @@ app.prepare().then(() => {
 
   server.listen(port, () => {
     console.log(`> Next.js ready on http://${hostname}:${port}`);
+
+    // Log pool status after warm-up completes (1s delay to let async warm-up finish)
+    setTimeout(() => {
+      const pool = getPoolStatus();
+      if (pool) {
+        console.log(`> DB pool: ${pool.totalCount} total, ${pool.idleCount} idle, ${pool.waitingCount} waiting`);
+      }
+    }, 1500);
   });
 
   startWsServer(wsPort);

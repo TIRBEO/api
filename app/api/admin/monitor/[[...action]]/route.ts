@@ -27,7 +27,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   const { action } = await params;
   const [first] = action;
   if (first === 'blocked') {
-    const body = await request.json();
+    const body: any = await request.json();
     const entry = await prisma.blocklist.create({
       data: {
         targetType: 'ip',
@@ -48,7 +48,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
   const { action } = await params;
   const [first] = action;
   if (first === 'blocked') {
-    const body = await request.json();
+    const body: any = await request.json();
     if (body.id) {
       await prisma.blocklist.delete({ where: { id: body.id } });
     } else if (body.ip) {

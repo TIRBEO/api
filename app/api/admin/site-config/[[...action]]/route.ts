@@ -28,7 +28,7 @@ export async function PUT(request: NextRequest) {
   const app = searchParams.get('app');
   if (!app) return new NextResponse('Missing app query param', { status: 400 });
 
-  const body = await request.json();
+  const body: any = await request.json();
 
   const config = await prisma.siteConfig.upsert({
     where: { app },

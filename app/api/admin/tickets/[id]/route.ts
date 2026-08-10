@@ -30,7 +30,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   if (session instanceof NextResponse) return session;
 
   const { id } = await params;
-  const body = await request.json();
+  const body: any = await request.json();
   const ticket = await prisma.ticket.findUnique({ where: { id } });
   if (!ticket) return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'Ticket not found' } }, { status: 404 });
 

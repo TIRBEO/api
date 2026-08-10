@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/db/prisma';
-import { requireAdmin } from '@/lib/session';
+import { withAdmin } from '@/lib/role-guard';
 import { cachedJson } from '../../../../lib/response';
 
-export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
-  if (session instanceof NextResponse) return session;
+export const GET = withAdmin(async (request, session) => {
 
   const limit = Number(request.nextUrl.searchParams.get('limit')) || 20;
 
@@ -25,4 +23,4 @@ export async function GET(request: NextRequest) {
   });
 
   return cachedJson({ logs, onlineUsers }, { ttl: 5, swr: 15 });
-}
+});

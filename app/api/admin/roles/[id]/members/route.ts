@@ -8,7 +8,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     if (session instanceof NextResponse) return session;
 
     const { id } = await params;
-    const body = await request.json();
+    const body: any = await request.json();
     const { userId, assignedById } = body;
 
     if (!userId) {
@@ -47,7 +47,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     if (session instanceof NextResponse) return session;
 
     const { id } = await params;
-    const body = await request.json();
+    const body: any = await request.json();
     const { userId } = body;
 
     if (!userId) {

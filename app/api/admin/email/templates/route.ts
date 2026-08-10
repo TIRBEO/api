@@ -14,7 +14,7 @@ export async function POST(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const payload = await request.json();
+  const payload: any = await request.json();
   const { name, label, subject, htmlBody, variables, fromEmail, fromName } = payload;
 
   if (!name || !label || !subject || !htmlBody) {

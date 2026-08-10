@@ -31,7 +31,7 @@ export async function PUT(request: NextRequest) {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
 
-    const body = await request.json();
+    const body: any = await request.json();
     
     // Only update allowed fields
     const allowedFields = ['email', 'push', 'inApp', 'security', 'forms', 'product', 'support'];

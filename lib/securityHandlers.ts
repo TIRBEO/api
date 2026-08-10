@@ -3,20 +3,29 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession } from './session';
 import { revokeSessionState } from './auth/redis';
-import { revokeSessionFamilyByUser } from './auth/session';
+import { revokeSessionFamilyByUser, bustSessionCache } from './auth/session';
 import { jsonUnauthorized, jsonError } from './response';
 import { createAuditEvent } from './audit';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } from './auth/totp';
 import { hashRecoveryCode } from './auth/password';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
 import { sendTemplateEmail } from './email';
+import { createNotification, NotifType } from './notifications';
+
+async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security') {
+  try {
+    await createNotification({ userId, type, title, body, link: link || '/dashboard/notifications' });
+  } catch (e) {
+    console.error('[NOTIFICATION CREATE]', (e as Error)?.message || e);
+  }
+}
 
 // ─── POST /api/security/phones/send-otp ─────────────────────
 export async function phonesSendOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { number } = await request.json();
+    const { number } = (await request.json()) as any;
     if (!number || typeof number !== 'string') {
       return new NextResponse('Phone number required', { status: 400 });
     }
@@ -39,7 +48,7 @@ export async function phonesVerifyOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { number, code } = await request.json();
+    const { number, code } = (await request.json()) as any;
     if (!number || typeof number !== 'string' || !code || typeof code !== 'string' || code.length !== 6) {
       return new NextResponse('Invalid request', { status: 400 });
     }
@@ -73,7 +82,7 @@ export async function phonesAddHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { number } = await request.json();
+    const { number } = (await request.json()) as any;
     if (!number || typeof number !== 'string') {
       return new NextResponse('Phone number required', { status: 400 });
     }
@@ -102,7 +111,7 @@ export async function phonesRemoveHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { number } = await request.json();
+    const { number } = (await request.json()) as any;
     await prisma.user.update({
       where: { id: session.userId },
       data: { phoneNumber: null, phoneVerified: false },
@@ -140,7 +149,11 @@ export async function securityEventsHandler(request: NextRequest) {
       },
     });
 
-    const events = auditLogs.map((log) => {
+    // Filter out admin-only actions that shouldn't appear in user security events
+    const adminOnlyActions = ['application.', 'oauth_client.', 'oauth.client.', 'user.ban', 'user.unban', 'user.suspend', 'user.role', 'config.', 'feature_flag.', 'setting.', 'theme.', 'route.'];
+    const filteredLogs = auditLogs.filter(log => !adminOnlyActions.some(prefix => log.action.startsWith(prefix)));
+
+    const events = filteredLogs.map((log) => {
       let type: 'sign_in' | 'password_change' | '2fa_enable' | '2fa_disable' | 'recovery_change' | 'session_revoke' | 'passkey_add' = 'sign_in';
       if (log.action.includes('password')) type = 'password_change';
       else if (log.action.includes('totp.enabled') || log.action.includes('2fa.enable')) type = '2fa_enable';
@@ -210,7 +223,7 @@ export async function totpVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { code } = await request.json();
+    const { code } = (await request.json()) as any;
     if (!code || typeof code !== 'string' || code.length !== 6) {
       return new NextResponse('Invalid code', { status: 400 });
     }
@@ -240,6 +253,7 @@ export async function totpVerifyHandler(request: NextRequest) {
       targetId: session.userId,
       severity: 'info',
     });
+    await notify(session.userId, 'Two-step verification enabled', 'Authenticator app two-factor is now active on your account.');
 
     const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
     if (userEmail?.email) {
@@ -263,7 +277,7 @@ export async function totpDisableHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { totpCode } = await request.json();
+    const { totpCode } = (await request.json()) as any;
     if (!totpCode || typeof totpCode !== 'string' || totpCode.length !== 6) {
       return new NextResponse('Invalid code', { status: 400 });
     }
@@ -290,6 +304,7 @@ export async function totpDisableHandler(request: NextRequest) {
       targetId: session.userId,
       severity: 'warning',
     });
+    await notify(session.userId, 'Two-step verification disabled', 'Two-factor authentication was turned off for your account.');
 
     const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
     if (userEmail?.email) {
@@ -353,20 +368,34 @@ export async function recoveryEmailHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return new NextResponse('Valid email required', { status: 400 });
     }
+    // Check if the email is already set and verified — don't reset verification status
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { secondaryEmail: true, secondaryEmailVerified: true },
+    });
+    const emailChanged = user?.secondaryEmail?.toLowerCase() !== email.toLowerCase();
     await prisma.user.update({
       where: { id: session.userId },
-      data: { secondaryEmail: email },
+      data: {
+        secondaryEmail: email,
+        // Only reset verification if the email actually changed
+        secondaryEmailVerified: emailChanged ? false : (user?.secondaryEmailVerified ?? false),
+      },
     });
+    // If email hasn't changed and is already verified, return early
+    if (!emailChanged && user?.secondaryEmailVerified) {
+      return NextResponse.json({ ok: true, alreadyVerified: true });
+    }
     await createAuditEvent({
       actorId: session.userId,
       action: 'recovery_email.updated',
       targetType: 'user',
       targetId: session.userId,
-      metadata: { email },
+      metadata: { email, verified: false },
       severity: 'info',
     });
     return NextResponse.json({ ok: true });
@@ -381,14 +410,19 @@ export async function recoveryEmailSendCodeHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { email } = await request.json();
+    const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return new NextResponse('Valid email required', { status: 400 });
     }
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
-    await sendEmailOtp(email, code);
-    return NextResponse.json({ ok: true, message: 'Verification code sent' });
+    const { sendTemplateEmail } = await import('./email');
+    const result = await sendTemplateEmail(email, 'verify_email', { otp: code });
+    if (!result.success) {
+      console.error(`[RECOVERY EMAIL SEND] Failed to deliver to ${email}: ${result.error}`);
+      return NextResponse.json({ ok: true, message: 'Verification code sent', delivered: false, error: result.error });
+    }
+    return NextResponse.json({ ok: true, message: 'Verification code sent', delivered: true, messageId: result.messageId });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL SEND]', err?.message || err);
     return new NextResponse('Failed to send code', { status: 500 });
@@ -400,7 +434,7 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { email, code } = await request.json();
+    const { email, code } = (await request.json()) as any;
     if (!email || !code || typeof code !== 'string') {
       return new NextResponse('Email and code required', { status: 400 });
     }
@@ -408,16 +442,29 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
     if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
     await prisma.user.update({
       where: { id: session.userId },
-      data: { secondaryEmail: email },
+      data: {
+        secondaryEmail: email,
+        secondaryEmailVerified: true,
+      },
     });
     await createAuditEvent({
       actorId: session.userId,
       action: 'recovery_email.verified',
       targetType: 'user',
       targetId: session.userId,
+      metadata: { email, verified: true },
+      severity: 'info',
+    });
+    // Surface the verified recovery email in the security event list.
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'recovery_email.verified_toast',
+      targetType: 'user',
+      targetId: session.userId,
       metadata: { email },
       severity: 'info',
     });
+    await notify(session.userId, 'Recovery email verified', `Your recovery email (${email}) has been confirmed.`);
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL VERIFY]', err?.message || err);
@@ -464,6 +511,7 @@ export async function sessionsRevokeAllHandler(request: NextRequest) {
       data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
     });
     for (const s of toRevoke) {
+      bustSessionCache(s.id);
       await revokeSessionState(s.id).catch(() => {});
     }
     await createAuditEvent({
@@ -473,6 +521,7 @@ export async function sessionsRevokeAllHandler(request: NextRequest) {
       targetId: session.userId,
       severity: 'warning',
     });
+    await notify(session.userId, 'Sessions signed out', 'All other sessions were signed out for your account.');
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[SESSIONS REVOKE ALL]', err?.message || err);
@@ -490,6 +539,7 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
       where: { id: sessionId, userId: session.userId },
       data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
     });
+    bustSessionCache(sessionId);
     await revokeSessionState(sessionId).catch(() => {});
     await createAuditEvent({
       actorId: session.userId,
@@ -498,9 +548,38 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
       targetId: sessionId,
       severity: 'info',
     });
+    await notify(session.userId, 'Session signed out', 'One of your sessions was signed out.');
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[SESSION REVOKE]', err?.message || err);
     return new NextResponse('Failed to revoke session', { status: 500 });
+  }
+}
+
+// ─── GET /api/security/login-history ──────────────────────
+export async function loginHistoryHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+    const logs = await prisma.login_history.findMany({
+      where: { userId: session.userId },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      select: {
+        id: true,
+        email: true,
+        ipAddress: true,
+        userAgent: true,
+        success: true,
+        method: true,
+        createdAt: true,
+      },
+    });
+    return NextResponse.json({ logs });
+  } catch (err: any) {
+    console.error('[LOGIN HISTORY]', err?.message || err);
+    return new NextResponse('Failed to fetch login history', { status: 500 });
   }
 }

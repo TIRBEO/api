@@ -8,10 +8,7 @@ function hashApiKey(rawKey: string): string {
 
 function extractBearerToken(request: NextRequest): string | null {
   const header = request.headers.get('authorization');
-  if (!header) {
-    console.log('[API_KEY_AUTH] No Authorization header present');
-    return null;
-  }
+  if (!header) return null;
 
   const parts = header.split(' ');
   if (parts.length !== 2 || parts[0] !== 'Bearer') {
@@ -38,8 +35,12 @@ export async function authenticateApiKey(request: NextRequest): Promise<ApiKeyAu
     const rawToken = extractBearerToken(request);
     if (!rawToken) return null;
 
+    // API keys always start with `tb_`. Session JWTs (sent by the dashboard
+    // as a Bearer fallback) start with `eyJ` and can never match an API key,
+    // so skip the DB lookup entirely — it was a wasted round trip per request.
+    if (!rawToken.startsWith('tb_')) return null;
+
     const keyHash = hashApiKey(rawToken);
-    console.log('[API_KEY_AUTH] Looking up key hash:', keyHash.substring(0, 8) + '...');
 
     const record = await prisma.apiKey.findUnique({ where: { keyHash } });
     if (!record) {
