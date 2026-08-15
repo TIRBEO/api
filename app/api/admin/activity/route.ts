@@ -7,10 +7,20 @@ export const GET = withAdmin(async (request, session) => {
 
   const limit = Number(request.nextUrl.searchParams.get('limit')) || 20;
 
-  // Recent logs
+  // Recent logs with actor info
   const logs = await prisma.auditEvent.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
+    include: {
+      actor: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          photoUrl: true,
+        },
+      },
+    },
   });
 
   // Online users (active in last 5 min)

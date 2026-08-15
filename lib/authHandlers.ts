@@ -190,14 +190,26 @@ const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }
   discord: { id: 'DISCORD_CLIENT_ID', secret: 'DISCORD_CLIENT_SECRET', uri: 'DISCORD_REDIRECT_URI' },
 };
 
+// The site_configs row is read on every OAuth start/callback request (~300ms DB
+// round-trip). Cache it briefly — it only changes through the admin panel.
+const OAUTH_CONFIG_TTL = 30_000;
+let oauthConfigCache: { record: any; at: number } | null = null;
+
 async function getOauthProviderConfig(provider: string): Promise<OauthProviderConfig> {
   const keys = OAUTH_ENV_KEYS[provider];
   let configured: any = {};
   try {
-    const record = await prisma.siteConfig.findUnique({ where: { app: 'accounts' } });
-    const cfgJson: any = record?.config || {};
+    if (!oauthConfigCache || Date.now() - oauthConfigCache.at > OAUTH_CONFIG_TTL) {
+      oauthConfigCache = {
+        record: await prisma.siteConfig.findUnique({ where: { app: 'accounts' } }),
+        at: Date.now(),
+      };
+    }
+    const cfgJson: any = oauthConfigCache.record?.config || {};
     configured = cfgJson?.oauth?.[provider] || {};
-  } catch {}
+  } catch {
+    oauthConfigCache = null;
+  }
   const envConfigured = !!process.env[keys?.id];
   return {
     enabled: configured.enabled !== undefined ? !!configured.enabled : envConfigured,

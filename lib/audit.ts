@@ -75,7 +75,7 @@ export async function listAuditEvents(options: {
       orderBy: { createdAt: 'desc' },
       take: limit,
       skip: offset,
-      include: { actor: { select: { email: true, name: true } } },
+      include: { actor: { select: { id: true, email: true, name: true, photoUrl: true } } },
     }),
     prisma.auditEvent.count({ where: where as any }),
   ]);

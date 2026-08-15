@@ -33,10 +33,13 @@ function createPool(): Pool {
   const base = process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL || '';
   const sep = base.includes('?') ? '&' : '?';
   // Append pooler-friendly params:
-  //   pgbouncer=true  — tells Supabase to use the pooled port (6543)
   //   sslmode=require  — encrypted, no CA-chain verification (Supabase self-signed)
   //   uselibpqcompat=true — makes sslmode=require use libpq semantics
-  const connectionString = `${base}${sep}uselibpqcompat=true&sslmode=require&pgbouncer=true`;
+  //   pgbouncer=true — only for transaction-mode pooling (port 6543); session
+  //     mode (5432) and direct connections keep a real backend per client.
+  const portMatch = base.match(/pooler\.supabase\.com:(\d+)/);
+  const pgbouncer = portMatch && portMatch[1] === '6543' ? '&pgbouncer=true' : '';
+  const connectionString = `${base}${sep}uselibpqcompat=true&sslmode=require${pgbouncer}`;
 
   const pool = new Pool({
     connectionString,
@@ -46,15 +49,19 @@ function createPool(): Pool {
       : undefined,
   });
 
-  // Surface pool errors so they don't go silent
-  pool.on('error', (err) => {
-    console.error('[DB-POOL] Unexpected idle client error:', err.message);
-  });
-
-  pool.on('connect', () => {
-    if (process.env.NODE_ENV === 'development') {
-      console.log('[DB-POOL] New client connected to pool');
+  // Surface pool errors so they don't go silent — throttled so routine idle
+  // resets from the pooler don't flood the logs.
+  let lastErrorLogAt = 0;
+  pool.on('error', (err: any) => {
+    const now = Date.now();
+    const code = err?.code || '';
+    const msg = err?.message || '';
+    const routine = code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || /econnreset|timed out|connection refused/i.test(msg);
+    if (routine) {
+      if (now - lastErrorLogAt < 60_000) return;
+      lastErrorLogAt = now;
     }
+    console.error('[DB-POOL] Unexpected idle client error:', err?.message);
   });
 
   return pool;
@@ -373,9 +380,6 @@ async function refreshIdleConnections() {
       );
     }
     await Promise.all(refreshPromises);
-    if (process.env.NODE_ENV === 'development') {
-      console.log(`[DB-POOL] Refreshed ${Math.min(idleCount, 3)} idle connections`);
-    }
   } catch {
     // Silently ignore refresh errors
   }
@@ -636,8 +640,13 @@ if (process.env.NODE_ENV === 'production') {
     try { if (pool) await pool.end(); } catch {}
     process.exit(0);
   }
-  process.on('SIGTERM', gracefulShutdown);
-  process.on('SIGINT', gracefulShutdown);
+  // Guard against HMR re-evaluating this module and stacking duplicate handlers.
+  const sigGlobal = globalThis as any;
+  if (!sigGlobal.__tirbeoPrismaSignalsInstalled) {
+    sigGlobal.__tirbeoPrismaSignalsInstalled = true;
+    process.on('SIGTERM', gracefulShutdown);
+    process.on('SIGINT', gracefulShutdown);
+  }
 }
 
 // ─── Fast DB Health Cache ───

@@ -12,6 +12,20 @@
 
 import Redis from 'ioredis';
 
+// ─── Log Throttling ───
+// Upstash (serverless Redis) drops idle connections regularly, so reconnect
+// logs fire constantly. Throttle them to keep the console readable.
+const logThrottle = new Map<string, number>();
+
+/** Run fn at most once per intervalMs per key. */
+function throttledLog(key: string, intervalMs: number, fn: () => void): void {
+  const now = Date.now();
+  const last = logThrottle.get(key) || 0;
+  if (now - last < intervalMs) return;
+  logThrottle.set(key, now);
+  fn();
+}
+
 // ─── Connection State ───
 interface RedisConnectionState {
   isConnected: boolean;
@@ -35,7 +49,7 @@ const REDIS_CONFIG = {
       return null;
     }
     const delay = Math.min(times * 100, 30000); // 100ms, 200ms, ... up to 30s
-    console.warn(`[REDIS-RETRY] Reconnecting in ${delay}ms (attempt ${times})`);
+    throttledLog('redis:retry', 30_000, () => console.warn(`[REDIS-RETRY] Reconnecting in ${delay}ms (attempt ${times})`));
     return delay;
   },
 
@@ -217,7 +231,7 @@ export function createRedisClient(options: CreateRedisOptions): Redis {
     if (isConnectionError(err)) {
       state.reconnectCount++;
       state.lastReconnectAt = Date.now();
-      console.warn(`[REDIS-${name}] ⚠️  Connection error (reconnect #${state.reconnectCount}): ${err?.message}`);
+      throttledLog(`redis:error:${name}`, 60_000, () => console.warn(`[REDIS-${name}] ⚠️  Connection error (reconnect #${state.reconnectCount}): ${err?.message}`));
     } else {
       console.error(`[REDIS-${name}] ❌ Non-reconnectable error: ${err?.message}`);
     }
@@ -225,7 +239,7 @@ export function createRedisClient(options: CreateRedisOptions): Redis {
 
   client.on('reconnecting', (delay: number) => {
     state.isConnected = false;
-    console.warn(`[REDIS-${name}] 🔄 Reconnecting in ${delay}ms...`);
+    throttledLog(`redis:reconnecting:${name}`, 60_000, () => console.warn(`[REDIS-${name}] 🔄 Reconnecting in ${delay}ms...`));
   });
 
   return client;
@@ -334,5 +348,10 @@ export async function disconnectAllRedis(): Promise<void> {
   cachedClients.clear();
 }
 
-process.on('SIGTERM', () => disconnectAllRedis().catch(() => {}));
-process.on('SIGINT', () => disconnectAllRedis().catch(() => {}));
+// Guard against HMR re-evaluating this module and stacking duplicate handlers.
+const sigGlobal = globalThis as any;
+if (!sigGlobal.__tirbeoRedisSignalsInstalled) {
+  sigGlobal.__tirbeoRedisSignalsInstalled = true;
+  process.on('SIGTERM', () => disconnectAllRedis().catch(() => {}));
+  process.on('SIGINT', () => disconnectAllRedis().catch(() => {}));
+}
