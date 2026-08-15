@@ -110,6 +110,9 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     totalSessions,
     activeSessions,
     totalAuditEvents,
+    totalRoles,
+    totalApps,
+    activeApiKeys,
   ] = await Promise.all([
     prisma.user.count(),
     prisma.user.count({ where: { lastActiveAt: { gte: weekAgo } } }),
@@ -118,11 +121,14 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     prisma.user.count({ where: { createdAt: { gte: monthAgo } } }),
     prisma.notification.count(),
     prisma.notification.count({ where: { isRead: false } }),
-    prisma.supportTicket?.count().catch(() => 0) as Promise<number>,
-    prisma.supportTicket?.count({ where: { status: 'open' } }).catch(() => 0) as Promise<number>,
+    prisma.ticket?.count().catch(() => 0) as Promise<number>,
+    prisma.ticket?.count({ where: { status: 'open' } }).catch(() => 0) as Promise<number>,
     prisma.session?.count().catch(() => 0) as Promise<number>,
     prisma.session?.count({ where: { expiresAt: { gt: now } } }).catch(() => 0) as Promise<number>,
     prisma.auditEvent?.count({ where: { createdAt: { gte: monthAgo } } }).catch(() => 0) as Promise<number>,
+    prisma.app_roles.count().catch(() => 0) as Promise<number>,
+    prisma.apps.count().catch(() => 0) as Promise<number>,
+    prisma.apiKey.count({ where: { isActive: true, revokedAt: null } }).catch(() => 0) as Promise<number>,
   ]);
 
   return NextResponse.json({
@@ -131,5 +137,8 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     tickets: { total: totalTickets, open: openTickets },
     sessions: { total: totalSessions, active: activeSessions },
     auditEvents: { last30Days: totalAuditEvents },
+    roles: { total: totalRoles },
+    apps: { total: totalApps },
+    apiKeys: { active: activeApiKeys },
   });
 }

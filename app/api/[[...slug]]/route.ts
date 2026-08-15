@@ -1125,9 +1125,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'content/apps/create':
         resp = await appsCreateHandler(request);
         break;
-      case 'content/health':
-
-        break;
       case 'content/incidents':
         resp = await incidentsListHandler(request);
         break;
