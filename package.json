@@ -21,6 +21,7 @@
     "@simplewebauthn/server": "^13.3.2",
     "@tirbeo/types": "^0.0.7",
     "@tirbeo/ui": "^1.0.5",
+    "@vercel/analytics": "^2.0.1",
     "argon2": "0.45.1",
     "date-fns": "4.4.0",
     "ioredis": "6.0.0",
