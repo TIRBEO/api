@@ -3,6 +3,7 @@ import { parse } from 'url';
 import next from 'next';
 import { startWsServer } from './lib/ws/server';
 import { getPoolStatus } from './lib/db/prisma';
+import { startPeriodicCleanup, startPeriodicDigests } from './lib/jobs';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
@@ -28,6 +29,11 @@ app.prepare().then(() => {
         console.log(`> DB pool: ${pool.totalCount} total, ${pool.idleCount} idle, ${pool.waitingCount} waiting`);
       }
     }, 1500);
+
+    // Start periodic notification cleanup (hourly)
+    startPeriodicCleanup();
+    // Start periodic email digests (hourly)
+    startPeriodicDigests();
   });
 
   startWsServer(wsPort);

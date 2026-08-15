@@ -18,9 +18,22 @@ export async function ticketListHandler(req: NextRequest) {
   const page = parseInt(searchParams.get('page') || '1');
   const limit = parseInt(searchParams.get('limit') || '20');
   const status = searchParams.get('status');
+  const q = searchParams.get('q')?.trim();
   const where: any = {};
   if (status) where.status = status;
-  if (!isAdmin(user)) where.customerId = user.userId;
+  if (q) {
+    where.OR = [
+      { subject: { contains: q, mode: 'insensitive' } },
+      { description: { contains: q, mode: 'insensitive' } },
+    ];
+  }
+  // scope=all is only available to admins; default is scope=mine (own tickets only)
+  const scope = searchParams.get('scope');
+  if (scope === 'all' && isAdmin(user)) {
+    // Admin: show all tickets
+  } else {
+    where.customerId = user.userId;
+  }
   const [data, total] = await Promise.all([
     prisma.ticket.findMany({
       where, skip: (page - 1) * limit, take: limit, orderBy: { createdAt: 'desc' },
@@ -35,13 +48,17 @@ export async function ticketCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
   const body: any = await req.json();
-  let description = body.description ? sanitizeInput(String(body.description), 20000) : undefined;
+  // Accept both field-name conventions (support portal used subject/message,
+  // dashboard uses title/description) so every consumer can create tickets.
+  const title = body.title || body.subject;
+  let description = (body.description || body.message) ? sanitizeInput(String(body.description || body.message), 20000) : undefined;
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) description = `${description || ''}![tirbeo-img](${url})`;
   const ticket = await prisma.ticket.create({
     data: {
-      subject: sanitizeInput(String(body.title || ''), 300),
+      subject: sanitizeInput(String(title || ''), 300),
       description,
+      category: body.category ? sanitizeInput(String(body.category), 50) : 'general',
       priority: body.priority,
       status: body.status,
       queueId: body.queueId,
@@ -138,6 +155,9 @@ export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
       status: body.status,
       queueId: body.queueId,
       assignedId: body.assignedId,
+      // Match the standalone PUT behavior: resolving/closing stamps closedAt
+      // (the close/reopen endpoints own clearing it on reopen).
+      ...(body.status === 'resolved' || body.status === 'closed' ? { closedAt: new Date() } : {}),
     },
   });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_UPDATED', targetType: 'ticket', targetId: ticketId, metadata: { prevStatus, newStatus: body.status } });
@@ -180,7 +200,9 @@ export async function ticketMessageHandler(req: NextRequest, ticketId: string) {
     return jsonError('TICKET_CLOSED', 'This ticket is resolved and no longer accepts messages. Open a new ticket if you need more help.', 400);
   }
   const body: any = await req.json();
-  let content = sanitizeInput(String(body.content || ''), 20000);
+  // Accept both field names: the support portal posts `content` via /messages
+  // and the documented /reply contract uses `message`.
+  let content = sanitizeInput(String(body.content || body.message || ''), 20000);
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) content = `${content}![tirbeo-img](${url})`;
   const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: body.isInternal || false } });
@@ -261,6 +283,54 @@ export async function queuesCreateHandler(req: NextRequest) {
   const body: any = await req.json();
   const queue = await prisma.support_queues.create({ data: { name: body.name, slug: body.slug, description: body.description } });
   return NextResponse.json(queue, { status: 201 });
+}
+
+// ─── POST /api/support/tickets/[id]/read — mark messages read ────────
+export async function ticketMarkReadHandler(req: NextRequest, ticketId: string) {
+  const session = await getSession(req);
+  if (!session) return jsonUnauthorized();
+
+  const body: any = await req.json().catch(() => ({}));
+  const messageIds: string[] = Array.isArray(body.messageIds) ? body.messageIds : [];
+
+  if (messageIds.length > 0) {
+    await prisma.ticketMessage.updateMany({
+      where: {
+        id: { in: messageIds },
+        ticketId,
+        authorId: { not: session.userId }, // Don't mark own messages
+      },
+      data: { readAt: new Date(), readBy: session.userId },
+    });
+  } else {
+    // Mark all unread messages in the ticket as read
+    await prisma.ticketMessage.updateMany({
+      where: { ticketId, authorId: { not: session.userId }, readAt: null },
+      data: { readAt: new Date(), readBy: session.userId },
+    });
+  }
+
+  // Notify the other party over WebSocket
+  const ticket = await prisma.ticket.findUnique({
+    where: { id: ticketId },
+    select: { customerId: true, assignedId: true },
+  });
+  if (ticket) {
+    const recipientId = ticket.customerId === session.userId ? ticket.assignedId : ticket.customerId;
+    if (recipientId) {
+      try {
+        sendToUser(recipientId, {
+          type: 'message_read',
+          ticketId,
+          readBy: session.userId,
+          messageIds,
+          readAt: new Date().toISOString(),
+        });
+      } catch {}
+    }
+  }
+
+  return NextResponse.json({ ok: true });
 }
 
 // ─── GET /api/support/tickets/[id]/attachments ──────────────────────

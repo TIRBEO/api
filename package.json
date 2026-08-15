@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "NODE_OPTIONS=--no-deprecation npx tsx --env-file=.env.local server.ts",
+    "dev": "NODE_ENV=development NODE_OPTIONS=--no-deprecation npx tsx --env-file=.env.local server.ts",
     "build": "prisma generate && next build",
     "start": "node server.js",
     "lint": "eslint .",
@@ -11,13 +11,15 @@
     "db:generate": "prisma generate",
     "seed": "tsx scripts/seedRoutes.ts",
     "seed:defaults": "tsx scripts/seed-defaults.ts",
+    "seed:org-rbac": "tsx scripts/seed-org-rbac.ts",
+    "seed:flows": "tsx scripts/seed-flows.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "7.9.1",
     "@simplewebauthn/server": "^13.3.2",
-    "@tirbeo/types": "^0.0.7",
+    "@tirbeo/types": "workspace:*",
     "@tirbeo/ui": "^1.0.5",
     "argon2": "0.45.1",
     "date-fns": "4.4.0",

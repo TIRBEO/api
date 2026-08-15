@@ -124,7 +124,7 @@ export async function sendPushNotification(
     body: payload.body,
     icon: payload.icon || '/icons/notification.png',
     badge: payload.badge || '/icons/badge.png',
-    url: payload.url || '/dashboard/notifications',
+    url: payload.url || '/account/inbox',
     tag: payload.tag || 'tirbeo-notification',
     data: payload.data || {},
     timestamp: Date.now(),
@@ -193,7 +193,7 @@ export async function broadcastPush(
     body: payload.body,
     icon: payload.icon || '/icons/notification.png',
     badge: payload.badge || '/icons/badge.png',
-    url: payload.url || '/dashboard/notifications',
+    url: payload.url || '/account/inbox',
     tag: payload.tag || 'tirbeo-broadcast',
     data: payload.data || {},
     timestamp: Date.now(),
@@ -255,7 +255,6 @@ export async function updateNotificationPrefs(
     push: boolean;
     inApp: boolean;
     security: boolean;
-    forms: boolean;
     product: boolean;
     support: boolean;
   }>
@@ -280,7 +279,7 @@ export async function shouldSendPush(userId: string, type: string): Promise<bool
     case 'form':
     case 'mention':
     case 'comment':
-      return prefs.forms !== false;
+      return true; // forms feature removed
     case 'product':
     case 'digest':
       return prefs.product !== false;
@@ -293,6 +292,22 @@ export async function shouldSendPush(userId: string, type: string): Promise<bool
 
 // ─── Helper: Create notification + push ───
 
+/** Check if current time is within user's quiet hours window */
+async function isInQuietHours(userId: string): Promise<boolean> {
+  try {
+    const prefs = await prisma.notificationPreference.findUnique({ where: { userId } });
+    if (!prefs?.quietHoursEnabled) return false;
+    const now = new Date();
+    const [startH, startM] = (prefs.quietHoursStart || '22:00').split(':').map(Number);
+    const [endH, endM] = (prefs.quietHoursEnd || '08:00').split(':').map(Number);
+    const mins = now.getHours() * 60 + now.getMinutes();
+    const start = startH * 60 + startM;
+    const end = endH * 60 + endM;
+    if (start > end) return mins >= start || mins < end;
+    return mins >= start && mins < end;
+  } catch { return false; }
+}
+
 export async function createNotificationWithPush(input: {
   userId: string;
   type: string;
@@ -303,7 +318,7 @@ export async function createNotificationWithPush(input: {
   push?: boolean;
   email?: boolean;
 }) {
-  // Create in-app notification
+  // Create in-app notification (always)
   const notif = await prisma.notification.create({
     data: {
       userId: input.userId,
@@ -315,23 +330,27 @@ export async function createNotificationWithPush(input: {
     },
   });
 
-  // Send push if enabled
-  if (input.push !== false) {
+  // Check quiet hours — suppress push and email during quiet window
+  const quiet = await isInQuietHours(input.userId);
+
+  // Send push if enabled and not in quiet hours
+  if (input.push !== false && !quiet) {
     const shouldPush = await shouldSendPush(input.userId, input.type);
     if (shouldPush) {
       await sendPushNotification(input.userId, {
         title: input.title,
         body: input.body || '',
-        url: input.link || '/dashboard/notifications',
+        url: input.link || '/account/inbox',
         tag: `notif-${notif.id}`,
       }).catch(() => {});
     }
   }
 
-  // Send email if enabled
-  if (input.email !== false) {
+  // Send email if enabled and not in quiet hours
+  // If digest is ON, don't send individual emails — the digest job batches them
+  if (input.email !== false && !quiet) {
     const prefs = await getNotificationPrefs(input.userId);
-    if (prefs.email) {
+    if (prefs.email && !prefs.digestEnabled) {
       const { sendTemplateEmail } = await import('./email');
       const user = await prisma.user.findUnique({
         where: { id: input.userId },
@@ -343,7 +362,7 @@ export async function createNotificationWithPush(input: {
           name: user.name || user.email,
           count: '1',
           digestItems: `<div style="padding:16px;background:#f8f9fa;border-radius:8px;margin-bottom:12px;"><strong>${input.title}</strong><br/>${input.body || ''}</div>`,
-          dashboardUrl: input.link || `${getDashboardBaseUrl()}/dashboard/notifications`,
+          dashboardUrl: input.link || `${getDashboardBaseUrl()}/account/inbox`,
         }).catch(() => {});
       }
     }

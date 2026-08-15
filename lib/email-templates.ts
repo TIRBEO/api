@@ -8,9 +8,9 @@ function tpl(subject: string, html: string): EmailTemplate {
 const PAPER = '#0a0a0a';     // page background (deep black)
 const CARD = '#141414';      // card / surface (dark charcoal)
 const INK = '#f2f2f2';       // text + borders (bright white)
-const ACCENT = '#8b5cf6';    // accent (violet/purple for buttons, highlights)
+const ACCENT = '#ffffff';      // accent (white for buttons, highlights)
 const MUTED = '#9ca3af';     // secondary text (gray)
-const SHADOW = '4px 4px 0 0 #8b5cf6';
+const SHADOW = '4px 4px 0 0 #ffffff';
 const BORDER = '#2a2a2a';    // border color (dark gray)
 
 function head(title: string): string {
@@ -20,7 +20,7 @@ function head(title: string): string {
 function headerHtml(logo: string, title: string, subtitle: string): string {
   const logoHtml = logo
     ? `<img src="${logo}" width="44" alt="Tirbeo" style="display:block;margin:0 auto 18px;border-radius:12px;">`
-    : `<span style="display:inline-block;width:44px;height:44px;border-radius:12px;background:${ACCENT};font-weight:800;color:#fff;font-size:20px;line-height:44px;text-align:center;">T</span>`;
+    : `<span style="display:inline-block;width:44px;height:44px;border-radius:12px;background:${ACCENT};font-weight:800;color:#000;font-size:20px;line-height:44px;text-align:center;">T</span>`;
   return `<table width="100%" cellpadding="0" cellspacing="0" style="background:${PAPER};padding:50px 20px;"><tr><td align="center"><table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:${CARD};border:1px solid ${BORDER};border-radius:16px;overflow:hidden;"><tr><td style="padding:48px 48px 40px;text-align:center;background:linear-gradient(180deg,${CARD} 0%,#1a1a1a 100%);"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center"><p style="margin:0 0 14px;font-size:11px;font-weight:800;letter-spacing:.22em;color:${ACCENT};text-transform:uppercase;">Tirbeo</p>${logoHtml}</td></tr><tr><td align="center"><h1 style="margin:0;font-size:30px;font-weight:800;color:${INK};letter-spacing:-.02em;">${title}</h1><p style="margin:14px 0 0;font-size:15px;line-height:26px;color:${MUTED};">${subtitle}</p></td></tr></table></td></tr>`;
 }
 
@@ -54,7 +54,7 @@ export function otpCodeBlock(code: string): string {
 }
 
 export function buttonBlock(url: string, label: string): string {
-  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center"><a href="${url}" style="display:inline-block;padding:16px 30px;background:${ACCENT};color:#ffffff;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;text-decoration:none;border-radius:10px;">${label}</a></td></tr></table>`;
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center"><a href="${url}" style="display:inline-block;padding:16px 30px;background:${ACCENT};color:#000000;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;text-decoration:none;border-radius:10px;">${label}</a></td></tr></table>`;
 }
 
 export function secondaryButtonBlock(url: string, label: string): string {
@@ -74,7 +74,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, imageBase: string) =
 
   welcome: (logo, imageBase) => tpl(
     'Welcome to Tirbeo, {{name}}!',
-    `${head('Welcome to Tirbeo')}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${PAPER};padding:50px 20px;"><tr><td align="center"><table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:${CARD};border:2px solid ${INK};border-radius:0;overflow:hidden;box-shadow:${SHADOW};"><tr><td align="center" style="padding:56px 40px;border-bottom:2px solid #17150f;">${logo ? `<img src="${logo}" width="60" alt="Tirbeo" style="display:block;margin:0 auto 20px;">` : `<span style="display:inline-block;width:40px;height:40px;border-radius:0;background:${ACCENT};font-weight:700;color:#ffffff;font-size:18px;line-height:40px;text-align:center;">T</span>`}<h1 style="margin:0;color:${INK};font-size:34px;font-weight:700;">Welcome to Tirbeo</h1><p style="margin:18px 0 0;color:${INK};font-size:17px;line-height:30px;">Your workspace is ready. Let us build something amazing together.</p></td></tr>${heroImg(imageBase, 'account-created')}<tr><td style="padding:48px 40px;background:${CARD};"><p style="margin:0;color:${INK};font-size:20px;font-weight:600;">Hi {{name}},</p><p style="margin:22px 0;color:${INK};font-size:16px;line-height:30px;">Thanks for joining <strong style="color:${INK};">Tirbeo</strong>. Your account has been created successfully and you are ready to start exploring everything our platform has to offer.</p><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:18px;border:1px solid ${BORDER};border-radius:0;"><p style="margin:0;font-size:15px;color:${INK};font-weight:600;">Explore Communities</p><p style="margin:10px 0 0;color:${INK};font-size:14px;line-height:24px;">Discover discussions and connect with people who share your interests.</p></td></tr></table>${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">Questions? Visit our <a href="https://tirbeo.app/help" style="color:${INK};text-decoration:underline;">Help Center</a></p></td></tr>${footerHtml('{{founder_signature}}')}`
+    `${head('Welcome to Tirbeo')}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${PAPER};padding:50px 20px;"><tr><td align="center"><table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;background:${CARD};border:2px solid ${INK};border-radius:0;overflow:hidden;box-shadow:${SHADOW};"><tr><td align="center" style="padding:56px 40px;border-bottom:2px solid #17150f;">${logo ? `<img src="${logo}" width="60" alt="Tirbeo" style="display:block;margin:0 auto 20px;">` : `<span style="display:inline-block;width:40px;height:40px;border-radius:0;background:${ACCENT};font-weight:700;color:#000000;font-size:18px;line-height:40px;text-align:center;">T</span>`}<h1 style="margin:0;color:${INK};font-size:34px;font-weight:700;">Welcome to Tirbeo</h1><p style="margin:18px 0 0;color:${INK};font-size:17px;line-height:30px;">Your workspace is ready. Let us build something amazing together.</p></td></tr>${heroImg(imageBase, 'account-created')}<tr><td style="padding:48px 40px;background:${CARD};"><p style="margin:0;color:${INK};font-size:20px;font-weight:600;">Hi {{name}},</p><p style="margin:22px 0;color:${INK};font-size:16px;line-height:30px;">Thanks for joining <strong style="color:${INK};">Tirbeo</strong>. Your account has been created successfully and you are ready to start exploring everything our platform has to offer.</p><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:18px;border:1px solid ${BORDER};border-radius:0;"><p style="margin:0;font-size:15px;color:${INK};font-weight:600;">Explore Communities</p><p style="margin:10px 0 0;color:${INK};font-size:14px;line-height:24px;">Discover discussions and connect with people who share your interests.</p></td></tr></table>${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">Questions? Visit our <a href="https://tirbeo.app/help" style="color:${INK};text-decoration:underline;">Help Center</a></p></td></tr>${footerHtml('{{founder_signature}}')}`
   ),
 
   password_reset_otp: (logo) => tpl(
@@ -220,6 +220,11 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, imageBase: string) =
     'Your admin request has been declined',
     `${head('Admin Request Declined')}${headerHtml(logo, 'Admin Request', 'Your admin access request has been reviewed.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello {{name}},</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Your admin access request for <strong style="color:${INK};">{{companyName}}</strong> has been declined. You can submit a new request at any time.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Request ID:</strong> {{requestId}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Company:</strong> {{companyName}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Role:</strong> {{requestedRole}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Reason:</strong> {{rejectionReason}}</p></div>${buttonBlock('{{dashboardUrl}}', 'Submit New Request')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">If you believe this was a mistake, please contact support.</p>${bodyEnd()}${footerHtml()}`
   ),
+
+  export_ready: (logo) => tpl(
+    'Your data export is ready',
+    `${head('Data Export Ready')}${headerHtml(logo, 'Your data export is ready', 'Download your Tirbeo data archive.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello {{name}},</p><p style="margin:20px 0 30px;font-size:16px;line-height:28px;color:${INK};">The archive you requested from the <strong style="color:${INK};">Privacy</strong> settings is ready. It includes your profile, sessions, activity and notifications.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Exported:</strong> {{exportedAt}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Format:</strong> JSON</p></div>${buttonBlock('{{downloadUrl}}', 'Download Archive')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">The download link is valid for <strong style="color:${INK};">7 days</strong>.</p><p style="margin:8px 0 0;font-size:14px;line-height:24px;color:${INK};">If you did not request this export, contact support immediately.</p>${bodyEnd()}${footerHtml()}`
+  ),
 };
 
 export function buildTemplates(logoUrl: string = '', imageBase: string = DEFAULT_IMAGE_BASE): Record<string, EmailTemplate> {
@@ -238,3 +243,65 @@ export function renderTemplate(html: string, vars: Record<string, string>): stri
   }
   return result;
 }
+
+// ─── Additional Form Notification Templates ──────────────────────────────
+
+// These are used by the form-email-notifications service
+// and provide fallback templates when DB templates are not configured.
+
+export const FORM_NOTIFICATION_TEMPLATES: Record<string, (logo: string, imageBase: string) => EmailTemplate> = {
+  form_milestone: (logo) => tpl(
+    '🎉 Milestone: {{formTitle}} reached {{milestone}} responses!',
+    `${head('Milestone Reached!')}${headerHtml(logo, 'Milestone Reached!', 'Your form has reached an important milestone.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Congratulations! Your form <strong style="color:${INK};">{{formTitle}}</strong> has reached <strong style="color:${INK};">{{milestone}}</strong> responses.</p><div style="border:2px solid ${BORDER};border-radius:12px;padding:32px;margin:16px 0;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:48px;font-weight:800;color:${ACCENT};">{{milestone}}</p><p style="margin:8px 0 0;font-size:14px;color:${MUTED};">Total Responses</p></div>${buttonBlock('{{adminUrl}}', 'View Overview')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">Keep up the great work! Your form is performing well.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_spike: (logo) => tpl(
+    '📈 Response spike detected on "{{formTitle}}"',
+    `${head('Response Spike')}${headerHtml(logo, 'Response Spike Detected', 'Your form is receiving responses at an increased rate.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">We detected a spike in responses for your form <strong style="color:${INK};">{{formTitle}}</strong>.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Responses in last 10 minutes:</strong> {{responseCount}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Total responses:</strong> {{totalResponses}}</p></div>${buttonBlock('{{adminUrl}}', 'View Responses')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">This is an automated notification from Tirbeo Forms.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_revival: (logo) => tpl(
+    '🔔 Your form "{{formTitle}}" is active again',
+    `${head('Form Revival')}${headerHtml(logo, 'Form is Active Again', 'Your dormant form has received new responses.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Your form <strong style="color:${INK};">{{formTitle}}</strong> has been dormant for a while, but it just received a new response!</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Last submission before this:</strong> {{lastSubmission}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Total responses:</strong> {{totalResponses}}</p></div>${buttonBlock('{{adminUrl}}', 'View Responses')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">Consider sharing your form again to keep the momentum going!</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_test: (logo) => tpl(
+    'Test notification: {{formTitle}}',
+    `${head('Test Notification')}${headerHtml(logo, 'Test Notification', 'Verifying your email notification settings.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">This is a test email to verify your notification settings are working correctly for <strong style="color:${INK};">{{formTitle}}</strong>.</p><div style="border:1px solid ${BORDER};border-radius:12px;padding:32px;margin:16px 0;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:32px;">✅</p><p style="margin:12px 0 0;font-size:16px;font-weight:600;color:${INK};">Email Notifications Working!</p></div>${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">You will receive similar emails when someone submits a response to your form.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_summary_daily: (logo) => tpl(
+    'Daily Summary: {{formTitle}} — {{newResponses}} new responses',
+    `${head('Daily Summary')}${headerHtml(logo, 'Daily Summary', 'Here is how your form performed today.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 24px;font-size:16px;line-height:28px;color:${INK};">Here is the daily summary for <strong style="color:${INK};">{{formTitle}}</strong>:</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;"><div style="border:1px solid ${BORDER};border-radius:12px;padding:20px;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:32px;font-weight:700;color:${ACCENT};">{{newResponses}}</p><p style="margin:4px 0 0;font-size:12px;color:${MUTED};">New Responses</p></div><div style="border:1px solid ${BORDER};border-radius:12px;padding:20px;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:32px;font-weight:700;color:${INK};">{{totalResponses}}</p><p style="margin:4px 0 0;font-size:12px;color:${MUTED};">Total Responses</p></div></div>${buttonBlock('{{adminUrl}}', 'View Analytics')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">You received this because you have daily summaries enabled.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_summary_weekly: (logo) => tpl(
+    'Weekly Summary: {{formTitle}} — {{newResponses}} new responses',
+    `${head('Weekly Summary')}${headerHtml(logo, 'Weekly Summary', 'Here is your weekly performance report.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 24px;font-size:16px;line-height:28px;color:${INK};">Here is the weekly summary for <strong style="color:${INK};">{{formTitle}}</strong>:</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0;"><div style="border:1px solid ${BORDER};border-radius:12px;padding:20px;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:32px;font-weight:700;color:${ACCENT};">{{newResponses}}</p><p style="margin:4px 0 0;font-size:12px;color:${MUTED};">New Responses</p></div><div style="border:1px solid ${BORDER};border-radius:12px;padding:20px;text-align:center;background:#1a1a1a;"><p style="margin:0;font-size:32px;font-weight:700;color:${INK};">{{totalResponses}}</p><p style="margin:4px 0 0;font-size:12px;color:${MUTED};">Total Responses</p></div></div>${buttonBlock('{{adminUrl}}', 'View Analytics')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">You received this because you have weekly summaries enabled.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  webhook_failed: (logo) => tpl(
+    'Webhook delivery failed for "{{formTitle}}"',
+    `${head('Webhook Failed')}${headerHtml(logo, 'Webhook Delivery Failed', 'A webhook delivery to your endpoint failed.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">A webhook delivery for your form <strong style="color:${INK};">{{formTitle}}</strong> failed.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Webhook URL:</strong> {{webhookUrl}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">HTTP Status:</strong> {{httpStatus}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Error:</strong> {{errorMessage}}</p></div>${buttonBlock('{{settingsUrl}}', 'Check Webhook Settings')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">Please verify your webhook endpoint is accessible.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  export_ready: (logo) => tpl(
+    'Your export for "{{formTitle}}" is ready',
+    `${head('Export Ready')}${headerHtml(logo, 'Export Ready', 'Your data export has been generated.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Your export for <strong style="color:${INK};">{{formTitle}}</strong> is ready to download.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Format:</strong> {{format}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Records:</strong> {{recordCount}}</p></div>${buttonBlock('{{downloadUrl}}', 'Download Export')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">This download link will expire in 24 hours.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  collaborator_added: (logo) => tpl(
+    'You have been added as a collaborator to "{{formTitle}}"',
+    `${head('Collaborator Added')}${headerHtml(logo, 'You are a Collaborator', 'You have been invited to collaborate on a form.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello {{name}},</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">You have been added as a <strong style="color:${INK};">{{role}}</strong> collaborator to the form <strong style="color:${INK};">{{formTitle}}</strong>.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Form:</strong> {{formTitle}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Your Role:</strong> {{role}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Added by:</strong> {{addedByName}}</p></div>${buttonBlock('{{formUrl}}', 'Open Form')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">If you did not expect this invitation, please contact the form owner.</p>${bodyEnd()}${footerHtml()}`
+  ),
+
+  response_limit_reached: (logo) => tpl(
+    'Response limit reached for "{{formTitle}}"',
+    `${head('Response Limit Reached')}${headerHtml(logo, 'Response Limit Reached', 'Your form has reached its response limit.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Your form <strong style="color:${INK};">{{formTitle}}</strong> has reached its response limit of <strong style="color:${INK};">{{limit}}</strong> responses.</p><div style="border:1px solid ${BORDER};border-radius:0;box-shadow:none;padding:16px;margin:16px 0;"><p style="margin:0;font-size:14px;color:${INK};"><strong style="color:${INK};">Current responses:</strong> {{currentResponses}}</p><p style="margin:8px 0 0;font-size:14px;color:${INK};"><strong style="color:${INK};">Limit:</strong> {{limit}}</p></div><p style="margin:0;font-size:14px;line-height:24px;color:${INK};">The form will no longer accept new responses until you increase the limit.</p>${buttonBlock('{{settingsUrl}}', 'Update Settings')}${bodyEnd()}${footerHtml()}`
+  ),
+
+  form_scheduled: (logo) => tpl(
+    'Your form "{{formTitle}}" will open on {{scheduledAt}}',
+    `${head('Form Scheduled')}${headerHtml(logo, 'Form Scheduled', 'Your form is scheduled to open automatically.')}${bodyStart()}<p style="margin:0;font-size:16px;line-height:28px;color:${INK};">Hello,</p><p style="margin:20px 0 35px;font-size:16px;line-height:28px;color:${INK};">Your form <strong style="color:${INK};">{{formTitle}}</strong> is scheduled to open and start accepting responses on <strong style="color:${INK};">{{scheduledAt}}</strong>.</p>${buttonBlock('{{adminUrl}}', 'View Form')}${divider()}<p style="margin:0;font-size:14px;line-height:24px;color:${INK};">The form will automatically be published at the scheduled time.</p>${bodyEnd()}${footerHtml()}`
+  ),
+};

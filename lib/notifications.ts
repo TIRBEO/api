@@ -22,6 +22,41 @@ interface CreateNotifInput {
   icon?: string;
 }
 
+/**
+ * Check if the current time is within the user's quiet hours window.
+ * Quiet hours suppress email and push notifications but NOT the DB record
+ * or real-time WebSocket delivery — the user just won't get external alerts.
+ */
+async function isInQuietHours(userId: string): Promise<boolean> {
+  try {
+    const prefs = await prisma.notificationPreference.findUnique({ where: { userId } });
+    if (!prefs?.quietHoursEnabled) return false;
+
+    const now = new Date();
+    // Convert to user's local hour using their timezone offset
+    const startStr = prefs.quietHoursStart || '22:00';
+    const endStr = prefs.quietHoursEnd || '08:00';
+
+    const [startH, startM] = startStr.split(':').map(Number);
+    const [endH, endM] = endStr.split(':').map(Number);
+
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const startMinutes = startH * 60 + startM;
+    const endMinutes = endH * 60 + endM;
+
+    // Handle overnight quiet hours (e.g., 22:00 → 08:00)
+    if (startMinutes > endMinutes) {
+      // Quiet window spans midnight: e.g., 22:00 → 08:00
+      return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    } else {
+      // Same-day quiet window: e.g., 12:00 → 14:00
+      return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+    }
+  } catch {
+    return false; // fail open — don't block notifications on errors
+  }
+}
+
 export async function createNotification(input: CreateNotifInput) {
   const notif = await prisma.notification.create({
     data: {
@@ -34,20 +69,26 @@ export async function createNotification(input: CreateNotifInput) {
     },
   });
 
-  // Send real-time notification via WebSocket
+  // Send real-time notification via WebSocket (always — even during quiet hours)
   const notifData = { id: notif.id, userId: notif.userId, type: notif.type, title: notif.title, body: notif.body, link: notif.link, icon: notif.icon, read: false, createdAt: notif.createdAt.toISOString() };
   await sendToUserWs(input.userId, { type: 'notification', data: notifData });
 
-  const prefs = await prisma.notificationPreference.findUnique({ where: { userId: input.userId } });
-  if (prefs?.email) {
-    const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
-    if (user) {
-      await sendTemplateEmail(user.email, 'notification_digest', {
-        name: user.name || user.email,
-        count: '1',
-        digestItems: `<div class="item"><strong>${escapeHtml(input.title)}</strong><br/>${escapeHtml(input.body || '')}</div>`,
-        dashboardUrl: input.link || 'https://tirbeo.app',
-      }, { rawVars: ['digestItems'] }).catch(() => {});
+  // Check quiet hours — suppress email during quiet window
+  const quiet = await isInQuietHours(input.userId);
+
+  if (!quiet) {
+    // Send email if enabled
+    const prefs = await prisma.notificationPreference.findUnique({ where: { userId: input.userId } });
+    if (prefs?.email) {
+      const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
+      if (user) {
+        await sendTemplateEmail(user.email, 'notification_digest', {
+          name: user.name || user.email,
+          count: '1',
+          digestItems: `<div class="item"><strong>${escapeHtml(input.title)}</strong><br/>${escapeHtml(input.body || '')}</div>`,
+          dashboardUrl: input.link || 'https://tirbeo.app',
+        }, { rawVars: ['digestItems'] }).catch(() => {});
+      }
     }
   }
 

@@ -16,7 +16,6 @@ export async function GET(request: NextRequest) {
       push: prefs.push,
       inApp: prefs.inApp,
       security: prefs.security,
-      forms: prefs.forms,
       product: prefs.product,
       support: prefs.support,
     });
@@ -34,7 +33,7 @@ export async function PUT(request: NextRequest) {
     const body: any = await request.json();
     
     // Only update allowed fields
-    const allowedFields = ['email', 'push', 'inApp', 'security', 'forms', 'product', 'support'];
+    const allowedFields = ['email', 'push', 'inApp', 'security', 'product', 'support'];
     const updateData: Record<string, boolean> = {};
     
     for (const field of allowedFields) {
@@ -54,7 +53,6 @@ export async function PUT(request: NextRequest) {
       push: prefs.push,
       inApp: prefs.inApp,
       security: prefs.security,
-      forms: prefs.forms,
       product: prefs.product,
       support: prefs.support,
     });

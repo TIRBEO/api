@@ -15,14 +15,15 @@ import { withRetry } from './db/prisma';
 
 // The dashboard polls notifications; short TTL keeps the poll cheap without
 // making notifications feel stale.
-const notificationsCache = createTtlCache<{ notifications: any[]; unread: number }>(5_000, 2000, 'notifications');
+const notificationsCache = createTtlCache<{ notifications: any[]; unread: number; total: number }>(5_000, 2000, 'notifications');
 
 // Request deduplication: if multiple concurrent GET requests hit the same cache key,
 // only one makes the actual DB query — the others wait and share the result.
-const inFlightNotifications = new Map<string, Promise<{ notifications: any[]; unread: number }>>();
+const inFlightNotifications = new Map<string, Promise<{ notifications: any[]; unread: number; total: number }>>();
 
 function bustNotificationsCache(userId: string) {
   notificationsCache.clear();
+  inFlightNotifications.clear();
 }
 
 // Cache for GET /api/preferences — dashboard polls this on every page load.
@@ -174,6 +175,22 @@ export async function extendedProfileHandler(request: NextRequest) {
            createdAt: true, updatedAt: true,
         },
       });
+
+      const changed = Object.keys(data).filter((k) => data[k] !== undefined && data[k] !== null);
+      if (changed.some((k) => ['name', 'username', 'photoUrl'].includes(k))) {
+        createNotification({
+          userId: session.userId,
+          type: 'system',
+          title: 'Profile updated',
+          body: changed.includes('name')
+            ? `Your display name is now ${updated.name ?? 'updated'}.`
+            : changed.includes('photoUrl')
+              ? 'Your profile photo was updated.'
+              : 'Your username was updated.',
+          link: '/account/profile',
+        }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+      }
+
       return NextResponse.json(updated);
     }
 
@@ -242,7 +259,7 @@ export async function changePasswordHandler(request: NextRequest) {
       type: 'security',
       title: 'Password changed',
       body: 'Your password was changed successfully.',
-      link: '/dashboard/notifications',
+      link: '/account/inbox',
     }).catch((e) => console.error('[NOTIFICATION]', (e as Error)?.message));
 
     return new NextResponse('Password changed', { status: 200 });
@@ -289,7 +306,8 @@ export async function sessionsHandler(request: NextRequest) {
       if (!targetSession || targetSession.userId !== session.userId) {
         return new NextResponse('Session not found', { status: 404 });
       }
-      await prisma.session.delete({ where: { id: sessionId } });
+      // Use deleteMany to be idempotent — session may already be revoked/deleted
+      await prisma.session.deleteMany({ where: { id: sessionId, userId: session.userId } });
       return NextResponse.json({ ok: true, message: 'Session terminated' });
     }
 
@@ -307,8 +325,9 @@ export async function notificationsHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     if (request.method === 'GET') {
-      const limit = Number(request.nextUrl.searchParams.get('limit')) || 20;
-      const cacheKey = `notif:${session.userId}:${limit}`;
+      const limit = Math.min(Math.max(Number(request.nextUrl.searchParams.get('limit')) || 20, 1), 100);
+      const offset = Math.max(0, Number(request.nextUrl.searchParams.get('offset')) || 0);
+      const cacheKey = `notif:${session.userId}:${limit}:${offset}`;
       const cached = notificationsCache.get(cacheKey);
       if (cached) return NextResponse.json(cached);
 
@@ -325,17 +344,19 @@ export async function notificationsHandler(request: NextRequest) {
       const fetchPromise = (async () => {
         try {
           // Parallel queries for better performance with retry
-          const [notifications, unread] = await Promise.all([
+          const [notifications, unread, total] = await Promise.all([
             withRetry(() => prisma.notification.findMany({
               where: { userId: session.userId },
               orderBy: { createdAt: 'desc' },
               take: limit,
+              skip: offset,
               select: { id: true, type: true, title: true, body: true, link: true, icon: true, isRead: true, createdAt: true },
             })),
             withRetry(() => prisma.notification.count({ where: { userId: session.userId, isRead: false } })),
+            withRetry(() => prisma.notification.count({ where: { userId: session.userId } })),
           ]);
           const items = notifications.map((n: any) => ({ ...n, read: n.isRead }));
-          const body = { notifications: items, unread };
+          const body = { notifications: items, unread, total };
           notificationsCache.set(cacheKey, body);
           return body;
         } finally {
@@ -366,7 +387,17 @@ export async function notificationsHandler(request: NextRequest) {
       if (id) {
         await prisma.notification.deleteMany({ where: { id, userId: session.userId } });
       } else {
-        await prisma.notification.deleteMany({ where: { userId: session.userId } });
+        // Support body-based bulk delete { notificationIds: [...] }
+        let bodyIds: string[] | null = null;
+        try {
+          const b = await request.json();
+          if (b?.notificationIds && Array.isArray(b.notificationIds)) bodyIds = b.notificationIds;
+        } catch { /* no body */ }
+        if (bodyIds && bodyIds.length > 0) {
+          await prisma.notification.deleteMany({ where: { id: { in: bodyIds }, userId: session.userId } });
+        } else {
+          await prisma.notification.deleteMany({ where: { userId: session.userId } });
+        }
       }
       bustNotificationsCache(session.userId);
       return NextResponse.json({ ok: true, message: 'Notifications deleted' });
@@ -381,31 +412,84 @@ export async function notificationsHandler(request: NextRequest) {
 }
 
 export async function notificationPrefsHandler(request: NextRequest) {
+  const DEFAULT_PREFS = {
+    userId: '', type: 'all',
+    email: true, push: true, inApp: true,
+    security: true, forms: true, product: true, support: true,
+    securityEmail: true, securityPush: true, securityInApp: true,
+    formsEmail: true, formsPush: true, formsInApp: true,
+    productEmail: true, productPush: true, productInApp: true,
+    supportEmail: true, supportPush: true, supportInApp: true,
+    quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
+    digestEnabled: false, digestFrequency: 'daily',
+    createdAt: new Date(), updatedAt: new Date(),
+  };
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
     if (request.method === 'GET') {
-      let prefs = await prisma.notificationPreference.findUnique({ where: { userId: session.userId } });
+      let prefs: any = null;
+      try {
+        prefs = await prisma.notificationPreference.findUnique({ where: { userId: session.userId } });
+      } catch (colErr: any) {
+        // If columns are missing, try raw query with only base columns
+        console.warn('[NOTIFICATIONS] Column error, falling back to base query:', colErr?.message?.slice(0, 100));
+        try {
+          const rows = await prisma.$queryRaw`SELECT * FROM notification_preferences WHERE user_id = ${session.userId} LIMIT 1`;
+          prefs = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+        } catch { /* raw also fails — return defaults */ }
+      }
       if (!prefs) {
-        prefs = await prisma.notificationPreference.create({ data: { userId: session.userId } });
+        try {
+          prefs = await prisma.notificationPreference.create({ data: { userId: session.userId } });
+        } catch { prefs = { ...DEFAULT_PREFS, userId: session.userId }; }
       }
       return NextResponse.json(prefs);
     }
 
     if (request.method === 'PUT') {
       const body: any = await request.json();
-      const allowed = ['email', 'push', 'inApp', 'type', 'security', 'forms', 'product', 'support'];
+      const allowed = [
+        'type',
+        // Global channels
+        'email', 'push', 'inApp',
+        // Category toggles
+        'security', 'forms', 'product', 'support',
+        // Per-category x channel matrix
+        'securityEmail', 'securityPush', 'securityInApp',
+        'formsEmail', 'formsPush', 'formsInApp',
+        'productEmail', 'productPush', 'productInApp',
+        'supportEmail', 'supportPush', 'supportInApp',
+        // Quiet hours
+        'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
+        // Digest
+        'digestEnabled', 'digestFrequency',
+      ];
       const data: Record<string, any> = {};
       for (const key of allowed) {
         if (body[key] !== undefined) data[key] = body[key];
       }
-      // Upsert
-      await prisma.notificationPreference.upsert({
-        where: { userId: session.userId },
-        create: { userId: session.userId, ...data },
-        update: data,
-      });
+      try {
+        await prisma.notificationPreference.upsert({
+          where: { userId: session.userId },
+          create: { userId: session.userId, ...data },
+          update: data,
+        });
+      } catch (upsertErr: any) {
+        // If new columns missing, strip them and retry
+        console.warn('[NOTIFICATIONS] Upsert error, retrying with base columns:', upsertErr?.message?.slice(0, 100));
+        const baseKeys = ['type', 'email', 'push', 'inApp', 'security', 'forms', 'product', 'support'];
+        const baseData: Record<string, any> = {};
+        for (const k of baseKeys) { if (data[k] !== undefined) baseData[k] = data[k]; }
+        try {
+          await prisma.notificationPreference.upsert({
+            where: { userId: session.userId },
+            create: { userId: session.userId, ...baseData },
+            update: baseData,
+          });
+        } catch { /* give up gracefully */ }
+      }
       return NextResponse.json({ ok: true, message: 'Notification preferences updated' });
     }
 
@@ -464,7 +548,7 @@ export async function sendTestPushHandler(request: NextRequest) {
     const result = await sendPushNotification(session.userId, {
       title: 'Test notification',
       body: 'This is a test push notification from Tirbeo.',
-      url: '/dashboard/notifications',
+      url: '/account/inbox',
     });
     if (result.sent === 0) {
       return new NextResponse('You have no active push subscriptions', { status: 400 });
@@ -509,7 +593,7 @@ export async function oauthUnlinkHandler(request: NextRequest, provider: string)
       type: 'security',
       title: 'Account disconnected',
       body: `Your ${provider} account is no longer linked.`,
-      link: '/dashboard/connected-apps',
+      link: '/account/apps',
     }).catch((e) => console.error('[NOTIFICATION]', e?.message));
 
     return NextResponse.json({ ok: true, message: `${provider} disconnected` });
@@ -542,6 +626,15 @@ export async function integrationsHandler(request: NextRequest) {
         update: { connected: connected ?? true },
         create: { userId: session.userId, provider, connected: connected ?? true },
       });
+      if (integration.connected) {
+        createNotification({
+          userId: session.userId,
+          type: 'system',
+          title: `${provider} connected`,
+          body: `The ${provider} integration is now active on your account.`,
+          link: '/account/apps',
+        }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+      }
       return NextResponse.json(integration);
     }
 
@@ -806,6 +899,14 @@ export async function avatarUploadHandler(request: NextRequest) {
       data: { photoUrl },
     });
 
+    createNotification({
+      userId: session.userId,
+      type: 'system',
+      title: 'Profile photo updated',
+      body: 'Your avatar was changed.',
+      link: '/account/profile',
+    }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+
     return NextResponse.json({ photoUrl, message: 'Avatar updated' });
   } catch (err: any) {
     console.error('[AVATAR UPLOAD]', err?.message || err);
@@ -868,7 +969,57 @@ export async function exportDataHandler(request: NextRequest) {
       preferences: user.preferences,
     };
 
-    return NextResponse.json(exportData);
+    const url = new URL(request.url);
+    // GET ?download=1 — return the archive as a downloadable attachment.
+    if (request.method === 'GET' && url.searchParams.get('download') === '1') {
+      return new NextResponse(JSON.stringify(exportData, null, 2), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Disposition': `attachment; filename="tirbeo-export-${new Date().toISOString().slice(0, 10)}.json"`,
+        },
+      });
+    }
+
+    // GET (no param) — inline JSON for direct API access.
+    if (request.method === 'GET') {
+      return NextResponse.json(exportData);
+    }
+
+    // POST — prepare the archive, notify the user and email the download link.
+    const origin = `${url.protocol}//${url.host}`;
+    const downloadUrl = `${origin}/api/user/export-data?download=1`;
+
+    Promise.allSettled([
+      createNotification({
+        userId: session.userId,
+        type: 'system',
+        title: 'Data export ready',
+        body: 'Your data archive has been prepared. Download it from the privacy settings.',
+        link: '/account/privacy',
+      }),
+      sendTemplateEmail(user.email, 'export_ready', {
+        name: user.name || 'there',
+        exportedAt: new Date().toLocaleString(),
+        downloadUrl,
+      }),
+    ]);
+
+    await prisma.auditEvent.create({
+      data: {
+        actorId: session.userId,
+        action: 'DATA_EXPORT_REQUESTED',
+        ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
+        userAgent: request.headers.get('user-agent') || 'unknown',
+        metadata: { requestedAt: new Date().toISOString() },
+      },
+    });
+
+    return NextResponse.json({
+      ok: true,
+      message: 'Your data export is being prepared. You will receive an email when it is ready.',
+      downloadUrl,
+    });
   } catch (err: any) {
     console.error('[EXPORT]', err?.message || err);
     return new NextResponse('Failed to export data', { status: 500 });

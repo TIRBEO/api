@@ -3,14 +3,8 @@ import { prisma } from '../../../../lib/db/prisma';
 import { getSession } from '../../../../lib/session';
 import { createAuditEvent } from '../../../../lib/audit';
 import { jsonUnauthorized } from '../../../../lib/response';
-import crypto from 'crypto';
-
-function generateBackupCode(): string {
-  const bytes = crypto.randomBytes(5);
-  const hex = Buffer.from(bytes).toString('hex').toUpperCase();
-  const parts = hex.match(/.{1,4}/g) || [];
-  return parts.join('-');
-}
+import { generateRecoveryCodes } from '../../../../lib/auth/totp';
+import { hashRecoveryCode } from '../../../../lib/auth/password';
 
 // GET /api/security/backup-codes - List backup codes
 export async function GET(request: NextRequest) {
@@ -48,13 +42,13 @@ export async function POST(request: NextRequest) {
     where: { userId: session.userId },
   });
 
-  // Generate new codes
-  const newCodes = Array.from({ length: 10 }, () => generateBackupCode());
-  
+  // Generate new codes (stored hashed so they match the login-time comparison)
+  const newCodes = generateRecoveryCodes(8);
+
   await prisma.recoveryCode.createMany({
     data: newCodes.map(code => ({
       userId: session.userId,
-      code,
+      code: hashRecoveryCode(code),
       used: false,
     })),
   });

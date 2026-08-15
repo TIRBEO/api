@@ -11,7 +11,7 @@ import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLi
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
 import { sanitizeInput, logSecurityEvent } from './security';
-import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, verifyPasswordReset, confirmPasswordReset } from './auth/password-reset';
+import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from './auth/password-reset';
 import { createAuditEvent } from './audit';
 import { enforceResendCooldown } from './auth/resend-cooldown';
 import { checkPasswordBreach } from './auth/breach';
@@ -23,11 +23,12 @@ import { SignJWT } from 'jose';
 import { checkWindowLimit, computeRiskScore, recordDeviceSeen } from './captcha/risk';
 import { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied, hasRecentLoginSuccess, getCaptchaSettings } from './captcha/service';
 import { recordRateLimitHit, clearRateLimitHits } from './auth/suspicious-activity';
+import { getAccountsBaseUrl } from './app-urls';
 
 // Cache email existence lookups (login/signup fire these on every debounced
 // keystroke). Results are almost never changed mid-session, so a 30s TTL is
 // safe and removes a DB round-trip per keystroke.
-const emailExistsCache = createTtlCache<{ exists: boolean; hasPassword: boolean; photoUrl: string | null; name: string | null }>(30_000, 5000, 'emailExists');
+const emailExistsCache = createTtlCache<{ exists: boolean; hasPassword: boolean; photoUrl: string | null; name: string | null; hasRecoveryEmail: boolean; recoveryEmail: string | null }>(30_000, 5000, 'emailExists');
 
 // Cache for GET /api/users/me — dashboard polls this frequently.
 // 10s TTL: stale data is acceptable for profile display, and bust on PATCH.
@@ -172,7 +173,8 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
   if (envUri) return envUri;
   const host = request.headers.get('host') || 'api.tirbeo.app';
   const protocol = request.headers.get('x-forwarded-proto') || 'https';
-  return `${protocol}://${host}${path}`;
+  // The catch-all route is at /api/[[...slug]], so the OAuth callback is /api/auth/{provider}/callback
+  return `${protocol}://${host}/api${path}`;
 }
 
 interface OauthProviderConfig {
@@ -375,8 +377,21 @@ export async function loginHandler(request: NextRequest) {
     }
 
     if (user.is2FAEnabled) {
+      // Suspicious sign-in from a new IP / device: challenge with an email OTP
+      // first, then the authenticator 2FA code (OTP → 2FA). With no suspicious
+      // activity, only the authenticator 2FA code is required.
+      const lastSession2fa = await prisma.session.findFirst({
+        where: { userId: user.id, status: { not: 'revoked' } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, ipAddress: true },
+      });
+      const isNewIp2fa = !lastSession2fa || lastSession2fa.ipAddress !== ip;
       const tempToken = await signTemp2faToken(user.id);
-      return NextResponse.json({ needs2FA: true, tempToken });
+      return NextResponse.json({
+        needs2FA: true,
+        tempToken,
+        ...(isNewIp2fa ? { needsOtp: true } : {}),
+      });
     }
 
     // Suspicious sign-in from a new IP / location (no 2FA configured): challenge
@@ -406,7 +421,7 @@ export async function loginHandler(request: NextRequest) {
         type: 'system',
         title: 'Signed in to your account',
         body: `New login from ${userAgent || 'Unknown device'}`,
-        link: '/dashboard/settings/security',
+        link: '/account/security',
       })),
       Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
       // Record login history for the Login History section
@@ -664,13 +679,6 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     const rc = codes.find(c => c.code === inputHash) || null;
     if (!rc) return new NextResponse('Invalid recovery code', { status: 401 });
 
-    if (rc.code !== inputHash) {
-      await prisma.recoveryCode.update({
-        where: { id: rc.id },
-        data: { code: inputHash },
-      });
-    }
-
     await prisma.recoveryCode.update({
       where: { id: rc.id },
       data: { used: true, usedAt: new Date() },
@@ -697,13 +705,15 @@ const signupSchema = z.object({
   photoUrl: z.string().url().optional().or(z.literal('')),
   occupation: z.string().optional(),
   companyName: z.string().optional().or(z.literal('')),
+  role: z.string().max(100).optional(),
+  recoveryEmail: z.string().email().optional().or(z.literal('')),
+  // Client-generated TOTP secret + flag when the user set up 2FA during signup.
+  totpSecret: z.string().optional(),
+  is2FAEnabled: z.boolean().optional(),
   policyAccepted: z.boolean(),
   adminDataAccess: z.boolean().optional(),
-  
-  
   turnstileToken: z.string().optional(),
   captchaRayId: z.string().optional(),
-  emailVerified: z.boolean().optional(),
   fingerprint: z.string().optional(),
   // Optional pre-verified signup OTP (requested via auth/signup-otp/request,
   // verified without consuming via auth/signup-otp/verify). When valid, the
@@ -723,13 +733,15 @@ export async function emailExistsHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { email },
-      select: { id: true, passwordHash: true, photoUrl: true, name: true },
+      select: { id: true, passwordHash: true, photoUrl: true, name: true, secondaryEmail: true },
     });
     const result = {
       exists: !!user,
       hasPassword: !!user?.passwordHash,
       photoUrl: user?.photoUrl || null,
       name: user?.name || null,
+      hasRecoveryEmail: !!user?.secondaryEmail,
+      recoveryEmail: user?.secondaryEmail ? maskEmail(user.secondaryEmail) : null,
     };
     emailExistsCache.set(email, result);
     return NextResponse.json(result, { status: 200 });
@@ -780,12 +792,15 @@ export async function signupHandler(request: NextRequest) {
       console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
       return new NextResponse('Invalid request payload', { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, policyAccepted, adminDataAccess, captchaRayId, emailVerified: emailVerifiedFlag, fingerprint, otpCode } = parsed.data;
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, role, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, captchaRayId, fingerprint, otpCode } = parsed.data;
     const normalizedEmail = email.toLowerCase().trim();
     const normalizedUsername = username.toString().trim().toLowerCase();
     const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
     const normalizedCompanyName = companyName ? companyName.toString().trim() : undefined;
     const normalizedOccupation = occupation ? sanitizeInput(occupation, 120).trim() : undefined;
+    const normalizedRole = role ? sanitizeInput(role, 100).trim() : undefined;
+    const normalizedRecoveryEmail = recoveryEmail ? recoveryEmail.toString().trim().toLowerCase() : undefined;
+    const normalizedTotpSecret = totpSecret ? totpSecret.toString().trim() : undefined;
     
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
@@ -865,9 +880,16 @@ export async function signupHandler(request: NextRequest) {
         photoUrl: normalizedPhotoUrl || undefined,
         occupation: normalizedOccupation,
         companyName: normalizedCompanyName ? sanitizeInput(normalizedCompanyName, 120) : undefined,
+        companyRole: normalizedRole || undefined,
+        secondaryEmail: normalizedRecoveryEmail || undefined,
+        totpSecret: normalizedTotpSecret || undefined,
+        is2FAEnabled: !!(is2FAEnabled && normalizedTotpSecret),
         gender: gender ? sanitizeInput(gender, 100) : undefined,
         birthday,
-        emailVerified: preVerifiedEmail || emailVerifiedFlag || false,
+        // Email can ONLY be marked verified through the signup OTP flow — a
+        // client-supplied flag is never trusted (would allow claiming a
+        // verified account without proving email ownership).
+        emailVerified: preVerifiedEmail,
         preferences: {
           signupConsent: {
             acceptedAt: new Date().toISOString(),
@@ -896,7 +918,7 @@ export async function signupHandler(request: NextRequest) {
       type: 'system',
       title: 'Welcome to Tirbeo!',
       body: 'Your account has been created successfully. Start by exploring the dashboard.',
-      link: '/dashboard',
+      link: '/overview',
     }).catch(() => {});
 
     // Send verification OTP — unless the user already verified via signup-otp
@@ -1263,7 +1285,7 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       type: 'security',
       title: 'Email updated',
       body: currentEmail === email ? 'Your email was verified.' : `Your email was updated to ${email}.`,
-      link: '/dashboard/settings/account-profile',
+      link: '/account/profile',
     }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
 
     return new NextResponse('Email verified', { status: 200 });
@@ -1369,8 +1391,9 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
     const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
-    const stateToken = await signOauthStateToken(nonce, safeRedirect);
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -1477,6 +1500,22 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       create: { userId: user.id, provider: 'google', connected: true, metadata: { googleId, email } },
     });
 
+    // Link mode: user is already logged in, just record integration and redirect back
+    if (state.link) {
+      const existingSession = await getSession(request);
+      if (existingSession) {
+        await prisma.integration.upsert({
+          where: { userId_provider: { userId: existingSession.userId, provider: 'google' } },
+          update: { connected: true, metadata: { googleId, email } },
+          create: { userId: existingSession.userId, provider: 'google', connected: true, metadata: { googleId, email } },
+        });
+        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        clearOauthStateCookie(res, request);
+        return res;
+      }
+      // Not logged in — fall through to normal login
+    }
+
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const target = oauthPostLoginTarget(user, redirectTo, 'google');
@@ -1502,8 +1541,9 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
     const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
-    const stateToken = await signOauthStateToken(nonce, safeRedirect);
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -1614,6 +1654,21 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       create: { userId: user.id, provider: 'github', connected: true, metadata: { githubId, email } },
     });
 
+    // Link mode: user is already logged in, just record integration and redirect back
+    if (state.link) {
+      const existingSession = await getSession(request);
+      if (existingSession) {
+        await prisma.integration.upsert({
+          where: { userId_provider: { userId: existingSession.userId, provider: 'github' } },
+          update: { connected: true, metadata: { githubId, email } },
+          create: { userId: existingSession.userId, provider: 'github', connected: true, metadata: { githubId, email } },
+        });
+        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        clearOauthStateCookie(res, request);
+        return res;
+      }
+    }
+
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
@@ -1640,8 +1695,9 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
     const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
-    const stateToken = await signOauthStateToken(nonce, safeRedirect);
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -1744,6 +1800,21 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
       update: { connected: true, metadata: { discordId, email } },
       create: { userId: user.id, provider: 'discord', connected: true, metadata: { discordId, email } },
     });
+
+    // Link mode: user is already logged in, just record integration and redirect back
+    if (state.link) {
+      const existingSession = await getSession(request);
+      if (existingSession) {
+        await prisma.integration.upsert({
+          where: { userId_provider: { userId: existingSession.userId, provider: 'discord' } },
+          update: { connected: true, metadata: { discordId, email } },
+          create: { userId: existingSession.userId, provider: 'discord', connected: true, metadata: { discordId, email } },
+        });
+        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        clearOauthStateCookie(res, request);
+        return res;
+      }
+    }
 
     const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -2001,8 +2072,11 @@ export async function requestPasswordResetHandler(request: NextRequest) {
         return new NextResponse('This email is not registered with admin access. Please reset your password from your account dashboard.', { status: 403 });
       }
     }
-    const resetMethod: 'otp' | 'magic_link' = method === 'magic_link' ? 'magic_link' : 'otp';
-    const result = await requestPasswordReset(email, resetMethod);
+    const resetMethod: 'otp' | 'magic_link' | 'recovery' = method === 'magic_link' ? 'magic_link' : method === 'recovery' ? 'recovery' : 'otp';
+    const result =
+      resetMethod === 'recovery'
+        ? await requestPasswordResetRecovery(email)
+        : await requestPasswordReset(email, resetMethod);
     if (!result.success && result.retryAfterMs) {
       return NextResponse.json(
         { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
@@ -2098,8 +2172,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
 
     const token = await signMagicLinkToken(user.id);
-    const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-    const callbackUrl = `https://accounts.${appDomain}/callback?magic_token=${token}`;
+    const callbackUrl = `${getAccountsBaseUrl()}/callback?magic_token=${token}`;
 
     let emailSent = false;
     try {
@@ -2417,7 +2490,7 @@ const DEFAULT_HELP_ARTICLES = [
   { id: "37", title: "Form Not Publishing", content: "Check that all required fields are filled and your plan allows form publishing.", category: "Troubleshooting", icon: "bug" },
   { id: "38", title: "Emails Not Sending", content: "Verify your email configuration in Settings → Email. Check spam folders and sender reputation.", category: "Troubleshooting", icon: "bug" },
   { id: "39", title: "Slow Dashboard Performance", content: "Try disabling browser extensions, clearing cache, or switching to a supported browser.", category: "Troubleshooting", icon: "bug" },
-  { id: "40", title: "Mobile App Support", content: "Tirbeo is fully responsive on mobile browsers. A native app is coming soon.", category: "Troubleshooting", icon: "bug" },
+  { id: "40", title: "Mobile App Support", content: "Tirbeo is fully responsive on mobile browsers, so you can create forms and review responses on any device.", category: "Troubleshooting", icon: "bug" },
   { id: "41", title: "Browser Compatibility", content: "We support Chrome, Firefox, Safari, and Edge (latest 2 versions). IE is not supported.", category: "Troubleshooting", icon: "bug" },
   { id: "42", title: "Contacting Support", content: "Email support@tirbeo.app or use the Contact Us page. Premium users get priority support.", category: "Support", icon: "lifebuoy" },
   { id: "43", title: "Support Response Times", content: "Free: 48 hours, Pro: 24 hours, Enterprise: 4 hours. Check status at support.tirbeo.app.", category: "Support", icon: "lifebuoy" },

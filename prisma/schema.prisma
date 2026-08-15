@@ -54,7 +54,6 @@ model User {
   lastLoginIp                                               String?                 @map("last_login_ip")
   loginCount                                                Int?                    @default(0) @map("login_count")
   loginHistory        login_history[]
-  authoredNotes       responseNote[]
   karmaPoints                                               Int?                    @default(0) @map("karma_points")
   isVerified                                                Boolean?                @default(false) @map("is_verified")
   createdAt                                                 DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -85,9 +84,8 @@ model User {
   accessTokens                                              access_tokens[]
   refreshTokens                                             refresh_tokens[]
   oAuthConsents                                             oAuthConsent[]
-  formCollaborators                                         formCollaborator[]
-  forms                                                     form[]
-  formSettings                                              formSettings?
+
+  // Organization & RBAC
 
   @@index([adminRole], map: "idx_users_admin_role")
   @@index([createdAt], map: "idx_users_created")
@@ -230,7 +228,6 @@ model AuditEvent {
    @@map("audit_events")
 }
 
-
 model Notification {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String   @map("user_id")
@@ -254,13 +251,35 @@ model NotificationPreference {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String   @unique @map("user_id")
   type      String   @default("all")
+  // Global channel toggles
   email     Boolean? @default(true)
   push      Boolean? @default(true)
   inApp     Boolean? @default(true) @map("in_app")
+  // Category toggles
   security  Boolean? @default(true)
   forms     Boolean? @default(true)
   product   Boolean? @default(true)
   support   Boolean? @default(true)
+  // Per-category x channel matrix
+  securityEmail   Boolean? @default(true) @map("security_email")
+  securityPush    Boolean? @default(true) @map("security_push")
+  securityInApp   Boolean? @default(true) @map("security_in_app")
+  formsEmail      Boolean? @default(true) @map("forms_email")
+  formsPush       Boolean? @default(true) @map("forms_push")
+  formsInApp      Boolean? @default(true) @map("forms_in_app")
+  productEmail    Boolean? @default(true) @map("product_email")
+  productPush     Boolean? @default(true) @map("product_push")
+  productInApp    Boolean? @default(true) @map("product_in_app")
+  supportEmail    Boolean? @default(true) @map("support_email")
+  supportPush     Boolean? @default(true) @map("support_push")
+  supportInApp    Boolean? @default(true) @map("support_in_app")
+  // Quiet hours
+  quietHoursEnabled  Boolean? @default(false) @map("quiet_hours_enabled")
+  quietHoursStart    String?  @default("22:00") @map("quiet_hours_start")
+  quietHoursEnd      String?  @default("08:00") @map("quiet_hours_end")
+  // Email digest
+  digestEnabled   Boolean?  @default(false) @map("digest_enabled")
+  digestFrequency String?   @default("daily") @map("digest_frequency")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
@@ -455,9 +474,6 @@ model TicketMessage {
   @@map("ticket_messages")
 }
 
-
-
-
 model Blocklist {
   id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
   targetType String    @map("target_type")
@@ -475,9 +491,6 @@ model Blocklist {
   @@index([targetType], map: "idx_blocklist_type")
   @@map("blocklist")
 }
-
-
-
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
@@ -624,7 +637,6 @@ model apps {
   @@index([slug])
 }
 
-
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -705,8 +717,6 @@ model email_logs {
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
-
-
 model incidents {
   id           String            @id @default(dbgenerated("(gen_random_uuid())"))
   title        String
@@ -783,7 +793,6 @@ model jobs {
   @@index([type])
 }
 
-
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
@@ -845,12 +854,9 @@ model Passkey {
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
-
-
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model SignupOtp {
@@ -865,7 +871,6 @@ model SignupOtp {
   @@index([expiresAt], map: "idx_signup_otps_expires")
   @@map("signup_otps")
 }
-
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -901,10 +906,7 @@ model ticket_assignments {
   @@index([ticketId])
 }
 
-
-
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 
@@ -940,141 +942,6 @@ enum report_status {
   dismissed
   actioned
 }
-
-model form {
-  id                     String             @id @default(dbgenerated("(gen_random_uuid())::text"))
-  title                  String
-  description            String?
-  ownerId                String
-  publicId               String             @unique
-  status                 String             @default("draft")
-  viewCount              Int                @default(0)
-  responseCount          Int                @default(0)
-  lastSubmissionAt       DateTime?          @db.Timestamptz(6)
-  submissionCountToday   Int                @default(0)
-  publishedAt            DateTime?          @db.Timestamptz(6)
-  thankYouMessage        String?            @default("Thank you for your response!")
-  allowCollaboratorEdits Boolean            @default(false)
-  captchaEnabled         Boolean            @default(false)
-  settings               Json?              @default("{}")
-  publishedData          Json?              @default("{}")
-  publishedVersion       Int                @default(0)
-  createdAt              DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt              DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
-  fields                 formField[]
-  collaborators          formCollaborator[]
-  versions               formVersion[]
-  notifications          formNotification?
-  responses              response[]
-  pages                  formPage[]
-  user                   User               @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-
-  @@index([ownerId])
-  @@index([publicId])
-  @@index([status])
-  @@map("forms")
-}
-
-model formCollaborator {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId    String
-  userId    String
-  role      String   @default("editor")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([formId, userId])
-  @@index([formId])
-  @@index([userId])
-  @@map("form_collaborators")
-}
-
-model formField {
-  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId          String?
-  pageId          String?
-  type            String
-  label           String
-  placeholder     String?
-  description     String?
-  required        Boolean           @default(false)
-  config          Json?             @default("{}")
-  options         formFieldOption[]
-  order           Int               @default(0)
-  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
-  form            form?             @relation(fields: [formId], references: [id], onDelete: Cascade)
-  page            formPage?         @relation(fields: [pageId], references: [id], onDelete: Cascade)
-  answers         responseAnswer[]
-
-  @@index([formId])
-  @@index([pageId])
-  @@map("form_fields")
-}
-
-model formFieldOption {
-  id      String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  fieldId String
-  label   String
-  value   String?
-  order   Int       @default(0)
-  field   formField @relation(fields: [fieldId], references: [id], onDelete: Cascade)
-
-  @@index([fieldId])
-  @@map("form_field_options")
-}
-
-
-model formVersion {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId    String
-  version   Int
-  data      Json
-  type      String   @default("draft") // draft | published
-  createdBy String
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@index([formId])
-  @@map("form_versions")
-}
-
-model formNotification {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId    String   @unique
-  email     String
-  events    Json     @default("[]")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-  form      form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@map("form_notifications")
-}
-
-model response {
-  id              String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId          String
-  versionId       String?          @map("form_version_id")
-  respondentEmail String?
-  respondentName  String?
-  ipAddress       String?
-  userAgent       String?
-  status          String           @default("completed")
-  completedAt     DateTime?        @db.Timestamptz(6)
-  duration        Int?
-  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  form            form             @relation(fields: [formId], references: [id], onDelete: Cascade)
-  answers             responseAnswer[]
-  notes               responseNote[]
-
-  @@index([formId])
-  @@index([status])
-  @@index([versionId])
-  @@map("responses")
-}
-
-
-
 
 enum session_status {
   active
@@ -1225,86 +1092,6 @@ model ticket_attachments {
   @@map("ticket_attachments")
 }
 
-model formPage {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId      String   @map("form_id")
-  title       String?
-  description String?
-  order       Int      @default(0)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-  form        form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-  fields      formField[]
-  @@index([formId])
-  @@map("form_pages")
-}
-
-model responseAnswer {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  responseId  String   @map("response_id")
-  fieldId     String   @map("field_id")
-  value       Json?
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  response    response @relation(fields: [responseId], references: [id], onDelete: Cascade)
-  field       formField? @relation(fields: [fieldId], references: [id], onDelete: SetNull)
-  @@index([responseId])
-  @@index([fieldId])
-  @@map("response_answers")
-}
-
-model responseNote {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  responseId  String   @map("response_id")
-  authorId    String?  @map("author_id")
-  content     String
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-  response    response @relation(fields: [responseId], references: [id], onDelete: Cascade)
-  author      User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
-  @@index([responseId])
-  @@map("response_notes")
-}
-
-model formSettings {
-  id                         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId                     String   @unique @map("user_id")
-  // Default form visibility
-  defaultVisibility          String   @default("private") @map("default_visibility")
-  // Default theme colors
-  defaultPrimaryColor        String?  @default("#000000") @map("default_primary_color")
-  defaultBackgroundColor     String?  @default("#ffffff") @map("default_background_color")
-  defaultSurfaceColor        String?  @default("#f5f5f5") @map("default_surface_color")
-  defaultTextColor           String?  @default("#000000") @map("default_text_color")
-  defaultMutedTextColor      String?  @default("#666666") @map("default_muted_text_color")
-  defaultBorderColor         String?  @default("#e5e5e5") @map("default_border_color")
-  // Default fonts
-  defaultHeadingFont         String?  @default("Inter") @map("default_heading_font")
-  defaultBodyFont            String?  @default("Inter") @map("default_body_font")
-  // Default layout
-  defaultBorderRadius        String?  @default("12px") @map("default_border_radius")
-  defaultPadding             String?  @default("32px") @map("default_padding")
-  defaultMaxWidth            String?  @default("640px") @map("default_max_width")
-  // Default button style
-  defaultButtonStyle         String?  @default("rounded") @map("default_button_style")
-  defaultButtonFullWidth     Boolean  @default(false) @map("default_button_full_width")
-  // Submission behavior
-  defaultSubmitButtonText    String?  @default("Submit") @map("default_submit_button_text")
-  defaultShowProgressBar     Boolean  @default(true) @map("default_show_progress_bar")
-  defaultAllowMultiple       Boolean  @default(true) @map("default_allow_multiple")
-  // Email notifications
-  emailNotifications         Boolean  @default(true) @map("email_notifications")
-  emailFormResponses         Boolean  @default(true) @map("email_form_responses")
-  emailFormUpdates           Boolean  @default(true) @map("email_form_updates")
-  emailWeeklyDigest          Boolean  @default(false) @map("email_weekly_digest")
-  emailMarketing             Boolean  @default(false) @map("email_marketing")
-  createdAt                  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user                       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@map("form_settings")
-}
-
 model incident_events {
   id          String   @id @default(uuid())
   incidentId  String   @map("incident_id")
@@ -1339,4 +1126,151 @@ model form_templates {
   @@map("form_templates")
 }
 
+// ═══ BUG TRACKING ═══
 
+enum BugSeverity {
+  P0_CRITICAL
+  P1_HIGH
+  P2_MEDIUM
+  P3_LOW
+}
+
+enum BugStatus {
+  NEW
+  CONFIRMED
+  ASSIGNED
+  IN_PROGRESS
+  FIXED
+  RETEST
+  CLOSED
+  REJECTED
+  DUPLICATE
+  WONT_FIX
+  REOPENED
+}
+
+enum BugCategory {
+  FUNCTIONAL
+  UI_VISUAL
+  UX
+  RESPONSIVE
+  BROWSER_COMPAT
+  ACCESSIBILITY
+  PERFORMANCE
+  SECURITY
+  AUTHENTICATION
+  AUTHORIZATION
+  API_BACKEND
+  DATABASE_DATA
+  PAYMENT
+  INTEGRATION
+  SEO
+  CONTENT
+  DEVICE_OS
+  INFRASTRUCTURE
+  BUSINESS_LOGIC
+  MONITORING
+}
+
+model BugProject {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String
+  slug        String   @unique
+  description String?
+  ownerId     String   @map("owner_id")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  bugs        Bug[]
+
+  @@map("bug_projects")
+}
+
+model Bug {
+  id               String      @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId        String      @map("project_id")
+  title            String
+  description      String?
+  category         BugCategory
+  severity         BugSeverity @default(P2_MEDIUM)
+  priority         Int         @default(0)
+  status           BugStatus   @default(NEW)
+  reporterId       String      @map("reporter_id")
+  assigneeId       String?     @map("assignee_id")
+  environment      String?
+  browser          String?
+  operatingSystem  String?     @map("operating_system")
+  device           String?
+  url              String?
+  expectedResult   String?     @map("expected_result")
+  actualResult     String?     @map("actual_result")
+  reproductionSteps String?    @map("reproduction_steps")
+  rootCause        String?     @map("root_cause")
+  proposedFix      String?     @map("proposed_fix")
+  businessImpact   String?     @map("business_impact")
+  securityImpact   String?     @map("security_impact")
+  tags             String[]
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  fixedAt          DateTime?   @map("fixed_at") @db.Timestamptz(6)
+  closedAt         DateTime?   @map("closed_at") @db.Timestamptz(6)
+  reopenedAt       DateTime?   @map("reopened_at") @db.Timestamptz(6)
+  project          BugProject  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  reporter         User        @relation("bug_reporter", fields: [reporterId], references: [id])
+  assignee         User?       @relation("bug_assignee", fields: [assigneeId], references: [id])
+  comments         BugComment[]
+  attachments     BugAttachment[]
+  events          BugEvent[]
+
+  @@index([projectId])
+  @@index([status])
+  @@index([severity])
+  @@index([category])
+  @@index([reporterId])
+  @@index([assigneeId])
+  @@map("bugs")
+}
+
+model BugComment {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  bugId     String   @map("bug_id")
+  authorId  String   @map("author_id")
+  content   String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  bug       Bug      @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id])
+
+  @@index([bugId])
+  @@map("bug_comments")
+}
+
+model BugAttachment {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  bugId     String   @map("bug_id")
+  filename  String
+  url       String
+  size      Int?
+  mimeType  String?  @map("mime_type")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  bug       Bug      @relation(fields: [bugId], references: [id], onDelete: Cascade)
+
+  @@index([bugId])
+  @@map("bug_attachments")
+}
+
+model BugEvent {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  bugId     String   @map("bug_id")
+  actorId   String   @map("actor_id")
+  action    String
+  fromValue String?  @map("from_value")
+  toValue   String?  @map("to_value")
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  bug       Bug      @relation(fields: [bugId], references: [id], onDelete: Cascade)
+  actor     User     @relation(fields: [actorId], references: [id])
+
+  @@index([bugId])
+  @@index([createdAt(sort: Desc)])
+  @@map("bug_events")
+}

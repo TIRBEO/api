@@ -7,7 +7,7 @@ const SEARCHABLE_PAGES = [
   { label: 'Routes', url: '/routes', category: 'Page' },
   { label: 'Monitor', url: '/monitor', category: 'Page' },
   { label: 'Users', url: '/users', category: 'Page' },
-  { label: 'Workspaces', url: '/workspaces', category: 'Page' },
+  { label: 'Organizations', url: '/organizations', category: 'Page' },
   { label: 'Roles', url: '/settings/roles', category: 'Page' },
   { label: 'Audit Trail', url: '/monitor/audit', category: 'Page' },
   { label: 'Email Config', url: '/settings/email', category: 'Page' },

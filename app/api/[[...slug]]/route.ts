@@ -106,6 +106,8 @@ import {
   helpArticleDetailHandler,
 } from '../../../lib/helpHandlers';
 
+// organizationHandlers removed (Organization feature not yet implemented)
+
 import {
   securityEventsHandler,
   totpSetupHandler,
@@ -129,8 +131,6 @@ import {
   apiKeysHandler,
   apiKeyDeleteHandler,
 } from '../../../lib/developerHandlers';
-
-
 
 import {
   chatHandler,
@@ -178,23 +178,9 @@ import {
   ticketMessageHandler, ticketAssignHandler, ticketCloseHandler, ticketReopenHandler,
   ticketAppealsHandler, ticketAppealUnblockHandler,
   ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
+  ticketMarkReadHandler,
   queuesListHandler, queuesCreateHandler,
 } from '../../../lib/supportHandlers';
-
-import {
-  listForms, createForm, getForm, updateForm, deleteForm, importForm,
-  listMyResponses,
-  publishForm, archiveForm,
-  getPublicForm, submitResponse,
-  listResponses, getResponse, deleteResponse, updateResponse,
-  getFormAnalytics,
-  listCollaborators, addCollaborator, removeCollaborator,
-  listVersions, restoreVersion,
-  getFormSettings, updateFormSettings, testFormWebhook,
-  publicDirectory, exportResponses,
-  listTemplates, createTemplate, deleteTemplate, useTemplate,
-  getFormOverview,
-} from '../../../lib/formHandlers';
 
 import {
   loginHistoryHandler,
@@ -203,13 +189,6 @@ import {
 import {
   incidentEventsListHandler, incidentEventsCreateHandler,
 } from '../../../lib/contentHandlers';
-
-import {
-  formPagesListHandler, formPagesCreateHandler,
-  responseAnswersListHandler,
-  responseNotesListHandler, responseNotesCreateHandler,
-  getFormSettingsHandler, updateFormSettingsHandler,
-} from '../../../lib/formHandlers';
 
 import {
   publicHealthHandler, detailedHealthHandler, poolHealthHandler,
@@ -263,9 +242,8 @@ const INTERNAL_ROUTES = [
   'admin/oauth/apps', 'admin/oauth/clients',
   'admin/help-articles',
   'admin/groups',
-  'admin/ous',
-  'admin/integrations',
-  'admin/security/score',
+  'admin/ous',  'admin/integrations', 'admin/security/score',
+  'admin/settings', 'admin/analytics/overview',
   'passkey/register/options', 'passkey/register/verify',
   'passkey/auth/options', 'passkey/auth/verify',
   'passkey/list',
@@ -284,13 +262,6 @@ const INTERNAL_ROUTES = [
   // Support
   'support/tickets', 'support/tickets/create',  'support/tickets/appeals',
   'support/queues', 'support/queues/create',
-  // Forms
-  'forms', 'forms/create',
-  'forms/import',
-  'forms/public',
-  'forms/directory',      'forms/my-responses',
-  'form-settings',
-  'templates',
   // OAuth / OIDC
   'auth/oauth/authorize', 'auth/oauth/token', 'auth/oauth/revoke', 'auth/oauth/consent',
   'oidc/userinfo',
@@ -331,14 +302,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   if (dbRoute) return dbRoute;
 
   // Handle email/templates/{name} dynamic route
-  if (slug.length === 3 && slug[0] === 'email' && slug[1] === 'templates') {
-    const templateName = slug[2];
-    const allowed = ['GET', 'PATCH', 'DELETE'];
-    if (allowed.includes(method.toUpperCase())) {
-      return { path: 'email/templates/[name]', method, internal: true, allowedRoles: ['guest'], meta: { templateName } };
-    }
-  }
-
   // Handle admin/emails/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'admin' && slug[1] === 'emails') {
     const emailId = slug[2];
@@ -404,17 +367,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
 
 // connected-accounts routes removed (LinkedAccount model removed)
 
-  // Handle templates/{id} dynamic route (use or delete)
-  if (slug.length === 2 && slug[0] === 'templates') {
-    const templateId = slug[1];
-    if (method.toUpperCase() === 'POST') {
-      return { path: 'templates/[id]/use', method, internal: true, allowedRoles: ['guest'], meta: { templateId } };
-    }
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'templates/[id]', method, internal: true, allowedRoles: ['guest'], meta: { templateId } };
-    }
-  }
-
   // Handle passkey/{id} dynamic route
   if (slug.length === 2 && slug[0] === 'passkey') {
     const passkeyId = slug[1];
@@ -426,10 +378,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
-
-
-
-
   // Handle content/retry-job/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'retry-job') {
     return { path: 'content/retry-job/[id]', method: 'POST', internal: true, allowedRoles: ['guest'], meta: { retryJobId: slug[2] } };
@@ -440,19 +388,19 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     return { path: 'content/incidents/[id]/events', method, internal: true, allowedRoles: ['guest'], meta: { incidentId: slug[2] } };
   }
 
-  // Handle support/tickets/{id} dynamic route
+  // Handle support/tickets/{id} dynamic route (GET/PATCH/PUT/DELETE)
   if (slug.length === 3 && slug[0] === 'support' && slug[1] === 'tickets') {
     const ticketId = slug[2];
-    const allowed: Record<string, string[]> = { 'GET': ['GET'], 'PATCH': ['PATCH'], 'DELETE': ['DELETE'] };
-    if (allowed[method.toUpperCase()]) {
+    const allowed = ['GET', 'PATCH', 'PUT', 'DELETE'];
+    if (allowed.includes(method.toUpperCase())) {
       return { path: 'support/tickets/[id]', method, internal: true, allowedRoles: ['guest'], meta: { ticketId } };
     }
   }
 
-  // Handle support/tickets/{id}/messages, assign, close, reopen
+  // Handle support/tickets/{id}/messages, reply, read, assign, close, reopen, attachments
   if (slug.length === 4 && slug[0] === 'support' && slug[1] === 'tickets') {
     const action = slug[3];
-    if (['messages', 'assign', 'close', 'reopen', 'attachments'].includes(action)) {
+    if (['messages', 'reply', 'read', 'assign', 'close', 'reopen', 'attachments'].includes(action)) {
       return { path: `support/tickets/[id]/${action}`, method, internal: true, allowedRoles: ['guest'], meta: { ticketId: slug[2] } };
     }
   }
@@ -460,102 +408,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   // Handle support/tickets/appeals/{rayId}/unblock
   if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] === 'appeals' && slug[4] === 'unblock') {
     return { path: 'support/tickets/appeals/[rayId]/unblock', method, internal: true, allowedRoles: ['guest'], meta: { appealRayId: slug[3] } };
-  }
-
-  // Handle forms/my-responses (user's submitted responses) before the forms/{id} catch-all
-  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'my-responses') {
-    if (method.toUpperCase() === 'GET') {
-      return { path: 'forms/my-responses', method, internal: true, allowedRoles: ['guest'] };
-    }
-  }
-
-  // Handle forms/create (create form) — must be before forms/{id} catch-all
-  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'create') {
-    if (method.toUpperCase() === 'POST') {
-      return { path: 'forms/create', method, internal: true, allowedRoles: ['guest'] };
-    }
-  }
-
-  // Handle forms/import (import form) — must be before forms/{id} catch-all
-  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'import') {
-    if (method.toUpperCase() === 'POST') {
-      return { path: 'forms/import', method, internal: true, allowedRoles: ['guest'] };
-    }
-  }
-
-  // Handle forms/public (public directory listing) — must be before forms/{id} catch-all
-  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'public') {
-    if (method.toUpperCase() === 'GET') {
-      return { path: 'forms/public', method, internal: true, allowedRoles: ['guest'] };
-    }
-  }
-
-  // Handle forms/directory (public directory listing alias)
-  if (slug.length === 2 && slug[0] === 'forms' && slug[1] === 'directory') {
-    if (method.toUpperCase() === 'GET') {
-      return { path: 'forms/directory', method, internal: true, allowedRoles: ['guest'] };
-    }
-  }
-
-  // Handle forms/{id} dynamic route
-  if (slug.length === 2 && slug[0] === 'forms') {
-    const formId = slug[1];
-    const allowed: Record<string, string[]> = { 'GET': ['GET'], 'PATCH': ['PATCH', 'PUT'], 'DELETE': ['DELETE'] };
-    if (allowed[method.toUpperCase()]) {
-      return { path: 'forms/[id]', method, internal: true, allowedRoles: ['guest'], meta: { formId } };
-    }
-  }
-
-  // Handle forms/{id}/* sub-routes
-  if (slug.length >= 3 && slug[0] === 'forms') {
-    const formId = slug[1];
-    const action = slug[2];
-    if (['publish', 'archive', 'responses', 'analytics', 'collaborators', 'versions', 'settings', 'export', 'pages', 'overview'].includes(action)) {
-      return { path: `forms/[id]/${action}`, method, internal: true, allowedRoles: ['guest'], meta: { formId } };
-    }
-    // Handle forms/{id}/webhook/test
-    if (action === 'webhook' && slug.length === 4 && slug[3] === 'test') {
-      return { path: 'forms/[id]/webhook/test', method, internal: true, allowedRoles: ['guest'], meta: { formId } };
-    }
-    // Handle forms/{id}/pages dynamic route
-    if (action === 'pages' && slug.length >= 4) {
-      return { path: 'forms/[id]/pages/[pageId]', method, internal: true, allowedRoles: ['guest'], meta: { formId, pageId: slug[3] } };
-    }
-  }
-
-  // Handle forms/{id}/responses/{responseId}
-  if (slug.length === 4 && slug[0] === 'forms' && slug[2] === 'responses') {
-    return { path: 'forms/[id]/responses/[responseId]', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
-  }
-
-  // Handle forms/{id}/responses/{responseId}/answers
-  if (slug.length === 5 && slug[0] === 'forms' && slug[2] === 'responses' && slug[4] === 'answers') {
-    return { path: 'forms/[id]/responses/[responseId]/answers', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
-  }
-
-  // Handle forms/{id}/responses/{responseId}/notes
-  if (slug.length === 5 && slug[0] === 'forms' && slug[2] === 'responses' && slug[4] === 'notes') {
-    return { path: 'forms/[id]/responses/[responseId]/notes', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], responseId: slug[3] } };
-  }
-
-  // Handle forms/{id}/collaborators/{collaboratorId}
-  if (slug.length === 4 && slug[0] === 'forms' && slug[2] === 'collaborators') {
-    return { path: 'forms/[id]/collaborators/[collaboratorId]', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], collaboratorId: slug[3] } };
-  }
-
-  // Handle forms/{id}/versions/{versionId}/restore
-  if (slug.length === 5 && slug[0] === 'forms' && slug[2] === 'versions' && slug[4] === 'restore') {
-    return { path: 'forms/[id]/versions/[versionId]/restore', method, internal: true, allowedRoles: ['guest'], meta: { formId: slug[1], versionId: slug[3] } };
-  }
-
-  // Handle public forms: forms/public/{publicId}
-  if (slug.length === 3 && slug[0] === 'forms' && slug[1] === 'public') {
-    return { path: 'forms/public/[publicId]', method, internal: true, allowedRoles: ['guest'], meta: { publicId: slug[2] } };
-  }
-
-  // Handle public form submission: forms/public/{publicId}/submit
-  if (slug.length === 4 && slug[0] === 'forms' && slug[1] === 'public' && slug[3] === 'submit') {
-    return { path: 'forms/public/[publicId]/submit', method, internal: true, allowedRoles: ['guest'], meta: { publicId: slug[2] } };
   }
 
   // Handle captcha/image/{id} dynamic route
@@ -671,6 +523,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'admin/ous': ['GET', 'POST'],
       'admin/integrations': ['GET', 'POST', 'DELETE'],
       'admin/security/score': ['GET'],
+      'admin/settings': ['GET', 'PATCH'],
+      'admin/analytics/overview': ['GET'],
       'passkey/register/options': ['POST'],
       'passkey/register/verify': ['POST'],
       'passkey/auth/options': ['POST'],
@@ -708,24 +562,13 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'content/jobs/create': ['POST'],
       'content/retry-job': ['POST'],
       // Support
-      'support/tickets': ['GET'],
+      'support/tickets': ['GET', 'POST'],
       'support/tickets/create': ['POST'],
+      'support/tickets/[id]/read': ['POST'],
       'support/tickets/[id]/attachments': ['GET', 'POST'],
       'support/tickets/appeals': ['GET'],
       'support/queues': ['GET'],
       'support/queues/create': ['POST'],
-      // Forms
-      'forms': ['GET', 'POST'],
-      'forms/create': ['POST'],
-      'forms/import': ['POST'],
-      'forms/[id]/pages': ['GET', 'POST'],
-      'forms/[id]/pages/[pageId]': ['GET', 'PATCH', 'DELETE'],
-      'forms/[id]/responses/[responseId]/answers': ['GET'],
-      'forms/[id]/responses/[responseId]/notes': ['GET', 'POST'],
-      'forms/public': ['GET'],
-      'forms/directory': ['GET'],
-      'form-settings': ['GET', 'PATCH'],
-      'templates': ['GET', 'POST'],
       // OAuth / OIDC
       'auth/oauth/authorize': ['POST'],
       'auth/oauth/token': ['POST'],
@@ -841,8 +684,10 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   // this check since they handle their own DB errors gracefully.
   const SKIP_DB_CHECK = ['health', 'health/pool', 'captcha/status', 'captcha/challenge',
     'public/app-config', 'public/help-config', 'public/faq', 'public/theme', 'public/branding',
-    'public/landing', 'public/landing-config', 'admin/check-setup'];
-  if (!SKIP_DB_CHECK.includes(pathStr) && !pathStr.startsWith('forms/public/')) {
+    'public/landing', 'public/landing-config', 'admin/check-setup',
+    'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
+    'auth/discord', 'auth/discord/callback'];
+  if (!SKIP_DB_CHECK.includes(pathStr)) {
     const dbOk = await isDbHealthy();
     if (!dbOk) {
       console.warn(`[DB-HEALTH] Rejecting request — DB is down: ${method} ${pathStr}`);
@@ -1162,6 +1007,19 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = new NextResponse('Handled by standalone route', { status: 200 });
         break;
 
+      case 'admin/settings': {
+        const { adminSettingsHandler, adminSettingsUpdateHandler } = await import('../../../lib/adminSettingsHandlers');
+        resp = request.method === 'GET'
+          ? await adminSettingsHandler(request)
+          : await adminSettingsUpdateHandler(request);
+        break;
+      }
+      case 'admin/analytics/overview': {
+        const { adminAnalyticsOverviewHandler } = await import('../../../lib/adminSettingsHandlers');
+        resp = await adminAnalyticsOverviewHandler(request);
+        break;
+      }
+
       case 'passkey/register/options':
         resp = await passkeyRegisterOptionsHandler(request);
         break;
@@ -1262,7 +1120,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       // Support routes
       case 'support/tickets':
-        resp = await ticketListHandler(request);
+        if (method === 'POST') resp = await ticketCreateHandler(request);
+        else resp = await ticketListHandler(request);
         break;
       case 'support/tickets/create':
         resp = await ticketCreateHandler(request);
@@ -1275,11 +1134,17 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/tickets/[id]':
         if (method === 'GET') resp = await ticketDetailHandler(request, (route as any).meta.ticketId);
-        else if (method === 'PATCH') resp = await ticketUpdateHandler(request, (route as any).meta.ticketId);
+        else if (method === 'PATCH' || method === 'PUT') resp = await ticketUpdateHandler(request, (route as any).meta.ticketId);
         else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'support/tickets/[id]/messages':
         resp = await ticketMessageHandler(request, (route as any).meta.ticketId);
+        break;
+      case 'support/tickets/[id]/reply':
+        resp = await ticketMessageHandler(request, (route as any).meta.ticketId);
+        break;
+      case 'support/tickets/[id]/read':
+        resp = await ticketMarkReadHandler(request, (route as any).meta.ticketId);
         break;
       case 'support/tickets/[id]/assign':
         resp = await ticketAssignHandler(request, (route as any).meta.ticketId);
@@ -1345,116 +1210,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = NextResponse.json({ message: 'Job queued for retry' });
         break;
       }
-      // Form routes
-      case 'forms':
-        if (method === 'POST') resp = await createForm(request);
-        else resp = await listForms(request);
-        break;
-      case 'forms/my-responses':
-        resp = await listMyResponses(request);
-        break;
-      case 'forms/create':
-        resp = await createForm(request);
-        break;
-      case 'forms/import':
-        resp = await importForm(request);
-        break;
-      case 'forms/[id]':
-        if (method === 'GET') resp = await getForm(request, (route as any).meta.formId);
-        else if (method === 'PATCH' || method === 'PUT') resp = await updateForm(request, (route as any).meta.formId);
-        else if (method === 'DELETE') resp = await deleteForm(request, (route as any).meta.formId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/[id]/publish':
-        resp = await publishForm(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/archive':
-        resp = await archiveForm(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/responses':
-        resp = await listResponses(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/overview':
-        resp = await getFormOverview(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/analytics':
-        resp = await getFormAnalytics(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/pages':
-        if (method === 'GET') resp = await formPagesListHandler(request, (route as any).meta.formId);
-        else if (method === 'POST') resp = await formPagesCreateHandler(request, (route as any).meta.formId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/[id]/settings':
-        if (method === 'GET') resp = await getFormSettings(request, (route as any).meta.formId);
-        else if (method === 'PATCH' || method === 'PUT') resp = await updateFormSettings(request, (route as any).meta.formId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/[id]/export':
-        resp = await exportResponses(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/webhook/test':
-        if (method === 'POST') resp = await testFormWebhook(request, (route as any).meta.formId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/[id]/collaborators':
-        if (method === 'GET') resp = await listCollaborators(request, (route as any).meta.formId);
-        else if (method === 'POST') resp = await addCollaborator(request, (route as any).meta.formId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/[id]/collaborators/[collaboratorId]':
-        resp = await removeCollaborator(request, (route as any).meta.formId, (route as any).meta.collaboratorId);
-        break;
-      case 'forms/[id]/versions':
-        resp = await listVersions(request, (route as any).meta.formId);
-        break;
-      case 'forms/[id]/versions/[versionId]/restore':
-        resp = await restoreVersion(request, (route as any).meta.formId, (route as any).meta.versionId);
-        break;
-case 'forms/[id]/responses/[responseId]':
-         if (method === 'GET') resp = await getResponse(request, (route as any).meta.formId, (route as any).meta.responseId);
-         else if (method === 'PATCH' || method === 'PUT') resp = await updateResponse(request, (route as any).meta.formId, (route as any).meta.responseId);
-         else if (method === 'DELETE') resp = await deleteResponse(request, (route as any).meta.formId, (route as any).meta.responseId);
-         else resp = new NextResponse('Method not allowed', { status: 405 });
-         break;
-      case 'forms/[id]/responses/[responseId]/answers':
-         if (method === 'GET') resp = await responseAnswersListHandler(request, (route as any).meta.responseId);
-         else resp = new NextResponse('Method not allowed', { status: 405 });
-         break;
-      case 'forms/[id]/responses/[responseId]/notes':
-         if (method === 'GET') resp = await responseNotesListHandler(request, (route as any).meta.responseId);
-         else if (method === 'POST') resp = await responseNotesCreateHandler(request, (route as any).meta.responseId);
-         else resp = new NextResponse('Method not allowed', { status: 405 });
-         break;
-      case 'forms/public':
-        resp = await publicDirectory(request);
-        break;
-      case 'forms/directory':
-        resp = await publicDirectory(request);
-        break;
-      case 'form-settings':
-        if (method === 'GET') resp = await getFormSettingsHandler(request);
-        else if (method === 'PATCH') resp = await updateFormSettingsHandler(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'templates':
-        if (method === 'GET') resp = await listTemplates(request);
-        else if (method === 'POST') resp = await createTemplate(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'templates/[id]/use':
-        resp = await useTemplate(request, (route as any).meta.templateId);
-        break;
-      case 'templates/[id]':
-        if (method === 'DELETE') resp = await deleteTemplate(request, (route as any).meta.templateId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
-      case 'forms/public/[publicId]':
-        resp = await getPublicForm(request, (route as any).meta.publicId);
-        break;
-      case 'forms/public/[publicId]/submit':
-        resp = await submitResponse(request, (route as any).meta.publicId);
-        break;
+      // Workspace routes
       default:
         resp = new NextResponse('Internal route not implemented', { status: 501 });
     }

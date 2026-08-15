@@ -5,6 +5,7 @@ import { addMinutes } from 'date-fns';
 import { sendTemplateEmail } from '../email';
 import { randomInt } from 'crypto';
 import { enforceResendCooldown } from './resend-cooldown';
+import { getAccountsBaseUrl } from '../app-urls';
 
 const RESET_TTL_MINUTES = 15;
 
@@ -21,11 +22,20 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
     data: { userId: user.id, type: 'email', otpHash, expiresAt },
   });
 
-  const result = await sendTemplateEmail(email, 'password_reset_otp', {
+  sendTemplateEmail(email, 'password_reset_otp', {
     OTP: code,
     otp: code,
     name: user.name || 'there',
-  });
+  })
+    .then((result) => {
+      if (!result.success) {
+        console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
+        }
+      }
+    })
+    .catch((err) => console.error('[PASSWORD RESET OTP] Email send threw:', err?.message));
 
   if (user.secondaryEmail) {
     sendTemplateEmail(user.secondaryEmail, 'password_reset_otp', {
@@ -33,13 +43,6 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
       otp: code,
       name: user.name || 'there',
     }).catch(err => console.error('[PASSWORD RESET OTP] Secondary email failed:', err?.message));
-  }
-
-  if (!result.success) {
-    console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
-    if (process.env.NODE_ENV !== 'production') {
-      console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
-    }
   }
 
   return { success: true, code };
@@ -53,13 +56,21 @@ export async function requestPasswordResetMagicLink(email: string): Promise<{ su
   }
 
   const resetToken = await signPasswordResetToken(user.id);
-  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-  const resetUrl = `https://accounts.${appDomain}/reset-password?token=${resetToken}`;
+  const resetUrl = `${getAccountsBaseUrl()}/reset-password?token=${resetToken}`;
 
-  const result = await sendTemplateEmail(email, 'password_reset_link', {
+  sendTemplateEmail(email, 'password_reset_link', {
     resetUrl,
     name: user.name || 'there',
-  });
+  })
+    .then((result) => {
+      if (!result.success) {
+        console.error(`[PASSWORD RESET MAGIC LINK] Email send failed for ${email}: ${result.error}`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
+        }
+      }
+    })
+    .catch((err) => console.error('[PASSWORD RESET MAGIC LINK] Email send threw:', err?.message));
 
   if (user.secondaryEmail) {
     sendTemplateEmail(user.secondaryEmail, 'password_reset_link', {
@@ -68,14 +79,46 @@ export async function requestPasswordResetMagicLink(email: string): Promise<{ su
     }).catch(err => console.error('[PASSWORD RESET MAGIC LINK] Secondary email failed:', err?.message));
   }
 
-  if (!result.success) {
-    console.error(`[PASSWORD RESET MAGIC LINK] Email send failed for ${email}: ${result.error}`);
-    if (process.env.NODE_ENV !== 'production') {
-      console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
-    }
+  return { success: true, resetUrl };
+}
+
+// Request password reset — send the OTP to the user's recovery (secondary) email only
+export async function requestPasswordResetRecovery(email: string): Promise<{ success: boolean; error?: string; code?: string; retryAfterMs?: number }> {
+  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  if (!user || !user.secondaryEmail) {
+    return { success: false, error: 'No recovery email on file for this account' };
   }
 
-  return { success: true, resetUrl };
+  const cooldown = enforceResendCooldown(`password-reset-recovery:${user.secondaryEmail.toLowerCase()}`);
+  if (!cooldown.allowed) {
+    return { success: false, error: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs };
+  }
+
+  const code = (randomInt as Function)(100000, 1000000).toString();
+  const otpHash = hashOtpCode(code);
+  const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
+
+  await prisma.otp.create({
+    data: { userId: user.id, type: 'email', otpHash, expiresAt },
+  });
+
+  const result = sendTemplateEmail(user.secondaryEmail, 'password_reset_otp', {
+    OTP: code,
+    otp: code,
+    name: user.name || 'there',
+  });
+  result
+    .then((r) => {
+      if (!r.success) {
+        console.error(`[PASSWORD RESET RECOVERY] Email send failed for ${user.secondaryEmail}: ${r.error}`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[PASSWORD RESET RECOVERY] FALLBACK CODE for ${user.secondaryEmail}: ${code}`);
+        }
+      }
+    })
+    .catch((err) => console.error('[PASSWORD RESET RECOVERY] Email send threw:', err?.message));
+
+  return { success: true, code };
 }
 
 type ResetMethod = 'otp' | 'magic_link';
@@ -96,31 +139,31 @@ export async function requestPasswordReset(
     return { success: true };
   }
 
-  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-
   if (method === 'magic_link') {
     // Generate JWT reset token for the link
     const resetToken = await signPasswordResetToken(user.id);
-    const resetUrl = `https://accounts.${appDomain}/reset-password?token=${resetToken}`;
+    const resetUrl = `${getAccountsBaseUrl()}/reset-password?token=${resetToken}`;
 
-    // Send email with magic link only
-    const result = await sendTemplateEmail(email, 'password_reset_link', {
+    // Send email with magic link only (non-blocking — response must be fast)
+    sendTemplateEmail(email, 'password_reset_link', {
       resetUrl,
       name: user.name || 'there',
-    });
+    })
+      .then((result) => {
+        if (!result.success) {
+          console.error(`[PASSWORD RESET] Email send failed for ${email}: ${result.error}`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
+          }
+        }
+      })
+      .catch((err) => console.error('[PASSWORD RESET] Email send threw:', err?.message));
 
     if (user.secondaryEmail) {
       sendTemplateEmail(user.secondaryEmail, 'password_reset_link', {
         resetUrl,
         name: user.name || 'there',
       }).catch(err => console.error('[PASSWORD RESET] Secondary email failed:', err?.message));
-    }
-
-    if (!result.success) {
-      console.error(`[PASSWORD RESET] Email send failed for ${email}: ${result.error}`);
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
-      }
     }
 
     return { success: true, resetUrl };
@@ -134,12 +177,21 @@ export async function requestPasswordReset(
       data: { userId: user.id, type: 'email', otpHash, expiresAt },
     });
 
-    // Send email with OTP only
-    const result = await sendTemplateEmail(email, 'password_reset_otp', {
+    // Send email with OTP only (non-blocking — response must be fast)
+    sendTemplateEmail(email, 'password_reset_otp', {
       OTP: code,
       otp: code,
       name: user.name || 'there',
-    });
+    })
+      .then((result) => {
+        if (!result.success) {
+          console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
+          if (process.env.NODE_ENV !== 'production') {
+            console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
+          }
+        }
+      })
+      .catch((err) => console.error('[PASSWORD RESET OTP] Email send threw:', err?.message));
 
     if (user.secondaryEmail) {
       sendTemplateEmail(user.secondaryEmail, 'password_reset_otp', {
@@ -147,13 +199,6 @@ export async function requestPasswordReset(
         otp: code,
         name: user.name || 'there',
       }).catch(err => console.error('[PASSWORD RESET OTP] Secondary email failed:', err?.message));
-    }
-
-    if (!result.success) {
-      console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
-      }
     }
 
     return { success: true, code };

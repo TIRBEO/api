@@ -1,0 +1,1 @@
+-- no-op: tables already removed

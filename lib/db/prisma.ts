@@ -622,20 +622,23 @@ export async function batchQueries<T extends Record<string, Promise<any>>>(
 }
 
 // ─── Graceful Shutdown ───
-async function gracefulShutdown() {
-  const pool = globalForPrisma.pgPool;
-  const prisma = globalForPrisma.prisma;
-  try {
-    await prisma.$disconnect();
-  } catch {}
-  try {
-    if (pool) await pool.end();
-  } catch {}
+// Graceful shutdown disabled in development to prevent pool kills during HMR.
+// In production, SIGTERM/SIGINT handlers are registered by the process manager.
+if (process.env.NODE_ENV === 'production') {
+  let isShuttingDown = false;
+  async function gracefulShutdown() {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log('[SHUTDOWN] Graceful shutdown initiated');
+    const pool = globalForPrisma.pgPool;
+    const prisma = globalForPrisma.prisma;
+    try { await prisma.$disconnect(); } catch {}
+    try { if (pool) await pool.end(); } catch {}
+    process.exit(0);
+  }
+  process.on('SIGTERM', gracefulShutdown);
+  process.on('SIGINT', gracefulShutdown);
 }
-
-process.on('SIGTERM', gracefulShutdown);
-process.on('SIGINT', gracefulShutdown);
-process.on('beforeExit', gracefulShutdown);
 
 // ─── Fast DB Health Cache ───
 // Cached DB status used by the route handler to short-circuit requests when DB is down.

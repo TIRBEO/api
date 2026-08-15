@@ -14,7 +14,7 @@ import { createNotification, NotifType } from './notifications';
 
 async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security') {
   try {
-    await createNotification({ userId, type, title, body, link: link || '/dashboard/notifications' });
+    await createNotification({ userId, type, title, body, link: link || '/account/inbox' });
   } catch (e) {
     console.error('[NOTIFICATION CREATE]', (e as Error)?.message || e);
   }
@@ -223,20 +223,21 @@ export async function totpVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { code } = (await request.json()) as any;
+    const body = (await request.json()) as any;
+    const code = body?.code || body?.token;
     if (!code || typeof code !== 'string' || code.length !== 6) {
-      return new NextResponse('Invalid code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid code. Enter a 6-digit code.' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { totpSecret: true },
     });
     if (!user?.totpSecret) {
-      return new NextResponse('TOTP not set up', { status: 400 });
+      return NextResponse.json({ error: 'TOTP not set up' }, { status: 400 });
     }
     const valid = await verifyTotp(code, user.totpSecret);
     if (!valid) {
-      return new NextResponse('Invalid code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid code. Please try again.' }, { status: 400 });
     }
     const recoveryCodes = generateRecoveryCodes(8);
     await prisma.recoveryCode.createMany({
@@ -279,18 +280,18 @@ export async function totpDisableHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const { totpCode } = (await request.json()) as any;
     if (!totpCode || typeof totpCode !== 'string' || totpCode.length !== 6) {
-      return new NextResponse('Invalid code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid code. Enter a 6-digit code.' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { totpSecret: true },
     });
     if (!user?.totpSecret) {
-      return new NextResponse('TOTP not configured', { status: 400 });
+      return NextResponse.json({ error: 'TOTP not configured' }, { status: 400 });
     }
     const valid = await verifyTotp(totpCode, user.totpSecret);
     if (!valid) {
-      return new NextResponse('Invalid code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid code. Please try again.' }, { status: 400 });
     }
     await prisma.user.update({
       where: { id: session.userId },
