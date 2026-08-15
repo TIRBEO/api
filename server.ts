@@ -1,14 +1,13 @@
 import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
-import { startWsServer } from './lib/ws/server';
 import { getPoolStatus } from './lib/db/prisma';
 import { startPeriodicCleanup, startPeriodicDigests } from './lib/jobs';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
 const port = parseInt(process.env.PORT || '3000', 10);
-const wsPort = parseInt(process.env.WS_PORT || '3001', 10);
+const wsPort = parseInt(process.env.WS_PORT || '', 10);
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
@@ -34,7 +33,20 @@ app.prepare().then(() => {
     startPeriodicCleanup();
     // Start periodic email digests (hourly)
     startPeriodicDigests();
-  });
 
-  startWsServer(wsPort);
+    // Start embedded WS server only if WS_PORT is set and port is available.
+    // In production the realtime service runs separately at ws.tirbeo.app.
+    if (wsPort && wsPort > 0) {
+      try {
+        const { startWsServer } = require('./lib/ws/server');
+        startWsServer(wsPort);
+        console.log(`> WebSocket server ready on ws://${hostname}:${wsPort}`);
+      } catch (e: any) {
+        console.warn(`[WS] Embedded WS server skipped: ${e?.message || e}`);
+        console.log(`> WebSocket service: use external realtime server (ws.tirbeo.app)`);
+      }
+    } else {
+      console.log(`> WebSocket service: external realtime server (ws.tirbeo.app)`);
+    }
+  });
 });
