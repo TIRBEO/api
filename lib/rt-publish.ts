@@ -1,17 +1,34 @@
 import { randomUUID } from 'crypto';
-import { getCachedRedisClient } from './db/redis';
 
 /**
  * Publish events from api.tirbeo.app into the Tirbeo Realtime Platform.
  *
- * The realtime platform (wss://ws.tirbeo.app/ws) shares the same Upstash Redis
- * instance and subscribes to `{RT_NAMESPACE}:events`, so publishing there fans
- * events out to every subscribed client — across Vercel instances. If Redis is
- * unavailable the call is a no-op (local WebSocket delivery still works).
+ * The realtime platform (wss://ws.tirbeo.app/ws) is a Cloudflare Worker that
+ * only accepts events over HTTP `POST /api/publish` (Bearer token) — it has no
+ * shared Redis channel. This module fans api events out to that endpoint.
+ * Fire-and-forget: never throws, never blocks callers. If the Worker is
+ * unreachable the call is a no-op (local WebSocket delivery still works).
  */
 
-const RT_NAMESPACE = process.env.RT_NAMESPACE || 'tirbeo:rt';
-const EVENT_CHANNEL = `${RT_NAMESPACE}:events`;
+const DEFAULT_PUBLISH_URL = 'https://ws.tirbeo.app/api/publish';
+const PUBLISH_TIMEOUT_MS = 5_000;
+
+function publishUrl(): string {
+  const explicit = process.env.RT_PUBLISH_URL;
+  if (explicit) return explicit;
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL;
+  if (wsUrl) {
+    try {
+      const u = new URL(wsUrl);
+      u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+      u.pathname = '/api/publish';
+      return u.toString();
+    } catch {
+      /* fall through to default */
+    }
+  }
+  return DEFAULT_PUBLISH_URL;
+}
 
 export interface RtPublishTarget {
   userId?: string;
@@ -33,26 +50,38 @@ export interface RtEventInput {
   correlationId?: string;
 }
 
+function buildEvent(target: RtPublishTarget, input: RtEventInput): Record<string, unknown> {
+  return {
+    type: input.type,
+    channel: input.channel || (target.userId ? `user:${target.userId}` : ''),
+    actor: input.actor,
+    app: input.app,
+    resource: input.resource,
+    resourceId: input.resourceId,
+    org: input.org,
+    workspace: input.workspace,
+    payload: input.payload,
+    version: input.version ?? 1,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 export function publishToRealtime(target: RtPublishTarget, input: RtEventInput): boolean {
   try {
-    const redis = getCachedRedisClient('rt-publish');
-    if (!redis) return false;
-    const event = {
-      id: randomUUID(),
-      type: input.type,
-      channel: input.channel || (target.userId ? `user:${target.userId}` : ''),
-      actor: input.actor,
-      app: input.app,
-      resource: input.resource,
-      resourceId: input.resourceId,
-      org: input.org,
-      workspace: input.workspace,
-      payload: input.payload,
-      version: input.version ?? 1,
-      timestamp: new Date().toISOString(),
-    };
-    const envelope = { instanceId: 'api', target, event };
-    void redis.publish(EVENT_CHANNEL, JSON.stringify(envelope));
+    const token = process.env.RT_API_TOKEN;
+    if (!token) return false;
+    const event = buildEvent(target, input);
+    void fetch(publishUrl(), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ ...target, event }),
+      signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS),
+    }).catch(() => {
+      /* non-fatal: local delivery still happens */
+    });
     return true;
   } catch {
     return false;
