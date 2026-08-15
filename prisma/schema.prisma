@@ -85,6 +85,12 @@ model User {
   refreshTokens                                             refresh_tokens[]
   oAuthConsents                                             oAuthConsent[]
 
+  bugProjectsOwned                                          BugProject[]
+  bugReports                                                Bug[]                   @relation("bug_reporter")
+  bugAssignments                                            Bug[]                   @relation("bug_assignee")
+  bugComments                                               BugComment[]
+  bugEvents                                                 BugEvent[]
+
   // Organization & RBAC
 
   @@index([adminRole], map: "idx_users_admin_role")
