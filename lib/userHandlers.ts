@@ -8,6 +8,7 @@ import { jsonUnauthorized } from './response';
 import { sendTemplateEmail } from './email';
 import { createNotification } from './notifications';
 import { sanitizeInput } from './security';
+import { verifyMergeToken } from './auth/jwt';
 import { isPushConfigured, getVapidPublicKey, subscribeToPush, unsubscribeFromPush, sendPushNotification } from './push-notifications';
 import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
@@ -1102,5 +1103,90 @@ export async function publicProfileHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[PUBLIC_PROFILE]', err?.message || err);
     return new NextResponse('Failed to fetch profile', { status: 500 });
+  }
+}
+
+/**
+ * POST /integrations/merge — Merge an OAuth provider account into the current user.
+ * Body: { merge_token: string, action: 'merge' | 'cancel' }
+ */
+export async function mergeAccountsHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body: any = await request.json();
+    const { merge_token, action } = body;
+
+    if (!merge_token || !action) {
+      return NextResponse.json({ error: 'merge_token and action required' }, { status: 400 });
+    }
+
+    if (action === 'cancel') {
+      return NextResponse.json({ ok: true, action: 'cancelled' });
+    }
+
+    if (action !== 'merge') {
+      return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
+    }
+
+    const data = await verifyMergeToken(merge_token);
+    if (!data) {
+      return NextResponse.json({ error: 'Invalid or expired merge token' }, { status: 400 });
+    }
+
+    const { provider, providerId, email, name, photoUrl, existingUserId } = data;
+
+    // Verify the existing user still exists
+    const existingUser = await prisma.user.findUnique({ where: { id: existingUserId } });
+    if (!existingUser) {
+      return NextResponse.json({ error: 'The account to merge with no longer exists' }, { status: 404 });
+    }
+
+    // Transfer the OAuth provider ID from existing user to current user
+    const providerField = `${provider}Id`;
+    await prisma.user.update({
+      where: { id: existingUserId },
+      data: { [providerField]: null },
+    });
+
+    // Set the provider ID on the current user
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: {
+        [providerField]: providerId,
+        photoUrl: photoUrl || undefined,
+        name: name || undefined,
+      },
+    });
+
+    // Create integration for current user
+    await prisma.integration.upsert({
+      where: { userId_provider: { userId: session.userId, provider } },
+      update: { connected: true, metadata: { [`${providerId}Id`]: providerId, email } },
+      create: { userId: session.userId, provider, connected: true, metadata: { [`${providerId}Id`]: providerId, email } },
+    });
+
+    // Remove integration from existing user if any
+    await prisma.integration.deleteMany({
+      where: { userId: existingUserId, provider },
+    }).catch(() => {});
+
+    // Audit log
+    await prisma.auditEvent.create({
+      data: {
+        actorId: session.userId,
+        action: 'account.merge',
+        targetType: 'user',
+        targetId: existingUserId,
+        metadata: { provider, email, mergedFrom: existingUserId, mergedTo: session.userId },
+        severity: 'warning',
+      },
+    }).catch(() => {});
+
+    return NextResponse.json({ ok: true, action: 'merged', provider, email });
+  } catch (err: any) {
+    console.error('[MERGE ACCOUNTS]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to merge accounts' }, { status: 500 });
   }
 }

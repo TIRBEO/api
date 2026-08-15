@@ -6,7 +6,7 @@ import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendS
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken } from './auth/jwt';
 
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
@@ -1516,12 +1516,30 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (state.link) {
       const existingSession = await getSession(request);
       if (existingSession) {
+        // Check for email conflict: OAuth user may belong to a different account
+        if (user && user.id !== existingSession.userId && email) {
+          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+          const mergeToken = await signMergeToken({
+            provider: 'google',
+            providerId: googleId,
+            email,
+            name: name || email,
+            photoUrl,
+            existingUserId: user.id,
+          });
+          // Undo the googleId we set on the wrong user above
+          await prisma.user.update({ where: { id: user.id }, data: { googleId: null } }).catch(() => {});
+          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
+          clearOauthStateCookie(res, request);
+          return res;
+        }
         await prisma.integration.upsert({
           where: { userId_provider: { userId: existingSession.userId, provider: 'google' } },
           update: { connected: true, metadata: { googleId, email } },
           create: { userId: existingSession.userId, provider: 'google', connected: true, metadata: { googleId, email } },
         });
-        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=google`);
         clearOauthStateCookie(res, request);
         return res;
       }
@@ -1670,12 +1688,28 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (state.link) {
       const existingSession = await getSession(request);
       if (existingSession) {
+        if (user && user.id !== existingSession.userId && email) {
+          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+          const mergeToken = await signMergeToken({
+            provider: 'github',
+            providerId: githubId,
+            email,
+            name: name || email,
+            photoUrl,
+            existingUserId: user.id,
+          });
+          await prisma.user.update({ where: { id: user.id }, data: { githubId: null } }).catch(() => {});
+          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
+          clearOauthStateCookie(res, request);
+          return res;
+        }
         await prisma.integration.upsert({
           where: { userId_provider: { userId: existingSession.userId, provider: 'github' } },
           update: { connected: true, metadata: { githubId, email } },
           create: { userId: existingSession.userId, provider: 'github', connected: true, metadata: { githubId, email } },
         });
-        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=github`);
         clearOauthStateCookie(res, request);
         return res;
       }
@@ -1817,12 +1851,28 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     if (state.link) {
       const existingSession = await getSession(request);
       if (existingSession) {
+        if (user && user.id !== existingSession.userId && email) {
+          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+          const mergeToken = await signMergeToken({
+            provider: 'discord',
+            providerId: discordId,
+            email,
+            name: name || email,
+            photoUrl,
+            existingUserId: user.id,
+          });
+          await prisma.user.update({ where: { id: user.id }, data: { discordId: null } }).catch(() => {});
+          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
+          clearOauthStateCookie(res, request);
+          return res;
+        }
         await prisma.integration.upsert({
           where: { userId_provider: { userId: existingSession.userId, provider: 'discord' } },
           update: { connected: true, metadata: { discordId, email } },
           create: { userId: existingSession.userId, provider: 'discord', connected: true, metadata: { discordId, email } },
         });
-        const res = NextResponse.redirect(new URL('/account/apps', request.url));
+        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=discord`);
         clearOauthStateCookie(res, request);
         return res;
       }

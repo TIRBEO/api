@@ -75,6 +75,7 @@ import {
   sendTestPushHandler,
   oauthUnlinkHandler,
   integrationsHandler,
+  mergeAccountsHandler,
   userActivityHandler,
   preferencesHandler,
   setPasswordHandler,
@@ -230,7 +231,7 @@ const INTERNAL_ROUTES = [
   'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
   'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'notifications/prefs', 'notifications/push', 'notifications/push/subscribe', 'integrations', 'user/activity', 'preferences',
+  'notifications', 'notifications/prefs', 'notifications/push', 'notifications/push/subscribe', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'admin/emails', 'admin/emails/reply',
   'public/help-config', 'public/faq',
@@ -499,6 +500,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'notifications/push': ['POST'],
       'notifications/push/subscribe': ['GET', 'POST', 'DELETE'],
       'integrations': ['GET', 'POST', 'DELETE'],
+      'integrations/merge': ['POST'],
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
       'admin/heartbeat': ['POST'],
@@ -649,6 +651,25 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     console.warn(`[AUTH] Blocked request — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
     return jsonForbidden('Your IP or account has been blocked');
+  }
+
+  // Redirect user-facing paths to the dashboard instead of returning 404.
+  // The API server only serves /api/* routes; pages live on dashboard.tirbeo.app.
+  if (!pathStr || pathStr.startsWith('account') || pathStr.startsWith('settings') || pathStr.startsWith('overview') || pathStr.startsWith('support')) {
+    const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+    const dashboardBase = `https://dashboard.${appDomain}`;
+    if (!pathStr) {
+      // Root — return helpful JSON
+      return NextResponse.json({
+        service: 'Tirbeo API',
+        status: 'healthy',
+        docs: '/api/health',
+        dashboard: dashboardBase,
+        accounts: `https://accounts.${appDomain}`,
+      });
+    }
+    const target = `${dashboardBase}/${pathStr}`;
+    return NextResponse.redirect(target);
   }
 
   const route = matchRoute(slug, method, routes);
@@ -923,6 +944,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'integrations':
         resp = await integrationsHandler(request);
+        break;
+      case 'integrations/merge':
+        resp = await mergeAccountsHandler(request);
         break;
       case 'user/activity':
         resp = await userActivityHandler(request);

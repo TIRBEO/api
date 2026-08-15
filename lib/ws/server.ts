@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { IncomingMessage } from 'http';
 import { getSessionFromToken } from '../auth/session';
+import { publishToRealtime } from '../rt-publish';
 
 // Cloudflare Durable Objects integration - use dynamic import instead of top-level await
 let cfDurable: typeof import('../cloudflare-durable') | null = null;
@@ -26,9 +27,11 @@ const g = globalThis as any;
 if (!g.__tirbeoWsClients) g.__tirbeoWsClients = new Map<string, WsClient>();
 if (!g.__tirbeoWsUserConns) g.__tirbeoWsUserConns = new Map<string, Set<string>>();
 if (!g.__tirbeoLastSeen) g.__tirbeoLastSeen = new Map<string, number>();
+if (!g.__tirbeoWsChannelSubs) g.__tirbeoWsChannelSubs = new Map<string, Set<string>>();
 const clients: Map<string, WsClient> = g.__tirbeoWsClients;
 const userConnections: Map<string, Set<string>> = g.__tirbeoWsUserConns;
 const lastSeenTimes: Map<string, number> = g.__tirbeoLastSeen;
+const channelSubs: Map<string, Set<string>> = g.__tirbeoWsChannelSubs;
 
 let wss: WebSocketServer | null = null;
 
@@ -517,6 +520,54 @@ export function startWsServer(port: number): WebSocketServer {
           }
           return;
         }
+
+        if (msg.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }));
+          return;
+        }
+
+        if (msg.type === 'subscribe' && typeof msg.channel === 'string') {
+          const client = clients.get(clientId);
+          const isAdmin = client?.adminRole && ['admin', 'super_admin'].includes(client.adminRole);
+          const isOwnUserChannel = msg.channel.startsWith('user:') && msg.channel === `user:${userId}`;
+          if (msg.channel === 'admin' && !isAdmin) {
+            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Admin channel requires an admin role' }));
+            return;
+          }
+          if (msg.channel.startsWith('user:') && !isOwnUserChannel && !isAdmin) {
+            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'You can only subscribe to your own user channel' }));
+            return;
+          }
+          let set = channelSubs.get(msg.channel);
+          if (!set) {
+            set = new Set();
+            channelSubs.set(msg.channel, set);
+          }
+          set.add(clientId);
+          ws.send(JSON.stringify({ type: 'subscribed', channel: msg.channel }));
+          return;
+        }
+
+        if (msg.type === 'unsubscribe' && typeof msg.channel === 'string') {
+          const set = channelSubs.get(msg.channel);
+          if (set) {
+            set.delete(clientId);
+            if (set.size === 0) channelSubs.delete(msg.channel);
+          }
+          ws.send(JSON.stringify({ type: 'unsubscribed', channel: msg.channel }));
+          return;
+        }
+
+        if (msg.type === 'publish' && typeof msg.channel === 'string' && msg.event) {
+          const client = clients.get(clientId);
+          const isAdmin = client?.adminRole && ['admin', 'super_admin'].includes(client.adminRole);
+          if (!isAdmin && !msg.channel.startsWith('user:')) {
+            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Publish not allowed on this channel' }));
+            return;
+          }
+          sendToChannel(msg.channel, msg.event, clientId);
+          return;
+        }
       } catch {
         ws.send(JSON.stringify({ type: 'error', message: 'Invalid message' }));
       }
@@ -531,6 +582,9 @@ export function startWsServer(port: number): WebSocketServer {
           conns.delete(clientId);
           if (conns.size === 0) userConnections.delete(client.userId);
         }
+      }
+      for (const [channel, set] of channelSubs) {
+        if (set.delete(clientId) && set.size === 0) channelSubs.delete(channel);
       }
       clients.delete(clientId);
     });
@@ -586,6 +640,17 @@ export function sendToUser(userId: string, data: unknown) {
       client.ws.send(msg);
     }
   }
+
+  // Mirror into the realtime platform (wss://ws.tirbeo.app/ws) via shared Redis.
+  const evt = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'message', payload: data };
+  publishToRealtime(
+    { userId },
+    {
+      type: typeof evt.type === 'string' ? evt.type : 'message',
+      actor: evt.actor as { id: string; email?: string } | undefined,
+      payload: evt,
+    },
+  );
 }
 
 export function broadcast(data: unknown) {
@@ -595,10 +660,54 @@ export function broadcast(data: unknown) {
       ws.send(msg);
     }
   });
+
+  const evt = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'broadcast', payload: data };
+  publishToRealtime(
+    { broadcast: true },
+    {
+      type: typeof evt.type === 'string' ? evt.type : 'broadcast',
+      actor: evt.actor as { id: string; email?: string } | undefined,
+      payload: evt,
+    },
+  );
 }
 
 export function getOnlineUserIds(): string[] {
   return Array.from(userConnections.keys());
+}
+
+/**
+ * Deliver a realtime event to every client subscribed to a channel
+ * (local protocol parity with the realtime platform), and mirror it into
+ * wss://ws.tirbeo.app/ws via shared Redis.
+ */
+export function sendToChannel(channel: string, data: unknown, excludeClientId?: string) {
+  const set = channelSubs.get(channel);
+  if (set && set.size > 0) {
+    const raw = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'message', payload: data };
+    const event = {
+      id: typeof raw.id === 'string' ? raw.id : crypto.randomUUID(),
+      type: typeof raw.type === 'string' ? raw.type : 'message',
+      channel,
+      payload: raw,
+      timestamp: new Date().toISOString(),
+    };
+    const msg = JSON.stringify({ type: 'event', channel, event });
+    for (const clientId of set) {
+      if (clientId === excludeClientId) continue;
+      const client = clients.get(clientId);
+      if (client && client.ws.readyState === WebSocket.OPEN) client.ws.send(msg);
+    }
+  }
+  const evt = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'message', payload: data };
+  publishToRealtime(
+    { channel },
+    {
+      type: typeof evt.type === 'string' ? evt.type : 'message',
+      actor: evt.actor as { id: string; email?: string } | undefined,
+      payload: evt,
+    },
+  );
 }
 
 export function getLastSeen(userId: string): number | null {

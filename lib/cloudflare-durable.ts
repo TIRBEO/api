@@ -190,7 +190,7 @@ export function isDurableObjectsConfigured(): boolean {
  * Get WebSocket URL for client connections
  */
 export function getWebSocketUrl(): string {
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'wss://api.tirbeo.app/ws';
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'wss://ws.tirbeo.app/ws';
   return wsUrl;
 }
 
