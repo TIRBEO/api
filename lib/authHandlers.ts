@@ -21,6 +21,7 @@ import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
 import { SignJWT } from 'jose';
 import { checkWindowLimit, computeRiskScore, recordDeviceSeen } from './captcha/risk';
+import { getCachedRedisClient } from './db/redis';
 import { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied, hasRecentLoginSuccess, getCaptchaSettings } from './captcha/service';
 import { recordRateLimitHit, clearRateLimitHits } from './auth/suspicious-activity';
 import { getAccountsBaseUrl } from './app-urls';
@@ -2265,12 +2266,38 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return new NextResponse('Token required', { status: 400 });
     }
 
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!checkWindowLimit(`magic-link-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
+      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+    }
 
-    const userId = await verifyMagicLinkToken(token);
-    if (!userId) {
+    const decoded = await verifyMagicLinkToken(token);
+    if (!decoded) {
       return new NextResponse('Invalid or expired magic link', { status: 401 });
     }
 
+    // Enforce one-time use: atomically claim the token's jti in Redis so a
+    // link that has already been redeemed cannot be replayed.
+    const claimKey = `magic-link:used:${decoded.jti}`;
+    const ttlSeconds = Math.max(1, Math.floor(decoded.expiresAt - Date.now() / 1000));
+    let claimed = false;
+    if (process.env.REDIS_URL) {
+      try {
+        const redis = getCachedRedisClient('magic-link');
+        const result = await redis.set(claimKey, '1', 'EX', ttlSeconds, 'NX');
+        claimed = result === 'OK';
+      } catch {
+        // Redis unavailable — fall back to rejecting the link to stay secure
+        // rather than allowing replays.
+        console.error('[MAGIC LINK VERIFY] Redis unavailable; rejecting one-time claim');
+        claimed = false;
+      }
+    }
+    if (!claimed) {
+      return NextResponse.json({ error: 'This magic link has already been used or is no longer valid. Please request a new one.' }, { status: 409 });
+    }
+
+    const userId = decoded.userId;
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true } });
     if (!user) {
       return new NextResponse('User not found', { status: 404 });

@@ -145,18 +145,28 @@ export async function verifySessionRevokeToken(token: string): Promise<string | 
   }
 }
 
+export interface MagicLinkPayload {
+  userId: string;
+  jti: string;
+  expiresAt: number;
+}
+
 export async function signMagicLinkToken(userId: string): Promise<string> {
   return new SignJWT({ sub: userId, purpose: 'magic-link' })
     .setProtectedHeader({ alg: 'HS256' })
+    .setJti(crypto.randomUUID())
     .setIssuedAt()
     .setExpirationTime('15m')
     .sign(getSecret());
 }
 
-export async function verifyMagicLinkToken(token: string): Promise<string | null> {
+export async function verifyMagicLinkToken(token: string): Promise<MagicLinkPayload | null> {
   try {
     const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
-    if (payload.sub && payload.purpose === 'magic-link') return payload.sub as string;
+    if (payload.sub && payload.purpose === 'magic-link' && payload.jti) {
+      const exp = typeof payload.exp === 'number' ? payload.exp : 0;
+      return { userId: payload.sub as string, jti: payload.jti as string, expiresAt: exp };
+    }
     return null;
   } catch {
     return null;
