@@ -58,21 +58,13 @@ import {
   captchaImageHandler,
 } from '../../../lib/captcha/captcha-dispatch';
 
-import {
-  oauthAuthorizeHandler,
-  oauthTokenHandler,
-  oauthRevokeHandler,
-  oidcUserInfoHandler,
-  oauthConsentInfoHandler,
-} from '../../../lib/oauthHandlers';
+// oauthHandlers removed — OAuth2 server models deleted
 
 import {
   extendedProfileHandler,
   changePasswordHandler,
   sessionsHandler,
   notificationsHandler,
-  pushSubscriptionHandler,
-  sendTestPushHandler,
   oauthUnlinkHandler,
   integrationsHandler,
   mergeAccountsHandler,
@@ -99,13 +91,7 @@ import {
   adminEmailDetailHandler,
 } from '../../../lib/emailAdminHandlers';
 
-import {
-  helpArticlesListHandler,
-  helpArticlesCreateHandler,
-  helpArticlesUpdateHandler,
-  helpArticlesDeleteHandler,
-  helpArticleDetailHandler,
-} from '../../../lib/helpHandlers';
+// helpHandlers removed — HelpArticle model deleted
 
 // organizationHandlers removed (Organization feature not yet implemented)
 
@@ -137,16 +123,7 @@ import {
   chatHandler,
 } from '../../../lib/authHandlers';
 
-import {
-  oauthAdminAppsListHandler,
-  oauthAdminAppsCreateHandler,
-  oauthAdminAppsUpdateHandler,
-  oauthAdminAppsDeleteHandler,
-  oauthAdminClientsCreateHandler,
-  oauthAdminClientsUpdateHandler,
-  oauthAdminClientsRegenerateSecretHandler,
-  oauthAdminClientsDeleteHandler,
-} from '../../../lib/oauthAdminHandlers';
+// oauthAdminHandlers removed — OAuth2 server models deleted
 
 import {
   knownAccountsHandler,
@@ -167,11 +144,9 @@ import {
 } from '../../../lib/passkeyHandlers';
 
 import {
-  settingsListHandler, settingsUpdateHandler,
-  featureFlagsListHandler, featureFlagsUpdateHandler,
   appsListHandler, appsAdminListHandler, appsCreateHandler,
   incidentsListHandler, incidentsCreateHandler,
-  jobsListHandler,
+  incidentEventsListHandler, incidentEventsCreateHandler,
 } from '../../../lib/contentHandlers';
 
 import {
@@ -180,16 +155,13 @@ import {
   ticketAppealsHandler, ticketAppealUnblockHandler,
   ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
   ticketMarkReadHandler,
-  queuesListHandler, queuesCreateHandler,
 } from '../../../lib/supportHandlers';
 
 import {
   loginHistoryHandler,
 } from '../../../lib/securityHandlers';
 
-import {
-  incidentEventsListHandler, incidentEventsCreateHandler,
-} from '../../../lib/contentHandlers';
+
 
 import {
   publicHealthHandler, detailedHealthHandler, poolHealthHandler,
@@ -198,7 +170,7 @@ import {
   cacheDebugHandler, cacheResetDebugHandler,
 } from '../../../lib/debugHandlers';
 
-import { createJob, retryJob } from '../../../lib/jobs';
+// jobs module removed
 
 const appUrl = (subdomain: string, path: string) =>
   `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
@@ -535,7 +507,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'connected-accounts': ['GET', 'DELETE'],
       'connected-accounts/link': ['POST'],
       'user/export-data': ['GET', 'POST'],
-      'user/delete-account': ['POST'],
+      'user/delete-account': ['POST', 'DELETE'],
       'profile/public': ['GET'],
       'auth/cli-token': ['POST'],
       'waitlist': ['POST'],

@@ -51,11 +51,11 @@ export async function sessionHandler(request: NextRequest) {
     
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { id: true, email: true, name: true, photoUrl: true, is2FAEnabled: true, adminRole: true, roles: { include: { role: true } }, emailVerified: true, preferences: true },
+      select: { id: true, email: true, name: true, photoUrl: true, is2FAEnabled: true, adminRole: true, emailVerified: true, consents: true },
     });
     if (!user) return jsonUnauthorized();
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
-    const userData = { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, preferences: user.preferences };
+    const adminRole = user.adminRole || null;
+    const userData = { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, consents: user.consents ?? {} };
     profileCache.set(session.userId, userData);
     logPerformance('auth/session', startTime);
     return NextResponse.json({ user: userData });
@@ -267,8 +267,7 @@ const OAUTH_STATE_COOKIE = '__oauth_state';
 // route it to the accounts app so the user can accept policy + optionally set
 // a password, instead of landing straight on the dashboard.
 function oauthPostLoginTarget(user: any, redirectTo: string | undefined, provider: string): string {
-  const prefs: any = user?.preferences || {};
-  const isNewOAuthUser = !user?.passwordHash && !prefs.signupConsent?.policyAccepted;
+  const isNewOAuthUser = !user?.passwordHash && !((user as any)?.consents as any)?.signupConsent?.policyAccepted;
   const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
   const accountsBase = (process.env.ACCOUNTS_URL || `https://accounts.${appDomain}`).replace(/\/$/, '');
   if (isNewOAuthUser) {
@@ -425,6 +424,7 @@ async function finishProviderSignIn(
         name: profile.name,
         photoUrl: profile.photoUrl || undefined,
         [idField]: profile.providerId,
+        mustChangePassword: true,
       } as any,
     });
     prisma.auditEvent.create({
@@ -572,7 +572,7 @@ export async function loginHandler(request: NextRequest) {
       return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
     }
 
-    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, deletedAt: true, adminRole: true, roles: { include: { role: true } } } });
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, deletedAt: true, adminRole: true, suspendReason: true, suspendedUntil: true } });
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
@@ -581,10 +581,14 @@ export async function loginHandler(request: NextRequest) {
       return new NextResponse('Account has been deleted', { status: 403 });
     }
     if (user.isBanned) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, message: 'Your account has been permanently banned.' }, { status: 403 });
     }
     if (user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      if (user.suspendedUntil && new Date(user.suspendedUntil) < new Date()) {
+        await prisma.user.update({ where: { id: user.id }, data: { isSuspended: false, suspendReason: null, suspendedUntil: null } });
+      } else {
+        return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: user.suspendReason || 'No reason provided', until: user.suspendedUntil?.toISOString() || null, message: `Your account is suspended${user.suspendedUntil ? ` until ${new Date(user.suspendedUntil).toUTCString()}` : ''}.` }, { status: 403 });
+      }
     }
     if (!user.passwordHash) {
       return new NextResponse('Invalid email or password', { status: 401 });
@@ -690,7 +694,7 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ needsOtp: true });
     }
 
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
+    const adminRole = user.adminRole || null;
     const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
@@ -769,17 +773,17 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     const user = await prisma.user.findUnique({
       where: { email: email.toLowerCase() },
-      select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, mustChangePassword: true, roles: { include: { role: true } } },
+      select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, mustChangePassword: true, suspendReason: true },
     });
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
     }
     if (user.isBanned) {
-      return new NextResponse('Account banned', { status: 403 });
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, message: 'Admin accounts cannot be banned users. Contact support.' }, { status: 403 });
     }
     if (user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: user.suspendReason || 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
     }
     if (!user.passwordHash) {
       return new NextResponse('Invalid email or password', { status: 401 });
@@ -814,7 +818,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       return new NextResponse('Invalid email or password', { status: 401 });
     }
 
-    if (!user.adminRole && !user.roles?.[0]?.role) {
+    if (!user.adminRole) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'not_admin' } }).catch(() => {});
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',
@@ -861,7 +865,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       return NextResponse.json({ needsPasswordChange: true, tempToken });
     }
 
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
+    const adminRole = user.adminRole || null;
     const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
@@ -1177,12 +1181,17 @@ export async function signupHandler(request: NextRequest) {
         // client-supplied flag is never trusted (would allow claiming a
         // verified account without proving email ownership).
         emailVerified: preVerifiedEmail,
-        preferences: {
+        consents: {
           signupConsent: {
             acceptedAt: new Date().toISOString(),
             policyAccepted: true,
             adminDataAccess: !!adminDataAccess,
           },
+        },
+        notificationPreferences: {
+          email: true, push: true, inApp: true,
+          security: true, forms: true, product: true, support: true,
+          productEmail: true, tipsEmail: true, weeklySummary: false,
         },
       },
     });
@@ -1306,11 +1315,11 @@ export async function oauthConsentHandler(request: NextRequest) {
       return new NextResponse('Policy acceptance is required', { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, preferences: true } });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, consents: true } });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
-    const prefs: any = (user.preferences as any) || {};
-    prefs.signupConsent = {
+    const consentRecord: any = (user.consents as any) || {};
+    consentRecord.signupConsent = {
       acceptedAt: new Date().toISOString(),
       policyAccepted: true,
       adminDataAccess: !!adminDataAccess,
@@ -1320,7 +1329,7 @@ export async function oauthConsentHandler(request: NextRequest) {
 
     await prisma.user.update({
       where: { id: user.id },
-      data: { preferences: prefs, emailVerified: true },
+      data: { consents: consentRecord, emailVerified: true },
     });
 
     return NextResponse.json({ ok: true, message: 'Consent recorded' });
@@ -2037,17 +2046,15 @@ export async function profileHandler(request: NextRequest) {
           companySize: true,
           adminRole: true,
           is2FAEnabled: true,
-          isVerified: true,
-          karmaPoints: true,
+
           lastLoginAt: true,
           lastLoginIp: true,
-          loginCount: true,
           createdAt: true,
           updatedAt: true,
           lastActiveAt: true,
           emailVerified: true,
           phoneVerified: true,
-          preferences: true,
+          consents: true,
           passwordHash: true,
           theme: true,
           dateFormat: true,
@@ -2099,7 +2106,6 @@ export async function profileHandler(request: NextRequest) {
         companyRole: z.string().optional().nullable(),
         industry: z.string().optional().nullable(),
         companySize: z.string().optional().nullable(),
-        preferences: z.record(z.string(), z.unknown()).optional(),
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
@@ -2125,7 +2131,6 @@ export async function profileHandler(request: NextRequest) {
             country: true, timezone: true, language: true,
             companyName: true, companyRole: true, industry: true, companySize: true,
             gender: true, birthday: true, secondaryEmail: true,
-            preferences: true, karmaPoints: true,
             emailVerified: true, createdAt: true, updatedAt: true,
           },
         });

@@ -190,6 +190,18 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, imageBase: string) =
     `${head('Tips & Updates')}${wrapperStart()}${appHeader('dashboard', logo)}${heroBlock('💡', 'Pro Tip', '{{tipTitle}}')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">{{tipBody}}</p>`}${buttonBlock('{{actionUrl}}', '{{actionLabel}}')}${divider()}${`<p style="margin:0;font-size:14px;line-height:22px;color:${MUTED};">These tips are generated automatically based on your account. Turn them off in your <a href="{{dashboardUrl}}/account/notifications" style="color:${BLUE};text-decoration:none;">email preferences</a>.</p>`}${appFooter('dashboard')}${wrapperEnd()}`
   ),
 
+  // ─── ACCOUNT STATUS (SUSPENDED / BANNED) ───
+
+  account_suspended: (logo) => tpl(
+    'Your Tirbeo account has been {{statusType}}',
+    `${head('Account Status')}${wrapperStart()}${appHeader('dashboard', logo)}${heroBlock('⚠', 'Account Status Update', 'Your account has been {{statusType}}.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};"><strong>Reason:</strong> {{reason}}</p><p style="margin:0 0 16px;font-size:15px;line-height:26px;color:${TEXT2};">{{untilLabel}} {{actionLabel}}</p>`}${buttonBlock('{{dashboardUrl}}/account', 'Go to Your Account')}${appFooter('dashboard')}${wrapperEnd()}`
+  ),
+
+  account_deleted: (logo) => tpl(
+    'Your Tirbeo account is scheduled for deletion',
+    `${head('Deletion Scheduled')}${wrapperStart()}${appHeader('dashboard', logo)}${heroBlock('🗑', 'Deletion Scheduled', 'Your account will be deleted on {{dateLabel}}.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">You requested deletion of your Tirbeo account. After this date, all your data will be permanently removed.</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Changed your mind? Sign in before <strong>{{dateLabel}}</strong> and cancel the deletion from your dashboard.</p>`}${buttonBlock('{{dashboardUrl}}/account/security', 'Cancel Deletion')}${appFooter('dashboard')}${wrapperEnd()}`
+  ),
+
   // ─── ADMIN TEMPLATES ───
 
   admin_alert: (logo) => tpl(

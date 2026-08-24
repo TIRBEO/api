@@ -6,96 +6,107 @@ datasource db {
   provider = "postgresql"
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CORE USER & AUTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
 model User {
-  id                                                        String                  @id @default(dbgenerated("(gen_random_uuid())::text"))
-  email                                                     String                  @unique
-  passwordHash                                              String                  @default("") @map("password_hash")
-  name                                                      String?
-  photoUrl                                                  String?                 @map("photo_url")
-  bio                                                       String?
-  secondaryEmail                                            String?                 @map("secondary_email")
-  secondaryEmailVerified                                    Boolean?                @default(false) @map("secondary_email_verified")
-  phoneNumber                                               String?                 @map("phone_number")
-  phoneVerified                                             Boolean?                @default(false) @map("phone_verified")
-  emailVerified                                             Boolean?                @default(false) @map("email_verified")
-  username                                                  String?                 @unique
-  gender                                                    String?
-  birthday                                                  DateTime?               @db.Timestamptz(6)
-  googleId                                                  String?                 @unique @map("google_id")
-  githubId                                                  String?                 @unique @map("github_id")
-  discordId                                                 String?                 @unique @map("discord_id")
-  occupation                                                String?
-  companyName                                               String?                 @map("company_name")
-  companyRole                                               String?                 @map("company_role")
-  industry                                                  String?
-  companySize                                               String?                 @map("company_size")
-  website                                                   String?
-  linkedin                                                  String?
-  githubUsername                                            String?                 @map("github_username")
-  twitter                                                   String?
-  country                                                   String?
-  timezone                                                  String?
-  language                                                  String?                 @default("en")
-  theme                                                     String?                 @default("system")
-  dateFormat                                                String?                 @default("MM/DD/YYYY") @map("date_format")
-  timeFormat                                                String?                 @default("12h") @map("time_format")
+  id                          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email                       String    @unique
+  passwordHash                String    @default("") @map("password_hash")
+  name                        String?
+  photoUrl                    String?   @map("photo_url")
+  bio                         String?
+  secondaryEmail              String?   @map("secondary_email")
+  secondaryEmailVerified      Boolean?  @default(false) @map("secondary_email_verified")
+  phoneNumber                 String?   @map("phone_number")
+  phoneVerified               Boolean?  @default(false) @map("phone_verified")
+  emailVerified               Boolean?  @default(false) @map("email_verified")
+  username                    String?   @unique
+  gender                      String?
+  birthday                    DateTime? @db.Timestamptz(6)
 
-  preferences                                               Json?                   @default("{}")
-  totpSecret                                                String?                 @map("totp_secret")
-  is2FAEnabled                                              Boolean?                @default(false) @map("is_2fa_enabled")
-  isBanned                                                  Boolean?                @default(false) @map("is_banned")
-  isSuspended                                               Boolean?                @default(false) @map("is_suspended")
-  suspendReason                                             String?                 @map("suspend_reason")
-  suspendedUntil                                            DateTime?               @map("suspended_until") @db.Timestamptz(6)
+  // OAuth IDs (provider tokens stored here instead of separate integrations table)
+  googleId                    String?   @unique @map("google_id")
+  githubId                    String?   @unique @map("github_id")
+  discordId                   String?   @unique @map("discord_id")
 
-  // Soft-delete: user data hidden immediately, permanently deleted after 30 days
-  deletedAt                                                 DateTime?               @map("deleted_at") @db.Timestamptz(6)
-  scheduledDeletionAt                                       DateTime?               @map("scheduled_deletion_at") @db.Timestamptz(6)
-  deletionReason                                            String?                 @map("deletion_reason")
-  adminRole                                                 String?                 @map("admin_role")
-  mustChangePassword                                        Boolean?                @default(false) @map("must_change_password")
-  lastActiveAt                                              DateTime?               @map("last_active_at") @db.Timestamptz(6)
-  lastLoginAt                                               DateTime?               @map("last_login_at") @db.Timestamptz(6)
-  lastLoginIp                                               String?                 @map("last_login_ip")
-  loginCount                                                Int?                    @default(0) @map("login_count")
-  loginHistory        login_history[]
-  karmaPoints                                               Int?                    @default(0) @map("karma_points")
-  isVerified                                                Boolean?                @default(false) @map("is_verified")
-  createdAt                                                 DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                                                 DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  apiKeys                                                   ApiKey[]
-  auditEvents                                               AuditEvent[]            @relation("AuditActor")
-  blocklist                                                 Blocklist[]
-  integrations                                              Integration[]
-  media                                                     Media[]
-  notificationPreferences                                   NotificationPreference?
-  notifications                                             Notification[]
-  pushSubscriptions                                         PushSubscription[]
-  otps                                                      Otp[]
-  recoveryCodes                                             RecoveryCode[]
-  securityEvents                                            SecurityEvent[]
-  sessions                                                  Session[]
-  deviceAccounts                                            deviceAccount[]
-  passkeys                                                  Passkey[]
-  tipLogs                                                   UserTipLog[]
+  occupation                  String?
+  companyName                 String?   @map("company_name")
+  companyRole                 String?   @map("company_role")
+  industry                    String?
+  companySize                 String?   @map("company_size")
+  website                     String?
+  linkedin                    String?
+  githubUsername              String?   @map("github_username")
+  twitter                     String?
+  country                     String?
+  timezone                    String?
+  language                    String?   @default("en")
+  theme                       String?   @default("system")
+  dateFormat                  String?   @default("MM/DD/YYYY") @map("date_format")
+  timeFormat                  String?   @default("12h") @map("time_format")
 
-  customerTickets                                           Ticket[]                @relation("TicketCustomer")
-  assignedTickets                                           Ticket[]                @relation("TicketAssignee")
-  ticketMessages                                            TicketMessage[]         @relation("TicketMessageAuthor")
-  apps                                                      apps[]                  @relation("AppOwner")
-  userRolesUserRolesAssignedByIdTousers                     UserRole[]              @relation("user_roles_assigned_by_idTousers")
-  roles                                                     UserRole[]
+  consents                    Json?     @default("{}")
 
-  authorizationCodes                                        authorization_codes[]
-  accessTokens                                              access_tokens[]
-  refreshTokens                                             refresh_tokens[]
-  oAuthConsents                                             oAuthConsent[]
+  // Security
+  totpSecret                  String?   @map("totp_secret")
+  is2FAEnabled                Boolean?  @default(false) @map("is_2fa_enabled")
+  backupCodes                 Json?     @default("[]") // [{code, used}]
+  isBanned                    Boolean?  @default(false) @map("is_banned")
+  isSuspended                 Boolean?  @default(false) @map("is_suspended")
+  suspendReason               String?   @map("suspend_reason")
+  suspendedUntil              DateTime? @map("suspended_until") @db.Timestamptz(6)
+  mustChangePassword          Boolean?  @default(false) @map("must_change_password")
+  lastActiveAt                DateTime? @map("last_active_at") @db.Timestamptz(6)
+  lastLoginAt                 DateTime? @map("last_login_at") @db.Timestamptz(6)
+  lastLoginIp                 String?   @map("last_login_ip")
 
-  // Forms
-  forms                                                     Form[]
+  // Soft-delete
+  deletedAt                   DateTime? @map("deleted_at") @db.Timestamptz(6)
+  scheduledDeletionAt         DateTime? @map("scheduled_deletion_at") @db.Timestamptz(6)
+  deletionReason              String?   @map("deletion_reason")
 
+  adminRole                   String?   @map("admin_role")
 
-  // Organization & RBAC
+  // Notifications (merged from old notification_preferences table)
+  notifEmail                  Boolean?  @default(true) @map("notif_email")
+  notifPush                   Boolean?  @default(true) @map("notif_push")
+  notifInApp                  Boolean?  @default(true) @map("notif_in_app")
+  notifSecurity               Boolean?  @default(true) @map("notif_security")
+  notifForms                  Boolean?  @default(true) @map("notif_forms")
+  notifProduct                Boolean?  @default(true) @map("notif_product")
+  notifSupport                Boolean?  @default(true) @map("notif_support")
+  notifQuietHoursEnabled      Boolean?  @default(false) @map("notif_quiet_hours_enabled")
+  notifQuietHoursStart        String?   @default("22:00") @map("notif_quiet_hours_start")
+  notifQuietHoursEnd          String?   @default("08:00") @map("notif_quiet_hours_end")
+  notifDigestEnabled          Boolean?  @default(false) @map("notif_digest_enabled")
+  notifDigestFrequency        String?   @default("daily") @map("notif_digest_frequency")
+  notificationPreferences     Json?     @default("{}") @map("notification_preferences")
+
+  createdAt                   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // Relations
+  loginHistory                login_history[]
+  apiKeys                     ApiKey[]
+  auditEvents                 AuditEvent[]     @relation("AuditActor")
+  blocklist                   Blocklist[]
+  media                       Media[]
+  notifications               Notification[]
+  otps                        Otp[]
+  securityEvents              SecurityEvent[]
+  sessions                    Session[]
+  deviceAccounts              deviceAccount[]
+  passkeys                    Passkey[]
+  tipLogs                     UserTipLog[]
+  integrations                Integration[]
+
+  customerTickets             Ticket[]          @relation("TicketCustomer")
+  assignedTickets             Ticket[]          @relation("TicketAssignee")
+  ticketMessages              TicketMessage[]   @relation("TicketMessageAuthor")
+  forms                       Form[]
+  apps                        apps[]        @relation("AppOwner")
 
   @@index([adminRole], map: "idx_users_admin_role")
   @@index([createdAt], map: "idx_users_created")
@@ -107,22 +118,6 @@ model User {
   @@index([deletedAt], map: "idx_users_deleted_at")
   @@index([scheduledDeletionAt], map: "idx_users_scheduled_deletion")
   @@map("users")
-}
-
-model UserRole {
-  id                                String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId                            String    @map("user_id")
-  roleId                            String    @map("role_id")
-  assignedById                      String?   @map("assigned_by_id")
-  createdAt                         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  usersUserRolesAssignedByIdTousers User?     @relation("user_roles_assigned_by_idTousers", fields: [assignedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  role                              app_roles @relation(fields: [roleId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  user                              User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([userId, roleId])
-  @@index([roleId], map: "idx_user_roles_role")
-  @@index([userId], map: "idx_user_roles_user")
-  @@map("user_roles")
 }
 
 model Session {
@@ -153,7 +148,6 @@ model Session {
   @@map("sessions")
 }
 
-/// Accounts remembered on a specific device for one-tap account switching.
 model deviceAccount {
   id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
   deviceId   String    @map("device_id")
@@ -165,6 +159,72 @@ model deviceAccount {
   @@unique([deviceId, userId], map: "idx_device_accounts_device_user")
   @@index([userId], map: "idx_device_accounts_user")
   @@map("device_accounts")
+}
+
+model Otp {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String   @map("user_id")
+  type      String
+  otpHash   String   @map("otp_hash")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  attempts  Int?     @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  users     User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([expiresAt], map: "idx_otps_expires")
+  @@index([type], map: "idx_otps_type")
+  @@index([userId], map: "idx_otps_user")
+  @@map("otps")
+}
+
+model SignupOtp {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email     String
+  otpHash   String   @map("otp_hash")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  attempts  Int?     @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([email], map: "idx_signup_otps_email")
+  @@index([expiresAt], map: "idx_signup_otps_expires")
+  @@map("signup_otps")
+}
+
+model ApiKey {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String    @map("user_id")
+  name       String
+  keyHash    String    @unique @map("key_hash")
+  keyPrefix  String    @map("key_prefix")
+  permissions Json?   @default("{}")
+  isActive   Boolean?  @default(true) @map("is_active")
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([keyHash], map: "idx_api_keys_hash")
+  @@index([keyPrefix], map: "idx_api_keys_prefix")
+  @@index([userId], map: "idx_api_keys_user")
+  @@map("api_keys")
+}
+
+model Passkey {
+  id                  String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId              String   @map("user_id")
+  credentialId        String   @unique @map("credential_id")
+  credentialPublicKey Bytes    @map("credential_public_key")
+  counter             BigInt   @default(0)
+  transports          String?
+  deviceName          String?  @map("device_name")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([credentialId])
+  @@index([userId])
+  @@map("passkeys")
 }
 
 model UserTipLog {
@@ -179,42 +239,27 @@ model UserTipLog {
   @@map("user_tip_logs")
 }
 
-model RecoveryCode {
-  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String    @map("user_id")
-  code      String
-  used      Boolean?  @default(false)
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
-  users     User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+model Blocklist {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  targetType String    @map("target_type")
+  targetId   String    @map("target_id")
+  reason     String?
+  blockedBy  String?   @map("blocked_by")
+  isActive   Boolean?  @default(true) @map("is_active")
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  users      User?     @relation(fields: [blockedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
-  @@index([code], map: "idx_recovery_codes_code")
-  @@index([userId], map: "idx_recovery_codes_user")
-  @@map("recovery_codes")
+  @@unique([targetType, targetId])
+  @@index([isActive], map: "idx_blocklist_active")
+  @@index([targetType], map: "idx_blocklist_type")
+  @@map("blocklist")
 }
 
-model Media {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  uploadedBy String   @map("uploaded_by")
-  url        String
-  filename   String?
-  mimeType   String?  @map("mime_type")
-  sizeBytes  BigInt?  @map("size_bytes")
-  width      Int?
-  height     Int?
-  duration   Float?
-  altText    String?  @map("alt_text")
-  isPublic   Boolean? @default(true) @map("is_public")
-  metadata   Json?    @default("{}")
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
-  user       User     @relation(fields: [uploadedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
-
-  @@index([mimeType], map: "idx_media_mime")
-  @@index([isPublic], map: "idx_media_public")
-  @@index([uploadedBy], map: "idx_media_uploader")
-  @@map("media")
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// EVENTS & SECURITY
+// ═══════════════════════════════════════════════════════════════════════════════
 
 model SecurityEvent {
   id        String          @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -244,13 +289,34 @@ model AuditEvent {
   ipAddress  String?         @map("ip_address")
   userAgent  String?         @map("user_agent")
   createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-   actor      User?           @relation("AuditActor", fields: [actorId], references: [id], onUpdate: NoAction)
+  actor      User?           @relation("AuditActor", fields: [actorId], references: [id], onUpdate: NoAction)
 
-   @@index([action], map: "idx_audit_events_action")
-   @@index([actorId, createdAt(sort: Desc)], map: "idx_audit_events_actor_created")
-   @@index([actorId], map: "idx_audit_events_actor")
-   @@map("audit_events")
+  @@index([action], map: "idx_audit_events_action")
+  @@index([actorId, createdAt(sort: Desc)], map: "idx_audit_events_actor_created")
+  @@index([actorId], map: "idx_audit_events_actor")
+  @@map("audit_events")
 }
+
+model login_history {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String   @map("user_id")
+  email     String?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  success   Boolean  @default(true)
+  method    String?
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([email])
+  @@map("login_history")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 model Notification {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -271,420 +337,48 @@ model Notification {
   @@map("notifications")
 }
 
-model NotificationPreference {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String   @unique @map("user_id")
-  type      String   @default("all")
-  // Global channel toggles
-  email     Boolean? @default(true)
-  push      Boolean? @default(true)
-  inApp     Boolean? @default(true) @map("in_app")
-  // Category toggles
-  security  Boolean? @default(true)
-  forms     Boolean? @default(true)
-  product   Boolean? @default(true)
-  support   Boolean? @default(true)
-  // Per-category x channel matrix
-  securityEmail   Boolean? @default(true) @map("security_email")
-  securityPush    Boolean? @default(true) @map("security_push")
-  securityInApp   Boolean? @default(true) @map("security_in_app")
-  formsEmail      Boolean? @default(true) @map("forms_email")
-  formsPush       Boolean? @default(true) @map("forms_push")
-  formsInApp      Boolean? @default(true) @map("forms_in_app")
-  productEmail    Boolean? @default(true) @map("product_email")
-  productPush     Boolean? @default(true) @map("product_push")
-  productInApp    Boolean? @default(true) @map("product_in_app")
-  supportEmail    Boolean? @default(true) @map("support_email")
-  supportPush     Boolean? @default(true) @map("support_push")
-  supportInApp    Boolean? @default(true) @map("support_in_app")
-  // Quiet hours
-  quietHoursEnabled  Boolean? @default(false) @map("quiet_hours_enabled")
-  quietHoursStart    String?  @default("22:00") @map("quiet_hours_start")
-  quietHoursEnd      String?  @default("08:00") @map("quiet_hours_end")
-  // Email digest
-  digestEnabled   Boolean?  @default(false) @map("digest_enabled")
-  digestFrequency String?   @default("daily") @map("digest_frequency")
-  // Email preferences card (product news / weekly summary / tips)
-  tipsEmail     Boolean?  @default(true)  @map("tips_email")
-  weeklySummary Boolean?  @default(false) @map("weekly_summary")
-  // Scheduling bookkeeping for periodic email jobs
-  lastDigestSentAt DateTime? @map("last_digest_sent_at") @db.Timestamptz(6)
-  lastWeeklySentAt DateTime? @map("last_weekly_sent_at") @db.Timestamptz(6)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+// ═══════════════════════════════════════════════════════════════════════════════
+// MEDIA
+// ═══════════════════════════════════════════════════════════════════════════════
 
-  @@map("notification_preferences")
+model Media {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  uploadedBy String   @map("uploaded_by")
+  url        String
+  filename   String?
+  mimeType   String?  @map("mime_type")
+  sizeBytes  BigInt?  @map("size_bytes")
+  width      Int?
+  height     Int?
+  duration   Float?
+  altText    String?  @map("alt_text")
+  isPublic   Boolean? @default(true) @map("is_public")
+  metadata   Json?    @default("{}")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user       User     @relation(fields: [uploadedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([mimeType], map: "idx_media_mime")
+  @@index([isPublic], map: "idx_media_public")
+  @@index([uploadedBy], map: "idx_media_uploader")
+  @@map("media")
 }
 
-model PushSubscription {
-  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId     String    @map("user_id")
-  endpoint   String
-  p256dh     String
-  auth       String
-  userAgent  String?   @map("user_agent")
-  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMAIL SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
 
-  @@unique([userId, endpoint], map: "push_subscriptions_user_id_endpoint_key")
-  @@index([userId], map: "idx_push_subscriptions_user_id")
-  @@map("push_subscriptions")
-}
-
-model ApiKey {
-  id           String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId       String           @map("user_id")
-  name         String
-  keyHash      String           @unique @map("key_hash")
-  keyPrefix    String           @map("key_prefix")
-  permissions  Json?            @default("{}")
-  isActive     Boolean?         @default(true) @map("is_active")
-  lastUsedAt   DateTime?        @map("last_used_at") @db.Timestamptz(6)
-  expiresAt    DateTime?        @map("expires_at") @db.Timestamptz(6)
-  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  revokedAt    DateTime?        @map("revoked_at") @db.Timestamptz(6)
-  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([keyHash], map: "idx_api_keys_hash")
-  @@index([keyPrefix], map: "idx_api_keys_prefix")
-  @@index([userId], map: "idx_api_keys_user")
-  @@map("api_keys")
-}
-
-model Setting {
-  id               String              @id @default(uuid())
-  key              String              @unique
-  value            Json
-  type             String              @default("string")
-  group            String              @default("general")
-  label            String?
-  description      String?
-  isSecret         Boolean             @default(false) @map("is_secret")
-  createdAt        DateTime            @default(now()) @map("created_at")
-  updatedAt        DateTime            @updatedAt @map("updated_at")
-
-  @@index([key])
-  @@index([group])
-  @@map("settings")
-}
-
-model SiteConfig {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  app       String   @unique
-  config    Json     @default("{}")
-  updatedBy String?  @map("updated_by")
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([app], map: "idx_site_configs_app")
-  @@map("site_configs")
-}
-
-model ThemeConfig {
-  id                 String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  name               String   @unique
-  isActive           Boolean? @default(false) @map("is_active")
-  isDefault          Boolean? @default(false) @map("is_default")
-  bgPrimary          String?  @default("#08150F") @map("bg_primary")
-  bgSecondary        String?  @default("#101c13") @map("bg_secondary")
-  bgCard             String?  @default("#12271D") @map("bg_card")
-  bgElevated         String?  @default("#1a3326") @map("bg_elevated")
-  textPrimary        String?  @default("#F2EEE8") @map("text_primary")
-  textSecondary      String?  @default("#B7C6BE") @map("text_secondary")
-  textMuted          String?  @default("#6b8a7a") @map("text_muted")
-  accentPrimary      String?  @default("#569578") @map("accent_primary")
-  accentSecondary    String?  @default("#275d46") @map("accent_secondary")
-  accentHover        String?  @default("#6aab8d") @map("accent_hover")
-  success            String?  @default("#59C173")
-  warning            String?  @default("#F4B942")
-  error              String?  @default("#E45D5D")
-  borderColor        String?  @default("rgba(255,255,255,0.08)") @map("border_color")
-  borderHover        String?  @default("rgba(255,255,255,0.14)") @map("border_hover")
-  borderRadius       String?  @default("16px") @map("border_radius")
-  fontPrimary        String?  @default("Inter") @map("font_primary")
-  fontHeading        String?  @default("Plus Jakarta Sans") @map("font_heading")
-  logoUrl            String?  @map("logo_url")
-  brandName          String?  @default("Tirbeo") @map("brand_name")
-  brandTagline       String?  @default("Premium Social Platform") @map("brand_tagline")
-  lightBgPrimary     String?  @map("light_bg_primary")
-  lightBgSecondary   String?  @map("light_bg_secondary")
-  lightTextPrimary   String?  @map("light_text_primary")
-  lightAccentPrimary String?  @map("light_accent_primary")
-  emailHeaderBg      String?  @default("linear-gradient(135deg,#022B22,#275D46,#569578)") @map("email_header_bg")
-  emailButtonColor   String?  @default("#569578") @map("email_button_color")
-  emailTextColor     String?  @default("#B7C6BE") @map("email_text_color")
-  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([isActive], map: "idx_theme_configs_active")
-  @@map("theme_configs")
-}
-
-model FeatureFlag {
-  id               String                 @id @default(dbgenerated("(gen_random_uuid())::text"))
-  key              String                 @unique
-  name             String
-  description      String?
-  isActive         Boolean?               @default(false) @map("is_active")
-  rolloutPct       Int?                   @default(100) @map("rollout_pct")
-  metadata         Json?                  @default("{}")
-  createdAt        DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt        DateTime               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([isActive], map: "idx_feature_flags_active")
-  @@index([key], map: "idx_feature_flags_key")
-  @@map("feature_flags")
-}
-
-model HelpArticle {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  slug      String   @unique
-  title     String
-  content   String
-  category  String
-  icon      String
-  ord       Int      @default(0)
-  published Boolean  @default(false)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([slug])
-  @@index([published])
-  @@index([ord])
-  @@map("help_articles")
-}
-
-model Ticket {
-  id                String               @id @default(uuid())
-  customerId        String               @map("customer_id")
-  subject           String
-  description       String?
-  category          String               @default("general")
-  priority          String               @default("normal")
-  status            String               @default("open")
-  source            String               @default("web")
-  application       String?
-  queueId           String?              @map("queue_id")
-  assignedId        String?              @map("assigned_id")
-  slaId             String?              @map("sla_id")
-  closedAt          DateTime?            @map("closed_at")
-  attachments         ticket_attachments[]
-  createdAt         DateTime             @default(now()) @map("created_at")
-  updatedAt         DateTime             @updatedAt @map("updated_at")
-  ticketAssignments ticket_assignments[]
-  messages          TicketMessage[]
-  queue             support_queues?      @relation(fields: [queueId], references: [id])
-  customer          User                 @relation("TicketCustomer", fields: [customerId], references: [id])
-  assigned          User?                @relation("TicketAssignee", fields: [assignedId], references: [id])
-
-  @@index([customerId])
-  @@index([status])
-  @@index([assignedId])
-  @@index([createdAt])
-  @@index([priority])
-  @@index([queueId])
-  @@map("tickets")
-}
-
-model TicketMessage {
-  id         String    @id @default(uuid())
-  ticketId   String    @map("ticket_id")
-  authorId   String    @map("author_id")
-  content    String
-  isInternal Boolean   @default(false) @map("is_internal")
-  readAt     DateTime? @map("read_at")
-  readBy     String?   @map("read_by")
-  createdAt  DateTime  @default(now()) @map("created_at")
-  ticket     Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  author     User      @relation("TicketMessageAuthor", fields: [authorId], references: [id])
-
-  @@index([ticketId])
-  @@index([authorId])
-  @@map("ticket_messages")
-}
-
-model Blocklist {
-  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  targetType String    @map("target_type")
-  targetId   String    @map("target_id")
-  reason     String?
-  blockedBy  String?   @map("blocked_by")
-  isActive   Boolean?  @default(true) @map("is_active")
-  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
-  users      User?     @relation(fields: [blockedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
-
-  @@unique([targetType, targetId])
-  @@index([isActive], map: "idx_blocklist_active")
-  @@index([targetType], map: "idx_blocklist_type")
-  @@map("blocklist")
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-model app_oauth_clients {
-  id                 String                @id @default(dbgenerated("(gen_random_uuid())"))
-  appId              String                @map("app_id")
-  clientId           String                @unique @map("client_id")
-  clientSecret       String?               @map("client_secret")
-  redirectUris       Json                  @default("[]") @map("redirect_uris")
-  grants             Json                  @default("[]")
-  scopes             Json                  @default("[]")
-  isActive           Boolean               @default(true) @map("is_active")
-  createdAt          DateTime              @default(now()) @map("created_at")
-  updatedAt          DateTime              @map("updated_at")
-  apps               apps                  @relation(fields: [appId], references: [id], onDelete: Cascade)
-  authorizationCodes authorization_codes[]
-  accessTokens       access_tokens[]
-  refreshTokens      refresh_tokens[]
-  oAuthConsents      oAuthConsent[]
-
-  @@index([appId])
-  @@index([clientId])
-}
-
-model authorization_codes {
-  id                  String            @id @default(dbgenerated("(gen_random_uuid())"))
-  clientId            String            @map("client_id")
-  userId              String            @map("user_id")
-  code                String            @unique
-  redirectUri         String            @map("redirect_uri")
-  scopes              Json
-  expiresAt           DateTime          @map("expires_at") @db.Timestamptz(6)
-  usedAt              DateTime?         @map("used_at") @db.Timestamptz(6)
-  codeChallenge       String?           @map("code_challenge")
-  codeChallengeMethod String?           @map("code_challenge_method")
-  createdAt           DateTime          @default(now()) @map("created_at")
-  app                 app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
-  user                User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([clientId])
-  @@index([userId])
-  @@index([code])
-}
-
-model access_tokens {
-  id        String            @id @default(dbgenerated("(gen_random_uuid())"))
-  clientId  String            @map("client_id")
-  userId    String            @map("user_id")
-  token     String            @unique
-  scopes    Json
-  expiresAt DateTime          @map("expires_at") @db.Timestamptz(6)
-  revokedAt DateTime?         @map("revoked_at") @db.Timestamptz(6)
-  createdAt DateTime          @default(now()) @map("created_at")
-  app       app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
-  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([clientId])
-  @@index([userId])
-  @@index([token])
-}
-
-model refresh_tokens {
-  id        String            @id @default(dbgenerated("(gen_random_uuid())"))
-  clientId  String            @map("client_id")
-  userId    String            @map("user_id")
-  token     String            @unique
-  scopes    Json
-  expiresAt DateTime          @map("expires_at") @db.Timestamptz(6)
-  revokedAt DateTime?         @map("revoked_at") @db.Timestamptz(6)
-  createdAt DateTime          @default(now()) @map("created_at")
-  app       app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
-  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([clientId])
-  @@index([userId])
-  @@index([token])
-}
-
-model oAuthConsent {
-  id        String            @id @default(dbgenerated("(gen_random_uuid())"))
-  clientId  String            @map("client_id")
-  userId    String            @map("user_id")
-  scopes    Json
-  createdAt DateTime          @default(now()) @map("created_at")
-  updatedAt DateTime          @updatedAt @map("updated_at")
-  app       app_oauth_clients @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
-  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([clientId, userId])
-  @@index([clientId])
-  @@index([userId])
-}
-
-model app_permissions {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())"))
-  appId       String   @map("app_id")
-  name        String
-  key         String
-  description String?
-  createdAt   DateTime @default(now()) @map("created_at")
-  apps        apps     @relation(fields: [appId], references: [id], onDelete: Cascade)
-
-  @@unique([appId, key])
-  @@index([appId])
-  @@index([key])
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-model app_roles {
-  id          String     @id @default(dbgenerated("(gen_random_uuid())::text"))
-  name        String     @unique
-  description String?
-  color       String?    @default("#4f7aff")
-  icon        String?    @default("shield")
-  isSystem    Boolean?   @default(false) @map("is_system")
-  permissions Json?      @default("{}")
-  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime   @default(now()) @map("updated_at") @db.Timestamptz(6)
-  userRoles   UserRole[]
-
-  @@index([name], map: "idx_app_roles_name")
-}
-
-model apps {
-  id           String              @id @default(dbgenerated("(gen_random_uuid())"))
-  name         String
-  slug         String              @unique
-  description  String?
-  icon         String?
-  url          String?
-  status       String              @default("active")
-  isPublic     Boolean             @default(true) @map("is_public")
-  ownerId      String              @map("owner_id")
-  version      String              @default("1.0.0")
-  createdAt    DateTime            @default(now()) @map("created_at")
-  updatedAt    DateTime            @updatedAt @map("updated_at")
-  oauthClients app_oauth_clients[]
-  permissions  app_permissions[]
-  owner        User                @relation("AppOwner", fields: [ownerId], references: [id])
-
-  @@index([ownerId])
-  @@index([slug])
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model emailConfig {
   id               String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  provider         String   @default("resend") // resend | smtp
-  // Resend
+  provider         String   @default("resend")
   resendApiKey     String?
   resendDomain     String?  @default("send.tirbeo.app")
-  // SMTP
   smtpHost         String?
   smtpPort         Int?     @default(587)
   smtpUser         String?
   smtpPass         String?
-  // Default sender
   defaultFromEmail String   @default("noreply@send.tirbeo.app")
   defaultFromName  String   @default("Tirbeo")
-  // Per-type overrides
   welcomeFromEmail String?
   welcomeFromName  String?
   otpFromEmail     String?
@@ -697,10 +391,8 @@ model emailConfig {
   alertFromName    String?
   formsFromEmail   String?  @default("forms@send.tirbeo.app")
   formsFromName    String?  @default("Tirbeo Forms")
-  // DKIM / custom domain settings
   customDomain     String?
   dkimEnabled      Boolean  @default(false)
-  // Status
   enabled          Boolean  @default(true)
   createdAt        DateTime @default(now()) @db.Timestamptz(6)
   updatedAt        DateTime @updatedAt @db.Timestamptz(6)
@@ -723,7 +415,6 @@ model emailTemplate {
   @@map("email_templates")
 }
 
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model email_logs {
   id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
   toEmail   String    @map("to_email")
@@ -736,262 +427,38 @@ model email_logs {
   openedAt  DateTime? @map("opened_at") @db.Timestamptz(6)
   clickedAt DateTime? @map("clicked_at") @db.Timestamptz(6)
   error     String?
+  metadata  Json?     @default("{}")
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
   @@index([createdAt], map: "idx_email_logs_created")
   @@index([status], map: "idx_email_logs_status")
   @@index([threadId], map: "idx_email_logs_thread")
   @@index([toEmail], map: "idx_email_logs_to")
+  @@map("email_logs")
 }
 
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-model incidents {
-  id           String            @id @default(dbgenerated("(gen_random_uuid())"))
-  title        String
-  description  String?
-  severity     String            @default("minor")
-  status       String            @default("investigating")
-  services     Json              @default("[]")
-  applications Json              @default("[]")
-  ownerId      String?           @map("owner_id")
-  resolvedAt   DateTime?         @map("resolved_at")
-  postmortem   String?
-  createdAt    DateTime          @default(now()) @map("created_at")
-  updatedAt    DateTime          @updatedAt @map("updated_at")
-  events              incident_events[]
-
-  @@index([severity])
-  @@index([status])
-}
-
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-model job_attempts {
-  id          String    @id @default(dbgenerated("(gen_random_uuid())"))
-  jobId       String    @map("job_id")
-  attempt     Int
-  status      String
-  error       String?
-  startedAt   DateTime? @map("started_at")
-  completedAt DateTime? @map("completed_at")
-  createdAt   DateTime  @default(now()) @map("created_at")
-  jobs        jobs      @relation(fields: [jobId], references: [id], onDelete: Cascade)
-
-  @@index([jobId])
-}
-
-model jobs {
-  id          String         @id @default(dbgenerated("(gen_random_uuid())"))
-  type        String
-  queue       String         @default("default")
-  payload     Json           @default("{}")
-  status      String         @default("pending")
-  attempts    Int            @default(0)
-  maxAttempts Int            @default(3) @map("max_attempts")
-  error       String?
-  startedAt   DateTime?      @map("started_at")
-  completedAt DateTime?      @map("completed_at")
-  createdAt   DateTime       @default(now()) @map("created_at")
-  updatedAt   DateTime       @map("updated_at")
-  jobAttempts job_attempts[]
-
-  @@index([createdAt])
-  @@index([queue])
-  @@index([status])
-  @@index([type])
-}
-
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-model Otp {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String   @map("user_id")
-  type      String
-  otpHash   String   @map("otp_hash")
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  attempts  Int?     @default(0)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  users     User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([expiresAt], map: "idx_otps_expires")
-  @@index([type], map: "idx_otps_type")
-  @@index([userId], map: "idx_otps_user")
-  @@map("otps")
-}
-
-model PasskeyChallenge {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  nonce     String   @unique
-  challenge String
-  type      String
-  userId    String?  @map("user_id")
-  expiresAt DateTime @map("expires_at")
-  createdAt DateTime @default(now()) @map("created_at")
-
-  @@index([expiresAt])
-  @@index([nonce])
-  @@map("passkey_challenges")
-}
-
-model Passkey {
-  id                  String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId              String   @map("user_id")
-  credentialId        String   @unique @map("credential_id")
-  credentialPublicKey Bytes    @map("credential_public_key")
-  counter             BigInt   @default(0)
-  transports          String?
-  deviceName          String?  @map("device_name")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
-  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([credentialId])
-  @@index([userId])
-  @@map("passkeys")
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-model SignupOtp {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  email     String
-  otpHash   String   @map("otp_hash")
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  attempts  Int?     @default(0)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([email], map: "idx_signup_otps_email")
-  @@index([expiresAt], map: "idx_signup_otps_expires")
-  @@map("signup_otps")
-}
-
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-model support_queues {
-  id           String           @id @default(dbgenerated("(gen_random_uuid())"))
-  name         String           @unique
-  slug         String           @unique
-  description  String?
-  managerId    String?          @map("manager_id")
-  autoAssign   Boolean          @default(true) @map("auto_assign")
-  slaId        String?          @map("sla_id")
-  workingHours Json             @default("{}") @map("working_hours")
-  createdAt    DateTime         @default(now()) @map("created_at")
-  updatedAt    DateTime         @updatedAt @map("updated_at")
-  tickets      Ticket[]
-
-  @@index([slug])
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-model ticket_assignments {
-  id           String    @id @default(dbgenerated("(gen_random_uuid())"))
-  ticketId     String    @map("ticket_id")
-  agentId      String    @map("agent_id")
-  assignedBy   String    @map("assigned_by")
-  assignedAt   DateTime  @default(now()) @map("assigned_at")
-  unassignedAt DateTime? @map("unassigned_at")
-  tickets      Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-
-  @@index([agentId])
-  @@index([ticketId])
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-
-enum AchievementType {
-  FIRST_PROJECT
-  FIRST_POST
-  FIRST_FOLLOWER
-  STREAK_7
-  STREAK_30
-  CONTRIBUTOR
-  MAINTAINER
-  MENTOR
-  BETA_USER
-  EARLY_ADOPTER
-}
-
-enum report_status {
-  pending
-  reviewed
-  dismissed
-  actioned
-}
-
-enum session_status {
-  active
-  expired
-  revoked
-}
-
-enum severity_level {
-  info
-  warning
-  error
-  critical
-}
-
-enum workspace_role {
-  OWNER
-  ADMIN
-  MEMBER
-  VIEWER
-}
+// ═══════════════════════════════════════════════════════════════════════════════
+// CAPTCHA (Rate Limiting / Bot Protection)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 model CaptchaChallenge {
-  id            String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  sessionId     String           @map("session_id")
-  userId        String?          @map("user_id")
-  difficulty    String           @default("easy") // easy, medium, hard
-  challengeType String           @default("image") // image, math, word
+  id            String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  sessionId     String          @map("session_id")
+  userId        String?         @map("user_id")
+  difficulty    String          @default("easy")
+  challengeType String          @default("image")
   question      String
-  answerHash    String           @map("answer_hash")
-  options       Json? // For multiple choice
-  imageUrl      String?          @map("image_url")
-  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  expiresAt     DateTime         @map("expires_at") @db.Timestamptz(6)
-  attempts      Int              @default(0)
-  solved        Boolean          @default(false)
-  solvedAt      DateTime?        @map("solved_at") @db.Timestamptz(6)
-  ipAddress     String?          @map("ip_address")
-  userAgent     String?          @map("user_agent")
-  rayId         String           @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  answerHash    String          @map("answer_hash")
+  options       Json?
+  imageUrl      String?         @map("image_url")
+  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt     DateTime        @map("expires_at") @db.Timestamptz(6)
+  attempts      Int             @default(0)
+  solved        Boolean         @default(false)
+  solvedAt      DateTime?       @map("solved_at") @db.Timestamptz(6)
+  ipAddress     String?         @map("ip_address")
+  userAgent     String?         @map("user_agent")
+  rayId         String          @unique @default(dbgenerated("(gen_random_uuid())::text"))
   attemptLogs   CaptchaAttempt[]
 
   @@index([sessionId])
@@ -1025,14 +492,14 @@ model CaptchaBlock {
   userId      String?   @map("user_id")
   sessionId   String    @map("session_id")
   ipAddress   String    @map("ip_address")
-  reason      String // "too_many_attempts", "suspicious_activity", "rate_limit"
+  reason      String
   difficulty  String    @default("hard")
   blockedAt   DateTime  @default(now()) @map("blocked_at") @db.Timestamptz(6)
   expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
   unblockedAt DateTime? @map("unblocked_at") @db.Timestamptz(6)
   unblockedBy String?   @map("unblocked_by")
   rayId       String    @unique @default(dbgenerated("(gen_random_uuid())::text"))
-  metadata    Json? // Additional context
+  metadata    Json?
 
   @@index([userId])
   @@index([sessionId])
@@ -1046,7 +513,7 @@ model CaptchaLog {
   userId     String?  @map("user_id")
   sessionId  String   @map("session_id")
   ipAddress  String   @map("ip_address")
-  eventType  String   @map("event_type") // "challenge_shown", "attempt_failed", "blocked", "unblocked", "settings_changed"
+  eventType  String   @map("event_type")
   difficulty String?
   rayId      String?  @map("ray_id")
   metadata   Json?
@@ -1058,69 +525,6 @@ model CaptchaLog {
   @@index([eventType])
   @@index([rayId])
   @@map("captcha_logs")
-}
-
-model login_history {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String   @map("user_id")
-  email       String?
-  ipAddress   String?  @map("ip_address")
-  userAgent   String?  @map("user_agent")
-  success     Boolean  @default(true)
-  method      String?
-  metadata    Json?
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  @@index([userId])
-  @@index([email])
-  @@map("login_history")
-}
-
-model ticket_attachments {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  ticketId    String   @map("ticket_id")
-  messageId   String?  @map("message_id")
-  fileName    String   @map("file_name")
-  fileUrl     String   @map("file_url")
-  fileSize    Int?     @map("file_size")
-  mimeType    String?  @map("mime_type")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  ticket      Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  @@index([ticketId])
-  @@index([messageId])
-  @@map("ticket_attachments")
-}
-
-model incident_events {
-  id          String   @id @default(uuid())
-  incidentId  String   @map("incident_id")
-  type        String
-  message     String?
-  userId      String?  @map("user_id")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  incident    incidents @relation(fields: [incidentId], references: [id], onDelete: Cascade)
-  @@index([incidentId])
-  @@index([userId])
-  @@map("incident_events")
-}
-
-/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
-model Integration {
-  id           String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId       String    @map("user_id")
-  provider     String
-  connected    Boolean?  @default(false)
-  accessToken  String?   @map("access_token")
-  refreshToken String?   @map("refresh_token")
-  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(6)
-  metadata     Json?     @default("{}")
-  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([userId, provider])
-  @@index([userId], map: "idx_integrations_user")
-  @@map("integrations")
 }
 
 model CaptchaSettings {
@@ -1136,81 +540,111 @@ model CaptchaSettings {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// FORMS — Core product: collect data from website forms
+// INCIDENTS & CRASH TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model incidents {
+  id           String            @id @default(dbgenerated("(gen_random_uuid())"))
+  title        String
+  description  String?
+  severity     String            @default("minor")
+  status       String            @default("investigating")
+  services     Json              @default("[]")
+  applications Json              @default("[]")
+  ownerId      String?           @map("owner_id")
+  resolvedAt   DateTime?         @map("resolved_at")
+  postmortem   String?
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+  events       incident_events[]
+
+  @@index([severity])
+  @@index([status])
+}
+
+model incident_events {
+  id         String     @id @default(uuid())
+  incidentId String     @map("incident_id")
+  type       String
+  message    String?
+  userId     String?    @map("user_id")
+  metadata   Json?      @default("{}")
+  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  incident   incidents  @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId])
+  @@index([userId])
+  @@map("incident_events")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORMS (Core Product)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 model Form {
-  id              String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId          String    @map("user_id")
-  name            String
-  slug            String    @unique
-  description     String?
-  status          String    @default("draft") // draft | published | archived
-  accessKey       String    @unique @map("access_key") @default("")
-  formType        String    @default("custom") @map("form_type") // contact | bug_report | feedback | waitlist | lead_capture | newsletter | job_application | support | survey | custom
-  websiteUrl      String?   @map("website_url")
+  id                String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId            String          @map("user_id")
+  name              String
+  slug              String          @unique
+  description       String?
+  status            String          @default("draft")
+  accessKey         String          @unique @map("access_key") @default("")
+  formType          String          @default("custom") @map("form_type")
+  websiteUrl        String?         @map("website_url")
 
-  // Submission settings
-  successMessage  String?   @default("Thanks! Your submission has been received.") @map("success_message")
-  successRedirect String?   @map("success_redirect")
-  redirectTarget String    @default("_self") @map("redirect_target") // _self | _blank
-  customSuccessHtml String? @map("custom_success_html")
+  successMessage    String?         @default("Thanks! Your submission has been received.") @map("success_message")
+  successRedirect   String?         @map("success_redirect")
+  redirectTarget    String          @default("_self") @map("redirect_target")
+  customSuccessHtml String?         @map("custom_success_html")
 
-  // Email settings
-  notificationEmails String[] @map("notification_emails")
-  ccEmails        String[]   @map("cc_emails")
-  bccEmails       String[]   @map("bcc_emails")
-  replyToEmail    String?    @map("reply_to_email")
-  emailSubject    String?    @map("email_subject")
-  fromName        String?    @map("from_name")
+  notificationEmails String[]       @map("notification_emails")
+  ccEmails          String[]        @map("cc_emails")
+  bccEmails         String[]        @map("bcc_emails")
+  replyToEmail      String?         @map("reply_to_email")
+  emailSubject      String?         @map("email_subject")
+  fromName          String?         @map("from_name")
 
-  // Auto-responder
-  autoReply       Boolean   @default(false) @map("auto_reply")
-  autoReplySubject String?  @map("auto_reply_subject")
-  autoReplyBody   String?   @map("auto_reply_body")
+  autoReply         Boolean         @default(false) @map("auto_reply")
+  autoReplySubject  String?         @map("auto_reply_subject")
+  autoReplyBody     String?         @map("auto_reply_body")
 
-  // Spam & Security
-  spamProtection  String    @default("automatic") @map("spam_protection") // automatic | turnstile | captcha | honeypot | none
-  turnstileKey    String?   @map("turnstile_key")
-  rateLimit       Int       @default(60) @map("rate_limit") // submissions per minute
-  allowedOrigins  String[]  @map("allowed_origins")
-  honeypot        Boolean   @default(true) // column name matches
+  spamProtection    String          @default("automatic") @map("spam_protection")
+  turnstileKey      String?         @map("turnstile_key")
+  rateLimit         Int             @default(60) @map("rate_limit")
+  allowedOrigins    String[]        @map("allowed_origins")
+  honeypot          Boolean         @default(true)
 
-  // Data settings
-  storeResponses  Boolean   @default(true) @map("store_responses")
-  retention       String    @default("forever") // column name matches
-  showMetadata    Boolean   @default(false) @map("show_metadata")
+  storeResponses    Boolean         @default(true) @map("store_responses")
+  retention         String          @default("forever")
+  showMetadata      Boolean         @default(false) @map("show_metadata")
 
-  // Design
-  layout          String    @default("comfortable") // column name matches
-  width           String    @default("full") // column name matches
-  alignment       String    @default("left") // column name matches
-  labelPosition   String    @default("above") @map("label_position") // above | inline | hidden
-  theme           String    @default("light") // column name matches
-  customCss       String?   @map("custom_css")
-  headless        Boolean   @default(false) // column name matches
+  layout            String          @default("comfortable")
+  width             String          @default("full")
+  alignment         String          @default("left")
+  labelPosition     String          @default("above") @map("label_position")
+  theme             String          @default("light")
+  customCss         String?         @map("custom_css")
+  headless          Boolean         @default(false)
 
-  // Theme
-  headerImage     String?   @map("header_image")
-  accentColor     String    @default("#09090b") @map("accent_color")
-  bgColor         String    @default("#ffffff") @map("bg_color")
-  headerFont      String    @default("Roboto") @map("header_font")
-  questionFont    String    @default("Roboto") @map("question_font")
-  headerImageHeight Int     @default(200) @map("header_image_height")
+  headerImage       String?         @map("header_image")
+  accentColor       String          @default("#09090b") @map("accent_color")
+  bgColor           String          @default("#ffffff") @map("bg_color")
+  headerFont        String          @default("Roboto") @map("header_font")
+  questionFont      String          @default("Roboto") @map("question_font")
+  headerImageHeight Int             @default(200) @map("header_image_height")
 
-  // Stats (denormalized for performance)
-  submissionCount Int       @default(0) @map("submission_count")
-  lastSubmissionAt DateTime? @map("last_submission_at") @db.Timestamptz(6)
-  conversionRate  Float     @default(0) @map("conversion_rate")
+  submissionCount   Int             @default(0) @map("submission_count")
+  lastSubmissionAt  DateTime?       @map("last_submission_at") @db.Timestamptz(6)
+  conversionRate    Float           @default(0) @map("conversion_rate")
 
-  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  fields          FormField[]
-  submissions     FormSubmission[]
-  analytics       FormAnalytic[]
-  connections     FormConnection[]
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fields            FormField[]
+  submissions       FormSubmission[]
+  analytics         FormAnalytic[]
+  connections       FormConnection[]
 
   @@index([userId])
   @@index([status])
@@ -1222,15 +656,15 @@ model FormField {
   id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   formId        String   @map("form_id")
   label         String
-  name          String   // field name used in submission data
-  type          String   @default("text") // text | email | phone | number | textarea | select | radio | checkbox | date | file | hidden
+  name          String
+  type          String   @default("text")
   required      Boolean  @default(false)
   placeholder   String?
   helpText      String?  @map("help_text")
   defaultValue  Json?    @map("default_value")
-  options       Json?    // for select/radio/checkbox: [{label, value}]
-  validation    Json?    // {min, max, minLength, maxLength, pattern, patternError}
-  appearance    Json?    // {width, cssClass}
+  options       Json?
+  validation    Json?
+  appearance    Json?
   order         Int      @default(0)
   hidden        Boolean  @default(false)
   readOnly      Boolean  @default(false) @map("read_only")
@@ -1246,14 +680,14 @@ model FormField {
 model FormSubmission {
   id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   formId        String   @map("form_id")
-  data          Json     @default("{}") // all field values
-  metadata      Json?    // {ip, userAgent, referrer, country, source, utm}
-  source        String?  // website url or source identifier
+  data          Json     @default("{}")
+  metadata      Json?
+  source        String?
   ipAddress     String?  @map("ip_address")
   userAgent     String?  @map("user_agent")
   referrer      String?  @map("referrer")
   country       String?
-  status        String   @default("new") // new | reviewed | spam | deleted
+  status        String   @default("new")
   notes         String?
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
@@ -1266,20 +700,20 @@ model FormSubmission {
 }
 
 model FormAnalytic {
-  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId        String   @map("form_id")
-  date          DateTime @db.Date
-  views         Int      @default(0)
-  starts        Int      @default(0)
-  submissions   Int      @default(0)
-  failedSubmissions Int @default(0) @map("failed_submissions")
-  avgCompletionTime Float? @map("avg_completion_time") // seconds
-  deviceBreakdown   Json?  @map("device_breakdown") // {desktop: 100, mobile: 50, tablet: 10}
-  countryBreakdown  Json?  @map("country_breakdown")
-  referrerBreakdown Json?  @map("referrer_breakdown")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id                String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId            String   @map("form_id")
+  date              DateTime @db.Date
+  views             Int      @default(0)
+  starts            Int      @default(0)
+  submissions       Int      @default(0)
+  failedSubmissions Int      @default(0) @map("failed_submissions")
+  avgCompletionTime Float?   @map("avg_completion_time")
+  deviceBreakdown   Json?    @map("device_breakdown")
+  countryBreakdown  Json?    @map("country_breakdown")
+  referrerBreakdown Json?    @map("referrer_breakdown")
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  form          Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  form              Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
 
   @@unique([formId, date])
   @@index([formId])
@@ -1289,9 +723,9 @@ model FormAnalytic {
 model FormConnection {
   id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   formId        String   @map("form_id")
-  type          String   // email | slack | sheets | webhook | flow
+  type          String
   name          String
-  config        Json     @default("{}") // type-specific config
+  config        Json     @default("{}")
   isActive      Boolean  @default(true) @map("is_active")
   order         Int      @default(0)
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -1301,4 +735,131 @@ model FormConnection {
 
   @@index([formId])
   @@map("form_connections")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPPORT TICKETS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model Ticket {
+  id          String          @id @default(uuid())
+  customerId  String          @map("customer_id")
+  subject     String
+  description String?
+  category    String          @default("general")
+  priority    String          @default("normal")
+  status      String          @default("open")
+  source      String          @default("web")
+  application String?
+  assignedId  String?         @map("assigned_id")
+  closedAt    DateTime?       @map("closed_at")
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  attachments ticket_attachments[]
+  messages    TicketMessage[]
+  customer    User            @relation("TicketCustomer", fields: [customerId], references: [id])
+  assigned    User?           @relation("TicketAssignee", fields: [assignedId], references: [id])
+
+  @@index([customerId])
+  @@index([status])
+  @@index([assignedId])
+  @@index([createdAt])
+  @@index([priority])
+  @@map("tickets")
+}
+
+model TicketMessage {
+  id         String    @id @default(uuid())
+  ticketId   String    @map("ticket_id")
+  authorId   String    @map("author_id")
+  content    String
+  isInternal Boolean   @default(false) @map("is_internal")
+  readAt     DateTime? @map("read_at")
+  readBy     String?   @map("read_by")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  ticket     Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author     User      @relation("TicketMessageAuthor", fields: [authorId], references: [id])
+
+  @@index([ticketId])
+  @@index([authorId])
+  @@map("ticket_messages")
+}
+
+model ticket_attachments {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  ticketId  String   @map("ticket_id")
+  messageId String?  @map("message_id")
+  fileName  String   @map("file_name")
+  fileUrl   String   @map("file_url")
+  fileSize  Int?     @map("file_size")
+  mimeType  String?  @map("mime_type")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([messageId])
+  @@map("ticket_attachments")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APPS PLATFORM
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model apps {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())"))
+  name        String
+  slug        String   @unique
+  description String?
+  icon        String?
+  url         String?
+  status      String   @default("active")
+  isPublic    Boolean  @default(true) @map("is_public")
+  ownerId     String   @map("owner_id")
+  version     String   @default("1.0.0")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  owner       User     @relation("AppOwner", fields: [ownerId], references: [id])
+
+  @@index([ownerId])
+  @@index([slug])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTEGRATIONS (OAuth Provider Connections)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+model Integration {
+  id           String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId       String    @map("user_id")
+  provider     String
+  connected    Boolean?  @default(false)
+  accessToken  String?   @map("access_token")
+  refreshToken String?   @map("refresh_token")
+  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(6)
+  metadata     Json?     @default("{}")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, provider])
+  @@index([userId], map: "idx_integrations_user")
+  @@map("integrations")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENUMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum session_status {
+  active
+  expired
+  revoked
+}
+
+enum severity_level {
+  info
+  warning
+  error
+  critical
 }

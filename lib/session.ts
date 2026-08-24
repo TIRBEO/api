@@ -68,12 +68,8 @@ export async function requireSession(request: NextRequest): Promise<{ userId: st
 
 export async function getAdminRole(userId: string): Promise<string | null> {
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: { roles: { include: { role: true } } },
-    });
-    const firstRole = user?.roles?.[0]?.role;
-    return firstRole?.name?.toLowerCase() || user?.adminRole || null;
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { adminRole: true } });
+    return user?.adminRole?.toLowerCase() || null;
   } catch (e: any) {
     console.error('[SESSION] getAdminRole failed:', e?.message || e);
     return null;

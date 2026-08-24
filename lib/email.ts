@@ -219,7 +219,7 @@ export async function sendTemplateEmail(
   const mergedVars = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
 
   // Set default from addresses based on email type
-  const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert', 'product_update', 'weekly_summary', 'account_tip'];
+  const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert', 'product_update', 'weekly_summary', 'account_tip', 'account_suspended', 'account_deleted'];
   const config = await getEmailConfig();
   
   let defaultFromEmail = branding.emailFromAddress || 'noreply@send.tirbeo.app';
@@ -258,6 +258,8 @@ export async function sendTemplateEmail(
         case 'product_update':
         case 'weekly_summary':
         case 'account_tip':
+        case 'account_suspended':
+        case 'account_deleted':
           defaultFromEmail = config.notifyFromEmail || config.alertFromEmail || config.defaultFromEmail;
           defaultFromName = config.notifyFromName || config.alertFromName || config.defaultFromName;
           break;

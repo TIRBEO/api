@@ -36,7 +36,7 @@ export async function listUsers(request: NextRequest) {
         createdAt: true,
         lastActiveAt: true,
         lastLoginAt: true,
-        preferences: true,
+        consents: true,
         roles: {
           select: { role: { select: { id: true, name: true } } },
         },
@@ -52,7 +52,7 @@ export async function listUsers(request: NextRequest) {
     ...u,
     status: u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
     roles: u.roles.map(a => a.role),
-    signupConsent: (u.preferences as Record<string, any> | null | undefined)?.signupConsent ?? null,
+    signupConsent: (u.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     lastActiveAt: u.lastActiveAt?.toISOString() || null,
     lastLoginAt: u.lastLoginAt?.toISOString() || null,
     roleAssignments: undefined,
@@ -79,7 +79,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       emailVerified: true,
       createdAt: true,
       updatedAt: true,
-      preferences: true,
+      consents: true,
       _count: { select: { sessions: true, memberships: true, notifications: true } },
       roles: {
         select: { role: { select: { id: true, name: true } } },
@@ -96,7 +96,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     ...user,
     status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
     roles: user.roles.map(a => a.role),
-    signupConsent: (user.preferences as Record<string, any> | null | undefined)?.signupConsent ?? null,
+    signupConsent: (user.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     roleAssignments: undefined,
   });
 }
@@ -299,6 +299,16 @@ export async function banUser(request: NextRequest, userId: string) {
     metadata: { email: existing.email, reason: reason || 'No reason provided' },
   });
 
+  const { sendTemplateEmail } = await import('./email');
+  sendTemplateEmail(existing.email, 'account_suspended', {
+    name: existing.name || existing.email,
+    statusType: 'permanently banned',
+    reason: reason || 'No reason provided',
+    untilLabel: '',
+    actionLabel: 'Contact support at support@tirbeo.app if you believe this is a mistake.',
+    dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
+  }, { rawVars: [] }).catch(() => {});
+
   return NextResponse.json({ message: 'User banned' });
 }
 
@@ -330,9 +340,12 @@ export async function suspendUser(request: NextRequest, userId: string) {
   if (!existing) return new NextResponse('User not found', { status: 404 });
   if (existing.adminRole === 'super_admin') return new NextResponse('Cannot suspend a super admin', { status: 403 });
 
-  const { reason } = (await request.json().catch(() => ({}))) as any;
+  const body: any = await request.json().catch(() => ({}));
+  const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : 'No reason provided';
+  const days = Number.isFinite(body.days) ? Math.max(1, Math.min(365, Number(body.days))) : null;
+  const until = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
-  await prisma.user.update({ where: { id: userId }, data: { isSuspended: true, isBanned: false, suspendReason: reason || 'No reason provided' } });
+  await prisma.user.update({ where: { id: userId }, data: { isSuspended: true, isBanned: false, suspendReason: reason, suspendedUntil: until } });
   await prisma.session.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -340,10 +353,20 @@ export async function suspendUser(request: NextRequest, userId: string) {
     action: 'user.suspended',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, reason: reason || 'No reason provided' },
+    metadata: { email: existing.email, reason, days },
   });
 
-  return NextResponse.json({ message: 'User suspended' });
+  const { sendTemplateEmail } = await import('./email');
+  sendTemplateEmail(existing.email, 'account_suspended', {
+    name: existing.name || existing.email,
+    statusType: days ? `suspended for ${days} day${days > 1 ? 's' : ''}` : 'suspended indefinitely',
+    reason,
+    untilLabel: until ? ` Your account will be restored automatically on ${until.toUTCString()}.` : ' Contact support to restore access.',
+    actionLabel: 'During suspension you cannot sign in or use Tirbeo services.',
+    dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
+  }).catch(() => {});
+
+  return NextResponse.json({ message: 'User suspended', until: until?.toISOString() || null });
 }
 
 export async function unsuspendUser(request: NextRequest, userId: string) {
@@ -369,56 +392,6 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
 
 
 
-
-export async function updateUserRoles(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
-  if (session instanceof NextResponse) return session;
-
-  const body: any = await request.json();
-  const { roleIds } = body;
-  if (!Array.isArray(roleIds)) {
-    return new NextResponse('roleIds array required', { status: 400 });
-  }
-
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
-
-  const existingAssignments = await prisma.userRole.findMany({
-    where: { userId },
-    select: { roleId: true },
-  });
-
-  await prisma.userRole.deleteMany({ where: { userId } });
-
-  if (roleIds.length > 0) {
-    const validRoles = await prisma.app_roles.findMany({
-      where: { id: { in: roleIds }, isSystem: false },
-      select: { id: true },
-    });
-    const validIds = new Set(validRoles.map(r => r.id));
-    const toCreate = roleIds.filter((id: string) => validIds.has(id));
-    if (toCreate.length > 0) {
-      await prisma.userRole.createMany({
-        data: toCreate.map((roleId: string) => ({ userId, roleId })),
-      });
-    }
-  }
-
-  const updated = await prisma.userRole.findMany({
-    where: { userId },
-    include: { role: { select: { id: true, name: true } } },
-  });
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'user.roles_updated',
-    targetType: 'user',
-    targetId: userId,
-    metadata: { roleIds, previousRoleIds: existingAssignments.map(a => a.roleId) },
-  });
-
-  return NextResponse.json({ roles: updated.map(a => a.role) });
-}
 
 export async function seedAdminHandler(request: NextRequest) {
   const session = await requireAdmin(request);

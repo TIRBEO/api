@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { listUsers, getUserDetail, createUser, updateUser, deleteUser, updateUserRoles, banUser, unbanUser, suspendUser, unsuspendUser } from '../../../../../lib/adminHandlers';
+import { listUsers, getUserDetail, createUser, updateUser, deleteUser, banUser, unbanUser, suspendUser, unsuspendUser } from '../../../../../lib/adminHandlers';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
   const { action } = await params;
@@ -20,9 +20,6 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   const [userId] = action || [];
   if (!userId) return new Response('Missing user id', { status: 400 });
 
-  if (action?.[1] === 'roles') {
-    return updateUserRoles(request, userId);
-  }
   if (action?.[1] === 'ban') {
     return banUser(request, userId);
   }

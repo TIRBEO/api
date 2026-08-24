@@ -67,14 +67,15 @@ export async function extendedProfileHandler(request: NextRequest) {
            companyName: true, companyRole: true, industry: true, companySize: true,
            gender: true, birthday: true,
            createdAt: true, updatedAt: true,
-           karmaPoints: true, lastLoginAt: true, lastLoginIp: true, loginCount: true, lastActiveAt: true,
+           lastLoginAt: true, lastLoginIp: true, lastActiveAt: true,
            passwordHash: true, googleId: true, githubId: true, discordId: true,
-           preferences: true,
+           mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true,
          },
        });
       if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-      const { passwordHash, googleId, githubId, discordId, totpSecret, preferences: prefsJson, ...safe } = user;
-      const prefs = (prefsJson as Record<string, any>) || {};
+      const { passwordHash, googleId, githubId, discordId, totpSecret, ...safe } = user;
+      const consentData = ((user as any).consents as Record<string, any>) || {};
+      const prefs = consentData;
       const [recoveryCodesCount] = await Promise.all([
         prisma.recoveryCode.count({ where: { userId: session.userId } }),
       ]);
@@ -89,7 +90,7 @@ export async function extendedProfileHandler(request: NextRequest) {
         recoveryEmailVerified: !!safe.secondaryEmailVerified,
         recoveryPhone: safe.phoneNumber || undefined,
         recoveryCodesCount,
-        skipPassword: !!prefs.skipPassword,
+        skipPassword: !!consentData.skipPassword,
         phones: safe.phoneNumber ? [{ number: safe.phoneNumber, verified: safe.phoneVerified }] : [],
         lastPasswordChange: safe.updatedAt?.toISOString() || null,
       });
@@ -234,16 +235,14 @@ export async function changePasswordHandler(request: NextRequest) {
       if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
      }
 
-    // Breach check runs in background — don't block password change
     const { checkPasswordBreach } = await import('./auth/breach');
-    checkPasswordBreach(newPassword).then(breach => {
-      if (breach.breached) {
-        console.warn(`[SECURITY] User ${session.userId} set a breached password (${breach.count} hits)`);
-      }
-    }).catch(() => {});
+    const breach = await checkPasswordBreach(newPassword);
+    if (breach.breached) {
+      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
+    }
 
     const newHash = await hashPassword(newPassword);
-    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: newHash } });
+    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: newHash, mustChangePassword: false } });
     await prisma.session.deleteMany({
       where: { userId: session.userId, NOT: { id: session.sessionId } },
     });
@@ -502,6 +501,9 @@ export async function notificationPrefsHandler(request: NextRequest) {
           });
         } catch { /* give up gracefully */ }
       }
+      const snapshot = { ...DEFAULT_PREFS, ...data };
+      await prisma.$executeRaw`UPDATE users SET notification_preferences = ${JSON.stringify(snapshot)}::jsonb, updated_at = now() WHERE id = ${session.userId}`;
+
       return NextResponse.json({ ok: true, message: 'Notification preferences updated' });
     }
 
@@ -760,23 +762,13 @@ export async function preferencesHandler(request: NextRequest) {
         where: { id: session.userId },
         select: {
           theme: true, language: true, timezone: true, dateFormat: true,
-          timeFormat: true, preferences: true,
+          timeFormat: true,
         },
       });
-      const prefs = (user?.preferences as Record<string, any>) || {};
+      if (!user) return jsonUnauthorized();
       const result = {
-        ...user,
-        privacy: prefs.privacy || {
-          showEmail: false, showPhone: false, showLocation: true, showOnlineStatus: true,
-          showActivityStatus: true, allowReadReceipts: true, showLastActive: true,
-          allowAnalytics: false, allowCrashReports: true, personalizedRecommendations: false,
-          allowSearchEngines: true, showInDirectory: true,
-        },
-        weekStart: prefs.weekStart || null,
-        currency: prefs.currency || null,
-        defaultLanding: prefs.defaultLanding || null,
-        themeId: prefs.themeId || null,
-        accentColor: prefs.accentColor || null,
+        theme: user.theme, language: user.language, timezone: user.timezone,
+        dateFormat: user.dateFormat, timeFormat: user.timeFormat,
       };
       preferencesCache.set(session.userId, result);
       return NextResponse.json(result);
@@ -784,47 +776,18 @@ export async function preferencesHandler(request: NextRequest) {
 
     if (request.method === 'PATCH') {
       const body: any = await request.json();
-      const bodyStr = JSON.stringify(body);
-      if (bodyStr.length > 10240) return new NextResponse('Payload too large (max 10KB)', { status: 413 });
       const schema = z.object({
         theme: z.enum(['light', 'dark', 'system']).optional(),
         language: z.string().optional(),
         timezone: z.string().optional(),
         dateFormat: z.string().optional(),
-        timeFormat: z.string().optional(),
-
-        preferences: z.any().optional(),
-        weekStart: z.string().optional(),
-        currency: z.string().optional(),
-        defaultLanding: z.string().optional(),
-        themeId: z.string().nullable().optional(),
-        accentColor: z.string().nullable().optional(),
+        timeFormat: z.enum(['12h', '24h']).optional(),
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
-      const data: Record<string, any> = { ...parsed.data };
-      const extraKeys = ['weekStart', 'currency', 'defaultLanding', 'themeId', 'accentColor'];
-      const existingPrefs = (await prisma.user.findUnique({ where: { id: session.userId }, select: { preferences: true } }))?.preferences as Record<string, any> || {};
-      for (const key of extraKeys) {
-        if (data[key] !== undefined) {
-          data.preferences = { ...existingPrefs, ...data.preferences, [key]: data[key] };
-          delete data[key];
-        }
-      }
-      if (data.preferences && typeof data.preferences === 'object') {
-        // Deep merge privacy specifically
-        if (data.preferences.privacy && typeof data.preferences.privacy === 'object') {
-          const existingPrivacy = (existingPrefs.privacy as Record<string, any>) || {};
-          data.preferences = {
-            ...existingPrefs,
-            ...data.preferences,
-            privacy: { ...existingPrivacy, ...data.preferences.privacy },
-          };
-        } else {
-          data.preferences = { ...existingPrefs, ...data.preferences };
-        }
-      }
-      await prisma.user.update({ where: { id: session.userId }, data });
+      const d: Record<string, any> = { ...parsed.data };
+      Object.keys(d).forEach(k => { if (d[k] === undefined) delete d[k]; });
+      await prisma.user.update({ where: { id: session.userId }, data: d });
       bustPreferencesCache(session.userId);
       bustNotificationsCache(session.userId);
       return NextResponse.json({ ok: true, message: 'Preferences updated' });
@@ -860,7 +823,7 @@ export async function setPasswordHandler(request: NextRequest) {
     if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
 
     const hash = await hashPassword(password);
-    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash } });
+    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash, mustChangePassword: false } });
     return new NextResponse('Password set successfully', { status: 200 });
   } catch (err: any) {
     console.error('[SET PASSWORD]', err?.message || err);
@@ -1008,7 +971,7 @@ export async function exportDataHandler(request: NextRequest) {
         companyName: true, companyRole: true, industry: true, companySize: true,
         adminRole: true, is2FAEnabled: true,
         createdAt: true, updatedAt: true,
-        preferences: true,
+        consents: true,
       },
     });
     if (!user) return new NextResponse('User not found', { status: 404 });
@@ -1039,7 +1002,7 @@ export async function exportDataHandler(request: NextRequest) {
       sessions,
       auditLogs,
       notifications,
-      preferences: user.preferences,
+      consents: (user as any).consents ?? {},
     };
 
     const url = new URL(request.url);
@@ -1104,13 +1067,31 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
+    const url = new URL(request.url);
+    // Cancel a scheduled deletion
+    if (request.method === 'DELETE' && url.searchParams.get('cancel') === '1') {
+      const existing = await prisma.user.findUnique({ where: { id: session.userId }, select: { scheduledDeletionAt: true } });
+      if (!existing?.scheduledDeletionAt) return NextResponse.json({ ok: false, message: 'No deletion is scheduled.' }, { status: 400 });
+      await prisma.user.update({ where: { id: session.userId }, data: { scheduledDeletionAt: null, deletionReason: null } });
+      await prisma.auditEvent.create({
+        data: { actorId: session.userId, action: 'DELETE_ACCOUNT_CANCELLED', ipAddress: request.headers.get('x-forwarded-for') || 'unknown', metadata: {} },
+      }).catch(() => {});
+      bustNotificationsCache(session.userId);
+      return NextResponse.json({ ok: true, message: 'Deletion cancelled. Your account is safe.' });
+    }
+
     if (request.method !== 'POST') return new NextResponse('Method not allowed', { status: 405 });
 
-    const user = await prisma.user.findUnique({
+    const body: any = await request.json().catch(() => ({}));
+    const reason = typeof body.reason === 'string' ? sanitizeInput(body.reason, 500).trim() : '';
+    const graceDays = 30;
+    const scheduledFor = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000);
+
+    const user = await prisma.user.update({
       where: { id: session.userId },
-      select: { email: true, name: true },
+      data: { scheduledDeletionAt: scheduledFor, deletionReason: reason || 'Not specified' },
+      select: { email: true, name: true, scheduledDeletionAt: true },
     });
-    if (!user) return new NextResponse('User not found', { status: 404 });
 
     await prisma.auditEvent.create({
       data: {
@@ -1118,17 +1099,26 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
         action: 'DELETE_ACCOUNT_REQUEST',
         ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
         userAgent: request.headers.get('user-agent') || 'unknown',
-        metadata: { email: user.email, name: user.name, requestedAt: new Date().toISOString() },
+        metadata: { email: user.email, reason: reason || 'Not specified', scheduledFor: scheduledFor.toISOString() },
       },
     });
 
+    const { sendTemplateEmail } = await import('./email');
+    sendTemplateEmail(user.email, 'account_deleted', {
+      name: user.name || user.email,
+      dateLabel: scheduledFor.toUTCString(),
+      dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
+    }).catch(() => {});
+
+    bustNotificationsCache(session.userId);
     return NextResponse.json({
       ok: true,
-      message: 'Deletion request submitted. Contact support@tirbeo.app to finalize.',
+      scheduledFor: scheduledFor.toISOString(),
+      message: `Account scheduled for deletion on ${scheduledFor.toUTCString()}. You can cancel anytime before then.`,
     });
   } catch (err: any) {
     console.error('[DELETE_ACCOUNT]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return new NextResponse('Failed to process deletion request', { status: 500 });
   }
 }
 
@@ -1149,26 +1139,20 @@ export async function publicProfileHandler(request: NextRequest) {
       select: {
         id: true, name: true, email: true, photoUrl: true, bio: true, occupation: true,
         country: true, createdAt: true, lastActiveAt: true,
-        isVerified: true, karmaPoints: true,
-        preferences: true,
       },
     });
     if (!user) return new NextResponse('User not found', { status: 404 });
 
-    const prefs = (user.preferences as Record<string, any>) || {};
-    const privacy = prefs.privacy || {};
 
     const profile: Record<string, any> = { id: user.id, name: user.name, photoUrl: user.photoUrl };
-    if (privacy.showEmail !== false) profile.email = user.email;
+    profile.email = user.email;
 
-    if (privacy.showLocation !== false) profile.country = user.country;
-    if (privacy.showOnlineStatus !== false) profile.isOnline = user.lastActiveAt && (Date.now() - new Date(user.lastActiveAt).getTime()) < 300000;
-    if (privacy.showLastActive !== false) profile.lastActiveAt = user.lastActiveAt;
-    if (privacy.showActivityStatus !== false) profile.bio = user.bio;
-    if (privacy.showOccupation !== false) profile.occupation = user.occupation;
+    profile.country = user.country;
+    profile.isOnline = user.lastActiveAt && (Date.now() - new Date(user.lastActiveAt).getTime()) < 300000;
+    profile.lastActiveAt = user.lastActiveAt;
+    profile.bio = user.bio;
+    profile.occupation = user.occupation;
     profile.createdAt = user.createdAt;
-    profile.isVerified = user.isVerified;
-    profile.karmaPoints = user.karmaPoints;
 
     publicProfileCache.set(userId, profile);
     return NextResponse.json(profile);

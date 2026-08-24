@@ -373,3 +373,71 @@ export function startPeriodicOauthSync() {
   oauthSyncInterval = setInterval(() => { reconcileOauthLinks(); }, 600_000);
   console.log('[OAUTH-SYNC] Periodic link reconciliation started (every 10 min)');
 }
+
+// ─── SCHEDULED ACCOUNT DELETIONS ───
+// Runs hourly. Hard-deletes accounts whose grace period has elapsed:
+// anonymizes identity, wipes sessions/tokens/devices/notifications, keeps the
+// audit trail (actorId nulled where possible via cascade-safe updates).
+
+export async function processScheduledDeletions() {
+  const due = await prisma.user.findMany({
+    where: { scheduledDeletionAt: { lte: new Date() }, deletedAt: null },
+    select: { id: true, email: true },
+    take: 200,
+  });
+  if (!due.length) return 0;
+
+  for (const user of due) {
+    try {
+      await prisma.$transaction([
+        prisma.session.deleteMany({ where: { userId: user.id } }),
+        prisma.refresh_tokens.deleteMany({ where: { userId: user.id } }),
+        prisma.apiKey.deleteMany({ where: { userId: user.id } }),
+        prisma.notification.deleteMany({ where: { userId: user.id } }),
+        prisma.pushSubscription.deleteMany({ where: { userId: user.id } }),
+        prisma.otp.deleteMany({ where: { userId: user.id } }),
+        prisma.recoveryCode.deleteMany({ where: { userId: user.id } }),
+        prisma.notificationPreference.deleteMany({ where: { userId: user.id } }),
+        prisma.userTipLog.deleteMany({ where: { userId: user.id } }),
+      ]);
+
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          deletedAt: new Date(),
+          email: `deleted+${user.id}@tirbeo.invalid`,
+          secondaryEmail: null,
+          name: 'Deleted User',
+          photoUrl: null,
+          bio: null,
+          username: null,
+          phoneNumber: null,
+          website: null,
+          linkedin: null,
+          githubUsername: null,
+          twitter: null,
+          passwordHash: null,
+          googleId: null,
+          githubId: null,
+          discordId: null,
+          totpSecret: null,
+          scheduledDeletionAt: null,
+          is2FAEnabled: false,
+        },
+      });
+
+      await prisma.auditEvent.create({
+        data: { action: 'user.deleted.scheduled', targetType: 'user', targetId: user.id, metadata: { email: user.email } },
+      }).catch(() => {});
+    } catch (err: any) {
+      console.error('[DELETION_SWEEP] failed for', user.id, err?.message);
+    }
+  }
+  return due.length;
+}
+
+let deletionInterval: ReturnType<typeof setInterval> | null = null;
+export function startPeriodicDeletionSweep() {
+  if (deletionInterval) return;
+  deletionInterval = setInterval(() => { processScheduledDeletions().catch(() => {}); }, 3_600_000);
+}

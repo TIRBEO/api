@@ -346,6 +346,7 @@ const isPublicFormSubmit = /^\/api\/forms\/[^/]+\/submit\/?$/.test(pathname) && 
 const isPublicPath = publicPaths.some(p => pathname.startsWith(p)) || isPublicFormSubmit;
 if (isPublicPath) return response;
 
+
 // ── Authentication check ──
 const hasAuthHeader = !!request.headers.get('authorization');
 const cookie = request.cookies.get('__session')?.value;
@@ -354,6 +355,49 @@ const hasCookie = !!cookie;
 if (!hasCookie && !hasAuthHeader) {
   return jsonResponse(allowedOrigin, { error: 'Not authenticated' }, 401);
 }
+
+// ── Account status enforcement (banned / suspended) ──
+// Runs once per authenticated request. Banned users get 403 ACCOUNT_BANNED;
+// suspended users get 403 ACCOUNT_SUSPENDED with reason + until; expired
+// suspensions are lifted automatically on first hit.
+const statusExempt = ['/api/auth/', '/api/health', '/api/users/me/status'];
+let statusResponse: NextResponse | null = null;
+if (!statusExempt.some(p => pathname.startsWith(p))) {
+  try {
+    const { verifyToken } = await import('./lib/auth/jwt');
+    const tokenForStatus: string | null = (preCookie || cookie || (hasAuthHeader ? request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') : '')) || null;
+    const tokenPayload = tokenForStatus ? await verifyToken(tokenForStatus) : null;
+    if (tokenPayload?.userId) {
+      const { prisma } = await import('./lib/db/prisma');
+      const su = await prisma.user.findUnique({
+        where: { id: String(tokenPayload.userId) },
+        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true },
+      });
+      if (su?.isBanned) {
+        await prisma.session.deleteMany({ where: { userId: tokenPayload.userId } }).catch(() => {});
+        statusResponse = jsonResponse(allowedOrigin, {
+          error: 'ACCOUNT_BANNED', banned: true,
+          message: 'Your account has been permanently banned.',
+        }, 403);
+      } else if (su?.isSuspended) {
+        if (su.suspendedUntil && new Date(su.suspendedUntil) < new Date()) {
+          await prisma.user.update({
+            where: { id: String(tokenPayload.userId) },
+            data: { isSuspended: false, suspendReason: null, suspendedUntil: null },
+          }).catch(() => {});
+        } else {
+          statusResponse = jsonResponse(allowedOrigin, {
+            error: 'ACCOUNT_SUSPENDED', suspended: true,
+            reason: su.suspendReason || 'No reason provided',
+            until: su.suspendedUntil?.toISOString() || null,
+            message: `Your account is suspended${su.suspendedUntil ? ` until ${new Date(su.suspendedUntil).toUTCString()}` : ''}.`,
+          }, 403);
+        }
+      }
+    }
+  } catch { /* never block on guard failure */ }
+}
+if (statusResponse) return statusResponse;
 
 if (hasAuthHeader) {
   const authHeader = request.headers.get('authorization') || '';

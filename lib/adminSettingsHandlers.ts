@@ -110,7 +110,6 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     totalSessions,
     activeSessions,
     totalAuditEvents,
-    totalRoles,
     totalApps,
     activeApiKeys,
   ] = await Promise.all([
@@ -126,7 +125,6 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     prisma.session?.count().catch(() => 0) as Promise<number>,
     prisma.session?.count({ where: { expiresAt: { gt: now } } }).catch(() => 0) as Promise<number>,
     prisma.auditEvent?.count({ where: { createdAt: { gte: monthAgo } } }).catch(() => 0) as Promise<number>,
-    prisma.app_roles.count().catch(() => 0) as Promise<number>,
     prisma.apps.count().catch(() => 0) as Promise<number>,
     prisma.apiKey.count({ where: { isActive: true, revokedAt: null } }).catch(() => 0) as Promise<number>,
   ]);
@@ -137,7 +135,7 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     tickets: { total: totalTickets, open: openTickets },
     sessions: { total: totalSessions, active: activeSessions },
     auditEvents: { last30Days: totalAuditEvents },
-    roles: { total: totalRoles },
+    roles: { total: 0 },
     apps: { total: totalApps },
     apiKeys: { active: activeApiKeys },
   });
