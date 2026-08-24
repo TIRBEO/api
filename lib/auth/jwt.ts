@@ -222,6 +222,41 @@ export async function verifyMergeToken(
       photoUrl: (payload.photoUrl as string) || undefined,
       existingUserId: payload.existingUserId as string,
     };
+  } catch { return null; }
+}
+
+// ═══ PENDING OAUTH SIGNUP ═══
+// Signed, short-lived token carrying the provider profile while the user
+// reviews the account-creation screen. No account exists until they accept.
+
+export async function signPendingSignupToken(data: {
+  provider: string;
+  providerId: string;
+  email: string;
+  name?: string;
+  photoUrl?: string;
+}): Promise<string> {
+  return new SignJWT({ purpose: 'pending-oauth-signup', ...data })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('15m')
+    .sign(getSecret());
+}
+
+export async function verifyPendingSignupToken(
+  token: string,
+): Promise<{ provider: string; providerId: string; email: string; name?: string; photoUrl?: string } | null> {
+  try {
+    const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
+    if (payload.purpose !== 'pending-oauth-signup') return null;
+    if (!payload.provider || !payload.providerId || !payload.email) return null;
+    return {
+      provider: payload.provider as string,
+      providerId: payload.providerId as string,
+      email: payload.email as string,
+      name: (payload.name as string) || undefined,
+      photoUrl: (payload.photoUrl as string) || undefined,
+    };
   } catch {
     return null;
   }

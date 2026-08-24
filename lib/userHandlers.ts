@@ -10,9 +10,9 @@ import { createNotification, describeDevice, fmtNow, getClientIpFromRequest } fr
 import { sanitizeInput } from './security';
 import { verifyMergeToken } from './auth/jwt';
 import { bustProfileCache } from './authHandlers';
-import { isPushConfigured, getVapidPublicKey, subscribeToPush, unsubscribeFromPush, sendPushNotification } from './push-notifications';
 import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
+import { logSecurityEvent } from './security';
 import { withRetry } from './db/prisma';
 
 // The dashboard polls notifications; short TTL keeps the poll cheap without
@@ -23,7 +23,7 @@ const notificationsCache = createTtlCache<{ notifications: any[]; unread: number
 // only one makes the actual DB query — the others wait and share the result.
 const inFlightNotifications = new Map<string, Promise<{ notifications: any[]; unread: number; total: number }>>();
 
-function bustNotificationsCache(userId: string) {
+export function bustNotificationsCache(userId: string) {
   notificationsCache.clear();
   inFlightNotifications.clear();
 }
@@ -76,9 +76,8 @@ export async function extendedProfileHandler(request: NextRequest) {
       const { passwordHash, googleId, githubId, discordId, totpSecret, ...safe } = user;
       const consentData = ((user as any).consents as Record<string, any>) || {};
       const prefs = consentData;
-      const [recoveryCodesCount] = await Promise.all([
-        prisma.recoveryCode.count({ where: { userId: session.userId } }),
-      ]);
+      const backupCodes = (user as any).backupCodes as any[] | null;
+      const recoveryCodesCount = Array.isArray(backupCodes) ? backupCodes.length : 0;
       return NextResponse.json({
         ...safe,
         hasPassword: !!passwordHash,
@@ -108,6 +107,7 @@ export async function extendedProfileHandler(request: NextRequest) {
         website: z.string().url().optional().nullable(),
         linkedin: z.string().optional().nullable(),
         github: z.string().optional().nullable(),
+        githubUsername: z.string().optional().nullable(),
         twitter: z.string().optional().nullable(),
         country: z.string().optional().nullable(),
         timezone: z.string().optional().nullable(),
@@ -136,6 +136,7 @@ export async function extendedProfileHandler(request: NextRequest) {
       if (raw.website !== undefined) data.website = raw.website;
       if (raw.linkedin !== undefined) data.linkedin = raw.linkedin;
       if (raw.github !== undefined) data.githubUsername = raw.github;
+      if (raw.githubUsername !== undefined) data.githubUsername = raw.githubUsername;
       if (raw.twitter !== undefined) data.twitter = raw.twitter;
       if (raw.country !== undefined) data.country = raw.country;
       if (raw.timezone !== undefined) data.timezone = raw.timezone;
@@ -226,14 +227,9 @@ export async function changePasswordHandler(request: NextRequest) {
       if (!(await verifyPassword(user.passwordHash, currentPassword))) {
         return new NextResponse('Current password is incorrect', { status: 401 });
       }
-    } else {
-      // Passwordless (OAuth-only) user — require OTP
-      if (!otpCode || typeof otpCode !== 'string') {
-        return new NextResponse('Verification code required for passwordless accounts', { status: 400 });
-      }
-      const ok = await verifyOtpCode(session.userId, 'email', otpCode);
-      if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
-     }
+    }
+    // Passwordless (OAuth) account: email already verified by the provider —
+    // no OTP or current password needed to set the first password.
 
     const { checkPasswordBreach } = await import('./auth/breach');
     const breach = await checkPasswordBreach(newPassword);
@@ -246,6 +242,7 @@ export async function changePasswordHandler(request: NextRequest) {
     await prisma.session.deleteMany({
       where: { userId: session.userId, NOT: { id: session.sessionId } },
     });
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.password_changed', details: { method: 'password' } }).catch(() => {});
 
     const userEmail = (await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } }))?.email || '';
     if (userEmail) {
@@ -381,8 +378,8 @@ export async function notificationsHandler(request: NextRequest) {
 
     if (request.method === 'PATCH') {
       const body: any = await request.json();
-      const { notificationIds, markAll } = body;
-      if (markAll) {
+      const { notificationIds, markAll, markAllRead } = body;
+      if (markAll || markAllRead) {
         await prisma.notification.updateMany({ where: { userId: session.userId, isRead: false }, data: { isRead: true } });
       } else if (notificationIds && Array.isArray(notificationIds)) {
         await prisma.notification.updateMany({ where: { id: { in: notificationIds }, userId: session.userId }, data: { isRead: true } });
@@ -421,156 +418,47 @@ export async function notificationsHandler(request: NextRequest) {
 }
 
 export async function notificationPrefsHandler(request: NextRequest) {
-  const DEFAULT_PREFS = {
-    userId: '', type: 'all',
-    email: true, push: true, inApp: true,
-    security: true, forms: true, product: true, support: true,
-    securityEmail: true, securityPush: true, securityInApp: true,
-    formsEmail: true, formsPush: true, formsInApp: true,
-    productEmail: true, productPush: true, productInApp: true,
-    supportEmail: true, supportPush: true, supportInApp: true,
-    quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
-    digestEnabled: false, digestFrequency: 'daily',
-    createdAt: new Date(), updatedAt: new Date(),
-  };
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
+    // Default notification preferences (all enabled)
+    const DEFAULT_PREFS: Record<string, any> = {
+      email: true, push: true, inApp: true,
+      security: true, forms: true, product: true, support: true,
+      quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
+      digestEnabled: false, digestFrequency: 'daily',
+      tipsEmail: true, weeklySummary: false,
+      securityEmail: true, securityPush: true, securityInApp: true,
+      formsEmail: true, formsPush: true, formsInApp: true,
+      productEmail: true, productPush: true, productInApp: true,
+      supportEmail: true, supportPush: true, supportInApp: true,
+    };
+
     if (request.method === 'GET') {
-      let prefs: any = null;
-      try {
-        prefs = await prisma.notificationPreference.findUnique({ where: { userId: session.userId } });
-      } catch (colErr: any) {
-        // If columns are missing, try raw query with only base columns
-        console.warn('[NOTIFICATIONS] Column error, falling back to base query:', colErr?.message?.slice(0, 100));
-        try {
-          const rows = await prisma.$queryRaw`SELECT * FROM notification_preferences WHERE user_id = ${session.userId} LIMIT 1`;
-          prefs = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
-        } catch { /* raw also fails — return defaults */ }
-      }
-      if (!prefs) {
-        try {
-          prefs = await prisma.notificationPreference.create({ data: { userId: session.userId } });
-        } catch { prefs = { ...DEFAULT_PREFS, userId: session.userId }; }
-      }
-      return NextResponse.json(prefs);
+      const user = await prisma.user.findUnique({ where: { id: session.userId },
+        select: { notificationPreferences: true }
+      });
+      if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+      const prefs = { ...DEFAULT_PREFS, ...((user.notificationPreferences as any) || {}) };
+      return NextResponse.json({ ok: true, ...prefs });
     }
 
     if (request.method === 'PUT') {
-      const body: any = await request.json();
-      const allowed = [
-        'type',
-        // Global channels
-        'email', 'push', 'inApp',
-        // Category toggles
-        'security', 'forms', 'product', 'support',
-        // Per-category x channel matrix
-        'securityEmail', 'securityPush', 'securityInApp',
-        'formsEmail', 'formsPush', 'formsInApp',
-        'productEmail', 'productPush', 'productInApp',
-        'supportEmail', 'supportPush', 'supportInApp',
-        // Quiet hours
-        'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
-        // Digest
-        'digestEnabled', 'digestFrequency',
-        // Email preferences card
-        'tipsEmail', 'weeklySummary',
-      ];
-      const data: Record<string, any> = {};
-      for (const key of allowed) {
-        if (body[key] !== undefined) data[key] = body[key];
-      }
-      try {
-        await prisma.notificationPreference.upsert({
-          where: { userId: session.userId },
-          create: { userId: session.userId, ...data },
-          update: data,
-        });
-      } catch (upsertErr: any) {
-        // If new columns missing, strip them and retry
-        console.warn('[NOTIFICATIONS] Upsert error, retrying with base columns:', upsertErr?.message?.slice(0, 100));
-        const baseKeys = ['type', 'email', 'push', 'inApp', 'security', 'forms', 'product', 'support'];
-        const baseData: Record<string, any> = {};
-        for (const k of baseKeys) { if (data[k] !== undefined) baseData[k] = data[k]; }
-        try {
-          await prisma.notificationPreference.upsert({
-            where: { userId: session.userId },
-            create: { userId: session.userId, ...baseData },
-            update: baseData,
-          });
-        } catch { /* give up gracefully */ }
-      }
-      const snapshot = { ...DEFAULT_PREFS, ...data };
-      await prisma.$executeRaw`UPDATE users SET notification_preferences = ${JSON.stringify(snapshot)}::jsonb, updated_at = now() WHERE id = ${session.userId}`;
-
-      return NextResponse.json({ ok: true, message: 'Notification preferences updated' });
+      const body: any = await request.json().catch(() => ({}));
+      // Read existing prefs
+      const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { notificationPreferences: true } });
+      const existing = (user?.notificationPreferences as any) || {};
+      // Merge incoming fields into the JSON column
+      const merged = { ...DEFAULT_PREFS, ...existing, ...body };
+      await prisma.user.update({ where: { id: session.userId }, data: { notificationPreferences: merged } });
+      return NextResponse.json({ ok: true, message: 'Notification preferences updated', ...merged });
     }
 
     return new NextResponse('Method not allowed', { status: 405 });
   } catch (err: any) {
     console.error('[NOTIFICATION_PREFS]', err?.message || err);
     return new NextResponse('Failed to process request', { status: 500 });
-  }
-}
-
-export async function pushSubscriptionHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    if (request.method === 'GET') {
-      if (!isPushConfigured()) {
-        return NextResponse.json({ error: { code: 'PUSH_NOT_CONFIGURED', message: 'Push notifications are not configured.' } }, { status: 400 });
-      }
-      return NextResponse.json({ publicKey: getVapidPublicKey() });
-    }
-
-    if (request.method === 'POST') {
-      const body: any = await request.json();
-      const { endpoint, p256dh, auth } = body;
-      if (!endpoint || !p256dh || !auth) {
-        return new NextResponse('Invalid push subscription', { status: 400 });
-      }
-      await subscribeToPush(session.userId, { endpoint, p256dh, auth }, request.headers.get('user-agent') || undefined);
-      return NextResponse.json({ ok: true, message: 'Subscribed' });
-    }
-
-    if (request.method === 'DELETE') {
-      const body: any = await request.json().catch(() => ({}));
-      const endpoint = body?.endpoint;
-      if (!endpoint) return new NextResponse('endpoint required', { status: 400 });
-      await unsubscribeFromPush(session.userId, endpoint);
-      return NextResponse.json({ ok: true, message: 'Unsubscribed' });
-    }
-
-    return new NextResponse('Method not allowed', { status: 405 });
-  } catch (err: any) {
-    console.error('[PUSH SUBSCRIBE]', err?.message || err);
-    return new NextResponse('Failed to update push subscription', { status: 500 });
-  }
-}
-
-export async function sendTestPushHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    if (!isPushConfigured()) {
-      return new NextResponse('Push notifications are not configured', { status: 400 });
-    }
-    const result = await sendPushNotification(session.userId, {
-      title: 'Test notification',
-      body: 'This is a test push notification from Tirbeo.',
-      url: '/account/inbox',
-    });
-    if (result.sent === 0) {
-      return new NextResponse('You have no active push subscriptions', { status: 400 });
-    }
-    return NextResponse.json({ message: `Test sent to ${result.sent} device(s)` });
-  } catch (err: any) {
-    console.error('[PUSH SEND]', err?.message || err);
-    return new NextResponse('Failed to send test notification', { status: 500 });
   }
 }
 
@@ -602,9 +490,6 @@ export async function oauthUnlinkHandler(request: NextRequest, provider: string)
 
     await prisma.user.update({ where: { id: user.id }, data: { [field]: null } });
 
-    // Full reset — remove the integration record so re-connecting starts clean.
-    await prisma.integration.deleteMany({ where: { userId: user.id, provider } }).catch(() => {});
-
     createNotification({
       userId: user.id,
       type: 'security',
@@ -625,547 +510,51 @@ export async function integrationsHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
+    const PROVIDERS: Record<string, 'googleId' | 'githubId' | 'discordId'> = {
+      google: 'googleId', github: 'githubId', discord: 'discordId',
+    };
+
+    const readConnections = async () => {
+      const user = await prisma.user.findUnique({
+        where: { id: session.userId },
+        select: { googleId: true, githubId: true, discordId: true },
+      });
+      return Object.entries(PROVIDERS).map(([provider, field]) => ({
+        id: `${session.userId}:${provider}`,
+        provider,
+        connected: !!((user as any)?.[field]),
+      }));
+    };
+
     if (request.method === 'GET') {
-      const integrations = await prisma.integration.findMany({
-        where: { userId: session.userId },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true, provider: true, connected: true, createdAt: true, updatedAt: true },
-      });
-      return NextResponse.json(integrations);
+      return NextResponse.json(await readConnections());
     }
 
-    if (request.method === 'POST') {
-      const body: any = await request.json();
-      const { provider, connected } = body;
-      if (!provider) return new NextResponse('provider required', { status: 400 });
-
-      // Disconnect semantics: remove everything — no lingering rows.
-      if (connected === false) {
-        const fieldMap: Record<string, 'googleId' | 'githubId' | 'discordId'> = { google: 'googleId', github: 'githubId', discord: 'discordId' };
-        if (fieldMap[provider]) {
-          await prisma.user.update({ where: { id: session.userId }, data: { [fieldMap[provider]]: null } }).catch(() => {});
-        }
-        await prisma.integration.deleteMany({ where: { userId: session.userId, provider } });
-        return NextResponse.json({ ok: true, message: `${provider} disconnected` });
-      }
-
-      const integration = await prisma.integration.upsert({
-        where: { userId_provider: { userId: session.userId, provider } },
-        update: { connected: connected ?? true },
-        create: { userId: session.userId, provider, connected: connected ?? true },
-      });
-      if (integration.connected) {
-        createNotification({
-          userId: session.userId,
-          type: 'security',
-          title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} connected`,
-          body: `Your ${provider} account is now linked and active on Tirbeo (connected on ${fmtNow()}).`,
-          link: '/account/apps',
-        }).catch((e) => console.error('[NOTIFICATION]', e?.message));
-      }
-      return NextResponse.json(integration);
+    // POST/DELETE only manage real sign-in links on the user row.
+    if (request.method !== 'POST' && request.method !== 'DELETE') {
+      return new NextResponse('Method not allowed', { status: 405 });
     }
+    const body: any = await request.json().catch(() => ({}));
+    const provider = body?.provider;
+    const field = PROVIDERS[provider];
+    if (!field) return new NextResponse('Unsupported provider', { status: 400 });
 
-    if (request.method === 'DELETE') {
-      const body: any = await request.json();
-      const { provider } = body;
-      if (!provider) return new NextResponse('provider required', { status: 400 });
-      // Sync rule: removing the integration also clears the sign-in link.
-      const fieldMap: Record<string, 'googleId' | 'githubId' | 'discordId'> = { google: 'googleId', github: 'githubId', discord: 'discordId' };
-      if (fieldMap[provider]) {
-        await prisma.user.update({ where: { id: session.userId }, data: { [fieldMap[provider]]: null } }).catch(() => {});
-      }
-      await prisma.integration.deleteMany({ where: { userId: session.userId, provider } });
-      return new NextResponse('Integration removed', { status: 200 });
-    }
+    await prisma.user.update({ where: { id: session.userId }, data: { [field]: null } }).catch(() => {});
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    createNotification({
+      userId: session.userId,
+      type: 'security',
+      title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} disconnected`,
+      body: `Your ${provider} sign-in link was removed on ${fmtNow()}.`,
+    }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+
+    return NextResponse.json({ ok: true, connections: await readConnections() });
   } catch (err: any) {
     console.error('[INTEGRATIONS]', err?.message || err);
     return new NextResponse('Failed to process request', { status: 500 });
   }
 }
 
-export async function userActivityHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-    const limit = Math.min(Math.max(Number(request.nextUrl.searchParams.get('limit')) || 50, 1), 100);
-    const cacheKey = `act2:${session.userId}:${limit}`;
-    const cached = activityCache.get(cacheKey);
-    if (cached) return NextResponse.json(cached);
-
-    const [audits, security] = await Promise.all([
-      prisma.auditEvent.findMany({
-        where: { actorId: session.userId },
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        select: { id: true, action: true, targetType: true, targetId: true, metadata: true, severity: true, createdAt: true },
-      }),
-      prisma.securityEvent.findMany({
-        where: { userId: session.userId },
-        orderBy: { createdAt: 'desc' },
-        take: limit,
-        select: { id: true, eventType: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true },
-      }),
-    ]);
-
-    const items = [
-      ...audits.map((a: any) => ({
-        id: a.id,
-        source: 'audit',
-        action: a.action,
-        targetType: a.targetType,
-        targetId: a.targetId,
-        metadata: a.metadata || {},
-        severity: a.severity,
-        createdAt: a.createdAt,
-      })),
-      ...security.map((s: any) => ({
-        id: `sec-${s.id}`,
-        source: 'security',
-        action: s.eventType,
-        targetType: 'security',
-        targetId: null,
-        metadata: {
-          ...(typeof s.metadata === 'object' && s.metadata !== null ? s.metadata : {}),
-          ip: s.ipAddress || undefined,
-          userAgent: s.userAgent || undefined,
-        },
-        severity: s.severity,
-        createdAt: s.createdAt,
-      })),
-    ]
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .slice(0, limit);
-
-    activityCache.set(cacheKey, items);
-    return NextResponse.json(items);
-  } catch (err: any) {
-    console.error('[USER ACTIVITY]', err?.message || err);
-    return new NextResponse('Failed to fetch activity', { status: 500 });
-  }
-}
-
-export async function preferencesHandler(request: NextRequest) {
-  const startTime = performance.now();
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    if (request.method === 'GET') {
-      // Check in-memory cache first
-      const cached = preferencesCache.get(session.userId);
-      if (cached) return NextResponse.json(cached);
-
-      const user = await prisma.user.findUnique({
-        where: { id: session.userId },
-        select: {
-          theme: true, language: true, timezone: true, dateFormat: true,
-          timeFormat: true,
-        },
-      });
-      if (!user) return jsonUnauthorized();
-      const result = {
-        theme: user.theme, language: user.language, timezone: user.timezone,
-        dateFormat: user.dateFormat, timeFormat: user.timeFormat,
-      };
-      preferencesCache.set(session.userId, result);
-      return NextResponse.json(result);
-    }
-
-    if (request.method === 'PATCH') {
-      const body: any = await request.json();
-      const schema = z.object({
-        theme: z.enum(['light', 'dark', 'system']).optional(),
-        language: z.string().optional(),
-        timezone: z.string().optional(),
-        dateFormat: z.string().optional(),
-        timeFormat: z.enum(['12h', '24h']).optional(),
-      });
-      const parsed = schema.safeParse(body);
-      if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
-      const d: Record<string, any> = { ...parsed.data };
-      Object.keys(d).forEach(k => { if (d[k] === undefined) delete d[k]; });
-      await prisma.user.update({ where: { id: session.userId }, data: d });
-      bustPreferencesCache(session.userId);
-      bustNotificationsCache(session.userId);
-      return NextResponse.json({ ok: true, message: 'Preferences updated' });
-    }
-
-    logPerformance('preferences', startTime);
-    return new NextResponse('Method not allowed', { status: 405 });
-  } catch (err: any) {
-    console.error('[PREFERENCES]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
-  }
-}
-
-// POST /api/security/set-password — OAuth users can set a password after verifying via OTP
-export async function setPasswordHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    const body: any = await request.json();
-    const { password, otpCode } = body;
-    if (!password || typeof password !== 'string' || password.length < 8) {
-      return new NextResponse('Password must be at least 8 characters', { status: 400 });
-    }
-    if (!otpCode || typeof otpCode !== 'string') {
-      return new NextResponse('OTP code required', { status: 400 });
-    }
-
-    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true } });
-    if (!user) return new NextResponse('User not found', { status: 404 });
-
-    const ok = await verifyOtpCode(session.userId, 'email', otpCode);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
-
-    const hash = await hashPassword(password);
-    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash, mustChangePassword: false } });
-    return new NextResponse('Password set successfully', { status: 200 });
-  } catch (err: any) {
-    console.error('[SET PASSWORD]', err?.message || err);
-    return new NextResponse('Failed to set password', { status: 500 });
-  }
-}
-
-export async function heartbeatHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (session?.userId) {
-      // Debounce: skip DB write if we already updated within the last 25s
-      const lastUpdate = heartbeatDebounce.get(session.userId) || 0;
-      if (Date.now() - lastUpdate < HEARTBEAT_DEBOUNCE_MS) {
-        return NextResponse.json({ ok: true });
-      }
-      heartbeatDebounce.set(session.userId, Date.now());
-      // Prune old entries periodically
-      if (heartbeatDebounce.size > 2000) {
-        const now = Date.now();
-        for (const [k, v] of heartbeatDebounce) {
-          if (now - v > HEARTBEAT_DEBOUNCE_MS) heartbeatDebounce.delete(k);
-        }
-      }
-      // Fire-and-forget: don't block the response
-      prisma.user.update({
-        where: { id: session.userId },
-        data: { lastActiveAt: new Date() },
-      }).catch(() => {});
-    }
-    return NextResponse.json({ ok: true });
-  } catch (err: any) {
-    console.error('[HEARTBEAT]', err?.message || err);
-    return NextResponse.json({ ok: true });
-  }
-}
-
-// POST /api/profile/request-edit-otp — send OTP before sensitive profile edits
-export async function requestProfileEditOtpHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
-    if (!user?.email) return new NextResponse('No email on file', { status: 400 });
-
-    const code = generateOtpCode();
-    await storeOtp(session.userId, 'email', code);
-    try {
-      await sendEmailOtp(user.email, code);
-    } catch (err) {
-      console.error('[PROFILE EDIT OTP] Email send failed, but OTP stored:', err);
-    }
-    return new NextResponse('Verification code sent', { status: 200 });
-  } catch (err: any) {
-    console.error('[PROFILE EDIT OTP REQUEST]', err?.message || err);
-    return new NextResponse('Failed to send verification code', { status: 500 });
-  }
-}
-
-// POST /api/profile/verify-edit-otp — verify OTP for sensitive profile edit
-export async function verifyProfileEditOtpHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    const { code } = (await request.json()) as any;
-    if (typeof code !== 'string') return new NextResponse('Invalid payload', { status: 400 });
-
-    const ok = await verifyOtpCode(session.userId, 'email', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
-
-    return NextResponse.json({ verified: true, message: 'Profile edit authorized' });
-  } catch (err: any) {
-    console.error('[PROFILE EDIT OTP VERIFY]', err?.message || err);
-    return new NextResponse('Failed to verify code', { status: 500 });
-  }
-}
-
-// POST /api/profile/avatar — upload avatar image
-export async function avatarUploadHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    const formData = await request.formData();
-    const file = formData.get('avatar') as File | null;
-    if (!file) return new NextResponse('No file uploaded', { status: 400 });
-
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-    if (!allowed.includes(file.type)) return new NextResponse('Invalid file type. Allowed: JPEG, PNG, WebP, GIF', { status: 400 });
-    if (file.size > 5 * 1024 * 1024) return new NextResponse('File too large. Max 5MB', { status: 400 });
-
-    const ext = file.name.split('.').pop() || 'jpg';
-    const fileName = `avatar-${session.userId}-${Date.now()}.${ext}`;
-
-    const { storeMediaFile } = await import('./mediaStorage');
-    const { url: photoUrl } = await storeMediaFile({
-      key: `avatars/${fileName}`,
-      body: Buffer.from(await file.arrayBuffer()),
-      contentType: file.type,
-    });
-
-    await prisma.user.update({
-      where: { id: session.userId },
-      data: { photoUrl },
-    });
-    // Header/sidebar read the 10s-cached /users/me — bust it so the new
-    // picture shows immediately on next navigation/poll.
-    bustProfileCache(session.userId);
-
-    createNotification({
-      userId: session.userId,
-      type: 'system',
-      title: 'Profile photo updated',
-      body: `Your profile photo was changed on ${fmtNow()}. It now appears across the dashboard, header and sidebar.`,
-      link: '/account/profile',
-    }).catch((e) => console.error('[NOTIFICATION]', e?.message));
-
-    return NextResponse.json({ photoUrl, message: 'Avatar updated' });
-  } catch (err: any) {
-    console.error('[AVATAR UPLOAD]', err?.message || err);
-    return new NextResponse('Failed to upload avatar', { status: 500 });
-  }
-}
-
-
-
-export async function exportDataHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    if (request.method !== 'GET' && request.method !== 'POST') return new NextResponse('Method not allowed', { status: 405 });
-
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      select: {
-        id: true, email: true, name: true, photoUrl: true,
-        phoneNumber: true, occupation: true, bio: true,
-        secondaryEmail: true, gender: true, birthday: true,
-        website: true, linkedin: true, githubUsername: true, twitter: true,
-        country: true, timezone: true, language: true, theme: true,
-        dateFormat: true, timeFormat: true,
-        companyName: true, companyRole: true, industry: true, companySize: true,
-        adminRole: true, is2FAEnabled: true,
-        createdAt: true, updatedAt: true,
-        consents: true,
-      },
-    });
-    if (!user) return new NextResponse('User not found', { status: 404 });
-
-    const sessions = await prisma.session.findMany({
-      where: { userId: session.userId },
-      select: { id: true, createdAt: true, expiresAt: true },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    const auditLogs = await prisma.auditEvent.findMany({
-      where: { actorId: session.userId },
-      select: { action: true, createdAt: true, ipAddress: true },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
-
-    const notifications = await prisma.notification.findMany({
-      where: { userId: session.userId },
-      select: { title: true, body: true, isRead: true, createdAt: true },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
-
-    const exportData = {
-      exportedAt: new Date().toISOString(),
-      profile: user,
-      sessions,
-      auditLogs,
-      notifications,
-      consents: (user as any).consents ?? {},
-    };
-
-    const url = new URL(request.url);
-    // GET ?download=1 — return the archive as a downloadable attachment.
-    if (request.method === 'GET' && url.searchParams.get('download') === '1') {
-      return new NextResponse(JSON.stringify(exportData, null, 2), {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Disposition': `attachment; filename="tirbeo-export-${new Date().toISOString().slice(0, 10)}.json"`,
-        },
-      });
-    }
-
-    // GET (no param) — inline JSON for direct API access.
-    if (request.method === 'GET') {
-      return NextResponse.json(exportData);
-    }
-
-    // POST — prepare the archive, notify the user and email the download link.
-    const origin = `${url.protocol}//${url.host}`;
-    const downloadUrl = `${origin}/api/user/export-data?download=1`;
-
-    Promise.allSettled([
-      createNotification({
-        userId: session.userId,
-        type: 'system',
-        title: 'Data export ready',
-        body: `Your data archive was prepared on ${fmtNow()}. Download it from Privacy settings — the link also works from the email we sent you.`,
-        link: '/account/privacy',
-      }),
-      sendTemplateEmail(user.email, 'export_ready', {
-        name: user.name || 'there',
-        exportedAt: new Date().toLocaleString(),
-        downloadUrl,
-      }),
-    ]);
-
-    await prisma.auditEvent.create({
-      data: {
-        actorId: session.userId,
-        action: 'DATA_EXPORT_REQUESTED',
-        ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
-        userAgent: request.headers.get('user-agent') || 'unknown',
-        metadata: { requestedAt: new Date().toISOString() },
-      },
-    });
-
-    return NextResponse.json({
-      ok: true,
-      message: 'Your data export is being prepared. You will receive an email when it is ready.',
-      downloadUrl,
-    });
-  } catch (err: any) {
-    console.error('[EXPORT]', err?.message || err);
-    return new NextResponse('Failed to export data', { status: 500 });
-  }
-}
-
-export async function deleteAccountRequestHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    const url = new URL(request.url);
-    // Cancel a scheduled deletion
-    if (request.method === 'DELETE' && url.searchParams.get('cancel') === '1') {
-      const existing = await prisma.user.findUnique({ where: { id: session.userId }, select: { scheduledDeletionAt: true } });
-      if (!existing?.scheduledDeletionAt) return NextResponse.json({ ok: false, message: 'No deletion is scheduled.' }, { status: 400 });
-      await prisma.user.update({ where: { id: session.userId }, data: { scheduledDeletionAt: null, deletionReason: null } });
-      await prisma.auditEvent.create({
-        data: { actorId: session.userId, action: 'DELETE_ACCOUNT_CANCELLED', ipAddress: request.headers.get('x-forwarded-for') || 'unknown', metadata: {} },
-      }).catch(() => {});
-      bustNotificationsCache(session.userId);
-      return NextResponse.json({ ok: true, message: 'Deletion cancelled. Your account is safe.' });
-    }
-
-    if (request.method !== 'POST') return new NextResponse('Method not allowed', { status: 405 });
-
-    const body: any = await request.json().catch(() => ({}));
-    const reason = typeof body.reason === 'string' ? sanitizeInput(body.reason, 500).trim() : '';
-    const graceDays = 30;
-    const scheduledFor = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000);
-
-    const user = await prisma.user.update({
-      where: { id: session.userId },
-      data: { scheduledDeletionAt: scheduledFor, deletionReason: reason || 'Not specified' },
-      select: { email: true, name: true, scheduledDeletionAt: true },
-    });
-
-    await prisma.auditEvent.create({
-      data: {
-        actorId: session.userId,
-        action: 'DELETE_ACCOUNT_REQUEST',
-        ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown',
-        userAgent: request.headers.get('user-agent') || 'unknown',
-        metadata: { email: user.email, reason: reason || 'Not specified', scheduledFor: scheduledFor.toISOString() },
-      },
-    });
-
-    const { sendTemplateEmail } = await import('./email');
-    sendTemplateEmail(user.email, 'account_deleted', {
-      name: user.name || user.email,
-      dateLabel: scheduledFor.toUTCString(),
-      dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
-    }).catch(() => {});
-
-    bustNotificationsCache(session.userId);
-    return NextResponse.json({
-      ok: true,
-      scheduledFor: scheduledFor.toISOString(),
-      message: `Account scheduled for deletion on ${scheduledFor.toUTCString()}. You can cancel anytime before then.`,
-    });
-  } catch (err: any) {
-    console.error('[DELETE_ACCOUNT]', err?.message || err);
-    return new NextResponse('Failed to process deletion request', { status: 500 });
-  }
-}
-
-export async function publicProfileHandler(request: NextRequest) {
-  try {
-    if (request.method !== 'GET') return new NextResponse('Method not allowed', { status: 405 });
-
-    const url = new URL(request.url);
-    const userId = url.searchParams.get('userId');
-    if (!userId) return new NextResponse('userId required', { status: 400 });
-
-    // Check cache first (public profiles rarely change)
-    const cached = publicProfileCache.get(userId);
-    if (cached) return NextResponse.json(cached);
-
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true, name: true, email: true, photoUrl: true, bio: true, occupation: true,
-        country: true, createdAt: true, lastActiveAt: true,
-      },
-    });
-    if (!user) return new NextResponse('User not found', { status: 404 });
-
-
-    const profile: Record<string, any> = { id: user.id, name: user.name, photoUrl: user.photoUrl };
-    profile.email = user.email;
-
-    profile.country = user.country;
-    profile.isOnline = user.lastActiveAt && (Date.now() - new Date(user.lastActiveAt).getTime()) < 300000;
-    profile.lastActiveAt = user.lastActiveAt;
-    profile.bio = user.bio;
-    profile.occupation = user.occupation;
-    profile.createdAt = user.createdAt;
-
-    publicProfileCache.set(userId, profile);
-    return NextResponse.json(profile);
-  } catch (err: any) {
-    console.error('[PUBLIC_PROFILE]', err?.message || err);
-    return new NextResponse('Failed to fetch profile', { status: 500 });
-  }
-}
-
-/**
- * POST /integrations/merge — Merge an OAuth provider account into the current user.
- * Body: { merge_token: string, action: 'merge' | 'cancel' }
- */
 export async function mergeAccountsHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
@@ -1229,17 +618,7 @@ export async function mergeAccountsHandler(request: NextRequest) {
       },
     });
 
-    // Create integration for current user
-    await prisma.integration.upsert({
-      where: { userId_provider: { userId: session.userId, provider } },
-      update: { connected: true, metadata: { [`${provider}Id`]: providerId, email } },
-      create: { userId: session.userId, provider, connected: true, metadata: { [`${provider}Id`]: providerId, email } },
-    });
 
-    // Remove integration from existing user if any
-    await prisma.integration.deleteMany({
-      where: { userId: existingUserId, provider },
-    }).catch(() => {});
 
     // Audit log
     await prisma.auditEvent.create({
@@ -1257,5 +636,319 @@ export async function mergeAccountsHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[MERGE ACCOUNTS]', err?.message || err);
     return NextResponse.json({ error: 'Failed to merge accounts' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// USER ACTIVITY HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function userActivityHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+    const offset = parseInt(url.searchParams.get('offset') || '0');
+
+    const [auditEvents, securityEvents] = await Promise.all([
+      prisma.auditEvent.findMany({
+        where: { actorId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        take: limit + offset,
+      }),
+      prisma.securityEvent.findMany({
+        where: { userId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        take: limit + offset,
+      }),
+    ]);
+
+    // Merge into a single flat array sorted by date — dashboard expects this format
+    const merged = [
+      ...auditEvents.map(e => ({
+        id: e.id, source: 'audit', action: e.action, targetType: e.targetType,
+        targetId: e.targetId, metadata: e.metadata, severity: e.severity,
+        createdAt: e.createdAt,
+      })),
+      ...securityEvents.map(e => ({
+        id: e.id, source: 'security', action: e.eventType, targetType: null as string | null,
+        targetId: null as string | null, metadata: e.metadata, severity: e.severity,
+        createdAt: e.createdAt,
+      })),
+    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(offset, offset + limit);
+
+    return NextResponse.json(merged);
+  } catch (err: any) {
+    console.error('[USER ACTIVITY]', err?.message || err);
+    return NextResponse.json([]);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PREFERENCES HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function preferencesHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    if (request.method === 'GET') {
+      return NextResponse.json({
+        ok: true,
+        preferences: {
+          theme: user.theme || 'system',
+          language: user.language || 'en',
+          timezone: user.timezone || 'UTC',
+        },
+      });
+    }
+
+    if (request.method === 'PATCH' || request.method === 'PUT') {
+      const body: any = await request.json().catch(() => ({}));
+      const update: Record<string, unknown> = {};
+      if (body.theme) update.theme = body.theme;
+      if (body.language) update.language = body.language;
+      if (body.timezone) update.timezone = body.timezone;
+
+      await prisma.user.update({ where: { id: session.userId }, data: update });
+      return NextResponse.json({ ok: true });
+    }
+
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
+  } catch (err: any) {
+    console.error('[PREFERENCES]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to update preferences' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SET PASSWORD HANDLER (for OAuth users adding a password)
+// ═══════════════════════════════════════════════════════════════════
+export async function setPasswordHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json().catch(() => ({}));
+    const { password, currentPassword } = body as { password?: string; currentPassword?: string };
+
+    if (!password || password.length < 8) {
+      return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    // If user has a password, verify current. Passwordless (OAuth) accounts
+    // can set their first password directly — email is provider-verified.
+    if (user.passwordHash) {
+      if (!currentPassword) return NextResponse.json({ error: 'Current password required' }, { status: 400 });
+      const valid = await verifyPassword(currentPassword, user.passwordHash);
+      if (!valid) return NextResponse.json({ error: 'Current password is incorrect' }, { status: 400 });
+    }
+
+    const hash = await hashPassword(password);
+    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash, mustChangePassword: false } });
+
+    return NextResponse.json({ ok: true, message: 'Password updated' });
+  } catch (err: any) {
+    console.error('[SET PASSWORD]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to set password' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PROFILE EDIT OTP HANDLERS
+// ═══════════════════════════════════════════════════════════════════
+export async function requestProfileEditOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json().catch(() => ({}));
+    const { field } = body as { field?: string };
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    const email = user.email;
+    const code = generateOtpCode();
+    await storeOtp(session.userId, `profile-edit:${field || 'general'}` as any, code);
+    await sendEmailOtp(email, code);
+
+    return NextResponse.json({ ok: true, message: 'Verification code sent' });
+  } catch (err: any) {
+    console.error('[REQUEST PROFILE EDIT OTP]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to send verification code' }, { status: 500 });
+  }
+}
+
+export async function verifyProfileEditOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json().catch(() => ({}));
+    const { code, field } = body as { code?: string; field?: string };
+
+    if (!code) return NextResponse.json({ error: 'Verification code required' }, { status: 400 });
+
+    const valid = await verifyOtpCode(session.userId, `profile-edit:${field || 'general'}` as any, code);
+    if (!valid) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
+
+    return NextResponse.json({ ok: true, verified: true });
+  } catch (err: any) {
+    console.error('[VERIFY PROFILE EDIT OTP]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to verify code' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// AVATAR UPLOAD HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function avatarUploadHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json().catch(() => ({}));
+    const { url } = body as { url?: string };
+
+    if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 });
+
+    await prisma.user.update({ where: { id: session.userId }, data: { photoUrl: url } });
+
+    return NextResponse.json({ ok: true, photoUrl: url });
+  } catch (err: any) {
+    console.error('[AVATAR UPLOAD]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to update avatar' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HEARTBEAT HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function heartbeatHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    await prisma.session.updateMany({
+      where: { userId: session.userId, revoked: false },
+      data: { lastActiveAt: new Date() },
+    }).catch(() => {});
+
+    return NextResponse.json({ ok: true });
+  } catch {
+    return NextResponse.json({ ok: true });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EXPORT DATA HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function exportDataHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    // Export user data (excluding sensitive fields)
+    const { passwordHash, totpSecret, backupCodes, ...userData } = user as any;
+    const [sessions, auditEvents, securityEvents, loginHistory, notifications] = await Promise.all([
+      prisma.session.findMany({ where: { userId: session.userId } }),
+      prisma.auditEvent.findMany({ where: { actorId: session.userId } }),
+      prisma.securityEvent.findMany({ where: { userId: session.userId } }),
+      prisma.login_history.findMany({ where: { userId: session.userId } }),
+      prisma.notification.findMany({ where: { userId: session.userId } }),
+    ]);
+
+    return NextResponse.json({
+      ok: true,
+      export: {
+        user: userData,
+        sessions: sessions.map(s => ({ id: s.id, userAgent: s.userAgent, ip: s.ipAddress, createdAt: s.createdAt })),
+        auditEvents,
+        securityEvents,
+        loginHistory,
+        notifications: notifications.map(n => ({ title: n.title, message: n.body, type: n.type, createdAt: n.createdAt })),
+      },
+    });
+  } catch (err: any) {
+    console.error('[EXPORT DATA]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to export data' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DELETE ACCOUNT REQUEST HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function deleteAccountRequestHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const body = await request.json().catch(() => ({}));
+    const { password, reason } = body as { password?: string; reason?: string };
+
+    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    // If user has password, verify it
+    if (user.passwordHash && password) {
+      const valid = await verifyPassword(password, user.passwordHash);
+      if (!valid) return NextResponse.json({ error: 'Password is incorrect' }, { status: 400 });
+    }
+
+    // Send confirmation email
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'delete-account' as any, code);
+    await sendEmailOtp(user.email, code);
+
+    // Log the request
+    await prisma.auditEvent.create({
+      data: {
+        actorId: session.userId,
+        action: 'account.delete-request',
+        targetType: 'user',
+        targetId: session.userId,
+        metadata: { reason },
+        severity: 'critical',
+      },
+    }).catch(() => {});
+
+    return NextResponse.json({ ok: true, message: 'Confirmation code sent to your email' });
+  } catch (err: any) {
+    console.error('[DELETE ACCOUNT]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to process deletion request' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PUBLIC PROFILE HANDLER
+// ═══════════════════════════════════════════════════════════════════
+export async function publicProfileHandler(request: NextRequest) {
+  try {
+    const url = new URL(request.url);
+    const userId = url.searchParams.get('userId') || url.pathname.split('/').pop();
+
+    if (!userId) return NextResponse.json({ error: 'userId required' }, { status: 400 });
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, name: true, username: true, photoUrl: true, createdAt: true },
+    });
+
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    return NextResponse.json({ ok: true, profile: user });
+  } catch (err: any) {
+    console.error('[PUBLIC PROFILE]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to fetch profile' }, { status: 500 });
   }
 }

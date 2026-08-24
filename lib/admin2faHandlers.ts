@@ -23,9 +23,9 @@ export async function setup2faHandler(request: NextRequest) {
     data: { totpSecret: secret },
   });
 
-  await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
-  await prisma.recoveryCode.createMany({
-    data: recoveryCodes.map(code => ({ userId: session.userId, code: hashRecoveryCode(code) })),
+  await prisma.user.update({
+    where: { id: session.userId },
+    data: { backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 
   await createAuditEvent({
@@ -95,7 +95,10 @@ export async function disable2faHandler(request: NextRequest) {
     data: { totpSecret: null, is2FAEnabled: false },
   });
 
-  await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
+  await prisma.user.update({
+    where: { id: session.userId },
+    data: { backupCodes: [] },
+  });
 
   await createAuditEvent({
     actorId: session.userId,
@@ -117,9 +120,9 @@ export async function status2faHandler(request: NextRequest) {
     select: { is2FAEnabled: true, totpSecret: true },
   });
 
-  const recoveryCount = await prisma.recoveryCode.count({
-    where: { userId: session.userId, used: false },
-  });
+  const fullUser = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
+  const allCodes = Array.isArray((fullUser as any)?.backupCodes) ? (fullUser as any).backupCodes as any[] : [];
+  const recoveryCount = allCodes.filter((c: any) => !c.used).length;
 
   return NextResponse.json({
     enabled: user?.is2FAEnabled || false,
@@ -137,10 +140,9 @@ export async function regenerateRecoveryCodesHandler(request: NextRequest) {
   }
 
   const codes = generateRecoveryCodes(8);
-
-  await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
-  await prisma.recoveryCode.createMany({
-    data: codes.map(code => ({ userId: session.userId, code: hashRecoveryCode(code) })),
+  await prisma.user.update({
+    where: { id: session.userId },
+    data: { backupCodes: codes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 
   await createAuditEvent({

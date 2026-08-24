@@ -166,12 +166,12 @@ const notificationTimestamps: Record<string, number> = {};
 const NOTIFY_THROTTLE_MS = 60_000;
 
 export async function getAdminUsers() {
-  const assignments = await prisma.userRole.findMany({
-    where: { role: { name: { in: ['admin', 'super_admin'] } } },
-    include: { user: { select: { id: true, email: true, name: true } }, role: { select: { name: true } } },
+  const admins = await prisma.user.findMany({
+    where: { adminRole: { not: null } },
+    select: { id: true, email: true, name: true, adminRole: true },
   });
-  return assignments
-    .map(a => ({ ...a.user, roleName: a.role.name }))
+  return admins
+    .map(a => ({ ...a, roleName: a.adminRole as string }))
     .filter(u => u.email);
 }
 

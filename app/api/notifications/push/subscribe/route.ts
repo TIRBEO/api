@@ -25,7 +25,12 @@ export async function POST(request: NextRequest) {
     }
 
     const body: any = await request.json();
-    const { endpoint, p256dh, auth } = body;
+    // Accept both { endpoint, p256dh, auth } and the standard
+    // PushSubscriptionJSON { endpoint, keys: { p256dh, auth } } shape.
+    const keys = body?.keys || body || {};
+    const endpoint = body?.endpoint;
+    const p256dh = keys.p256dh;
+    const auth = keys.auth;
 
     if (!endpoint || !p256dh || !auth) {
       return NextResponse.json({ error: 'Missing subscription keys' }, { status: 400 });

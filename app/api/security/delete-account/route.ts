@@ -4,6 +4,7 @@ import { getSession } from '../../../../lib/session';
 import { verifyPassword } from '../../../../lib/auth/password';
 import { revokeSession } from '../../../../lib/auth/session';
 import { createAuditEvent } from '../../../../lib/audit';
+import { logSecurityEvent } from '../../../../lib/security';
 
 export const runtime = 'nodejs';
 
@@ -59,6 +60,7 @@ export async function POST(request: NextRequest) {
 
     // ─── Step 2: Soft-delete — hide all user data ───
     // The user row stays but is marked deleted. All queries exclude deletedAt != null.
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.deletion_scheduled', severity: 'warning', details: { reason: reason || 'user_requested' } }).catch(() => {});
     const scheduledDeletionAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
     await prisma.user.update({
@@ -96,16 +98,11 @@ export async function POST(request: NextRequest) {
     const deleteOps = [
       prisma.apiKey.deleteMany({ where: { userId: session.userId } }),
       prisma.otp.deleteMany({ where: { userId: session.userId } }),
-      prisma.recoveryCode.deleteMany({ where: { userId: session.userId } }),
+      prisma.user.update({ where: { id: session.userId }, data: { backupCodes: [] } }),
       prisma.passkey.deleteMany({ where: { userId: session.userId } }),
-      prisma.passkeyChallenge.deleteMany({ where: { userId: session.userId } }),
       prisma.notification.deleteMany({ where: { userId: session.userId } }),
-      prisma.notificationPreference.deleteMany({ where: { userId: session.userId } }),
-      prisma.pushSubscription.deleteMany({ where: { userId: session.userId } }),
       prisma.securityEvent.deleteMany({ where: { userId: session.userId } }),
-      prisma.integration.deleteMany({ where: { userId: session.userId } }),
       prisma.media.deleteMany({ where: { uploadedBy: session.userId } }),
-      prisma.userRole.deleteMany({ where: { userId: session.userId } }),
       prisma.login_history.deleteMany({ where: { userId: session.userId } }),
       prisma.ticket.deleteMany({ where: { customerId: session.userId } }),
       prisma.ticketMessage.deleteMany({ where: { authorId: session.userId } }),
@@ -216,6 +213,7 @@ export async function PATCH(request: NextRequest) {
       targetId: session.userId,
       metadata: { cancelledAt: new Date().toISOString() },
     }).catch(() => {});
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.deletion_cancelled' }).catch(() => {});
 
     return NextResponse.json({
       success: true,

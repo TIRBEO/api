@@ -6,29 +6,25 @@ import { jsonUnauthorized } from '../../../../lib/response';
 import { generateRecoveryCodes } from '../../../../lib/auth/totp';
 import { hashRecoveryCode } from '../../../../lib/auth/password';
 
-// GET /api/security/backup-codes - List backup codes
+// Backup codes live on users.backup_codes: [{ code: <hash>, used: boolean }]
+// Codes are stored hashed; plaintext is shown exactly once at generation time.
+
+// GET /api/security/backup-codes - Status only (codes are hashed at rest)
 export async function GET(request: NextRequest) {
   const session = await getSession(request);
   if (!session) return jsonUnauthorized();
 
-  const codes = await prisma.recoveryCode.findMany({
-    where: { userId: session.userId },
-    select: { id: true, code: true, used: true, createdAt: true, usedAt: true },
-    orderBy: { createdAt: 'desc' },
+  const user = await prisma.user.findUnique({
+    where: { id: session.userId },
+    select: { backupCodes: true },
   });
-
-  const count = codes.filter(c => !c.used).length;
+  const codes = Array.isArray((user as any)?.backupCodes) ? (user as any).backupCodes as any[] : [];
+  const unused = codes.filter((c) => c && c.used !== true).length;
 
   return NextResponse.json({
-    codes: codes.map(c => ({
-      id: c.id,
-      code: c.used ? '****-****' : c.code,
-      used: c.used || false,
-      usedAt: c.usedAt,
-      createdAt: c.createdAt,
-    })),
-    count,
-    enabled: count > 0,
+    total: codes.length,
+    count: unused,
+    enabled: codes.length > 0,
   });
 }
 
@@ -37,23 +33,15 @@ export async function POST(request: NextRequest) {
   const session = await getSession(request);
   if (!session) return jsonUnauthorized();
 
-  // Delete old codes
-  await prisma.recoveryCode.deleteMany({
-    where: { userId: session.userId },
-  });
-
-  // Generate new codes (stored hashed so they match the login-time comparison)
   const newCodes = generateRecoveryCodes(8);
 
-  await prisma.recoveryCode.createMany({
-    data: newCodes.map(code => ({
-      userId: session.userId,
-      code: hashRecoveryCode(code),
-      used: false,
-    })),
+  await prisma.user.update({
+    where: { id: session.userId },
+    data: {
+      backupCodes: newCodes.map((code) => ({ code: hashRecoveryCode(code), used: false })),
+    },
   });
 
-  // Audit event
   await createAuditEvent({
     actorId: session.userId,
     action: 'backup_codes.regenerated',

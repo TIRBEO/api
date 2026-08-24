@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
       return new NextResponse('Invalid 2FA code', { status: 401 });
     }
 
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name || null;
+    const adminRole = user.adminRole || null;
     if (!adminRole) {
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',

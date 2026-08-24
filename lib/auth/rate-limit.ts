@@ -156,35 +156,12 @@ let alertTriggered = false;
 
 async function getRateLimitConfig(): Promise<RateLimitConfig> {
   if (cachedConfig && Date.now() - cachedConfigAt < CONFIG_TTL) return cachedConfig;
-  let config: RateLimitConfig = {
+  const config: RateLimitConfig = {
     rateLimitEnabled: true,
     rateLimitPerMinute: MAX_REQUESTS,
     adminRoleMultipliers: DEFAULT_ADMIN_ROLE_MULTIPLIERS,
     ...DEFAULT_ALERT_CONFIG,
   };
-  try {
-    const { prisma } = await import('../db/prisma');
-    const record = await prisma.siteConfig.findUnique({ where: { app: 'api' } });
-    const c: any = record?.config || {};
-    config = {
-      rateLimitEnabled: c.rateLimitEnabled !== undefined ? !!c.rateLimitEnabled : true,
-      rateLimitPerMinute: typeof c.rateLimitPerMinute === 'number' && c.rateLimitPerMinute > 0
-        ? c.rateLimitPerMinute
-        : MAX_REQUESTS,
-      adminRoleMultipliers: c.adminRoleMultipliers && typeof c.adminRoleMultipliers === 'object'
-        ? { ...DEFAULT_ADMIN_ROLE_MULTIPLIERS, ...c.adminRoleMultipliers }
-        : DEFAULT_ADMIN_ROLE_MULTIPLIERS,
-      blockRateAlertThreshold: typeof c.blockRateAlertThreshold === 'number'
-        ? c.blockRateAlertThreshold
-        : DEFAULT_ALERT_CONFIG.blockRateAlertThreshold,
-      blockRateAlertEnabled: c.blockRateAlertEnabled !== undefined
-        ? !!c.blockRateAlertEnabled
-        : DEFAULT_ALERT_CONFIG.blockRateAlertEnabled,
-      blockRateAlertCooldown: typeof c.blockRateAlertCooldown === 'number'
-        ? c.blockRateAlertCooldown
-        : DEFAULT_ALERT_CONFIG.blockRateAlertCooldown,
-    };
-  } catch {}
   cachedConfig = config;
   cachedConfigAt = Date.now();
   return config;

@@ -5,6 +5,7 @@ import { requireAdmin, requireRole, canManageRole, getAdminRole } from './sessio
 import { hashPassword } from './auth/password';
 import { cachedJson, jsonUnauthorized, jsonForbidden } from './response';
 import { createAuditEvent } from './audit';
+import { logSecurityEvent } from './security';
 
 export async function listUsers(request: NextRequest) {
   const session = await requireRole(request, 'manager');
@@ -37,9 +38,6 @@ export async function listUsers(request: NextRequest) {
         lastActiveAt: true,
         lastLoginAt: true,
         consents: true,
-        roles: {
-          select: { role: { select: { id: true, name: true } } },
-        },
       },
       orderBy: { lastActiveAt: 'desc' },
       skip: (page - 1) * limit,
@@ -51,11 +49,10 @@ export async function listUsers(request: NextRequest) {
   const mapped = users.map(u => ({
     ...u,
     status: u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-    roles: u.roles.map(a => a.role),
+    roles: [] as string[],
     signupConsent: (u.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     lastActiveAt: u.lastActiveAt?.toISOString() || null,
     lastLoginAt: u.lastLoginAt?.toISOString() || null,
-    roleAssignments: undefined,
   }));
 
   return NextResponse.json({ users: mapped, total, page, limit });
@@ -80,10 +77,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       createdAt: true,
       updatedAt: true,
       consents: true,
-      _count: { select: { sessions: true, memberships: true, notifications: true } },
-      roles: {
-        select: { role: { select: { id: true, name: true } } },
-      },
+      _count: { select: { sessions: true, notifications: true } },
       sessions: {
         select: { id: true, userAgent: true, ipAddress: true, createdAt: true, expiresAt: true },
         orderBy: { createdAt: 'desc' },
@@ -95,7 +89,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
   return NextResponse.json({
     ...user,
     status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-    roles: user.roles.map(a => a.role),
+    roles: [],
     signupConsent: (user.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     roleAssignments: undefined,
   });
@@ -298,6 +292,7 @@ export async function banUser(request: NextRequest, userId: string) {
     targetId: userId,
     metadata: { email: existing.email, reason: reason || 'No reason provided' },
   });
+  logSecurityEvent({ request, userId, eventType: 'security.account_banned', severity: 'critical', details: { reason: reason || 'No reason provided', byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('./email');
   sendTemplateEmail(existing.email, 'account_suspended', {
@@ -328,6 +323,7 @@ export async function unbanUser(request: NextRequest, userId: string) {
     targetId: userId,
     metadata: { email: existing.email },
   });
+  logSecurityEvent({ request, userId, eventType: 'security.account_unbanned', details: { byAdmin: session.userId } }).catch(() => {});
 
   return NextResponse.json({ message: 'User unbanned' });
 }
@@ -355,6 +351,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
     targetId: userId,
     metadata: { email: existing.email, reason, days },
   });
+  logSecurityEvent({ request, userId, eventType: 'security.account_suspended', severity: 'warning', details: { reason, days, until: until?.toISOString() || null, byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('./email');
   sendTemplateEmail(existing.email, 'account_suspended', {
@@ -385,6 +382,7 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
     targetId: userId,
     metadata: { email: existing.email },
   });
+  logSecurityEvent({ request, userId, eventType: 'security.account_unsuspended', details: { byAdmin: session.userId } }).catch(() => {});
 
   return NextResponse.json({ message: 'User unsuspended' });
 }
@@ -481,4 +479,38 @@ export async function getStats(request: NextRequest) {
     counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
     adminUsers,
   }, { ttl: 15, swr: 120 });
+}
+
+export async function adminMaintenanceHandler(request: NextRequest) {
+  const session = await requireRole(request, 'admin');
+  if (session instanceof NextResponse) return session;
+
+  const { getMaintenanceState, setMaintenanceMode } = await import('./ws/server');
+
+  if (request.method === 'GET') {
+    return NextResponse.json(getMaintenanceState());
+  }
+
+  try {
+    const body = await request.json().catch(() => ({}));
+    const { enabled, message, estimatedEnd, allowedUsers, scheduledStart, scheduledEnd } = body as {
+      enabled?: boolean; message?: string; estimatedEnd?: number | null;
+      allowedUsers?: string[]; scheduledStart?: number | null; scheduledEnd?: number | null;
+    };
+    if (typeof enabled !== 'boolean') {
+      return NextResponse.json({ error: 'enabled (boolean) is required' }, { status: 400 });
+    }
+    setMaintenanceMode(enabled, message, estimatedEnd, allowedUsers, scheduledStart, scheduledEnd);
+    createAuditEvent({
+      action: enabled ? 'maintenance.enabled' : 'maintenance.disabled',
+      actorId: session.userId,
+      targetType: 'maintenance',
+      targetId: 'system',
+      metadata: { message: message || undefined },
+    }).catch(() => {});
+    return NextResponse.json({ ok: true, ...getMaintenanceState() });
+  } catch (err: any) {
+    console.error('[ADMIN MAINTENANCE]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to update maintenance mode' }, { status: 500 });
+  }
 }

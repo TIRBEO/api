@@ -1,8 +1,6 @@
-import { NextResponse, NextRequest } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
+import { NextResponse } from 'next/server';
 import { cachedJson } from '../../../../lib/response';
 
-export async function GET(request: NextRequest) {
-  const config = await prisma.siteConfig.findUnique({ where: { app: 'landing' } });
-  return cachedJson(config?.config || {}, { ttl: 30, swr: 300 });
+export async function GET() {
+  return cachedJson({}, { ttl: 30, swr: 300 });
 }

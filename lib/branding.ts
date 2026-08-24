@@ -1,5 +1,3 @@
-import { prisma } from './db/prisma';
-
 export interface Branding {
   logoUrl: string;
   brandName: string;
@@ -26,8 +24,13 @@ export function normalizeLogoUrl(raw: string | null | undefined): string {
   return `${base}/${cleaned}`;
 }
 
-const CACHE_TTL_MS = 30_000;
-let cache: { data: Branding; at: number } | null = null;
+// Always resolve logo to the public /logo.png served by the API
+function resolveLogoUrl(raw?: string | null): string {
+  if (raw && /^(https?:\/\/|data:image\/|\/\/)/i.test(String(raw).trim())) {
+    return String(raw).trim();
+  }
+  return `${getApiOrigin()}/logo.png`;
+}
 
 const DEFAULT_BRANDING: Branding = {
   logoUrl: '',
@@ -37,43 +40,9 @@ const DEFAULT_BRANDING: Branding = {
   emailFromAddress: 'noreply@send.tirbeo.app',
 };
 
-// Always resolve logo to the public /logo.png served by the API
-function resolveLogoUrl(raw?: string | null): string {
-  if (raw && /^(https?:\/\/|data:image\/|\/\/)/i.test(String(raw).trim())) {
-    return String(raw).trim();
-  }
-  return `${getApiOrigin()}/logo.png`;
-}
-
-export async function getBranding(force = false): Promise<Branding> {
-  if (!force && cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.data;    const defaults: Branding = {
-      ...DEFAULT_BRANDING,
-      logoUrl: resolveLogoUrl(process.env.TIRBEO_LOGO_URL),
-    };
-
-    try {
-      const [theme, site, emailConfig] = await Promise.all([
-        prisma.themeConfig.findFirst({ where: { isActive: true } }),
-        prisma.siteConfig.findUnique({ where: { app: 'brand' } }),
-        prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } }),
-      ]);
-
-      const siteBrand = (site?.config as Record<string, unknown>) || {};
-      const brand = {
-        logoUrl: resolveLogoUrl(siteBrand.logoUrl as string | undefined || theme?.logoUrl),
-        brandName: (siteBrand.brandName as string) || theme?.brandName || defaults.brandName,
-        brandTagline: (siteBrand.brandTagline as string) || theme?.brandTagline || defaults.brandTagline,
-        emailFromName: (siteBrand.emailFromName as string) || emailConfig?.defaultFromName || defaults.emailFromName,
-        emailFromAddress: (siteBrand.emailFromAddress as string) || emailConfig?.defaultFromEmail || defaults.emailFromAddress,
-      };
-
-      cache = { data: brand, at: Date.now() };
-      return brand;
-    } catch {
-      return defaults;
-    }
-}
-
-export function clearBrandingCache(): void {
-  cache = null;
+export async function getBranding(): Promise<Branding> {
+  return {
+    ...DEFAULT_BRANDING,
+    logoUrl: resolveLogoUrl(process.env.TIRBEO_LOGO_URL),
+  };
 }

@@ -129,7 +129,7 @@ export async function ticketDetailHandler(req: NextRequest, ticketId: string) {
   if (!user) return jsonUnauthorized();
   const ticket = await prisma.ticket.findUnique({
     where: { id: ticketId },
-    include: { customer: true, assigned: true, queue: true, messages: { orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, name: true, photoUrl: true } } } }, attachments: true },
+    include: { customer: true, assigned: true, messages: { orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, name: true, photoUrl: true } } } }, attachments: true },
   });
   if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
@@ -234,8 +234,7 @@ export async function ticketAssignHandler(req: NextRequest, ticketId: string) {
   if (!user || !isAdmin(user)) return jsonForbidden();
   const body: any = await req.json();
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { assignedId: body.agentId } });
-  await prisma.ticket_assignments.create({ data: { ticketId, agentId: body.agentId, assignedBy: user.userId } });
-  await createAuditEvent({ actorId: user.userId, action: 'TICKET_ASSIGNED', targetType: 'ticket', targetId: ticketId, metadata: { agentId: body.agentId } });
+  await createAuditEvent({ actorId: user.userId, action: 'TICKET_ASSIGNED', targetType: 'ticket', targetId: ticketId, metadata: { agentId: body.agentId, assignedBy: user.userId } });
   return NextResponse.json(updated);
 }
 
@@ -273,16 +272,14 @@ export async function ticketReopenHandler(req: NextRequest, ticketId: string) {
 export async function queuesListHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  const queues = await prisma.support_queues.findMany();
-  return NextResponse.json(queues);
+  // Queues removed — return empty list for backward compatibility
+  return NextResponse.json([]);
 }
 
 export async function queuesCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  const body: any = await req.json();
-  const queue = await prisma.support_queues.create({ data: { name: body.name, slug: body.slug, description: body.description } });
-  return NextResponse.json(queue, { status: 201 });
+  return NextResponse.json({ error: 'Support queues removed' }, { status: 410 });
 }
 
 // ─── POST /api/support/tickets/[id]/read — mark messages read ────────

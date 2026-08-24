@@ -110,10 +110,12 @@ export function fmtNow(): string {
 export async function createNotification(input: CreateNotifInput) {
   const category = notifCategory(input.type);
 
-  // Load preferences (defaults to all-on when no row exists).
+  // Load preferences from the user jsonb column (defaults all-on).
   let prefs: any = null;
   try {
-    prefs = await prisma.notificationPreference.findUnique({ where: { userId: input.userId } });
+    const u = await prisma.user.findUnique({ where: { id: input.userId }, select: { notificationPreferences: true } });
+    prefs = (u as any)?.notificationPreferences;
+    if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = null;
   } catch { /* fall through with defaults */ }
 
   const inAppOn = on(prefs?.inApp) && on(prefs?.[`${category}InApp`]) && on(prefs?.[category]);
@@ -138,10 +140,29 @@ export async function createNotification(input: CreateNotifInput) {
   const notifData = { id: notif.id, userId: notif.userId, type: notif.type, title: notif.title, body: notif.body, link: notif.link, icon: notif.icon, read: false, createdAt: notif.createdAt.toISOString() };
   await sendToUserWs(input.userId, { type: 'notification', data: notifData });
 
+  // Bust the notifications list cache so polling clients see it immediately.
+  try {
+    const { bustNotificationsCache } = await import('./userHandlers');
+    bustNotificationsCache(input.userId);
+  } catch { /* non-fatal */ }
+
   // External channels (email / push) respect quiet hours.
   if (!emailOn && !pushOn) return notif;
   const quiet = await isInQuietHours(prefs);
   if (quiet) return notif;
+
+  if (pushOn) {
+    try {
+      const { sendPushNotification } = await import('./push-notifications');
+      await sendPushNotification(input.userId, {
+        title: input.title,
+        body: input.body || '',
+        icon: input.icon || undefined,
+        url: input.link || '/dashboard/notifications',
+        tag: input.type,
+      });
+    } catch { /* push is best-effort */ }
+  }
 
   if (emailOn) {
     const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
@@ -155,18 +176,6 @@ export async function createNotification(input: CreateNotifInput) {
         dashboardUrl: input.link ? `${dash}${input.link}` : dash,
       }, { rawVars: ['digestItems'] }).catch(() => {});
     }
-  }
-
-  if (pushOn) {
-    try {
-      const { sendPushNotification } = await import('./push-notifications');
-      await sendPushNotification(input.userId, {
-        title: input.title,
-        body: input.body || '',
-        url: input.link,
-        icon: input.icon || undefined,
-      });
-    } catch { /* push not configured or failed — non-fatal */ }
   }
 
   return notif;
@@ -197,22 +206,26 @@ export async function markAsRead(userId: string, notifId?: string) {
   }
 }
 
-export async function getOrCreatePrefs(userId: string) {
-  let prefs = await prisma.notificationPreference.findUnique({ where: { userId } });
-  if (!prefs) {
-    prefs = await prisma.notificationPreference.create({
-      data: { userId },
-    });
-  }
-  return prefs;
+const DEFAULT_PREFS: Record<string, unknown> = {
+  email: true, push: true, inApp: true,
+  security: true, forms: true, product: true, support: true,
+};
+
+/** Read a user's notification preferences from their jsonb column. */
+export async function getOrCreatePrefs(userId: string): Promise<Record<string, any>> {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { notificationPreferences: true } });
+  const raw = (user as any)?.notificationPreferences;
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...DEFAULT_PREFS, ...raw } : { ...DEFAULT_PREFS };
 }
 
-export async function updatePrefs(userId: string, data: Record<string, unknown>) {
-  await getOrCreatePrefs(userId);
-  return prisma.notificationPreference.update({
-    where: { userId },
-    data: data as any,
-  });
+/** Merge-update the user's notification_preferences jsonb. */
+export async function updatePrefs(userId: string, data: Record<string, unknown>): Promise<Record<string, any>> {
+  const prefs = await getOrCreatePrefs(userId);
+  Object.assign(prefs, data);
+  await prisma.$executeRaw`
+    UPDATE "users" SET "notification_preferences" = ${JSON.stringify(prefs)}::jsonb
+    WHERE "id" = ${userId}`;
+  return prefs;
 }
 
 // Send real-time notification to a specific user via WebSocket

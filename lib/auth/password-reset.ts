@@ -34,6 +34,10 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
           console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
         }
       }
+      // Always log in dev for testing
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`[PASSWORD RESET OTP] CODE for ${email}: ${code}`);
+      }
     })
     .catch((err) => console.error('[PASSWORD RESET OTP] Email send threw:', err?.message));
 

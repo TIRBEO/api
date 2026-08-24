@@ -324,25 +324,7 @@ export async function getEffectivePermissions(userId: string): Promise<Permissio
     return { ...LEGACY_ROLE_PERMISSIONS[role] };
   }
 
-  // Check assigned roles
-  const assignments = await prisma.userRole.findMany({
-    where: { userId },
-    include: { role: { select: { permissions: true } } },
-  });
-
-  if (assignments.length === 0) {
-    return {};
-  }
-
-  // Aggregate permissions across all assigned roles
-  const perms: PermissionSet = {};
-  for (const a of assignments) {
-    const rolePerms = a.role.permissions as Record<string, boolean>;
-    for (const [k, v] of Object.entries(rolePerms)) {
-      if (v) perms[k] = true;
-    }
-  }
-  return perms;
+  return {};
 }
 
 export function hasPermission(perms: PermissionSet, key: string): boolean {

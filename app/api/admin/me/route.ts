@@ -10,22 +10,18 @@ export async function GET(request: Request) {
 
   const user = await prisma.user.findUnique({
     where: { id: session.userId },
-    include: { roles: { include: { role: true } } },
+    select: { id: true, email: true, name: true, adminRole: true },
   });
-  if (!user || (!user.adminRole && !user.roles?.[0]?.role)) return new NextResponse('Forbidden', { status: 403 });
+  if (!user || !user.adminRole) return new NextResponse('Forbidden', { status: 403 });
 
   const permissions = await getEffectivePermissions(user.id);
-  const roleAssignments = await prisma.userRole.findMany({
-    where: { userId: user.id },
-    include: { role: { select: { id: true, name: true } } },
-  });
 
   return cachedJson({
     id: user.id,
     email: user.email,
     name: user.name,
-    adminRole: user.adminRole || user.roles[0].role.name,
+    adminRole: user.adminRole,
     permissions,
-    roles: roleAssignments.map(a => a.role),
+    roles: [],
   });
 }

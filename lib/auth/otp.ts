@@ -52,6 +52,10 @@ export async function sendEmailOtp(email: string, code: string) {
   if (!result.success) {
     console.error(`[EMAIL OTP] Failed to send to ${email}: ${result.error}`);
   }
+  // Always log in dev for testing
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[EMAIL OTP] CODE for ${email}: ${code}`);
+  }
 }
 
 /** Placeholder SMS sender – replace with a free Nepali SMS provider */

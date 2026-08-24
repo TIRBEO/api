@@ -1,73 +1,5 @@
 import { prisma } from './db/prisma';
 
-export type JobType = 'email' | 'webhook' | 'cleanup' | 'backup' | 'report' | 'sync' | string;
-
-export async function createJob(type: JobType, payload: Record<string, unknown>, queue = 'default', maxAttempts = 3) {
-  return prisma.jobs.create({
-    data: { type, queue, payload: payload as any, maxAttempts, updatedAt: new Date() },
-  });
-}
-
-export async function processNextJob(queue = 'default') {
-  const job = await prisma.jobs.findFirst({
-    where: { queue, status: 'pending' },
-    orderBy: { createdAt: 'asc' },
-  });
-  if (!job) return null;
-
-  await prisma.jobs.update({ where: { id: job.id }, data: { status: 'processing', startedAt: new Date(), attempts: job.attempts + 1 } });
-
-  await prisma.job_attempts.create({
-    data: { jobId: job.id, attempt: job.attempts + 1, status: 'processing', startedAt: new Date() },
-  });
-
-  return job;
-}
-
-export async function completeJob(jobId: string, result?: Record<string, unknown>) {
-  await prisma.jobs.update({ where: { id: jobId }, data: { status: 'completed', completedAt: new Date(), payload: (result || {}) as any } });
-  await prisma.job_attempts.updateMany({
-    where: { jobId, status: 'processing' },
-    data: { status: 'completed', completedAt: new Date() },
-  });
-}
-
-export async function failJob(jobId: string, error: string) {
-  const job = await prisma.jobs.findUnique({ where: { id: jobId } });
-  if (!job) return;
-  if (job.attempts >= job.maxAttempts) {
-    await prisma.jobs.update({ where: { id: jobId }, data: { status: 'failed', error, completedAt: new Date() } });
-  } else {
-    await prisma.jobs.update({ where: { id: jobId }, data: { status: 'pending', error } });
-  }
-  await prisma.job_attempts.updateMany({
-    where: { jobId, status: 'processing' },
-    data: { status: 'failed', error, completedAt: new Date() },
-  });
-}
-
-export async function retryJob(jobId: string) {
-  await prisma.jobs.update({ where: { id: jobId }, data: { status: 'pending', error: null, startedAt: null, completedAt: null, attempts: 0 } });
-  await prisma.job_attempts.updateMany({ where: { jobId }, data: { status: 'cancelled' } });
-}
-
-export async function processQueue(queue = 'default', handler: (job: any) => Promise<void>) {
-  const job = await processNextJob(queue);
-  if (!job) return;
-  try {
-    await handler(job);
-    await completeJob(job.id);
-  } catch (err: any) {
-    await failJob(job.id, err?.message || 'Unknown error');
-  }
-}
-
-export async function cleanupOldJobs(olderThanDays = 30) {
-  const cutoff = new Date(Date.now() - olderThanDays * 86400000);
-  await prisma.jobs.deleteMany({ where: { createdAt: { lt: cutoff }, status: { in: ['completed', 'failed'] } } });
-  await prisma.job_attempts.deleteMany({ where: { createdAt: { lt: cutoff } } });
-}
-
 /** Delete notifications older than 30 days. Runs on startup + hourly. */
 export async function cleanupOldNotifications(olderThanDays = 30) {
   const cutoff = new Date(Date.now() - olderThanDays * 86400000);
@@ -103,91 +35,101 @@ export function startPeriodicCleanup() {
  * Both are rate-limited with last_digest_sent_at / last_weekly_sent_at so the
  * hourly job never double-sends.
  */
+export interface DigestPrefs {
+  digestEnabled: boolean;
+  digestFrequency: 'daily' | 'weekly' | 'monthly';
+  weeklySummary: boolean;
+  lastDigestSentAt?: string | null;
+  lastWeeklySentAt?: string | null;
+}
+
+function readPrefs(json: unknown): Partial<DigestPrefs> {
+  return (json && typeof json === 'object' && !Array.isArray(json)) ? json as Partial<DigestPrefs> : {};
+}
+
 export async function sendEmailDigests() {
   try {
-    const prefs = await prisma.notificationPreference.findMany({
-      where: { email: true, OR: [{ digestEnabled: true }, { weeklySummary: true }] },
+    // Users opt into digests via their notification_preferences jsonb column.
+    const users = await prisma.user.findMany({
       select: {
-        userId: true,
-        digestEnabled: true,
-        digestFrequency: true,
-        weeklySummary: true,
-        lastDigestSentAt: true,
-        lastWeeklySentAt: true,
+        id: true,
+        email: true,
+        name: true,
+        notificationPreferences: true,
       },
+      take: 2000,
     });
-
-    if (prefs.length === 0) return;
 
     const now = new Date();
     const { sendTemplateEmail } = await import('./email');
     const { getDashboardBaseUrl } = await import('./app-urls');
     const dashboardUrl = getDashboardBaseUrl();
 
-    for (const p of prefs) {
+    for (const u of users) {
+      const prefs = readPrefs((u as any).notificationPreferences);
+      if (!(u as any).email) continue;
+      const digestEnabled = prefs.digestEnabled === true;
+      const weeklySummary = prefs.weeklySummary === true;
+      if (!digestEnabled && !weeklySummary) continue;
       try {
         // ── 1. Unread-notifications digest ──
-        if (p.digestEnabled) {
+        if (digestEnabled) {
           const freqMs =
-            p.digestFrequency === 'weekly' ? 7 * 86400000 :
-            p.digestFrequency === 'monthly' ? 30 * 86400000 : 86400000;
-          const lastSent = p.lastDigestSentAt ? new Date(p.lastDigestSentAt).getTime() : 0;
+            prefs.digestFrequency === 'weekly' ? 7 * 86400000 :
+            prefs.digestFrequency === 'monthly' ? 30 * 86400000 : 86400000;
+          const lastSent = prefs.lastDigestSentAt ? new Date(prefs.lastDigestSentAt).getTime() : 0;
 
           if (now.getTime() - lastSent >= freqMs) {
             const cutoff = new Date(Math.max(lastSent, now.getTime() - freqMs));
             const notifs = await prisma.notification.findMany({
-              where: { userId: p.userId, isRead: false, createdAt: { gte: cutoff } },
+              where: { userId: u.id, isRead: false, createdAt: { gte: cutoff } },
               orderBy: { createdAt: 'desc' },
               take: 50,
               select: { id: true, title: true, body: true, createdAt: true },
             });
 
             if (notifs.length > 0) {
-              const user = await prisma.user.findUnique({ where: { id: p.userId }, select: { email: true, name: true } });
-              if (user) {
-                const itemsHtml = notifs.map(n =>
-                  `<div style="padding:12px 16px;background:#f8f9fa;border-radius:8px;margin-bottom:8px;"><strong>${esc(n.title)}</strong><br/><span style="color:#666;font-size:13px;">${esc(n.body || '')}</span></div>`
-                ).join('');
+              const itemsHtml = notifs.map(n =>
+                `<div style="padding:12px 16px;background:#f8f9fa;border-radius:8px;margin-bottom:8px;"><strong>${esc(n.title)}</strong><br/><span style="color:#666;font-size:13px;">${esc(n.body || '')}</span></div>`
+              ).join('');
 
-                await sendTemplateEmail(user.email, 'notification_digest', {
-                  name: user.name || user.email,
-                  count: String(notifs.length),
-                  digestItems: itemsHtml,
-                  dashboardUrl,
-                }).catch(() => {});
+              await sendTemplateEmail(u.email, 'notification_digest', {
+                name: u.name || u.email,
+                count: String(notifs.length),
+                digestItems: itemsHtml,
+                dashboardUrl,
+              }).catch(() => {});
 
-                await prisma.notificationPreference.update({
-                  where: { userId: p.userId },
-                  data: { lastDigestSentAt: now },
-                }).catch(() => {});
+              savePrefsSnapshot(u.id, { ...prefs, email: true, digestEnabled, digestFrequency: prefs.digestFrequency || 'daily', weeklySummary, lastDigestSentAt: now.toISOString(), lastWeeklySentAt: prefs.lastWeeklySentAt ?? null }).catch(() => {});
 
-                console.log(`[DIGEST] Sent ${notifs.length} notifications to ${user.email} (${p.digestFrequency})`);
-              }
+              console.log(`[DIGEST] Sent ${notifs.length} notifications to ${u.email} (${prefs.digestFrequency || 'daily'})`);
             }
           }
         }
 
         // ── 2. Weekly activity summary ──
-        if (p.weeklySummary) {
+        if (weeklySummary) {
           const WEEK = 7 * 86400000;
-          const lastWeekly = p.lastWeeklySentAt ? new Date(p.lastWeeklySentAt).getTime() : 0;
+          const lastWeekly = prefs.lastWeeklySentAt ? new Date(prefs.lastWeeklySentAt).getTime() : 0;
           if (now.getTime() - lastWeekly >= WEEK) {
-            const sent = await sendWeeklySummary(p.userId, new Date(now.getTime() - WEEK), now, sendTemplateEmail, dashboardUrl);
+            const sent = await sendWeeklySummary(u.id, new Date(now.getTime() - WEEK), now, sendTemplateEmail, dashboardUrl);
             if (sent) {
-              await prisma.notificationPreference.update({
-                where: { userId: p.userId },
-                data: { lastWeeklySentAt: now },
-              }).catch(() => {});
+              savePrefsSnapshot(u.id, { ...prefs, email: true, digestEnabled, digestFrequency: prefs.digestFrequency || 'daily', weeklySummary, lastDigestSentAt: prefs.lastDigestSentAt ?? null, lastWeeklySentAt: now.toISOString() }).catch(() => {});
             }
           }
         }
       } catch (err: any) {
-        console.error(`[DIGEST] Failed for user ${p.userId}:`, err?.message);
+        console.error(`[DIGEST] Failed for user ${u.id}:`, err?.message);
       }
     }
   } catch (err: any) {
     console.error('[DIGEST] Error:', err?.message);
   }
+}
+
+/** Persist a full prefs snapshot back into the user jsonb column. */
+async function savePrefsSnapshot(userId: string, snapshot: Record<string, unknown>) {
+  await prisma.$executeRaw`UPDATE "users" SET "notification_preferences" = ${JSON.stringify(snapshot)}::jsonb WHERE "id" = ${userId}`;
 }
 
 const esc = (s: string) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
@@ -305,75 +247,6 @@ export function startPeriodicDigests() {
   console.log('[DIGEST] Periodic email digest started (hourly)');
 }
 
-/**
- * Reconcile OAuth state so the DB is always self-consistent:
- *   user.{provider}Id  ←→  integration(provider)
- *  - linked user without an integration row → row created
- *  - integration row for a user WITHOUT the provider id (disconnected /
- *    transferred elsewhere) → row deleted outright
- */
-export async function reconcileOauthLinks(): Promise<{ created: number; removed: number }> {
-  let created = 0;
-  let removed = 0;
-  const providers: Array<'google' | 'github' | 'discord'> = ['google', 'github', 'discord'];
-  try {
-    const linkedUsers = await prisma.user.findMany({
-      where: { OR: providers.map((p) => ({ [`${p}Id`]: { not: null } })) },
-      select: { id: true, googleId: true, githubId: true, discordId: true },
-    });
-
-    const rows = await prisma.integration.findMany({
-      where: { provider: { in: providers } },
-      select: { id: true, userId: true, provider: true },
-    });
-    const rowKey = (userId: string, provider: string) => `${userId}:${provider}`;
-    const existing = new Set(rows.map((r) => rowKey(r.userId, r.provider)));
-
-    // 1) Missing rows for linked identities.
-    if (linkedUsers.length) {
-      const missing: Array<{ userId: string; provider: string; connected: boolean; metadata: Record<string, string> }> = [];
-      for (const u of linkedUsers) {
-        for (const p of providers) {
-          const pid = (u as any)[`${p}Id`] as string | null;
-          if (pid && !existing.has(rowKey(u.id, p))) {
-            missing.push({ userId: u.id, provider: p, connected: true, metadata: { [`${p}Id`]: pid } });
-          }
-        }
-      }
-      if (missing.length) {
-        await prisma.integration.createMany({ data: missing as any });
-        created = missing.length;
-        missing.forEach((m) => existing.add(rowKey(m.userId, m.provider)));
-      }
-    }
-
-    // 2) Rows whose identity no longer lives on the user → hard delete.
-    const linkedIds = new Set(linkedUsers.map((u) => u.id));
-    const orphanIds = rows
-      .filter((r) => !linkedIds.has(r.userId) || !(linkedUsers.find((u) => u.id === r.userId) as any)?.[`${r.provider}Id`])
-      .map((r) => r.id);
-    if (orphanIds.length) {
-      await prisma.integration.deleteMany({ where: { id: { in: orphanIds } } });
-      removed = orphanIds.length;
-    }
-
-    if (created || removed) console.log(`[OAUTH-SYNC] Reconciled: ${created} integration row(s) created, ${removed} deleted`);
-    return { created, removed };
-  } catch (err: any) {
-    console.error('[OAUTH-SYNC] Failed:', err?.message);
-    return { created, removed };
-  }
-}
-
-/** Start periodic OAuth reconciliation — every 10 minutes. */
-let oauthSyncInterval: ReturnType<typeof setInterval> | null = null;
-export function startPeriodicOauthSync() {
-  if (oauthSyncInterval) return;
-  setTimeout(() => { reconcileOauthLinks(); }, 45_000);
-  oauthSyncInterval = setInterval(() => { reconcileOauthLinks(); }, 600_000);
-  console.log('[OAUTH-SYNC] Periodic link reconciliation started (every 10 min)');
-}
-
 // ─── SCHEDULED ACCOUNT DELETIONS ───
 // Runs hourly. Hard-deletes accounts whose grace period has elapsed:
 // anonymizes identity, wipes sessions/tokens/devices/notifications, keeps the
@@ -391,13 +264,10 @@ export async function processScheduledDeletions() {
     try {
       await prisma.$transaction([
         prisma.session.deleteMany({ where: { userId: user.id } }),
-        prisma.refresh_tokens.deleteMany({ where: { userId: user.id } }),
         prisma.apiKey.deleteMany({ where: { userId: user.id } }),
         prisma.notification.deleteMany({ where: { userId: user.id } }),
-        prisma.pushSubscription.deleteMany({ where: { userId: user.id } }),
         prisma.otp.deleteMany({ where: { userId: user.id } }),
-        prisma.recoveryCode.deleteMany({ where: { userId: user.id } }),
-        prisma.notificationPreference.deleteMany({ where: { userId: user.id } }),
+        prisma.user.update({ where: { id: user.id }, data: { backupCodes: [] } }),
         prisma.userTipLog.deleteMany({ where: { userId: user.id } }),
       ]);
 

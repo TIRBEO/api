@@ -32,6 +32,9 @@ import {
   requestSignupOtpHandler,
   signupOtpVerifyHandler,
   oauthConsentHandler,
+  oauthPendingHandler,
+  oauthSignupCompleteHandler,
+
   requestLoginOtpHandler,
   verifyLoginOtpHandler,
   requestMagicLinkHandler,
@@ -43,8 +46,7 @@ import {
   suspiciousLoginConfirmHandler,
   suspiciousLoginDenyHandler,
   verifyHandler,
-   helpConfigHandler,
-   faqHandler,
+
    cliTokenHandler,
    sessionHandler,
    refreshHandler,
@@ -144,10 +146,11 @@ import {
 } from '../../../lib/passkeyHandlers';
 
 import {
-  appsListHandler, appsAdminListHandler, appsCreateHandler,
-  incidentsListHandler, incidentsCreateHandler,
   incidentEventsListHandler, incidentEventsCreateHandler,
 } from '../../../lib/contentHandlers';
+
+import { adminAnalyticsOverviewHandler } from '../../../lib/adminAnalytics';
+import { adminMaintenanceHandler } from '../../../lib/adminHandlers';
 
 import {
   ticketListHandler, ticketCreateHandler, ticketDetailHandler, ticketUpdateHandler,
@@ -181,7 +184,7 @@ const INTERNAL_ROUTES = [
   'auth/phone-otp/request', 'auth/phone-otp/verify',
     'auth/signup-otp/request', 'auth/signup-otp/verify',
     'auth/change-email/request', 'auth/change-email/verify',
-  'auth/oauth-consent',
+  'auth/oauth-consent', 'auth/oauth/consent', 'auth/oauth/pending', 'auth/oauth/complete',
   'auth/login-otp/request', 'auth/login-otp/verify',
   'auth/magic-link/request', 'auth/magic-link/verify',
   'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
@@ -203,25 +206,24 @@ const INTERNAL_ROUTES = [
   'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
   'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'notifications/prefs', 'notifications/push', 'notifications/push/subscribe', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
+  'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'admin/emails', 'admin/emails/reply',
-  'public/help-config', 'public/faq',
   'districts',
   'developer/api-keys',
   'user/mailbox', 'user/mailbox/check', 'user/mailbox/dns',
   'user/apps',
   'admin/reserved-addresses',
-  'admin/oauth/apps', 'admin/oauth/clients',
-  'admin/help-articles',
   'admin/groups',
-  'admin/ous',  'admin/integrations', 'admin/security/score',
-  'admin/settings', 'admin/analytics/overview',
+  'admin/ous', 'admin/security/score',
+  'admin/settings', 'admin/analytics/overview', 'admin/maintenance',
   'passkey/register/options', 'passkey/register/verify',
   'passkey/auth/options', 'passkey/auth/verify',
   'passkey/list',
-  'connected-accounts', 'connected-accounts/link',
+  // connected-accounts removed — OAuth IDs stored on users table directly
   'user/export-data', 'user/delete-account', 'profile/public',
+  'content/incident-events', 'content/health', 'content/jobs', 'content/jobs/create', 'content/retry-job',
+  'support/tickets/[id]/read', 'support/tickets/[id]/attachments',
    'auth/cli-token',
    'waitlist',
    'feedback',
@@ -234,10 +236,8 @@ const INTERNAL_ROUTES = [
     'debug/rate-limits/reset',
   // Support
   'support/tickets', 'support/tickets/create',  'support/tickets/appeals',
-  'support/queues', 'support/queues/create',
-  // OAuth / OIDC
-  'auth/oauth/authorize', 'auth/oauth/token', 'auth/oauth/revoke', 'auth/oauth/consent',
-  'oidc/userinfo',
+
+
 ];
 
 let routeCache: { data: any[]; ts: number } | null = null;
@@ -307,37 +307,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
-  // Handle admin/oauth/apps/{id} dynamic route
-  if (slug.length === 4 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'apps') {
-    const oauthAppId = slug[3];
-    if (method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
-      return { path: 'admin/oauth/apps/[id]', method, internal: true, allowedRoles: ['guest'], meta: { oauthAppId } };
-    }
-  }
-
-  // Handle admin/oauth/clients/{id} dynamic route
-  if (slug.length === 4 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'clients') {
-    const oauthClientId = slug[3];
-    if (method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
-      return { path: 'admin/oauth/clients/[id]', method, internal: true, allowedRoles: ['guest'], meta: { oauthClientId } };
-    }
-  }
-
-  // Handle admin/help-articles/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'admin' && slug[1] === 'help-articles') {
-    const helpArticleId = slug[2];
-    if (method.toUpperCase() === 'GET' || method.toUpperCase() === 'PATCH' || method.toUpperCase() === 'DELETE') {
-      return { path: 'admin/help-articles/[id]', method, internal: true, allowedRoles: ['guest'], meta: { helpArticleId } };
-    }
-  }
-
-  // Handle admin/oauth/clients/{id}/secret dynamic route
-  if (slug.length === 5 && slug[0] === 'admin' && slug[1] === 'oauth' && slug[2] === 'clients' && slug[4] === 'secret') {
-    if (method.toUpperCase() === 'POST') {
-      return { path: 'admin/oauth/clients/[id]/secret', method, internal: true, allowedRoles: ['guest'], meta: { oauthClientId: slug[3] } };
-    }
-  }
-
 // connected-accounts routes removed (LinkedAccount model removed)
 
   // Handle passkey/{id} dynamic route
@@ -354,11 +323,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
   // Handle content/retry-job/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'retry-job') {
     return { path: 'content/retry-job/[id]', method: 'POST', internal: true, allowedRoles: ['guest'], meta: { retryJobId: slug[2] } };
-  }
-
-  // Handle content/incidents/{id}/events dynamic route
-  if (slug.length === 4 && slug[0] === 'content' && slug[1] === 'incidents' && slug[3] === 'events') {
-    return { path: 'content/incidents/[id]/events', method, internal: true, allowedRoles: ['guest'], meta: { incidentId: slug[2] } };
   }
 
   // Handle support/tickets/{id} dynamic route (GET/PATCH/PUT/DELETE)
@@ -418,6 +382,9 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
        'auth/change-email/request': ['POST'],
        'auth/change-email/verify': ['POST'],
       'auth/oauth-consent': ['POST'],
+      'auth/oauth/consent': ['POST'],
+      'auth/oauth/pending': ['GET'],
+      'auth/oauth/complete': ['POST'],
       'auth/login-otp/request': ['POST'],
       'auth/login-otp/verify': ['POST'],
       'auth/magic-link/request': ['POST'],
@@ -469,10 +436,9 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'profile/avatar': ['POST'],
       'notifications': ['GET', 'PATCH', 'DELETE'],
       'notifications/prefs': ['GET', 'PUT'],
-      'notifications/push': ['POST'],
-      'notifications/push/subscribe': ['GET', 'POST', 'DELETE'],
       'integrations': ['GET', 'POST', 'DELETE'],
       'integrations/merge': ['POST'],
+
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
       'admin/heartbeat': ['POST'],
@@ -481,8 +447,6 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/test': ['POST'],
       'admin/emails': ['GET'],
       'admin/emails/reply': ['POST'],
-      'public/help-config': ['GET'],
-      'public/faq': ['GET'],
       'districts': ['GET'],
       'developer/api-keys': ['GET', 'POST'],
       'user/mailbox': ['GET', 'POST', 'PUT', 'DELETE'],
@@ -490,27 +454,22 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'user/mailbox/dns': ['GET'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'admin/reserved-addresses': ['GET', 'POST'],
-      'admin/oauth/apps': ['GET', 'POST'],
-      'admin/oauth/clients': ['POST'],
-      'admin/help-articles': ['GET', 'POST'],
       'admin/groups': ['GET', 'POST'],
       'admin/ous': ['GET', 'POST'],
-      'admin/integrations': ['GET', 'POST', 'DELETE'],
       'admin/security/score': ['GET'],
       'admin/settings': ['GET', 'PATCH'],
+      'admin/maintenance': ['GET', 'POST'],
       'admin/analytics/overview': ['GET'],
       'passkey/register/options': ['POST'],
       'passkey/register/verify': ['POST'],
       'passkey/auth/options': ['POST'],
       'passkey/auth/verify': ['POST'],
       'passkey/list': ['GET'],
-      'connected-accounts': ['GET', 'DELETE'],
-      'connected-accounts/link': ['POST'],
+      // connected-accounts removed — OAuth IDs stored on users table directly
       'user/export-data': ['GET', 'POST'],
       'user/delete-account': ['POST', 'DELETE'],
-      'profile/public': ['GET'],
-      'auth/cli-token': ['POST'],
-      'waitlist': ['POST'],
+      'profile/public': ['GET'],       'auth/cli-token': ['POST'],
+       'waitlist': ['POST'],
       'feedback': ['POST', 'GET'],
       'chat': ['POST'],
       'admin/subscribers': ['GET'],
@@ -521,17 +480,9 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'debug/cache/reset': ['POST'],
       'debug/rate-limits/reset': ['GET'],
       // Content
-      'content/settings': ['GET'],
-      'content/settings/update': ['PATCH'],
-      'content/feature-flags': ['GET'],
-      'content/feature-flags/update': ['PATCH'],
-      'content/apps': ['GET'],
-      'content/apps/admin': ['GET'],
-      'content/apps/create': ['POST'],
+
       'content/health': ['GET'],
-      'content/incidents': ['GET'],
-      'content/incidents/create': ['POST'],
-      'content/incidents/[id]/events': ['GET', 'POST'],
+      'content/incident-events': ['GET', 'POST'],
       'content/jobs': ['GET'],
       'content/jobs/create': ['POST'],
       'content/retry-job': ['POST'],
@@ -541,14 +492,8 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'support/tickets/[id]/read': ['POST'],
       'support/tickets/[id]/attachments': ['GET', 'POST'],
       'support/tickets/appeals': ['GET'],
-      'support/queues': ['GET'],
-      'support/queues/create': ['POST'],
-      // OAuth / OIDC
-      'auth/oauth/authorize': ['POST'],
-      'auth/oauth/token': ['POST'],
-      'auth/oauth/revoke': ['POST'],
-      'auth/oauth/consent': ['GET'],
-      'oidc/userinfo': ['GET'],
+
+
     };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
@@ -750,7 +695,14 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await changeEmailVerifyHandler(request);
         break;
       case 'auth/oauth-consent':
+      case 'auth/oauth/consent':
         resp = await oauthConsentHandler(request);
+        break;
+      case 'auth/oauth/pending':
+        resp = await oauthPendingHandler(request);
+        break;
+      case 'auth/oauth/complete':
+        resp = await oauthSignupCompleteHandler(request);
         break;
       case 'auth/login-otp/request':
         resp = await requestLoginOtpHandler(request);
@@ -908,12 +860,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'notifications/prefs':
         resp = await notificationPrefsHandler(request);
         break;
-      case 'notifications/push':
-        resp = await sendTestPushHandler(request);
-        break;
-      case 'notifications/push/subscribe':
-        resp = await pushSubscriptionHandler(request);
-        break;
+      // notifications/push routes handled by standalone routes at app/api/notifications/push/
       case 'integrations':
         resp = await integrationsHandler(request);
         break;
@@ -945,13 +892,11 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await adminEmailReplyHandler(request);
         break;
       case 'public/help-config':
-        resp = await helpConfigHandler(request);
-        break;
       case 'public/faq':
-        resp = await faqHandler(request);
+        resp = NextResponse.json({ articles: [] });
         break;
       case 'districts':
-
+        resp = NextResponse.json({ districts: [] });
         break;
       case 'developer/api-keys':
         resp = await apiKeysHandler(request);
@@ -959,62 +904,44 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'developer/api-keys/[id]':
         resp = await apiKeyDeleteHandler(request, (route as any).meta.keyId);
         break;
+      case 'admin/reserved-addresses/[id]':
+        resp = NextResponse.json({ error: 'Not implemented' }, { status: 501 });
+        break;
 
       case 'admin/oauth/apps':
-        if (method === 'GET') resp = await oauthAdminAppsListHandler(request);
-        else resp = await oauthAdminAppsCreateHandler(request);
-        break;
       case 'admin/oauth/apps/[id]':
-        if (method === 'PATCH') resp = await oauthAdminAppsUpdateHandler(request, (route as any).meta.oauthAppId);
-        else if (method === 'DELETE') resp = await oauthAdminAppsDeleteHandler(request, (route as any).meta.oauthAppId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
       case 'admin/oauth/clients':
-        resp = await oauthAdminClientsCreateHandler(request);
-        break;
       case 'admin/oauth/clients/[id]':
-        if (method === 'PATCH') resp = await oauthAdminClientsUpdateHandler(request, (route as any).meta.oauthClientId);
-        else if (method === 'DELETE') resp = await oauthAdminClientsDeleteHandler(request, (route as any).meta.oauthClientId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
-        break;
       case 'admin/oauth/clients/[id]/secret':
-        resp = await oauthAdminClientsRegenerateSecretHandler(request, (route as any).meta.oauthClientId);
+        resp = NextResponse.json({ error: 'OAuth2 server removed' }, { status: 410 });
         break;
 
       case 'admin/help-articles':
-        if (method === 'GET') resp = await helpArticlesListHandler(request);
-        else resp = await helpArticlesCreateHandler(request);
-        break;
       case 'admin/help-articles/[id]':
-        if (method === 'GET') resp = await helpArticleDetailHandler(request, (route as any).meta.helpArticleId);
-        else if (method === 'PATCH') resp = await helpArticlesUpdateHandler(request, (route as any).meta.helpArticleId);
-        else if (method === 'DELETE') resp = await helpArticlesDeleteHandler(request, (route as any).meta.helpArticleId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
+        resp = NextResponse.json({ error: 'Help articles removed' }, { status: 410 });
         break;
 
       case 'admin/groups':
-        resp = new NextResponse('Handled by standalone route', { status: 200 });
+        resp = NextResponse.json({ groups: [] });
         break;
 
       case 'admin/integrations':
-        resp = new NextResponse('Handled by standalone route', { status: 200 });
+        resp = new NextResponse('Feature removed', { status: 410 });
         break;
       case 'admin/security/score':
         resp = new NextResponse('Handled by standalone route', { status: 200 });
         break;
 
-      case 'admin/settings': {
-        const { adminSettingsHandler, adminSettingsUpdateHandler } = await import('../../../lib/adminSettingsHandlers');
-        resp = request.method === 'GET'
-          ? await adminSettingsHandler(request)
-          : await adminSettingsUpdateHandler(request);
-        break;
-      }
-      case 'admin/analytics/overview': {
-        const { adminAnalyticsOverviewHandler } = await import('../../../lib/adminSettingsHandlers');
+      case 'admin/analytics/overview':
         resp = await adminAnalyticsOverviewHandler(request);
         break;
-      }
+      case 'admin/settings':
+        resp = NextResponse.json({ error: 'Settings are code-owned defaults now' }, { status: 410 });
+        break;
+
+      case 'admin/maintenance':
+        resp = await adminMaintenanceHandler(request);
+        break;
 
       case 'passkey/register/options':
         resp = await passkeyRegisterOptionsHandler(request);
@@ -1054,20 +981,39 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await chatHandler(request);
         break;
 
+      case 'waitlist':
+        resp = NextResponse.json({ ok: true, message: 'Waitlist feature coming soon' });
+        break;
+      case 'feedback':
+        resp = NextResponse.json({ ok: true, message: 'Feedback received' });
+        break;
+      case 'admin/feedback':
+        resp = NextResponse.json({ feedback: [] });
+        break;
+      case 'admin/subscribers':
+        resp = NextResponse.json({ subscribers: [] });
+        break;
+      case 'user/mailbox':
+        resp = NextResponse.json({ mailbox: [] });
+        break;
+      case 'user/mailbox/check':
+        resp = NextResponse.json({ checked: true });
+        break;
+      case 'user/mailbox/dns':
+        resp = NextResponse.json({ records: [] });
+        break;
+      case 'user/apps':
+        resp = NextResponse.json({ apps: [] });
+        break;
+      case 'auth/verify':
+        resp = await verifyHandler(request);
+        break;
+
       case 'auth/oauth/authorize':
-        resp = await oauthAuthorizeHandler(request);
-        break;
-      case 'auth/oauth/consent':
-        resp = await oauthConsentInfoHandler(request);
-        break;
       case 'auth/oauth/token':
-        resp = await oauthTokenHandler(request);
-        break;
       case 'auth/oauth/revoke':
-        resp = await oauthRevokeHandler(request);
-        break;
       case 'oidc/userinfo':
-        resp = await oidcUserInfoHandler(request);
+        resp = NextResponse.json({ error: 'OAuth2/OIDC server removed' }, { status: 410 });
         break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
@@ -1077,39 +1023,20 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       // Content routes
       case 'content/settings':
-        resp = await settingsListHandler(request);
-        break;
       case 'content/settings/update':
-        resp = await settingsUpdateHandler(request);
-        break;
       case 'content/feature-flags':
-        resp = await featureFlagsListHandler(request);
-        break;
       case 'content/feature-flags/update':
-        resp = await featureFlagsUpdateHandler(request);
+        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
         break;
-      case 'content/apps':
-        resp = await appsListHandler(request);
-        break;
-      case 'content/apps/admin':
-        resp = await appsAdminListHandler(request);
-        break;
-      case 'content/apps/create':
-        resp = await appsCreateHandler(request);
-        break;
-      case 'content/incidents':
-        resp = await incidentsListHandler(request);
-        break;
-      case 'content/incidents/create':
-        resp = await incidentsCreateHandler(request);
-        break;
-      case 'content/incidents/[id]/events':
-        if (method === 'GET') resp = await incidentEventsListHandler(request, (route as any).meta.incidentId);
-        else if (method === 'POST') resp = await incidentEventsCreateHandler(request, (route as any).meta.incidentId);
+      case 'content/incident-events':
+        if (method === 'GET') resp = await incidentEventsListHandler(request);
+        else if (method === 'POST') resp = await incidentEventsCreateHandler(request);
         else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'content/jobs':
-        resp = await jobsListHandler(request);
+      case 'content/jobs/create':
+      case 'content/retry-job/[id]':
+        resp = NextResponse.json({ error: 'Job system removed' }, { status: 410 });
         break;
       // Support routes
       case 'support/tickets':
@@ -1154,10 +1081,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         else resp = new NextResponse('Method not allowed', { status: 405 });
         break;
       case 'support/queues':
-        resp = await queuesListHandler(request);
-        break;
       case 'support/queues/create':
-        resp = await queuesCreateHandler(request);
+        resp = NextResponse.json({ error: 'Queue system removed' }, { status: 410 });
         break;
       case 'health':
         resp = await publicHealthHandler();
@@ -1180,29 +1105,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'content/health':
         resp = await detailedHealthHandler(request);
         break;
-      case 'content/jobs/create': {
-        const jobAdmin = await isAdmin(request);
-        if (!jobAdmin) {
-          await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
-          resp = jsonForbidden();
-          break;
-        }
-        const jobBody: any = await request.json();
-        const job = await createJob(jobBody.type, jobBody.payload || {}, jobBody.queue || 'default', jobBody.maxAttempts || 3);
-        resp = NextResponse.json(job, { status: 201 });
-        break;
-      }
-      case 'content/retry-job/[id]': {
-        const retryAdmin = await isAdmin(request);
-        if (!retryAdmin) {
-          await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
-          resp = jsonForbidden();
-          break;
-        }
-        await retryJob((route as any).meta.retryJobId);
-        resp = NextResponse.json({ message: 'Job queued for retry' });
-        break;
-      }
+
       // Workspace routes
       default:
         resp = new NextResponse('Internal route not implemented', { status: 501 });
@@ -1220,10 +1123,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     try {
       const user = await prisma.user.findUnique({
         where: { id: session.userId },
-        include: { roles: { include: { role: true } } },
+        select: { adminRole: true },
       });
-      const firstRole = user?.roles?.[0]?.role;
-      userRole = firstRole?.name?.toLowerCase() || 'member';
+      userRole = user?.adminRole?.toLowerCase() || 'member';
     } catch (e: any) {
       console.error('[HANDLER] DB query failed during role lookup:', e?.message);
       userRole = 'guest';

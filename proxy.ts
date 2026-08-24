@@ -367,14 +367,14 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
     const { verifyToken } = await import('./lib/auth/jwt');
     const tokenForStatus: string | null = (preCookie || cookie || (hasAuthHeader ? request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') : '')) || null;
     const tokenPayload = tokenForStatus ? await verifyToken(tokenForStatus) : null;
-    if (tokenPayload?.userId) {
+    if (tokenPayload?.sub) {
       const { prisma } = await import('./lib/db/prisma');
       const su = await prisma.user.findUnique({
-        where: { id: String(tokenPayload.userId) },
+        where: { id: String(tokenPayload.sub) },
         select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true },
       });
       if (su?.isBanned) {
-        await prisma.session.deleteMany({ where: { userId: tokenPayload.userId } }).catch(() => {});
+        await prisma.session.deleteMany({ where: { userId: tokenPayload.sub } }).catch(() => {});
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_BANNED', banned: true,
           message: 'Your account has been permanently banned.',
@@ -382,7 +382,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
       } else if (su?.isSuspended) {
         if (su.suspendedUntil && new Date(su.suspendedUntil) < new Date()) {
           await prisma.user.update({
-            where: { id: String(tokenPayload.userId) },
+            where: { id: String(tokenPayload.sub) },
             data: { isSuspended: false, suspendReason: null, suspendedUntil: null },
           }).catch(() => {});
         } else {

@@ -2,7 +2,7 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { getPoolStatus } from './lib/db/prisma';
-import { startPeriodicCleanup, startPeriodicDigests, startPeriodicOauthSync, startPeriodicDeletionSweep } from './lib/jobs';
+import { startPeriodicCleanup, startPeriodicDigests, startPeriodicDeletionSweep } from './lib/jobs';
 import { startPeriodicTips } from './lib/tips';
 
 const dev = process.env.NODE_ENV !== 'production';
@@ -34,7 +34,6 @@ app.prepare().then(() => {
     startPeriodicCleanup();
     // Start periodic email digests (hourly)
     startPeriodicDigests();
-    startPeriodicOauthSync();
     startPeriodicDeletionSweep();
     startPeriodicTips();
 

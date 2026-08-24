@@ -13,24 +13,51 @@ export function generateOtpCode(): string {
 export async function storeSignupOtp(email: string, code: string) {
   const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), OTP_TTL_MINUTES);
+  // One live code per email — a fresh send replaces the previous one.
+  await prisma.signupOtp.deleteMany({ where: { email: email.toLowerCase() } });
   await prisma.signupOtp.create({
     data: { email: email.toLowerCase(), otpHash, expiresAt },
   });
 }
 
-export async function verifySignupOtp(email: string, code: string): Promise<boolean> {
+const MAX_OTP_ATTEMPTS = 5;
+
+async function findLiveOtp(email: string) {
   const otp = await prisma.signupOtp.findFirst({
     where: { email: email.toLowerCase() },
     orderBy: { createdAt: 'desc' },
   });
-  if (!otp) return false;
+  if (!otp) return null;
   if (otp.expiresAt < new Date()) {
-    await prisma.signupOtp.delete({ where: { id: otp.id } });
-    return false;
+    await prisma.signupOtp.delete({ where: { id: otp.id } }).catch(() => {});
+    return null;
   }
+  if ((otp.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
+    // Too many wrong tries — invalidate and force a new code.
+    await prisma.signupOtp.delete({ where: { id: otp.id } }).catch(() => {});
+    return null;
+  }
+  return otp;
+}
+
+/** Register a failed attempt; invalidates the code once MAX_OTP_ATTEMPTS is hit. */
+async function registerFailedAttempt(otpId: string, attempts: number) {
+  const next = attempts + 1;
+  if (next >= MAX_OTP_ATTEMPTS) {
+    await prisma.signupOtp.delete({ where: { id: otpId } }).catch(() => {});
+  } else {
+    await prisma.signupOtp.update({ where: { id: otpId }, data: { attempts: next } }).catch(() => {});
+  }
+}
+
+export async function verifySignupOtp(email: string, code: string): Promise<boolean> {
+  const otp = await findLiveOtp(email);
+  if (!otp) return false;
   const ok = await verifyOtpCode(otp.otpHash, code);
   if (ok) {
-    await prisma.signupOtp.delete({ where: { id: otp.id } });
+    await prisma.signupOtp.delete({ where: { id: otp.id } }).catch(() => {});
+  } else {
+    await registerFailedAttempt(otp.id, otp.attempts ?? 0);
   }
   return ok;
 }
@@ -41,16 +68,13 @@ export async function verifySignupOtp(email: string, code: string): Promise<bool
  * `auth/signup` (which consumes it via verifySignupOtp).
  */
 export async function checkSignupOtp(email: string, code: string): Promise<boolean> {
-  const otp = await prisma.signupOtp.findFirst({
-    where: { email: email.toLowerCase() },
-    orderBy: { createdAt: 'desc' },
-  });
+  const otp = await findLiveOtp(email);
   if (!otp) return false;
-  if (otp.expiresAt < new Date()) {
-    await prisma.signupOtp.delete({ where: { id: otp.id } });
-    return false;
+  const ok = await verifyOtpCode(otp.otpHash, code);
+  if (!ok) {
+    await registerFailedAttempt(otp.id, otp.attempts ?? 0);
   }
-  return verifyOtpCode(otp.otpHash, code);
+  return ok;
 }
 
 export async function sendSignupOtpEmail(email: string, code: string, templateName: string = 'signup_otp') {
@@ -58,6 +82,10 @@ export async function sendSignupOtpEmail(email: string, code: string, templateNa
   if (!result.success) {
     console.error(`[SIGNUP OTP] Email send failed for ${email}: ${result.error}`);
     console.log(`[SIGNUP OTP] FALLBACK CODE for ${email}: ${code}`);
+  }
+  // Always log in dev for testing
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`[SIGNUP OTP] CODE for ${email}: ${code}`);
   }
   return result;
 }

@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer';
+import crypto from 'crypto';
 import { prisma } from './db/prisma';
-import { getBranding } from './branding';
+import { getBranding, getApiOrigin } from './branding';
 
 interface EmailResult { success: boolean; error?: string; messageId?: string; }
 
@@ -14,9 +15,10 @@ export async function logEmail(input: {
   status?: string;
   messageId?: string;
   error?: string;
-}) {
+  metadata?: Record<string, unknown>;
+}): Promise<string | null> {
   try {
-    await prisma.email_logs.create({
+    const row = await prisma.email_logs.create({
       data: {
         toEmail: input.toEmail,
         fromEmail: input.fromEmail,
@@ -26,11 +28,57 @@ export async function logEmail(input: {
         replyTo: input.replyTo,
         status: input.status || 'sent',
         error: input.error,
+        metadata: (input.metadata || {}) as any,
       },
+      select: { id: true },
     });
+    return row.id;
   } catch (e: any) {
     console.error('[EMAIL_LOG]', e?.message || e);
+    return null;
   }
+}
+
+/** Update a previously created email_logs row after the provider responds. */
+async function finalizeEmailLog(logId: string | null, result: EmailResult) {
+  if (!logId) return;
+  try {
+    await prisma.email_logs.update({
+      where: { id: logId },
+      data: result.success
+        ? { status: 'sent' as any, messageId: result.messageId || null, error: null }
+        : { status: 'failed' as any, error: (result.error || 'Send failed').slice(0, 1000) },
+    });
+  } catch (e: any) {
+    console.error('[EMAIL_LOG] finalize failed:', e?.message);
+  }
+}
+
+/** Stable thread id so replies and follow-ups group in mail clients. */
+function deriveThreadId(to: string, subject: string, explicit?: string): string {
+  if (explicit) return explicit.slice(0, 255);
+  return crypto.createHash('sha1').update(`${to.toLowerCase()}|${subject}`).digest('hex').slice(0, 24);
+}
+
+const TRACKED_TEMPLATES_WITHOUT_PIXEL = new Set(['signup_otp', 'login_otp', 'password_reset_otp']);
+
+/** Wrap links for click tracking and append the open-tracking pixel. */
+function injectTracking(htmlBody: string, logId: string, templateName?: string): string {
+  const base = getApiOrigin();
+  let html = htmlBody;
+
+  // Click tracking: rewrite http(s) anchors through /api/e/c/<id>?u=<b64>
+  html = html.replace(/href="(https?:\/\/[^"]+)"/gi, (_m, url: string) => {
+    const wrapped = `${base}/api/e/c/${logId}?u=${Buffer.from(url).toString('base64url')}`;
+    return `href="${wrapped}"`;
+  });
+
+  // Open tracking pixel (skip OTP-style emails where images are usually blocked)
+  if (!templateName || !TRACKED_TEMPLATES_WITHOUT_PIXEL.has(templateName)) {
+    const pixel = `<img src="${base}/api/e/o/${logId}" width="1" height="1" alt="" style="display:none;border:0;" />`;
+    html = html.includes('</body>') ? html.replace('</body>', `${pixel}</body>`) : html + pixel;
+  }
+  return html;
 }
 
 export async function getEmailConfig() {
@@ -91,7 +139,7 @@ export async function sendEmail(
   to: string,
   subject: string,
   htmlBody: string,
-  options?: { fromEmail?: string; fromName?: string; replyTo?: string; threadId?: string; templateName?: string }
+  options?: { fromEmail?: string; fromName?: string; replyTo?: string; threadId?: string; templateName?: string; metadata?: Record<string, unknown> }
 ): Promise<EmailResult> {
   let config: any = null;
   try {
@@ -116,6 +164,26 @@ export async function sendEmail(
 
   const fromEmail = options?.fromEmail || config?.fromEmail || 'noreply@send.tirbeo.app';
   const fromName = options?.fromName || config?.fromName || 'Tirbeo';
+  const threadId = deriveThreadId(to, subject, options?.threadId);
+
+  // Create the log row up front so tracking URLs can reference it.
+  let logId: string | null = null;
+  try {
+    logId = await logEmail({
+      toEmail: to,
+      fromEmail,
+      subject,
+      template: options?.templateName || undefined,
+      threadId,
+      replyTo: options?.replyTo,
+      status: 'pending',
+      metadata: options?.metadata,
+    });
+  } catch { /* logging is best-effort */ }
+
+  if (logId) {
+    htmlBody = injectTracking(htmlBody, logId, options?.templateName);
+  }
 
   let result: EmailResult = { success: false };
   if (provider === 'resend' || (!config && apiKey)) {
@@ -123,23 +191,11 @@ export async function sendEmail(
   } else if (provider === 'smtp') {
     result = await sendViaSmtp(config, to, fromEmail, fromName, subject, htmlBody, options?.replyTo);
   } else {
+    result = { success: false, error: `Unknown email provider: ${provider}` };
     console.error(`[EMAIL] Unknown provider "${provider}". Cannot send to ${to}`);
-    return { success: false, error: `Unknown email provider: ${provider}` };
   }
 
-  // Log email to database (non-blocking)
-  if (result.success) {
-    logEmail({
-      toEmail: to,
-      fromEmail,
-      subject,
-      template: options?.templateName || undefined,
-      threadId: options?.threadId,
-      replyTo: options?.replyTo,
-      status: 'sent',
-      messageId: result.messageId,
-    }).catch(() => {});
-  }
+  await finalizeEmailLog(logId, result);
 
   return result;
 }
@@ -211,7 +267,7 @@ export async function sendTemplateEmail(
   to: string,
   templateName: string,
   variables: Record<string, string>,
-  options?: { fromEmail?: string; fromName?: string; rawVars?: string[] }
+  options?: { fromEmail?: string; fromName?: string; rawVars?: string[]; replyTo?: string; threadId?: string }
 ): Promise<EmailResult> {
   const rawKeys = new Set(options?.rawVars || []);
   const branding = await getBranding();
@@ -273,6 +329,8 @@ export async function sendTemplateEmail(
   const finalOptions = {
     fromEmail: options?.fromEmail || defaultFromEmail,
     fromName: options?.fromName || defaultFromName,
+    replyTo: options?.replyTo,
+    threadId: options?.threadId,
   };
 
   // Always prefer built-in templates (clean light design) over DB templates
@@ -296,6 +354,8 @@ export async function sendTemplateEmail(
     return sendEmail(to, subject, htmlBody, {
       fromEmail: finalOptions.fromEmail,
       fromName: finalOptions.fromName,
+      replyTo: finalOptions.replyTo,
+      threadId: finalOptions.threadId,
       templateName,
     });
   }

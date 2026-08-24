@@ -249,6 +249,14 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     if (!form) form = await prisma.form.findUnique({ where: { slug: id }, include: { fields: { orderBy: { order: 'asc' } } } });
     if (!form) return NextResponse.json({ error: 'Form not found' }, { status: 404 });
 
+    // Track view (non-blocking)
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    prisma.formAnalytic.upsert({
+      where: { formId_date: { formId: form.id, date: today } },
+      create: { formId: form.id, date: today, views: 1, starts: 1 },
+      update: { views: { increment: 1 }, starts: { increment: 1 } },
+    }).catch(() => {});
+
     return NextResponse.json({
       id: form.id,
       name: form.name,

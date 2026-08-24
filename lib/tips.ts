@@ -30,7 +30,10 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
       photoUrl: true,
       username: true,
       lastLoginAt: true,
-      _count: { select: { passkeys: true, integrations: true } },
+      googleId: true,
+      githubId: true,
+      discordId: true,
+      _count: { select: { passkeys: true } },
     },
   });
   if (!user) return [];
@@ -57,7 +60,8 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
     });
   }
 
-  if (user._count.passkeys === 0 && user._count.integrations === 0) {
+  const hasLinkedAccount = !!(user.googleId || user.githubId || user.discordId);
+  if (user._count.passkeys === 0 && !hasLinkedAccount) {
     tips.push({
       id: 'faster-signin',
       title: 'Sign in faster with a passkey or connected account',
@@ -118,12 +122,13 @@ export async function nextUnsentTip(userId: string): Promise<AccountTip | null> 
  */
 export async function sendNextTipForUser(userId: string): Promise<boolean> {
   try {
-    const prefs = await prisma.notificationPreference.findUnique({
-      where: { userId },
-      select: { email: true, tipsEmail: true },
+    const u = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { notificationPreferences: true },
     }).catch(() => null);
-    // Default ON when prefs row doesn't exist yet; respect explicit opt-outs.
-    if (prefs && (prefs.email === false || prefs.tipsEmail === false)) return false;
+    // Default ON; respect explicit opt-outs in the jsonb column.
+    const prefs: any = (u as any)?.notificationPreferences;
+    if (prefs && typeof prefs === 'object' && (prefs.email === false || prefs.tipsEmail === false)) return false;
 
     const tip = await nextUnsentTip(userId);
     if (!tip) return false;
@@ -161,22 +166,28 @@ export async function sendNextTipForUser(userId: string): Promise<boolean> {
 export async function runAutoTipsSweep() {
   try {
     const cutoff = new Date(Date.now() - 3 * 86400000);
-    const eligible = await prisma.notificationPreference.findMany({
-      where: { email: true, tipsEmail: true },
+    // One query for opted-in users instead of a per-user prefs lookup.
+    type Row = { id: string };
+    const eligible = await prisma.$queryRaw<Row[]>`
+      SELECT "id" FROM "users"
+      WHERE "deleted_at" IS NULL AND "is_banned" = false
+        AND ("notification_preferences"->>'email')::boolean IS NOT FALSE
+        AND ("notification_preferences"->>'tipsEmail')::boolean IS NOT FALSE
+      LIMIT 5000`;
+    if (eligible.length === 0) return;
+
+    // One query for the most recent tip per user (dedup + throttle).
+    const recentLogs = await prisma.userTipLog.findMany({
+      where: { userId: { in: eligible.map((u) => u.id) }, sentAt: { gt: cutoff } },
       select: { userId: true },
-      take: 5000,
+      distinct: ['userId'],
     });
+    const throttled = new Set(recentLogs.map((l) => l.userId));
 
     let sentCount = 0;
-    for (const p of eligible) {
-      const last = await prisma.userTipLog.findFirst({
-        where: { userId: p.userId },
-        orderBy: { sentAt: 'desc' },
-        select: { sentAt: true },
-      });
-      // Skip users who got a tip very recently (unless they have NO tips logged yet)
-      if (last && last.sentAt > cutoff) continue;
-      const ok = await sendNextTipForUser(p.userId);
+    for (const u of eligible) {
+      if (throttled.has(u.id)) continue;
+      const ok = await sendNextTipForUser(u.id);
       if (ok) sentCount++;
     }
     if (sentCount > 0) console.log(`[TIPS] Sweep complete — ${sentCount} tips sent`);

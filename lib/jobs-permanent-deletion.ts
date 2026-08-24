@@ -47,25 +47,17 @@ async function permanentlyDeleteUser(userId: string, email: string) {
   const deleteOps = [
     prisma.apiKey.deleteMany({ where: { userId } }),
     prisma.otp.deleteMany({ where: { userId } }),
-    prisma.recoveryCode.deleteMany({ where: { userId } }),
+    prisma.user.update({ where: { id: userId }, data: { backupCodes: [] } }),
     prisma.passkey.deleteMany({ where: { userId } }),
-    prisma.passkeyChallenge.deleteMany({ where: { userId } }),
     prisma.notification.deleteMany({ where: { userId } }),
-    prisma.notificationPreference.deleteMany({ where: { userId } }),
-    prisma.pushSubscription.deleteMany({ where: { userId } }),
     prisma.securityEvent.deleteMany({ where: { userId } }),
     prisma.auditEvent.deleteMany({ where: { actorId: userId } }),
-    prisma.integration.deleteMany({ where: { userId } }),
     prisma.media.deleteMany({ where: { uploadedBy: userId } }),
-    prisma.userRole.deleteMany({ where: { userId } }),
     prisma.login_history.deleteMany({ where: { userId } }),
+    prisma.incident_events.deleteMany({ where: { userId } }),
     prisma.ticket.deleteMany({ where: { customerId: userId } }),
     prisma.ticketMessage.deleteMany({ where: { authorId: userId } }),
     prisma.session.deleteMany({ where: { userId } }),
-    prisma.oAuthConsent.deleteMany({ where: { userId } }),
-    prisma.authorization_codes.deleteMany({ where: { userId } }),
-    prisma.access_tokens.deleteMany({ where: { userId } }),
-    prisma.refresh_tokens.deleteMany({ where: { userId } }),
   ];
 
   await Promise.allSettled(deleteOps);

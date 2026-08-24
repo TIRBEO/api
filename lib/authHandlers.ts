@@ -6,7 +6,7 @@ import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendS
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken } from './auth/jwt';
 
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
@@ -51,11 +51,25 @@ export async function sessionHandler(request: NextRequest) {
     
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { id: true, email: true, name: true, photoUrl: true, is2FAEnabled: true, adminRole: true, emailVerified: true, consents: true },
+      select: {
+        id: true, email: true, name: true, photoUrl: true,
+        is2FAEnabled: true, adminRole: true, emailVerified: true, consents: true,
+        // Dashboard needs these to render the "Add password" banner,
+        // scheduled-deletion countdown, etc.
+        mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true, loginCount: true,
+      },
     });
     if (!user) return jsonUnauthorized();
     const adminRole = user.adminRole || null;
-    const userData = { id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl, is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified, consents: user.consents ?? {} };
+    const userData = {
+      id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl,
+      is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified,
+      consents: user.consents ?? {},
+      mustChangePassword: user.mustChangePassword,
+      scheduledDeletionAt: user.scheduledDeletionAt,
+      deletionReason: user.deletionReason,
+      loginCount: user.loginCount,
+    };
     profileCache.set(session.userId, userData);
     logPerformance('auth/session', startTime);
     return NextResponse.json({ user: userData });
@@ -219,38 +233,32 @@ interface OauthProviderConfig {
   redirectUri?: string;
 }
 
+/** Structured UA breakdown stored on every login_history row. */
+function parseLoginMetadata(ua?: string | null): Record<string, string> {
+  const d = describeDevice(ua);
+  const [browser, ...osParts] = d.split(' on ');
+  return {
+    os: osParts.join(' on ') || 'Unknown',
+    browser: browser || 'Unknown',
+    deviceType: /mobile|android|iphone|ipad/i.test(ua || '') ? 'mobile'
+      : /tablet|ipad/i.test(ua || '') ? 'tablet' : 'desktop',
+  };
+}
+
 const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }> = {
   google: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', uri: 'GOOGLE_REDIRECT_URI' },
   github: { id: 'GITHUB_CLIENT_ID', secret: 'GITHUB_CLIENT_SECRET', uri: 'GITHUB_REDIRECT_URI' },
   discord: { id: 'DISCORD_CLIENT_ID', secret: 'DISCORD_CLIENT_SECRET', uri: 'DISCORD_REDIRECT_URI' },
 };
 
-// The site_configs row is read on every OAuth start/callback request (~300ms DB
-// round-trip). Cache it briefly — it only changes through the admin panel.
-const OAUTH_CONFIG_TTL = 30_000;
-let oauthConfigCache: { record: any; at: number } | null = null;
-
 async function getOauthProviderConfig(provider: string): Promise<OauthProviderConfig> {
+  // OAuth providers are configured purely via environment variables.
   const keys = OAUTH_ENV_KEYS[provider];
-  let configured: any = {};
-  try {
-    if (!oauthConfigCache || Date.now() - oauthConfigCache.at > OAUTH_CONFIG_TTL) {
-      oauthConfigCache = {
-        record: await prisma.siteConfig.findUnique({ where: { app: 'accounts' } }),
-        at: Date.now(),
-      };
-    }
-    const cfgJson: any = oauthConfigCache.record?.config || {};
-    configured = cfgJson?.oauth?.[provider] || {};
-  } catch {
-    oauthConfigCache = null;
-  }
-  const envConfigured = !!process.env[keys?.id];
   return {
-    enabled: configured.enabled !== undefined ? !!configured.enabled : envConfigured,
-    clientId: configured.clientId || process.env[keys?.id],
-    clientSecret: configured.clientSecret || process.env[keys?.secret],
-    redirectUri: configured.redirectUri || process.env[keys?.uri],
+    enabled: !!process.env[keys?.id],
+    clientId: process.env[keys?.id],
+    clientSecret: process.env[keys?.secret],
+    redirectUri: process.env[keys?.uri],
   };
 }
 
@@ -263,21 +271,18 @@ function getOauthCookieDomain(request: NextRequest): string | undefined {
 
 const OAUTH_STATE_COOKIE = '__oauth_state';
 
-// A freshly-created OAuth account has no password and no recorded consent —
-// route it to the accounts app so the user can accept policy + optionally set
-// a password, instead of landing straight on the dashboard.
-function oauthPostLoginTarget(user: any, redirectTo: string | undefined, provider: string): string {
-  const isNewOAuthUser = !user?.passwordHash && !((user as any)?.consents as any)?.signupConsent?.policyAccepted;
-  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-  const accountsBase = (process.env.ACCOUNTS_URL || `https://accounts.${appDomain}`).replace(/\/$/, '');
-  if (isNewOAuthUser) {
-    const url = new URL(`${accountsBase}/callback`);
-    url.searchParams.set('oauth', 'new');
-    url.searchParams.set('provider', provider);
-    if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
-    return url.toString();
-  }
-  return redirectTo || process.env.NEXT_PUBLIC_DASHBOARD_URL || `https://dashboard.${appDomain}`;
+// Post-login target for an EXISTING account. Legacy accounts may still be
+// missing the recorded policy consent — send them to the in-dashboard
+// confirmation screen (session cookie is already set on this response).
+function oauthPostLoginTarget(user: any, redirectTo: string | undefined): string {
+  const dashboardBase = getDashboardBase();
+  const target = redirectTo || dashboardBase;
+  const needsConsent = !((user as any)?.consents as any)?.signupConsent?.policyAccepted;
+  if (!needsConsent) return target;
+  const url = new URL(`${dashboardBase}/oauth-complete`);
+  url.searchParams.set('finish', '1');
+  if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
+  return url.toString();
 }
 
 // ═══ SHARED OAUTH CALLBACK COMPLETION ═══
@@ -381,10 +386,8 @@ async function finishProviderSignIn(
         }).catch(() => {});
       }
       const metadata = { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) };
-      await prisma.integration.upsert({
-        where: { userId_provider: { userId: existingSession.userId, provider } },
-        update: { connected: true, metadata },
-        create: { userId: existingSession.userId, provider, connected: true, metadata },
+      await prisma.auditEvent.create({
+        data: { actorId: existingSession.userId, action: `oauth.${provider}.connected`, targetType: 'user', targetId: existingSession.userId, metadata, severity: 'info' },
       }).catch(() => {});
       const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=${provider}`);
       clearOauthStateCookie(res, request);
@@ -415,21 +418,26 @@ async function finishProviderSignIn(
 
   let account = user;
   if (!account) {
+    // ── Brand-new user: DO NOT create the account here. ──
+    // Hand the provider profile to the in-dashboard confirmation screen via a
+    // short-lived signed token; the account (and consent record) is only
+    // created when the user explicitly clicks "Create account".
     if (!profile.email) {
       return new NextResponse(`${provider[0].toUpperCase()}${provider.slice(1)} email not available`, { status: 400 });
     }
-    account = await prisma.user.create({
-      data: {
-        email: profile.email,
-        name: profile.name,
-        photoUrl: profile.photoUrl || undefined,
-        [idField]: profile.providerId,
-        mustChangePassword: true,
-      } as any,
+    const signupToken = await signPendingSignupToken({
+      provider,
+      providerId: profile.providerId,
+      email: profile.email,
+      name: profile.name || undefined,
+      photoUrl: profile.photoUrl || undefined,
     });
-    prisma.auditEvent.create({
-      data: { actorId: account.id, action: 'user.created', targetType: 'user', targetId: account.id, metadata: { provider, email: profile.email } },
-    }).catch(() => {});
+    const url = new URL(`${dashboardBase}/oauth-complete`);
+    url.searchParams.set('signup', signupToken);
+    if (state.redirect && isAllowedRedirect(state.redirect)) url.searchParams.set('redirect_to', state.redirect);
+    const res = NextResponse.redirect(url.toString());
+    clearOauthStateCookie(res, request);
+    return res;
   } else if (!account.photoUrl && profile.photoUrl) {
     // Backfill avatar only — the identity link already exists in this branch.
     await prisma.user.update({ where: { id: account.id }, data: { photoUrl: profile.photoUrl } as any }).catch(() => {});
@@ -440,14 +448,12 @@ async function finishProviderSignIn(
   // Session + integration bookkeeping run concurrently — neither depends on
   // the other and the round-trips were previously serial.
   const [, { token, refreshToken }] = await Promise.all([
-    prisma.integration.upsert({
-      where: { userId_provider: { userId: account.id, provider } },
-      update: { connected: true, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) } },
-      create: { userId: account.id, provider, connected: true, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) } },
+    prisma.auditEvent.create({
+      data: { actorId: account.id, action: `oauth.${provider}.login`, targetType: 'user', targetId: account.id, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) }, severity: 'info' },
     }).catch(() => null),
     createSession(account.id, request.headers.get('user-agent') || undefined, ip),
   ]);
-  const target = oauthPostLoginTarget(account, redirectTo, provider);
+  const target = oauthPostLoginTarget(account, redirectTo);
   const res = NextResponse.redirect(target);
   setSessionCookie(res, token, refreshToken, request);
   clearOauthStateCookie(res, request);
@@ -492,21 +498,14 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
 
     // Link + sign in to the matched account in one step.
     const [, { token, refreshToken }] = await Promise.all([
-      prisma.$transaction([
-        prisma.user.update({ where: { id: target.id }, data: { [idField]: data.providerId, ...(target.photoUrl ? {} : { photoUrl: data.photoUrl || undefined }) } as any }),
-        prisma.integration.upsert({
-          where: { userId_provider: { userId: target.id, provider: data.provider } },
-          update: { connected: true, metadata },
-          create: { userId: target.id, provider: data.provider, connected: true, metadata },
-        }),
-      ]),
+      prisma.user.update({ where: { id: target.id }, data: { [idField]: data.providerId, ...(target.photoUrl ? {} : { photoUrl: data.photoUrl || undefined }) } as any }),
       createSession(target.id, request.headers.get('user-agent') || undefined, (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()),
     ]);
     prisma.auditEvent.create({
       data: { actorId: target.id, action: 'account.merge.login', targetType: 'user', targetId: target.id, metadata: { provider: data.provider, providerId: data.providerId } },
     }).catch(() => {});
 
-    const res = NextResponse.json({ ok: true, redirect_to: oauthPostLoginTarget(target, undefined, data.provider) });
+    const res = NextResponse.json({ ok: true, redirect_to: oauthPostLoginTarget(target, undefined) });
     setSessionCookie(res, token, refreshToken, request);
     return res;
   } catch (err: any) {
@@ -586,6 +585,7 @@ export async function loginHandler(request: NextRequest) {
     if (user.isSuspended) {
       if (user.suspendedUntil && new Date(user.suspendedUntil) < new Date()) {
         await prisma.user.update({ where: { id: user.id }, data: { isSuspended: false, suspendReason: null, suspendedUntil: null } });
+        logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: user.suspendedUntil?.toISOString() || null } }).catch(() => {});
       } else {
         return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: user.suspendReason || 'No reason provided', until: user.suspendedUntil?.toISOString() || null, message: `Your account is suspended${user.suspendedUntil ? ` until ${new Date(user.suspendedUntil).toUTCString()}` : ''}.` }, { status: 403 });
       }
@@ -635,6 +635,7 @@ export async function loginHandler(request: NextRequest) {
           userAgent: userAgent || null,
           success: false,
           method: 'password',
+          metadata: parseLoginMetadata(userAgent),
         },
       }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
@@ -704,6 +705,7 @@ export async function loginHandler(request: NextRequest) {
     Promise.allSettled([
       Promise.resolve(clearRateLimitHits(ip)),
       Promise.resolve(logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_success', details: { reason: 'password' } })),
+      createAuditEvent({ actorId: user.id, action: 'user.login', targetType: 'user', targetId: user.id, metadata: { method: 'password', ip, device: describeDevice(userAgent) } }).catch(() => {}),
       Promise.resolve(createNotification({
         userId: user.id,
         type: 'security',
@@ -724,6 +726,7 @@ export async function loginHandler(request: NextRequest) {
           userAgent: userAgent || null,
           success: true,
           method: 'password',
+          metadata: parseLoginMetadata(userAgent),
         },
       }).catch(() => {}),
       ...(isNewIp ? [sendTemplateEmail(user.email, 'login_alert', {
@@ -962,17 +965,16 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       return new NextResponse('2FA not enabled', { status: 400 });
     }
 
-    const codes = await prisma.recoveryCode.findMany({
-      where: { userId, used: false },
-      orderBy: { createdAt: 'asc' },
-    });
+    const fullUser = await prisma.user.findUnique({ where: { id: userId }, select: { backupCodes: true } });
+    const backupCodes = Array.isArray((fullUser as any)?.backupCodes) ? (fullUser as any).backupCodes as any[] : [];
     const inputHash = hashRecoveryCode(recoveryCode);
-    const rc = codes.find(c => c.code === inputHash) || null;
-    if (!rc) return new NextResponse('Invalid recovery code', { status: 401 });
+    const idx = backupCodes.findIndex((c: any) => c.code === inputHash && !c.used);
+    if (idx === -1) return new NextResponse('Invalid recovery code', { status: 401 });
 
-    await prisma.recoveryCode.update({
-      where: { id: rc.id },
-      data: { used: true, usedAt: new Date() },
+    backupCodes[idx].used = true;
+    await prisma.user.update({
+      where: { id: userId },
+      data: { backupCodes },
     });
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -1187,6 +1189,7 @@ export async function signupHandler(request: NextRequest) {
             policyAccepted: true,
             adminDataAccess: !!adminDataAccess,
           },
+          allowCrashReports: true,
         },
         notificationPreferences: {
           email: true, push: true, inApp: true,
@@ -1336,6 +1339,130 @@ export async function oauthConsentHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[OAUTH CONSENT]', err?.message || err);
     return new NextResponse('Failed to record consent', { status: 500 });
+  }
+}
+
+// GET /api/auth/oauth/pending?token=… — preview the provider profile carried by
+// a pending-signup token, for the in-dashboard account-creation screen.
+export async function oauthPendingHandler(request: NextRequest) {
+  try {
+    const token = request.nextUrl.searchParams.get('token') || '';
+    const data = await verifyPendingSignupToken(token);
+    if (!data) {
+      return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
+    }
+    return NextResponse.json({
+      provider: data.provider,
+      email: data.email,
+      name: data.name || '',
+      photoUrl: data.photoUrl || null,
+    });
+  } catch (err: any) {
+    console.error('[OAUTH PENDING]', err?.message || err);
+    return new NextResponse('Failed to load signup info', { status: 500 });
+  }
+}
+
+// POST /api/auth/oauth/complete — create the Tirbeo account from a
+// pending-signup token. The signed token is the authorization; the explicit
+// policyAccepted flag means the account (and its consent record) only ever
+// exists after the user clicked "Create account".
+export async function oauthSignupCompleteHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    if (!body?.policyAccepted) {
+      return new NextResponse('Policy acceptance is required', { status: 400 });
+    }
+    const data = typeof body.token === 'string' ? await verifyPendingSignupToken(body.token) : null;
+    if (!data) {
+      return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
+    }
+    const idField = PROVIDER_ID_FIELD[data.provider];
+    if (!idField) return new NextResponse('Unsupported provider', { status: 400 });
+
+    // Optional password chosen on the confirmation screen.
+    let passwordHash: string | undefined;
+    if (typeof body.password === 'string' && body.password.length > 0) {
+      if (body.password.length < 8) {
+        return NextResponse.json({ error: 'Password must be at least 8 characters.' }, { status: 400 });
+      }
+      passwordHash = await hashPassword(body.password);
+    }
+
+    // The provider identity may have been claimed meanwhile — never hijack.
+    const holder = await prisma.user.findUnique({ where: { [idField]: data.providerId } as any });
+    if (holder) {
+      return NextResponse.json({ error: `This ${data.provider} account is already linked.` }, { status: 409 });
+    }
+
+    let email = data.email.toLowerCase().trim();
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      // Account was created for this email between callback and confirm —
+      // attach the identity instead of failing.
+      await prisma.user.update({ where: { id: existing.id }, data: { [idField]: data.providerId } as any }).catch(() => {});
+      email = existing.email;
+    }
+
+    const user = await prisma.user.create({
+      select: { id: true },
+      data: {
+        email,
+        name: data.name ? sanitizeInput(data.name, 120) : undefined,
+        photoUrl: data.photoUrl || undefined,
+        [idField]: data.providerId,
+        passwordHash,
+        mustChangePassword: !passwordHash,
+        // The OAuth provider already verified this email — skip the
+        // verification gate so social signups aren't blocked.
+        emailVerified: true,
+        consents: {
+          signupConsent: {
+            acceptedAt: new Date().toISOString(),
+            policyAccepted: true,
+            adminDataAccess: false,
+            oauth: true,
+          },
+        },
+        notificationPreferences: {
+          email: true, push: true, inApp: true,
+          security: true, forms: true, product: true, support: true,
+          productEmail: true, tipsEmail: true, weeklySummary: false,
+        },
+      } as any,
+    });
+
+    prisma.auditEvent.create({
+      data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: data.provider, email, via: 'oauth_complete' } },
+    }).catch(() => {});
+
+    // Welcome notification (best-effort).
+    Promise.resolve(createNotification({
+      userId: user.id,
+      type: 'system',
+      title: 'Welcome to Tirbeo!',
+      body: 'Your account is ready. Explore your dashboard to get started.',
+      link: '/overview',
+      icon: 'welcome',
+    })).catch(() => {});
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.json({
+      ok: true,
+      redirect_to: process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase(),
+    });
+    setSessionCookie(res, sessionToken, refreshToken, request);
+
+    sendTemplateEmail(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
+      fromEmail: 'noreply@send.tirbeo.app',
+      fromName: 'Tirbeo',
+    }).catch(err => console.error('[OAUTH COMPLETE] Welcome email failed:', err?.message));
+
+    return res;
+  } catch (err: any) {
+    console.error('[OAUTH COMPLETE]', err?.message || err);
+    return NextResponse.json({ error: 'Could not create your account. Please try again.' }, { status: 500 });
   }
 }
 
@@ -2049,6 +2176,7 @@ export async function profileHandler(request: NextRequest) {
 
           lastLoginAt: true,
           lastLoginIp: true,
+          loginCount: true,
           createdAt: true,
           updatedAt: true,
           lastActiveAt: true,
@@ -2061,6 +2189,11 @@ export async function profileHandler(request: NextRequest) {
           timeFormat: true,
           isBanned: true,
           isSuspended: true,
+          suspendReason: true,
+          suspendedUntil: true,
+          mustChangePassword: true,
+          scheduledDeletionAt: true,
+          deletionReason: true,
           googleId: true,
           githubId: true,
           discordId: true,
@@ -2069,7 +2202,9 @@ export async function profileHandler(request: NextRequest) {
       if (!user) return new NextResponse('User not found', { status: 404 });
       const { passwordHash, googleId, githubId, discordId, ...safeUser } = user as any;
 
-      const backupCodeCount = await prisma.recoveryCode.count({ where: { userId: session.userId } });
+      const backupUser = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
+      const backupCodes = Array.isArray((backupUser as any)?.backupCodes) ? (backupUser as any).backupCodes : [];
+      const backupCodeCount = backupCodes.length;
       const result = {
         ...safeUser,
         hasPassword: !!passwordHash,
@@ -2101,6 +2236,7 @@ export async function profileHandler(request: NextRequest) {
         linkedIn: z.string().optional().nullable(),
         linkedin: z.string().optional().nullable(),
         github: z.string().optional().nullable(),
+        githubUsername: z.string().optional().nullable(),
         twitter: z.string().optional().nullable(),
         companyName: z.string().optional().nullable(),
         companyRole: z.string().optional().nullable(),
@@ -2119,6 +2255,11 @@ export async function profileHandler(request: NextRequest) {
       if ('linkedIn' in data) { data.linkedin = data.linkedIn; delete data.linkedIn; }
       if ('linkedin' in data) { data.linkedin = data.linkedin ?? null; }
       if ('github' in data) { data.githubUsername = data.github; delete data.github; }
+      if (data.githubUsername === undefined) delete data.githubUsername;
+      if (data.githubUsername !== undefined && typeof data.githubUsername === 'string') {
+        const gh = data.githubUsername.trim().replace(/^@/, '').replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\/+$/, '');
+        data.githubUsername = gh || null;
+      }
       let updated;
       try {
         updated = await prisma.user.update({
@@ -2713,41 +2854,10 @@ const DEFAULT_HELP_ARTICLES = [
 ];
 
 export async function helpConfigHandler(request: NextRequest) {
-  try {
-    const dbArticles = await prisma.helpArticle.findMany({
-      where: { published: true },
-      orderBy: [{ ord: 'asc' }, { title: 'asc' }],
-      select: { id: true, title: true, content: true, category: true, icon: true },
-    });
-
-    if (dbArticles.length > 0) {
-      // Merge: DB articles override the in-code defaults by title, and any
-      // new articles are appended. This way adding a doc in the support app
-      // never wipes out the built-in article set.
-      const byTitle = new Map(dbArticles.map((a) => [a.title.toLowerCase(), a]));
-      const merged = DEFAULT_HELP_ARTICLES.map((def) => byTitle.get(def.title.toLowerCase()) || def);
-      for (const db of dbArticles) {
-        if (!merged.some((m) => m.title.toLowerCase() === db.title.toLowerCase())) {
-          merged.push(db);
-        }
-      }
-      return NextResponse.json({
-        articles: merged,
-        contactEmail: "support@tirbeo.app",
-        faqEnabled: true,
-        syncedFromDb: true,
-      });
-    }
-  } catch (err: any) {
-    console.error('[HELP CONFIG] DB fallback', err?.message || err);
-  }
-
-  // Fallback: in-code defaults when no published articles exist in the DB yet.
   return NextResponse.json({
     articles: DEFAULT_HELP_ARTICLES,
     contactEmail: "support@tirbeo.app",
     faqEnabled: true,
-    syncedFromDb: false,
   });
 }
 

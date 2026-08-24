@@ -46,7 +46,7 @@ async function handleVerify(request: NextRequest) {
     const { prisma } = await import('../../../../lib/db/prisma');
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, mustChangePassword: true, roles: { include: { role: true } } },
+      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, mustChangePassword: true },
     });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
       return new NextResponse('2FA not enabled', { status: 400 });
@@ -57,7 +57,7 @@ async function handleVerify(request: NextRequest) {
       return new NextResponse('Invalid 2FA code', { status: 401 });
     }
 
-    if (!user.adminRole && !user.roles?.[0]?.role) {
+    if (!user.adminRole) {
       const { sendTemplateEmail } = await import('../../../../lib/email');
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',
@@ -78,7 +78,7 @@ async function handleVerify(request: NextRequest) {
 
     const ip = request.headers.get('x-forwarded-for') || '';
     const { createSession, setSessionCookie } = await import('@/lib/session');
-    const adminRole = user.adminRole || user.roles?.[0]?.role?.name;
+    const adminRole = user.adminRole;
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);

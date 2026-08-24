@@ -119,17 +119,16 @@ export async function detailedHealthHandler(req: NextRequest) {
   }
 
   try {
-    const [pendingJobs, failedJobs] = await Promise.all([
-      prisma.jobs.count({ where: { status: 'pending' } }),
-      prisma.jobs.count({ where: { status: 'failed' } }),
-    ]);
-    checks.queue = { pendingJobs, failedJobs };
+    const recentCriticalEvents = await prisma.incident_events.findMany({
+      where: { severity: 'critical', createdAt: { gte: new Date(Date.now() - 24 * 3600_000) } },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      select: { id: true, type: true, message: true, createdAt: true },
+    });
+    checks.recentCriticalEvents = recentCriticalEvents;
   } catch (e: any) {
-    checks.queue = { status: 'error', error: e?.message };
-    healthy = false;
+    checks.recentCriticalEvents = { status: 'error', error: e?.message };
   }
-
-  const recentIncidents = await prisma.incidents.findMany({ where: { resolvedAt: null }, orderBy: { createdAt: 'desc' }, take: 5 });
 
   const poolStatus = getPoolStatus();
   return NextResponse.json({
@@ -140,7 +139,6 @@ export async function detailedHealthHandler(req: NextRequest) {
     version: process.env.npm_package_version || '0.0.1',
     checks,
     pool: poolStatus || undefined,
-    incidents: recentIncidents,
   });
 }
 

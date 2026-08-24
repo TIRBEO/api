@@ -5,6 +5,7 @@ import { getSession } from './session';
 import { revokeSessionState } from './auth/redis';
 import { revokeSessionFamilyByUser, bustSessionCache } from './auth/session';
 import { jsonUnauthorized, jsonError } from './response';
+import { logSecurityEvent } from './security';
 import { createAuditEvent } from './audit';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } from './auth/totp';
 import { hashRecoveryCode } from './auth/password';
@@ -251,12 +252,10 @@ export async function totpVerifyHandler(request: NextRequest) {
       data: { totpSecret: secretToVerify },
     });
     const recoveryCodes = generateRecoveryCodes(8);
-    await prisma.recoveryCode.createMany({
-      data: recoveryCodes.map(rc => ({ userId: session.userId, code: hashRecoveryCode(rc) })),
-    });
+    const backupCodesJson = recoveryCodes.map(rc => ({ code: hashRecoveryCode(rc), used: false }));
     await prisma.user.update({
       where: { id: session.userId },
-      data: { is2FAEnabled: true },
+      data: { is2FAEnabled: true, backupCodes: backupCodesJson },
     });
     await createAuditEvent({
       actorId: session.userId,
@@ -265,6 +264,7 @@ export async function totpVerifyHandler(request: NextRequest) {
       targetId: session.userId,
       severity: 'info',
     });
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.2fa_enabled', details: { method: 'totp' } }).catch(() => {});
     await notify(session.userId, 'Two-step verification enabled', 'Authenticator app two-factor is now active on your account.');
 
     const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
@@ -306,9 +306,8 @@ export async function totpDisableHandler(request: NextRequest) {
     }
     await prisma.user.update({
       where: { id: session.userId },
-      data: { totpSecret: null, is2FAEnabled: false },
+      data: { totpSecret: null, is2FAEnabled: false, backupCodes: [] },
     });
-    await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
     await createAuditEvent({
       actorId: session.userId,
       action: 'totp.disabled',
@@ -316,6 +315,7 @@ export async function totpDisableHandler(request: NextRequest) {
       targetId: session.userId,
       severity: 'warning',
     });
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.2fa_disabled', severity: 'warning' }).catch(() => {});
     await notify(session.userId, 'Two-step verification disabled', 'Two-factor authentication was turned off for your account.');
 
     const userEmail = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
@@ -342,8 +342,9 @@ export async function backupCodesListHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const count = await prisma.recoveryCode.count({ where: { userId: session.userId } });
-    // Codes are stored hashed and are only shown once at creation — never returned here.
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
+    const codes = Array.isArray((user as any)?.backupCodes) ? (user as any).backupCodes : [];
+    const count = codes.length;
     return NextResponse.json({ codes: [], count, enabled: count > 0 });
   } catch (err: any) {
     console.error('[BACKUP CODES LIST]', err?.message || err);
@@ -356,10 +357,11 @@ export async function backupCodesRegenerateHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    await prisma.recoveryCode.deleteMany({ where: { userId: session.userId } });
     const codes = generateRecoveryCodes(8);
-    await prisma.recoveryCode.createMany({
-      data: codes.map(code => ({ userId: session.userId, code: hashRecoveryCode(code) })),
+    const backupCodesJson = codes.map(code => ({ code: hashRecoveryCode(code), used: false }));
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { backupCodes: backupCodesJson },
     });
     await createAuditEvent({
       actorId: session.userId,

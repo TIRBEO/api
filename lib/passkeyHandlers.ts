@@ -48,40 +48,25 @@ function getOrigin(request: NextRequest): string {
   return `https://${host}`;
 }
 
-// ─── DB-backed challenge helpers ────────────────────────
+// ─── In-memory challenge cache ────────────────────────
+// Challenges are short-lived (5 min) so in-memory is fine.
+const challengeCache = new Map<string, { challenge: string; type: 'register' | 'auth'; userId?: string; expiresAt: number }>();
 
-async function storeChallenge(nonce: string, challenge: string, type: 'register' | 'auth', userId?: string) {
-  try {
-    // Lazy cleanup: delete expired challenges on each write (no cron needed for serverless)
-    const deleted = await prisma.passkeyChallenge.deleteMany({
-      where: { expiresAt: { lt: new Date() } },
-    });
-    if (deleted.count > 0) {
-      console.log(`[PASSKEY] Cleaned up ${deleted.count} expired challenges`);
-    }
-    
-    await prisma.passkeyChallenge.create({
-      data: {
-        nonce,
-        challenge,
-        type,
-        userId: userId || null,
-        expiresAt: new Date(Date.now() + CHALLENGE_TTL_MS),
-      },
-    });
-    console.log(`[PASSKEY] Stored ${type} challenge with nonce: ${nonce}`);
-  } catch (err: any) {
-    console.error('[PASSKEY] Error storing challenge:', err?.message || err);
-    throw err;
+function storeChallenge(nonce: string, challenge: string, type: 'register' | 'auth', userId?: string) {
+  // Lazy cleanup
+  const now = Date.now();
+  for (const [k, v] of challengeCache) {
+    if (v.expiresAt < now) challengeCache.delete(k);
   }
+  challengeCache.set(nonce, { challenge, type, userId, expiresAt: now + CHALLENGE_TTL_MS });
+  console.log(`[PASSKEY] Stored ${type} challenge with nonce: ${nonce}`);
 }
 
-async function getAndDeleteChallenge(nonce: string) {
-  const row = await prisma.passkeyChallenge.findUnique({ where: { nonce } });
+function getAndDeleteChallenge(nonce: string) {
+  const row = challengeCache.get(nonce);
   if (!row) return null;
-  // Delete regardless of expiry
-  await prisma.passkeyChallenge.delete({ where: { nonce } });
-  if (row.expiresAt.getTime() < Date.now()) return null;
+  challengeCache.delete(nonce);
+  if (row.expiresAt < Date.now()) return null;
   return row;
 }
 

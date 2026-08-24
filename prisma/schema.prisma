@@ -6,107 +6,75 @@ datasource db {
   provider = "postgresql"
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CORE USER & AUTH
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model User {
-  id                          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  email                       String    @unique
-  passwordHash                String    @default("") @map("password_hash")
-  name                        String?
-  photoUrl                    String?   @map("photo_url")
-  bio                         String?
-  secondaryEmail              String?   @map("secondary_email")
-  secondaryEmailVerified      Boolean?  @default(false) @map("secondary_email_verified")
-  phoneNumber                 String?   @map("phone_number")
-  phoneVerified               Boolean?  @default(false) @map("phone_verified")
-  emailVerified               Boolean?  @default(false) @map("email_verified")
-  username                    String?   @unique
-  gender                      String?
-  birthday                    DateTime? @db.Timestamptz(6)
-
-  // OAuth IDs (provider tokens stored here instead of separate integrations table)
-  googleId                    String?   @unique @map("google_id")
-  githubId                    String?   @unique @map("github_id")
-  discordId                   String?   @unique @map("discord_id")
-
-  occupation                  String?
-  companyName                 String?   @map("company_name")
-  companyRole                 String?   @map("company_role")
-  industry                    String?
-  companySize                 String?   @map("company_size")
-  website                     String?
-  linkedin                    String?
-  githubUsername              String?   @map("github_username")
-  twitter                     String?
-  country                     String?
-  timezone                    String?
-  language                    String?   @default("en")
-  theme                       String?   @default("system")
-  dateFormat                  String?   @default("MM/DD/YYYY") @map("date_format")
-  timeFormat                  String?   @default("12h") @map("time_format")
-
-  consents                    Json?     @default("{}")
-
-  // Security
-  totpSecret                  String?   @map("totp_secret")
-  is2FAEnabled                Boolean?  @default(false) @map("is_2fa_enabled")
-  backupCodes                 Json?     @default("[]") // [{code, used}]
-  isBanned                    Boolean?  @default(false) @map("is_banned")
-  isSuspended                 Boolean?  @default(false) @map("is_suspended")
-  suspendReason               String?   @map("suspend_reason")
-  suspendedUntil              DateTime? @map("suspended_until") @db.Timestamptz(6)
-  mustChangePassword          Boolean?  @default(false) @map("must_change_password")
-  lastActiveAt                DateTime? @map("last_active_at") @db.Timestamptz(6)
-  lastLoginAt                 DateTime? @map("last_login_at") @db.Timestamptz(6)
-  lastLoginIp                 String?   @map("last_login_ip")
-
-  // Soft-delete
-  deletedAt                   DateTime? @map("deleted_at") @db.Timestamptz(6)
-  scheduledDeletionAt         DateTime? @map("scheduled_deletion_at") @db.Timestamptz(6)
-  deletionReason              String?   @map("deletion_reason")
-
-  adminRole                   String?   @map("admin_role")
-
-  // Notifications (merged from old notification_preferences table)
-  notifEmail                  Boolean?  @default(true) @map("notif_email")
-  notifPush                   Boolean?  @default(true) @map("notif_push")
-  notifInApp                  Boolean?  @default(true) @map("notif_in_app")
-  notifSecurity               Boolean?  @default(true) @map("notif_security")
-  notifForms                  Boolean?  @default(true) @map("notif_forms")
-  notifProduct                Boolean?  @default(true) @map("notif_product")
-  notifSupport                Boolean?  @default(true) @map("notif_support")
-  notifQuietHoursEnabled      Boolean?  @default(false) @map("notif_quiet_hours_enabled")
-  notifQuietHoursStart        String?   @default("22:00") @map("notif_quiet_hours_start")
-  notifQuietHoursEnd          String?   @default("08:00") @map("notif_quiet_hours_end")
-  notifDigestEnabled          Boolean?  @default(false) @map("notif_digest_enabled")
-  notifDigestFrequency        String?   @default("daily") @map("notif_digest_frequency")
-  notificationPreferences     Json?     @default("{}") @map("notification_preferences")
-
-  createdAt                   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt                   DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  // Relations
-  loginHistory                login_history[]
-  apiKeys                     ApiKey[]
-  auditEvents                 AuditEvent[]     @relation("AuditActor")
-  blocklist                   Blocklist[]
-  media                       Media[]
-  notifications               Notification[]
-  otps                        Otp[]
-  securityEvents              SecurityEvent[]
-  sessions                    Session[]
-  deviceAccounts              deviceAccount[]
-  passkeys                    Passkey[]
-  tipLogs                     UserTipLog[]
-  integrations                Integration[]
-
-  customerTickets             Ticket[]          @relation("TicketCustomer")
-  assignedTickets             Ticket[]          @relation("TicketAssignee")
-  ticketMessages              TicketMessage[]   @relation("TicketMessageAuthor")
-  forms                       Form[]
-  apps                        apps[]        @relation("AppOwner")
+  id                      String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  email                   String          @unique
+  passwordHash            String          @default("") @map("password_hash")
+  name                    String?
+  photoUrl                String?         @map("photo_url")
+  bio                     String?
+  secondaryEmail          String?         @map("secondary_email")
+  secondaryEmailVerified  Boolean?        @default(false) @map("secondary_email_verified")
+  phoneNumber             String?         @map("phone_number")
+  phoneVerified           Boolean?        @default(false) @map("phone_verified")
+  emailVerified           Boolean?        @default(false) @map("email_verified")
+  username                String?         @unique
+  gender                  String?
+  birthday                DateTime?       @db.Timestamptz(6)
+  googleId                String?         @unique @map("google_id")
+  githubId                String?         @unique @map("github_id")
+  discordId               String?         @unique @map("discord_id")
+  occupation              String?
+  companyName             String?         @map("company_name")
+  companyRole             String?         @map("company_role")
+  industry                String?
+  companySize             String?         @map("company_size")
+  website                 String?
+  linkedin                String?
+  githubUsername          String?         @map("github_username")
+  twitter                 String?
+  country                 String?
+  timezone                String?
+  language                String?         @default("en")
+  theme                   String?         @default("system")
+  dateFormat              String?         @default("MM/DD/YYYY") @map("date_format")
+  timeFormat              String?         @default("12h") @map("time_format")
+  consents                Json?           @default("{}")
+  totpSecret              String?         @map("totp_secret")
+  is2FAEnabled            Boolean?        @default(false) @map("is_2fa_enabled")
+  backupCodes             Json?           @default("[]")
+  isBanned                Boolean?        @default(false) @map("is_banned")
+  isSuspended             Boolean?        @default(false) @map("is_suspended")
+  suspendReason           String?         @map("suspend_reason")
+  suspendedUntil          DateTime?       @map("suspended_until") @db.Timestamptz(6)
+  mustChangePassword      Boolean?        @default(false) @map("must_change_password")
+  lastActiveAt            DateTime?       @map("last_active_at") @db.Timestamptz(6)
+  lastLoginAt       DateTime? @map("last_login_at") @db.Timestamptz(6)
+  lastLoginIp       String?   @map("last_login_ip")
+  loginCount        Int?      @default(0) @map("login_count")
+  deletedAt               DateTime?       @map("deleted_at") @db.Timestamptz(6)
+  scheduledDeletionAt     DateTime?       @map("scheduled_deletion_at") @db.Timestamptz(6)
+  deletionReason          String?         @map("deletion_reason")
+  adminRole               String?         @map("admin_role")
+  notificationPreferences Json?           @default("{\"email\":true,\"push\":true,\"inApp\":true,\"security\":true,\"forms\":true,\"product\":true,\"support\":true,\"quietHoursEnabled\":false,\"quietHoursStart\":\"22:00\",\"quietHoursEnd\":\"08:00\",\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
+  createdAt               DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  apiKeys                 ApiKey[]
+  auditEvents             AuditEvent[]    @relation("AuditActor")
+  blocklist               Blocklist[]
+  deviceAccounts          deviceAccount[]
+  forms                   Form[]
+  loginHistory            login_history[]
+  media                   Media[]
+  notifications           Notification[]
+  otps                    Otp[]
+  passkeys                Passkey[]
+  securityEvents          SecurityEvent[]
+  sessions                Session[]
+  ticketMessages          TicketMessage[] @relation("TicketMessageAuthor")
+  assignedTickets         Ticket[]        @relation("TicketAssignee")
+  customerTickets         Ticket[]        @relation("TicketCustomer")
+  tipLogs                 UserTipLog[]
 
   @@index([adminRole], map: "idx_users_admin_role")
   @@index([createdAt], map: "idx_users_created")
@@ -191,18 +159,18 @@ model SignupOtp {
 }
 
 model ApiKey {
-  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String    @map("user_id")
-  name       String
-  keyHash    String    @unique @map("key_hash")
-  keyPrefix  String    @map("key_prefix")
-  permissions Json?   @default("{}")
-  isActive   Boolean?  @default(true) @map("is_active")
-  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
-  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String    @map("user_id")
+  name        String
+  keyHash     String    @unique @map("key_hash")
+  keyPrefix   String    @map("key_prefix")
+  permissions Json?     @default("{}")
+  isActive    Boolean?  @default(true) @map("is_active")
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([keyHash], map: "idx_api_keys_hash")
   @@index([keyPrefix], map: "idx_api_keys_prefix")
@@ -257,10 +225,6 @@ model Blocklist {
   @@map("blocklist")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EVENTS & SECURITY
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model SecurityEvent {
   id        String          @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String?         @map("user_id")
@@ -314,10 +278,6 @@ model login_history {
   @@map("login_history")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// NOTIFICATIONS
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model Notification {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String   @map("user_id")
@@ -336,10 +296,6 @@ model Notification {
   @@index([userId], map: "idx_notifications_user")
   @@map("notifications")
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// MEDIA
-// ═══════════════════════════════════════════════════════════════════════════════
 
 model Media {
   id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -363,10 +319,6 @@ model Media {
   @@index([uploadedBy], map: "idx_media_uploader")
   @@map("media")
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// EMAIL SYSTEM
-// ═══════════════════════════════════════════════════════════════════════════════
 
 model emailConfig {
   id               String   @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -421,7 +373,7 @@ model email_logs {
   fromEmail String?   @map("from_email")
   subject   String
   template  String?
-  status    String?   @default("sent")
+  status    String?   @default("pending")
   threadId  String?   @map("thread_id")
   replyTo   String?   @map("reply_to")
   openedAt  DateTime? @map("opened_at") @db.Timestamptz(6)
@@ -429,6 +381,7 @@ model email_logs {
   error     String?
   metadata  Json?     @default("{}")
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  messageId String?   @map("message_id")
 
   @@index([createdAt], map: "idx_email_logs_created")
   @@index([status], map: "idx_email_logs_status")
@@ -437,28 +390,24 @@ model email_logs {
   @@map("email_logs")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CAPTCHA (Rate Limiting / Bot Protection)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model CaptchaChallenge {
-  id            String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  sessionId     String          @map("session_id")
-  userId        String?         @map("user_id")
-  difficulty    String          @default("easy")
-  challengeType String          @default("image")
+  id            String           @id @default(dbgenerated("(gen_random_uuid())::text"))
+  sessionId     String           @map("session_id")
+  userId        String?          @map("user_id")
+  difficulty    String           @default("easy")
+  challengeType String           @default("image")
   question      String
-  answerHash    String          @map("answer_hash")
+  answerHash    String           @map("answer_hash")
   options       Json?
-  imageUrl      String?         @map("image_url")
-  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  expiresAt     DateTime        @map("expires_at") @db.Timestamptz(6)
-  attempts      Int             @default(0)
-  solved        Boolean         @default(false)
-  solvedAt      DateTime?       @map("solved_at") @db.Timestamptz(6)
-  ipAddress     String?         @map("ip_address")
-  userAgent     String?         @map("user_agent")
-  rayId         String          @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  imageUrl      String?          @map("image_url")
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt     DateTime         @map("expires_at") @db.Timestamptz(6)
+  attempts      Int              @default(0)
+  solved        Boolean          @default(false)
+  solvedAt      DateTime?        @map("solved_at") @db.Timestamptz(6)
+  ipAddress     String?          @map("ip_address")
+  userAgent     String?          @map("user_agent")
+  rayId         String           @unique @default(dbgenerated("(gen_random_uuid())::text"))
   attemptLogs   CaptchaAttempt[]
 
   @@index([sessionId])
@@ -469,17 +418,16 @@ model CaptchaChallenge {
 }
 
 model CaptchaAttempt {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  challengeId String   @map("challenge_id")
-  userId      String?  @map("user_id")
-  sessionId   String   @map("session_id")
+  id          String           @id @default(dbgenerated("(gen_random_uuid())::text"))
+  challengeId String           @map("challenge_id")
+  userId      String?          @map("user_id")
+  sessionId   String           @map("session_id")
   answer      String
-  isCorrect   Boolean  @default(false) @map("is_correct")
-  ipAddress   String?  @map("ip_address")
-  userAgent   String?  @map("user_agent")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  challenge CaptchaChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+  isCorrect   Boolean          @default(false) @map("is_correct")
+  ipAddress   String?          @map("ip_address")
+  userAgent   String?          @map("user_agent")
+  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  challenge   CaptchaChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
 
   @@index([challengeId])
   @@index([userId])
@@ -539,112 +487,79 @@ model CaptchaSettings {
   @@map("captcha_settings")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// INCIDENTS & CRASH TRACKING
-// ═══════════════════════════════════════════════════════════════════════════════
-
-model incidents {
-  id           String            @id @default(dbgenerated("(gen_random_uuid())"))
-  title        String
-  description  String?
-  severity     String            @default("minor")
-  status       String            @default("investigating")
-  services     Json              @default("[]")
-  applications Json              @default("[]")
-  ownerId      String?           @map("owner_id")
-  resolvedAt   DateTime?         @map("resolved_at")
-  postmortem   String?
-  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime          @updatedAt @map("updated_at")
-  events       incident_events[]
-
-  @@index([severity])
-  @@index([status])
-}
-
 model incident_events {
-  id         String     @id @default(uuid())
-  incidentId String     @map("incident_id")
-  type       String
-  message    String?
-  userId     String?    @map("user_id")
-  metadata   Json?      @default("{}")
-  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
-  incident   incidents  @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  id        String   @id @default(uuid())
+  type      String
+  message   String?
+  userId    String?  @map("user_id")
+  metadata  Json?    @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  severity  String   @default("error")
+  source    String   @default("client")
+  stack     String?
+  url       String?
+  userAgent String?  @map("user_agent")
 
-  @@index([incidentId])
+  @@index([type])
   @@index([userId])
+  @@index([createdAt])
   @@map("incident_events")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// FORMS (Core Product)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model Form {
-  id                String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId            String          @map("user_id")
-  name              String
-  slug              String          @unique
-  description       String?
-  status            String          @default("draft")
-  accessKey         String          @unique @map("access_key") @default("")
-  formType          String          @default("custom") @map("form_type")
-  websiteUrl        String?         @map("website_url")
-
-  successMessage    String?         @default("Thanks! Your submission has been received.") @map("success_message")
-  successRedirect   String?         @map("success_redirect")
-  redirectTarget    String          @default("_self") @map("redirect_target")
-  customSuccessHtml String?         @map("custom_success_html")
-
-  notificationEmails String[]       @map("notification_emails")
-  ccEmails          String[]        @map("cc_emails")
-  bccEmails         String[]        @map("bcc_emails")
-  replyToEmail      String?         @map("reply_to_email")
-  emailSubject      String?         @map("email_subject")
-  fromName          String?         @map("from_name")
-
-  autoReply         Boolean         @default(false) @map("auto_reply")
-  autoReplySubject  String?         @map("auto_reply_subject")
-  autoReplyBody     String?         @map("auto_reply_body")
-
-  spamProtection    String          @default("automatic") @map("spam_protection")
-  turnstileKey      String?         @map("turnstile_key")
-  rateLimit         Int             @default(60) @map("rate_limit")
-  allowedOrigins    String[]        @map("allowed_origins")
-  honeypot          Boolean         @default(true)
-
-  storeResponses    Boolean         @default(true) @map("store_responses")
-  retention         String          @default("forever")
-  showMetadata      Boolean         @default(false) @map("show_metadata")
-
-  layout            String          @default("comfortable")
-  width             String          @default("full")
-  alignment         String          @default("left")
-  labelPosition     String          @default("above") @map("label_position")
-  theme             String          @default("light")
-  customCss         String?         @map("custom_css")
-  headless          Boolean         @default(false)
-
-  headerImage       String?         @map("header_image")
-  accentColor       String          @default("#09090b") @map("accent_color")
-  bgColor           String          @default("#ffffff") @map("bg_color")
-  headerFont        String          @default("Roboto") @map("header_font")
-  questionFont      String          @default("Roboto") @map("question_font")
-  headerImageHeight Int             @default(200) @map("header_image_height")
-
-  submissionCount   Int             @default(0) @map("submission_count")
-  lastSubmissionAt  DateTime?       @map("last_submission_at") @db.Timestamptz(6)
-  conversionRate    Float           @default(0) @map("conversion_rate")
-
-  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt         DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  fields            FormField[]
-  submissions       FormSubmission[]
-  analytics         FormAnalytic[]
-  connections       FormConnection[]
+  id                 String           @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId             String           @map("user_id")
+  name               String
+  slug               String           @unique
+  description        String?
+  status             String           @default("draft")
+  accessKey          String           @unique @default("") @map("access_key")
+  formType           String           @default("custom") @map("form_type")
+  websiteUrl         String?          @map("website_url")
+  successMessage     String?          @default("Thanks! Your submission has been received.") @map("success_message")
+  successRedirect    String?          @map("success_redirect")
+  redirectTarget     String           @default("_self") @map("redirect_target")
+  customSuccessHtml  String?          @map("custom_success_html")
+  notificationEmails String[]         @map("notification_emails")
+  ccEmails           String[]         @map("cc_emails")
+  bccEmails          String[]         @map("bcc_emails")
+  replyToEmail       String?          @map("reply_to_email")
+  emailSubject       String?          @map("email_subject")
+  fromName           String?          @map("from_name")
+  autoReply          Boolean          @default(false) @map("auto_reply")
+  autoReplySubject   String?          @map("auto_reply_subject")
+  autoReplyBody      String?          @map("auto_reply_body")
+  spamProtection     String           @default("automatic") @map("spam_protection")
+  turnstileKey       String?          @map("turnstile_key")
+  rateLimit          Int              @default(60) @map("rate_limit")
+  allowedOrigins     String[]         @map("allowed_origins")
+  honeypot           Boolean          @default(true)
+  storeResponses     Boolean          @default(true) @map("store_responses")
+  retention          String           @default("forever")
+  showMetadata       Boolean          @default(false) @map("show_metadata")
+  layout             String           @default("comfortable")
+  width              String           @default("full")
+  alignment          String           @default("left")
+  labelPosition      String           @default("above") @map("label_position")
+  theme              String           @default("light")
+  customCss          String?          @map("custom_css")
+  headless           Boolean          @default(false)
+  headerImage        String?          @map("header_image")
+  accentColor        String           @default("#09090b") @map("accent_color")
+  bgColor            String           @default("#ffffff") @map("bg_color")
+  headerFont         String           @default("Roboto") @map("header_font")
+  questionFont       String           @default("Roboto") @map("question_font")
+  headerImageHeight  Int              @default(200) @map("header_image_height")
+  submissionCount    Int              @default(0) @map("submission_count")
+  lastSubmissionAt   DateTime?        @map("last_submission_at") @db.Timestamptz(6)
+  conversionRate     Float            @default(0) @map("conversion_rate")
+  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  analytics          FormAnalytic[]
+  connections        FormConnection[]
+  fields             FormField[]
+  submissions        FormSubmission[]
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([status])
@@ -653,45 +568,43 @@ model Form {
 }
 
 model FormField {
-  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId        String   @map("form_id")
-  label         String
-  name          String
-  type          String   @default("text")
-  required      Boolean  @default(false)
-  placeholder   String?
-  helpText      String?  @map("help_text")
-  defaultValue  Json?    @map("default_value")
-  options       Json?
-  validation    Json?
-  appearance    Json?
-  order         Int      @default(0)
-  hidden        Boolean  @default(false)
-  readOnly      Boolean  @default(false) @map("read_only")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  form          Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId       String   @map("form_id")
+  label        String
+  name         String
+  type         String   @default("text")
+  required     Boolean  @default(false)
+  placeholder  String?
+  helpText     String?  @map("help_text")
+  defaultValue Json?    @map("default_value")
+  options      Json?
+  validation   Json?
+  appearance   Json?
+  order        Int      @default(0)
+  hidden       Boolean  @default(false)
+  readOnly     Boolean  @default(false) @map("read_only")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  form         Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
 
   @@index([formId])
   @@map("form_fields")
 }
 
 model FormSubmission {
-  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId        String   @map("form_id")
-  data          Json     @default("{}")
-  metadata      Json?
-  source        String?
-  ipAddress     String?  @map("ip_address")
-  userAgent     String?  @map("user_agent")
-  referrer      String?  @map("referrer")
-  country       String?
-  status        String   @default("new")
-  notes         String?
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  form          Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId    String   @map("form_id")
+  data      Json     @default("{}")
+  metadata  Json?
+  source    String?
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  referrer  String?  @map("referrer")
+  country   String?
+  status    String   @default("new")
+  notes     String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  form      Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
 
   @@index([formId])
   @@index([createdAt])
@@ -712,7 +625,6 @@ model FormAnalytic {
   countryBreakdown  Json?    @map("country_breakdown")
   referrerBreakdown Json?    @map("referrer_breakdown")
   createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
   form              Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
 
   @@unique([formId, date])
@@ -721,45 +633,39 @@ model FormAnalytic {
 }
 
 model FormConnection {
-  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId        String   @map("form_id")
-  type          String
-  name          String
-  config        Json     @default("{}")
-  isActive      Boolean  @default(true) @map("is_active")
-  order         Int      @default(0)
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  form          Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  formId    String   @map("form_id")
+  type      String
+  name      String
+  config    Json     @default("{}")
+  isActive  Boolean  @default(true) @map("is_active")
+  order     Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  form      Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
 
   @@index([formId])
   @@map("form_connections")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SUPPORT TICKETS
-// ═══════════════════════════════════════════════════════════════════════════════
-
 model Ticket {
-  id          String          @id @default(uuid())
-  customerId  String          @map("customer_id")
+  id          String               @id @default(uuid())
+  customerId  String               @map("customer_id")
   subject     String
   description String?
-  category    String          @default("general")
-  priority    String          @default("normal")
-  status      String          @default("open")
-  source      String          @default("web")
+  category    String               @default("general")
+  priority    String               @default("normal")
+  status      String               @default("open")
+  source      String               @default("web")
   application String?
-  assignedId  String?         @map("assigned_id")
-  closedAt    DateTime?       @map("closed_at")
-  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime        @updatedAt @map("updated_at")
-
+  assignedId  String?              @map("assigned_id")
+  closedAt    DateTime?            @map("closed_at")
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime             @updatedAt @map("updated_at")
   attachments ticket_attachments[]
   messages    TicketMessage[]
-  customer    User            @relation("TicketCustomer", fields: [customerId], references: [id])
-  assigned    User?           @relation("TicketAssignee", fields: [assignedId], references: [id])
+  assigned    User?                @relation("TicketAssignee", fields: [assignedId], references: [id])
+  customer    User                 @relation("TicketCustomer", fields: [customerId], references: [id])
 
   @@index([customerId])
   @@index([status])
@@ -778,8 +684,8 @@ model TicketMessage {
   readAt     DateTime? @map("read_at")
   readBy     String?   @map("read_by")
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  ticket     Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   author     User      @relation("TicketMessageAuthor", fields: [authorId], references: [id])
+  ticket     Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 
   @@index([ticketId])
   @@index([authorId])
@@ -801,55 +707,6 @@ model ticket_attachments {
   @@index([messageId])
   @@map("ticket_attachments")
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// APPS PLATFORM
-// ═══════════════════════════════════════════════════════════════════════════════
-
-model apps {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())"))
-  name        String
-  slug        String   @unique
-  description String?
-  icon        String?
-  url         String?
-  status      String   @default("active")
-  isPublic    Boolean  @default(true) @map("is_public")
-  ownerId     String   @map("owner_id")
-  version     String   @default("1.0.0")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @updatedAt @map("updated_at")
-  owner       User     @relation("AppOwner", fields: [ownerId], references: [id])
-
-  @@index([ownerId])
-  @@index([slug])
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// INTEGRATIONS (OAuth Provider Connections)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-model Integration {
-  id           String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId       String    @map("user_id")
-  provider     String
-  connected    Boolean?  @default(false)
-  accessToken  String?   @map("access_token")
-  refreshToken String?   @map("refresh_token")
-  expiresAt    DateTime? @map("expires_at") @db.Timestamptz(6)
-  metadata     Json?     @default("{}")
-  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([userId, provider])
-  @@index([userId], map: "idx_integrations_user")
-  @@map("integrations")
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// ENUMS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 enum session_status {
   active
