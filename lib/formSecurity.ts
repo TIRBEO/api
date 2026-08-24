@@ -3,7 +3,88 @@
 
 import { detectXss, sanitizeInput } from './security';
 import { prisma } from './db/prisma';
-import { validateFields, normalizeLogicRules, evaluateLogicRules, type FormField } from '@tirbeo/types';
+// ─── Inline form field types (until @tirbeo/types exports these) ──────
+type FormField = {
+  id: string;
+  type: string;
+  label?: string;
+  required?: boolean;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  min?: number;
+  max?: number;
+  options?: string[];
+};
+
+type LogicRule = {
+  fieldId: string;
+  condition: string;
+  value: string;
+  action: string;
+  targetFieldId?: string;
+};
+
+/** Normalize logic rules — return [] if input is falsy */
+function normalizeLogicRules(rules: any): LogicRule[] {
+  if (!rules || !Array.isArray(rules)) return [];
+  return rules.filter(Boolean);
+}
+
+/** Evaluate logic rules and return visible/required/optional field sets */
+function evaluateLogicRules(
+  rules: LogicRule[],
+  answers: Record<string, any>,
+  _fields: FormField[],
+): { visible: Set<string>; required: Set<string>; optional: Set<string> } {
+  const visible = new Set<string>();
+  const required = new Set<string>();
+  const optional = new Set<string>();
+  for (const rule of rules) {
+    const answer = String(answers[rule.fieldId] || '');
+    const match = rule.condition === 'equals' ? answer === rule.value
+      : rule.condition === 'contains' ? answer.includes(rule.value)
+      : rule.condition === 'not_empty' ? answer.length > 0
+      : rule.condition === 'empty' ? answer.length === 0
+      : false;
+    if (match && rule.targetFieldId) {
+      if (rule.action === 'show') visible.add(rule.targetFieldId);
+      if (rule.action === 'hide') visible.delete(rule.targetFieldId);
+      if (rule.action === 'require') required.add(rule.targetFieldId);
+      if (rule.action === 'optional') optional.add(rule.targetFieldId);
+    }
+  }
+  return { visible, required, optional };
+}
+
+/** Validate fields against answers, returning a map of fieldId → error message */
+function validateFields(
+  fields: FormField[],
+  answers: Record<string, any>,
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  for (const f of fields) {
+    if (f.required) {
+      const val = answers[f.id];
+      if (val === undefined || val === null || val === '') {
+        errors[f.id] = `${f.label || f.id} is required`;
+        continue;
+      }
+    }
+    const val = answers[f.id];
+    if (val === undefined || val === null || val === '') continue;
+    if (typeof val === 'string') {
+      if (f.minLength != null && val.length < f.minLength) errors[f.id] = `${f.label || f.id} must be at least ${f.minLength} characters`;
+      else if (f.maxLength != null && val.length > f.maxLength) errors[f.id] = `${f.label || f.id} must be at most ${f.maxLength} characters`;
+      else if (f.pattern && !new RegExp(f.pattern).test(val)) errors[f.id] = `${f.label || f.id} has an invalid format`;
+    }
+    if (typeof val === 'number') {
+      if (f.min != null && val < f.min) errors[f.id] = `${f.label || f.id} must be at least ${f.min}`;
+      if (f.max != null && val > f.max) errors[f.id] = `${f.label || f.id} must be at most ${f.max}`;
+    }
+  }
+  return errors;
+}
 
 // In-memory rate limiter (per-form, per-IP)
 const submissionRateLimits = new Map<string, { count: number; windowStart: number }>();

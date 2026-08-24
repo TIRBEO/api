@@ -2,7 +2,8 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { getPoolStatus } from './lib/db/prisma';
-import { startPeriodicCleanup, startPeriodicDigests } from './lib/jobs';
+import { startPeriodicCleanup, startPeriodicDigests, startPeriodicOauthSync } from './lib/jobs';
+import { startPeriodicTips } from './lib/tips';
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
@@ -33,6 +34,8 @@ app.prepare().then(() => {
     startPeriodicCleanup();
     // Start periodic email digests (hourly)
     startPeriodicDigests();
+    startPeriodicOauthSync();
+    startPeriodicTips();
 
     // Start embedded WS server only if WS_PORT is set and port is available.
     // In production the realtime service runs separately at ws.tirbeo.app.

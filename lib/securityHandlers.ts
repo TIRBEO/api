@@ -10,11 +10,17 @@ import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } fr
 import { hashRecoveryCode } from './auth/password';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from './auth/otp';
 import { sendTemplateEmail } from './email';
-import { createNotification, NotifType } from './notifications';
+import { createNotification, fmtNow, NotifType } from './notifications';
 
 async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security') {
   try {
-    await createNotification({ userId, type, title, body, link: link || '/account/inbox' });
+    await createNotification({
+      userId,
+      type,
+      title,
+      body: body ? `${body} — ${fmtNow()}` : undefined,
+      link: link || '/account/inbox',
+    });
   } catch (e) {
     console.error('[NOTIFICATION CREATE]', (e as Error)?.message || e);
   }
@@ -207,10 +213,7 @@ export async function totpSetupHandler(request: NextRequest) {
     const secret = generateSecret();
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
     const uri = generateTotpUri(secret, user?.email || 'user');
-    await prisma.user.update({
-      where: { id: session.userId },
-      data: { totpSecret: secret },
-    });
+    // Don't save to DB yet — only save after user verifies the 6-digit code
     return NextResponse.json({ secret, uri });
   } catch (err: any) {
     console.error('[TOTP SETUP]', err?.message || err);
@@ -225,20 +228,28 @@ export async function totpVerifyHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const body = (await request.json()) as any;
     const code = body?.code || body?.token;
+    const clientSecret = body?.secret; // Secret from setup step (not yet in DB)
     if (!code || typeof code !== 'string' || code.length !== 6) {
       return NextResponse.json({ error: 'Invalid code. Enter a 6-digit code.' }, { status: 400 });
     }
+    // Try client-provided secret first, then fall back to DB (for re-verification)
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { totpSecret: true },
     });
-    if (!user?.totpSecret) {
-      return NextResponse.json({ error: 'TOTP not set up' }, { status: 400 });
+    const secretToVerify = clientSecret || user?.totpSecret;
+    if (!secretToVerify) {
+      return NextResponse.json({ error: 'TOTP not set up. Please start setup again.' }, { status: 400 });
     }
-    const valid = await verifyTotp(code, user.totpSecret);
+    const valid = await verifyTotp(code, secretToVerify);
     if (!valid) {
       return NextResponse.json({ error: 'Invalid code. Please try again.' }, { status: 400 });
     }
+    // Only NOW save the secret to DB — after user verified the code
+    await prisma.user.update({
+      where: { id: session.userId },
+      data: { totpSecret: secretToVerify },
+    });
     const recoveryCodes = generateRecoveryCodes(8);
     await prisma.recoveryCode.createMany({
       data: recoveryCodes.map(rc => ({ userId: session.userId, code: hashRecoveryCode(rc) })),

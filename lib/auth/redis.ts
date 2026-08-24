@@ -1,4 +1,3 @@
-import Redis from 'ioredis';
 import { getCachedRedisClient, checkRedisHealth } from '../db/redis';
 
 type SessionState = {
@@ -12,13 +11,13 @@ type SessionState = {
 
 const REDIS_URL = process.env.REDIS_URL;
 
-let _client: Redis | null = null;
+let _client: any = null;
 
 /**
  * Get the auth Redis client with automatic reconnection and keep-alive.
  * Uses the shared Redis factory for connection management.
  */
-export function getRedis(): Redis | null {
+export function getRedis(): any {
   if (typeof window !== 'undefined') return null;
   if (!REDIS_URL) return null;
   

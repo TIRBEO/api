@@ -390,9 +390,7 @@ export function startWsServer(port: number): WebSocketServer {
     'https://support.tirbeo.app',
     'https://docs.tirbeo.app',
     'http://localhost:3000',
-    'http://localhost:3001',
     'http://localhost:3002',
-    'http://localhost:3003',
     'http://localhost:3004',
     'http://localhost:3005',
   ]);

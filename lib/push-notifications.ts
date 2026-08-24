@@ -40,7 +40,11 @@ const VAPID_PUBLIC_KEY = VAPID_KEYS.publicKey;
 const VAPID_PRIVATE_KEY = VAPID_KEYS.privateKey;
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-  webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  try {
+    webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  } catch (e: any) {
+    console.warn('[PUSH] VAPID keys invalid, push notifications disabled:', e?.message);
+  }
 }
 
 export function isPushConfigured(): boolean {

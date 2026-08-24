@@ -68,11 +68,10 @@ const DEFAULT_SETTINGS: CaptchaSettings = {
 // ─── Signed challenge tokens (forgery + replay protection) ───
 
 import { getCachedRedisClient } from '../db/redis';
-import type Redis from 'ioredis';
 
-let _redis: Redis | null = null;
+let _redis: any = null;
 
-function getRedis(): Redis | null {
+function getRedis(): any {
   const url = process.env.REDIS_URL;
   if (!url) return null;
   if (!_redis) {

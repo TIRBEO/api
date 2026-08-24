@@ -6,9 +6,10 @@ import { hashPassword, verifyPassword } from './auth/password';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from './auth/otp';
 import { jsonUnauthorized } from './response';
 import { sendTemplateEmail } from './email';
-import { createNotification } from './notifications';
+import { createNotification, describeDevice, fmtNow, getClientIpFromRequest } from './notifications';
 import { sanitizeInput } from './security';
 import { verifyMergeToken } from './auth/jwt';
+import { bustProfileCache } from './authHandlers';
 import { isPushConfigured, getVapidPublicKey, subscribeToPush, unsubscribeFromPush, sendPushNotification } from './push-notifications';
 import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
@@ -184,10 +185,10 @@ export async function extendedProfileHandler(request: NextRequest) {
           type: 'system',
           title: 'Profile updated',
           body: changed.includes('name')
-            ? `Your display name is now ${updated.name ?? 'updated'}.`
+            ? `Your display name was changed to "${updated.name ?? 'updated'}" on ${fmtNow()}.`
             : changed.includes('photoUrl')
-              ? 'Your profile photo was updated.'
-              : 'Your username was updated.',
+              ? `Your profile photo was updated on ${fmtNow()}.`
+              : `Your username was changed to "${updated.username ?? 'updated'}" on ${fmtNow()}.`,
           link: '/account/profile',
         }).catch((e) => console.error('[NOTIFICATION]', e?.message));
       }
@@ -233,11 +234,13 @@ export async function changePasswordHandler(request: NextRequest) {
       if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
      }
 
+    // Breach check runs in background — don't block password change
     const { checkPasswordBreach } = await import('./auth/breach');
-    const breach = await checkPasswordBreach(newPassword);
-    if (breach.breached) {
-      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
-    }
+    checkPasswordBreach(newPassword).then(breach => {
+      if (breach.breached) {
+        console.warn(`[SECURITY] User ${session.userId} set a breached password (${breach.count} hits)`);
+      }
+    }).catch(() => {});
 
     const newHash = await hashPassword(newPassword);
     await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: newHash } });
@@ -255,13 +258,19 @@ export async function changePasswordHandler(request: NextRequest) {
       }).catch(() => {});
     }
 
+    const loginIp = getClientIpFromRequest(request);
+    const loginDevice = describeDevice(request.headers.get('user-agent'));
     await createNotification({
       userId: session.userId,
       type: 'security',
       title: 'Password changed',
-      body: 'Your password was changed successfully.',
-      link: '/account/inbox',
+      body: `Your password was changed on ${fmtNow()} from ${loginDevice} (IP ${loginIp || 'unknown'}). All other sessions were signed out.`,
+      link: '/account/security',
+      metadata: { ip: loginIp, device: loginDevice, method: 'Password' },
     }).catch((e) => console.error('[NOTIFICATION]', (e as Error)?.message));
+
+    // Event-triggered auto tip (only if tipsEmail enabled & tip unsent)
+    import('./tips').then(m => m.sendNextTipForUser(session.userId)).catch(() => {});
 
     return new NextResponse('Password changed', { status: 200 });
   } catch (err: any) {
@@ -351,7 +360,7 @@ export async function notificationsHandler(request: NextRequest) {
               orderBy: { createdAt: 'desc' },
               take: limit,
               skip: offset,
-              select: { id: true, type: true, title: true, body: true, link: true, icon: true, isRead: true, createdAt: true },
+              select: { id: true, type: true, title: true, body: true, link: true, icon: true, isRead: true, metadata: true, createdAt: true },
             })),
             withRetry(() => prisma.notification.count({ where: { userId: session.userId, isRead: false } })),
             withRetry(() => prisma.notification.count({ where: { userId: session.userId } })),
@@ -391,7 +400,7 @@ export async function notificationsHandler(request: NextRequest) {
         // Support body-based bulk delete { notificationIds: [...] }
         let bodyIds: string[] | null = null;
         try {
-          const b = await request.json();
+          const b: any = await request.json();
           if (b?.notificationIds && Array.isArray(b.notificationIds)) bodyIds = b.notificationIds;
         } catch { /* no body */ }
         if (bodyIds && bodyIds.length > 0) {
@@ -466,6 +475,8 @@ export async function notificationPrefsHandler(request: NextRequest) {
         'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
         // Digest
         'digestEnabled', 'digestFrequency',
+        // Email preferences card
+        'tipsEmail', 'weeklySummary',
       ];
       const data: Record<string, any> = {};
       for (const key of allowed) {
@@ -589,11 +600,14 @@ export async function oauthUnlinkHandler(request: NextRequest, provider: string)
 
     await prisma.user.update({ where: { id: user.id }, data: { [field]: null } });
 
+    // Full reset — remove the integration record so re-connecting starts clean.
+    await prisma.integration.deleteMany({ where: { userId: user.id, provider } }).catch(() => {});
+
     createNotification({
       userId: user.id,
       type: 'security',
       title: 'Account disconnected',
-      body: `Your ${provider} account is no longer linked.`,
+      body: `Your ${provider} account was unlinked from Tirbeo on ${fmtNow()}. You can no longer sign in with it until you reconnect it.`,
       link: '/account/apps',
     }).catch((e) => console.error('[NOTIFICATION]', e?.message));
 
@@ -622,6 +636,17 @@ export async function integrationsHandler(request: NextRequest) {
       const body: any = await request.json();
       const { provider, connected } = body;
       if (!provider) return new NextResponse('provider required', { status: 400 });
+
+      // Disconnect semantics: remove everything — no lingering rows.
+      if (connected === false) {
+        const fieldMap: Record<string, 'googleId' | 'githubId' | 'discordId'> = { google: 'googleId', github: 'githubId', discord: 'discordId' };
+        if (fieldMap[provider]) {
+          await prisma.user.update({ where: { id: session.userId }, data: { [fieldMap[provider]]: null } }).catch(() => {});
+        }
+        await prisma.integration.deleteMany({ where: { userId: session.userId, provider } });
+        return NextResponse.json({ ok: true, message: `${provider} disconnected` });
+      }
+
       const integration = await prisma.integration.upsert({
         where: { userId_provider: { userId: session.userId, provider } },
         update: { connected: connected ?? true },
@@ -630,9 +655,9 @@ export async function integrationsHandler(request: NextRequest) {
       if (integration.connected) {
         createNotification({
           userId: session.userId,
-          type: 'system',
-          title: `${provider} connected`,
-          body: `The ${provider} integration is now active on your account.`,
+          type: 'security',
+          title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} connected`,
+          body: `Your ${provider} account is now linked and active on Tirbeo (connected on ${fmtNow()}).`,
           link: '/account/apps',
         }).catch((e) => console.error('[NOTIFICATION]', e?.message));
       }
@@ -643,6 +668,11 @@ export async function integrationsHandler(request: NextRequest) {
       const body: any = await request.json();
       const { provider } = body;
       if (!provider) return new NextResponse('provider required', { status: 400 });
+      // Sync rule: removing the integration also clears the sign-in link.
+      const fieldMap: Record<string, 'googleId' | 'githubId' | 'discordId'> = { google: 'googleId', github: 'githubId', discord: 'discordId' };
+      if (fieldMap[provider]) {
+        await prisma.user.update({ where: { id: session.userId }, data: { [fieldMap[provider]]: null } }).catch(() => {});
+      }
       await prisma.integration.deleteMany({ where: { userId: session.userId, provider } });
       return new NextResponse('Integration removed', { status: 200 });
     }
@@ -658,18 +688,57 @@ export async function userActivityHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const limit = Number(request.nextUrl.searchParams.get('limit')) || 30;
-    const cacheKey = `${session.userId}:${limit}`;
+    const limit = Math.min(Math.max(Number(request.nextUrl.searchParams.get('limit')) || 50, 1), 100);
+    const cacheKey = `act2:${session.userId}:${limit}`;
     const cached = activityCache.get(cacheKey);
     if (cached) return NextResponse.json(cached);
-    const logs = await prisma.auditEvent.findMany({
-      where: { actorId: session.userId },
-      orderBy: { createdAt: 'desc' },
-      take: limit,
-      select: { id: true, action: true, targetType: true, targetId: true, metadata: true, severity: true, createdAt: true },
-    });
-    activityCache.set(cacheKey, logs);
-    return NextResponse.json(logs);
+
+    const [audits, security] = await Promise.all([
+      prisma.auditEvent.findMany({
+        where: { actorId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        select: { id: true, action: true, targetType: true, targetId: true, metadata: true, severity: true, createdAt: true },
+      }),
+      prisma.securityEvent.findMany({
+        where: { userId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        select: { id: true, eventType: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true },
+      }),
+    ]);
+
+    const items = [
+      ...audits.map((a: any) => ({
+        id: a.id,
+        source: 'audit',
+        action: a.action,
+        targetType: a.targetType,
+        targetId: a.targetId,
+        metadata: a.metadata || {},
+        severity: a.severity,
+        createdAt: a.createdAt,
+      })),
+      ...security.map((s: any) => ({
+        id: `sec-${s.id}`,
+        source: 'security',
+        action: s.eventType,
+        targetType: 'security',
+        targetId: null,
+        metadata: {
+          ...(typeof s.metadata === 'object' && s.metadata !== null ? s.metadata : {}),
+          ip: s.ipAddress || undefined,
+          userAgent: s.userAgent || undefined,
+        },
+        severity: s.severity,
+        createdAt: s.createdAt,
+      })),
+    ]
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(0, limit);
+
+    activityCache.set(cacheKey, items);
+    return NextResponse.json(items);
   } catch (err: any) {
     console.error('[USER ACTIVITY]', err?.message || err);
     return new NextResponse('Failed to fetch activity', { status: 500 });
@@ -899,12 +968,15 @@ export async function avatarUploadHandler(request: NextRequest) {
       where: { id: session.userId },
       data: { photoUrl },
     });
+    // Header/sidebar read the 10s-cached /users/me — bust it so the new
+    // picture shows immediately on next navigation/poll.
+    bustProfileCache(session.userId);
 
     createNotification({
       userId: session.userId,
       type: 'system',
       title: 'Profile photo updated',
-      body: 'Your avatar was changed.',
+      body: `Your profile photo was changed on ${fmtNow()}. It now appears across the dashboard, header and sidebar.`,
       link: '/account/profile',
     }).catch((e) => console.error('[NOTIFICATION]', e?.message));
 
@@ -996,7 +1068,7 @@ export async function exportDataHandler(request: NextRequest) {
         userId: session.userId,
         type: 'system',
         title: 'Data export ready',
-        body: 'Your data archive has been prepared. Download it from the privacy settings.',
+        body: `Your data archive was prepared on ${fmtNow()}. Download it from Privacy settings — the link also works from the email we sent you.`,
         link: '/account/privacy',
       }),
       sendTemplateEmail(user.email, 'export_ready', {
@@ -1143,11 +1215,24 @@ export async function mergeAccountsHandler(request: NextRequest) {
       return NextResponse.json({ error: 'The account to merge with no longer exists' }, { status: 404 });
     }
 
-    // Transfer the OAuth provider ID from existing user to current user
+    // Transfer the OAuth provider ID from existing user to current user.
+    // Never overwrite an existing name/photo — those are managed from the
+    // dashboard profile; provider values only fill EMPTY fields.
     const providerField = `${provider}Id`;
+    const currentUser = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { id: true, name: true, photoUrl: true },
+    });
+    if (!currentUser) {
+      return NextResponse.json({ error: 'Current account not found' }, { status: 404 });
+    }
     await prisma.user.update({
-      where: { id: existingUserId },
-      data: { [providerField]: null },
+      where: { id: session.userId },
+      data: {
+        [providerField]: providerId,
+        ...(currentUser.photoUrl ? {} : { photoUrl: photoUrl || undefined }),
+        ...(currentUser.name ? {} : { name: name || undefined }),
+      },
     });
 
     // Set the provider ID on the current user
@@ -1163,8 +1248,8 @@ export async function mergeAccountsHandler(request: NextRequest) {
     // Create integration for current user
     await prisma.integration.upsert({
       where: { userId_provider: { userId: session.userId, provider } },
-      update: { connected: true, metadata: { [`${providerId}Id`]: providerId, email } },
-      create: { userId: session.userId, provider, connected: true, metadata: { [`${providerId}Id`]: providerId, email } },
+      update: { connected: true, metadata: { [`${provider}Id`]: providerId, email } },
+      create: { userId: session.userId, provider, connected: true, metadata: { [`${provider}Id`]: providerId, email } },
     });
 
     // Remove integration from existing user if any

@@ -3,7 +3,7 @@ import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, 
 import { getSession } from './session';
 import { jsonUnauthorized, jsonForbidden } from './response';
 import { getCachedRedisClient, checkRedisHealth, getAllRedisStates } from './db/redis';
-import type Redis from 'ioredis';
+
 
 function isAdmin(user: any): boolean {
   return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
@@ -18,10 +18,10 @@ let healthCache: { data: any; ts: number } | null = null;
 const HEALTH_CACHE_TTL = 15_000;
 
 // Shared Redis connection for health checks (avoids creating/destroying a connection every 15s)
-let healthRedis: Redis | null = null;
+let healthRedis: any = null;
 let healthRedisFailed = false;
 
-function getHealthRedis(): Redis | null {
+function getHealthRedis(): any {
   if (healthRedisFailed) return null;
   if (healthRedis) return healthRedis;
   const redisUrl = process.env.REDIS_URL;

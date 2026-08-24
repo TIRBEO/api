@@ -6,7 +6,7 @@ import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendS
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken } from './auth/jwt';
 
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
@@ -16,7 +16,7 @@ import { createAuditEvent } from './audit';
 import { enforceResendCooldown } from './auth/resend-cooldown';
 import { checkPasswordBreach } from './auth/breach';
 import { jsonUnauthorized } from './response';
-import { createNotification } from './notifications';
+import { createNotification, describeDevice, fmtNow } from './notifications';
 import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
 import { SignJWT } from 'jose';
@@ -34,7 +34,7 @@ const emailExistsCache = createTtlCache<{ exists: boolean; hasPassword: boolean;
 // Cache for GET /api/users/me — dashboard polls this frequently.
 // 10s TTL: stale data is acceptable for profile display, and bust on PATCH.
 const profileCache = createTtlCache<any>(10_000, 2000, 'profile');
-function bustProfileCache(userId: string) { profileCache.delete(userId); }
+export function bustProfileCache(userId: string) { profileCache.delete(userId); }
 
 export async function sessionHandler(request: NextRequest) {
   const startTime = performance.now();
@@ -163,6 +163,20 @@ function isAllowedRedirect(url: string): boolean {
   } catch { return false; }
 }
 
+/**
+ * Canonical OAuth redirect URI for a provider callback path.
+ *
+ * Resolution order:
+ *   1. {PROVIDER}_REDIRECT_URI env (explicit, wins over everything here)
+ *   2. Derived from the canonical API domain (API_DOMAIN / APP_DOMAIN env)
+ *      → https://<api-domain>/api/auth/<provider>/callback
+ *   3. Request host — ONLY for local dev (localhost/127.0.0.1).
+ *
+ * The incoming Host/x-forwarded-proto headers are never trusted on public
+ * deployments: behind Vercel the Host is the deployment hostname (e.g.
+ * tirbeo-api.vercel.app or a preview URL), which is not registered with the
+ * provider and causes Error 400: redirect_uri_mismatch.
+ */
 function getDynamicRedirectUri(request: NextRequest, path: string): string {
   const provider = path.split('/')[2];
   const envMap: Record<string, string | undefined> = {
@@ -172,9 +186,29 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
   };
   const envUri = envMap[provider || ''];
   if (envUri) return envUri;
-  const host = request.headers.get('host') || 'api.tirbeo.app';
-  const protocol = request.headers.get('x-forwarded-proto') || 'https';
-  // The catch-all route is at /api/[[...slug]], so the OAuth callback is /api/auth/{provider}/callback
+
+  const rawDomain =
+    process.env.API_DOMAIN ||
+    process.env.APP_DOMAIN ||
+    process.env.NEXT_PUBLIC_APP_DOMAIN ||
+    '';
+  const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (cleanDomain && !cleanDomain.includes('localhost') && !cleanDomain.includes('127.0.0.1')) {
+    // Accept either the apex domain (derive api.) or an explicit API host.
+    const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
+    return `https://${apiHost}/api${path}`;
+  }
+
+  // Local development fallback.
+  const host = request.headers.get('host') || 'localhost:3000';
+  if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) {
+    console.warn(
+      `[OAUTH:${provider}] Host "${host}" is not trusted for redirect URIs. ` +
+      `Set ${provider.toUpperCase()}_REDIRECT_URI or APP_DOMAIN to pin the callback URL.`,
+    );
+  }
+  const protoHeader = (request.headers.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const protocol = protoHeader || 'https';
   return `${protocol}://${host}/api${path}`;
 }
 
@@ -244,7 +278,241 @@ function oauthPostLoginTarget(user: any, redirectTo: string | undefined, provide
     if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
     return url.toString();
   }
-  return redirectTo || `https://dashboard.${appDomain}`;
+  return redirectTo || process.env.NEXT_PUBLIC_DASHBOARD_URL || `https://dashboard.${appDomain}`;
+}
+
+// ═══ SHARED OAUTH CALLBACK COMPLETION ═══
+// One implementation for Google/GitHub/Discord: account lookup → link-or-create
+// → integration upsert (parallel with session creation) → redirect. The three
+// handlers only differ in how they exchange the code for a provider profile.
+
+interface ProviderProfile {
+  providerId: string;
+  email?: string;
+  name?: string;
+  photoUrl?: string;
+}
+
+const PROVIDER_ID_FIELD: Record<string, string> = {
+  google: 'googleId',
+  github: 'githubId',
+  discord: 'discordId',
+};
+
+function getDashboardBase(): string {
+  return process.env.NEXT_PUBLIC_DASHBOARD_URL || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+}
+
+/** URL of the accounts-app merge confirmation screen. */
+function accountsMergeUrl(provider: string, mode: 'login' | 'transfer', token: string): string {
+  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+  const base = (process.env.ACCOUNTS_URL || `https://accounts.${appDomain}`).replace(/\/$/, '');
+  const url = new URL(`${base}/callback`);
+  url.searchParams.set('oauth', 'merge');
+  url.searchParams.set('mode', mode);
+  url.searchParams.set('provider', provider);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
+/**
+ * Locate the account for this provider identity WITHOUT writing anything.
+ * matchedBy: 'provider' → identity already linked; 'email' → same-email
+ * account exists but identity never connected (needs explicit merge).
+ */
+async function findProviderUser(provider: string, profile: ProviderProfile) {
+  const idField = PROVIDER_ID_FIELD[provider];
+  const byProvider = await prisma.user.findUnique({ where: { [idField]: profile.providerId } as any });
+  if (byProvider) return { user: byProvider, matchedBy: 'provider' as const };
+  if (profile.email) {
+    const byEmail = await prisma.user.findUnique({ where: { email: profile.email } });
+    if (byEmail) return { user: byEmail, matchedBy: 'email' as const };
+  }
+  return { user: null, matchedBy: null };
+}
+
+/**
+ * Finish any provider callback: issue the session (and record the integration
+ * in parallel), handle link-mode, then redirect.
+ *
+ * Sign-in matrix:
+ *  - identity already linked → direct sign-in
+ *  - same-email account, identity never connected → merge confirmation screen
+ *    (merging is only ever offered for matching emails)
+ *  - dashboard "Connect" while logged in: fresh identity attaches silently;
+ *    an identity owned by ANOTHER account goes to a transfer-merge screen
+ */
+async function finishProviderSignIn(
+  request: NextRequest,
+  provider: string,
+  profile: ProviderProfile,
+  state: { nonce: string; redirect: string; link: boolean },
+): Promise<NextResponse> {
+  const idField = PROVIDER_ID_FIELD[provider];
+  const dashboardBase = getDashboardBase();
+
+  // ── Link mode: initiated from dashboard Connected Apps while logged in ──
+  if (state.link) {
+    const existingSession = await getSession(request);
+    if (existingSession) {
+      let owner = await prisma.user.findUnique({ where: { [idField]: profile.providerId } as any });
+      if (!owner && profile.email) {
+        owner = await prisma.user.findUnique({ where: { email: profile.email } });
+      }
+      // Identity belongs to a DIFFERENT account → signed transfer decision.
+      if (owner && owner.id !== existingSession.userId) {
+        const mergeToken = await signMergeToken({
+          provider,
+          providerId: profile.providerId,
+          email: profile.email || owner.email,
+          name: profile.name || profile.email || 'account',
+          photoUrl: profile.photoUrl,
+          existingUserId: owner.id,
+        });
+        const res = NextResponse.redirect(accountsMergeUrl(provider, 'transfer', mergeToken));
+        clearOauthStateCookie(res, request);
+        return res;
+      }
+      // Fresh identity, or already ours → make sure the sign-in link is on
+      // the logged-in account (email-matched owner may still lack the ID).
+      if (!owner || (owner as any)[idField] !== profile.providerId) {
+        await prisma.user.update({
+          where: { id: existingSession.userId },
+          data: { [idField]: profile.providerId } as any,
+        }).catch(() => {});
+      }
+      const metadata = { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) };
+      await prisma.integration.upsert({
+        where: { userId_provider: { userId: existingSession.userId, provider } },
+        update: { connected: true, metadata },
+        create: { userId: existingSession.userId, provider, connected: true, metadata },
+      }).catch(() => {});
+      const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=${provider}`);
+      clearOauthStateCookie(res, request);
+      return res;
+    }
+    // Not logged in — fall through to normal login below.
+  }
+
+  // ── Plain sign-in ──
+  const { user, matchedBy } = await findProviderUser(provider, profile);
+
+  if (user && matchedBy === 'email') {
+    // Same-email account exists but this provider was never connected —
+    // never auto-link silently; ask via the merge screen. Only same-email
+    // merges reach this point by construction.
+    const mergeToken = await signMergeToken({
+      provider,
+      providerId: profile.providerId,
+      email: profile.email!,
+      name: profile.name || profile.email || 'account',
+      photoUrl: profile.photoUrl,
+      existingUserId: user.id,
+    });
+    const res = NextResponse.redirect(accountsMergeUrl(provider, 'login', mergeToken));
+    clearOauthStateCookie(res, request);
+    return res;
+  }
+
+  let account = user;
+  if (!account) {
+    if (!profile.email) {
+      return new NextResponse(`${provider[0].toUpperCase()}${provider.slice(1)} email not available`, { status: 400 });
+    }
+    account = await prisma.user.create({
+      data: {
+        email: profile.email,
+        name: profile.name,
+        photoUrl: profile.photoUrl || undefined,
+        [idField]: profile.providerId,
+      } as any,
+    });
+    prisma.auditEvent.create({
+      data: { actorId: account.id, action: 'user.created', targetType: 'user', targetId: account.id, metadata: { provider, email: profile.email } },
+    }).catch(() => {});
+  } else if (!account.photoUrl && profile.photoUrl) {
+    // Backfill avatar only — the identity link already exists in this branch.
+    await prisma.user.update({ where: { id: account.id }, data: { photoUrl: profile.photoUrl } as any }).catch(() => {});
+  }
+
+  const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
+  const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  // Session + integration bookkeeping run concurrently — neither depends on
+  // the other and the round-trips were previously serial.
+  const [, { token, refreshToken }] = await Promise.all([
+    prisma.integration.upsert({
+      where: { userId_provider: { userId: account.id, provider } },
+      update: { connected: true, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) } },
+      create: { userId: account.id, provider, connected: true, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) } },
+    }).catch(() => null),
+    createSession(account.id, request.headers.get('user-agent') || undefined, ip),
+  ]);
+  const target = oauthPostLoginTarget(account, redirectTo, provider);
+  const res = NextResponse.redirect(target);
+  setSessionCookie(res, token, refreshToken, request);
+  clearOauthStateCookie(res, request);
+  return res;
+}
+
+/**
+ * POST /api/auth/oauth/merge — GUEST login-merge (no session required).
+ *
+ * Body: { token: string }
+ * The signed merge token (10 min) is the authorization: it is only ever
+ * issued for a same-email match. Links the provider identity to the token's
+ * account, issues the session, and returns { redirect_to }.
+ *
+ * NOTE: transfer-merge (identity owned by ANOTHER account while logged in)
+ * goes through POST /api/integrations/merge with the session instead.
+ */
+export async function oauthMergeCompleteHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json().catch(() => ({}));
+    if (body.transfer === true) {
+      return NextResponse.json({ error: 'Transfer requires an active session — use /api/integrations/merge.' }, { status: 400 });
+    }
+    const data = typeof body.token === 'string' ? await verifyMergeToken(body.token) : null;
+    if (!data) {
+      return NextResponse.json({ error: 'This merge request expired. Please sign in again.' }, { status: 400 });
+    }
+    const idField = PROVIDER_ID_FIELD[data.provider];
+    if (!idField) return new NextResponse('Unsupported provider', { status: 400 });
+
+    const target = await prisma.user.findUnique({ where: { id: data.existingUserId } });
+    if (!target) {
+      return NextResponse.json({ error: 'The account to merge with no longer exists.' }, { status: 404 });
+    }
+    // The identity must not have been bound to a different account meanwhile.
+    const holder = await prisma.user.findUnique({ where: { [idField]: data.providerId } as any });
+    if (holder && holder.id !== target.id) {
+      return NextResponse.json({ error: `This ${data.provider} account is already linked to a different Tirbeo account.` }, { status: 409 });
+    }
+
+    const metadata = { [`${data.provider}Id`]: data.providerId, email: data.email };
+
+    // Link + sign in to the matched account in one step.
+    const [, { token, refreshToken }] = await Promise.all([
+      prisma.$transaction([
+        prisma.user.update({ where: { id: target.id }, data: { [idField]: data.providerId, ...(target.photoUrl ? {} : { photoUrl: data.photoUrl || undefined }) } as any }),
+        prisma.integration.upsert({
+          where: { userId_provider: { userId: target.id, provider: data.provider } },
+          update: { connected: true, metadata },
+          create: { userId: target.id, provider: data.provider, connected: true, metadata },
+        }),
+      ]),
+      createSession(target.id, request.headers.get('user-agent') || undefined, (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()),
+    ]);
+    prisma.auditEvent.create({
+      data: { actorId: target.id, action: 'account.merge.login', targetType: 'user', targetId: target.id, metadata: { provider: data.provider, providerId: data.providerId } },
+    }).catch(() => {});
+
+    const res = NextResponse.json({ ok: true, redirect_to: oauthPostLoginTarget(target, undefined, data.provider) });
+    setSessionCookie(res, token, refreshToken, request);
+    return res;
+  } catch (err: any) {
+    console.error('[OAUTH MERGE]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to complete the merge. Please try signing in again.' }, { status: 500 });
+  }
 }
 
 function setOauthStateCookie(res: NextResponse, nonce: string, request: NextRequest) {
@@ -304,10 +572,13 @@ export async function loginHandler(request: NextRequest) {
       return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
     }
 
-    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, roles: { include: { role: true } } } });
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, deletedAt: true, adminRole: true, roles: { include: { role: true } } } });
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return new NextResponse('Invalid email or password', { status: 401 });
+    }
+    if (user.deletedAt) {
+      return new NextResponse('Account has been deleted', { status: 403 });
     }
     if (user.isBanned) {
       return new NextResponse('Account suspended', { status: 403 });
@@ -431,12 +702,15 @@ export async function loginHandler(request: NextRequest) {
       Promise.resolve(logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_success', details: { reason: 'password' } })),
       Promise.resolve(createNotification({
         userId: user.id,
-        type: 'system',
-        title: 'Signed in to your account',
-        body: `New login from ${userAgent || 'Unknown device'}`,
-        link: '/account/security',
+        type: 'security',
+        title: 'New sign-in to your account',
+        body: `Signed in with your password from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}) on ${fmtNow()}. If this wasn't you, review your sessions immediately.`,
+        link: '/account/sessions',
+        metadata: { ip, device: describeDevice(userAgent), method: 'Password' },
       })),
       Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
+      // Event-triggered auto tip (only if tipsEmail enabled & tip unsent)
+      import('./tips').then(m => m.sendNextTipForUser(user.id)).catch(() => {}),
       // Record login history for the Login History section
       prisma.login_history.create({
         data: {
@@ -929,8 +1203,8 @@ export async function signupHandler(request: NextRequest) {
     createNotification({
       userId: user.id,
       type: 'system',
-      title: 'Welcome to Tirbeo!',
-      body: 'Your account has been created successfully. Start by exploring the dashboard.',
+      title: 'Welcome to Tirbeo',
+      body: `Your account (${user.email}) was created on ${fmtNow()}. Start by exploring the dashboard and completing your profile.`,
       link: '/overview',
     }).catch(() => {});
 
@@ -1297,7 +1571,9 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       userId: user.id,
       type: 'security',
       title: 'Email updated',
-      body: currentEmail === email ? 'Your email was verified.' : `Your email was updated to ${email}.`,
+      body: currentEmail === email
+        ? `Your email (${email}) was verified on ${fmtNow()}.`
+        : `Your email was changed to ${email} on ${fmtNow()}. If this wasn't you, contact support immediately.`,
       link: '/account/profile',
     }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
 
@@ -1398,6 +1674,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     const cfg = await getOauthProviderConfig('google');
     const clientId = cfg.clientId;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
+    console.info(`[OAUTH:google] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GOOGLE_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('Google OAuth not configured', { status: 500 });
     }
@@ -1412,8 +1689,9 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
       redirect_uri: redirectUri,
       response_type: 'code',
       scope: 'openid email profile',
-      access_type: 'offline',
-      prompt: 'consent',
+      // No prompt=consent / access_type=offline: we don't need Google refresh
+      // tokens and forcing re-approval every sign-in slows returning users to
+      // a crawl. Returning users now sail through with one click.
       state: stateToken,
     });
     const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
@@ -1447,7 +1725,6 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
       return new NextResponse('Invalid OAuth state', { status: 400 });
     }
-    const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
     if (!code) {
       return new NextResponse('Missing code', { status: 400 });
     }
@@ -1478,82 +1755,13 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       return new NextResponse('Failed to fetch user info', { status: 500 });
     }
     const profile: any = await userInfoRes.json();
-    const googleId = profile.id as string;
-    const email = profile.email as string;
-    const name = profile.name as string;
-    const photoUrl = profile.picture as string | undefined;
 
-    let user = await prisma.user.findUnique({ where: { googleId: googleId } });
-    if (!user) {
-      user = await prisma.user.findUnique({ where: { email } });
-      if (user) {
-        await prisma.user.update({
-          where: { id: user.id },
-          data: { googleId: googleId, photoUrl: user.photoUrl || photoUrl || undefined },
-        });
-      } else {
-        user = await prisma.user.create({
-          data: {
-            email, name, googleId: googleId, photoUrl: photoUrl || undefined,
-          },
-        });
-        await prisma.auditEvent.create({
-          data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'google', email } },
-        });
-      }
-    } else {
-      if (!user.photoUrl && photoUrl) {
-        await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
-      }
-    }
-
-    await prisma.integration.upsert({
-      where: { userId_provider: { userId: user.id, provider: 'google' } },
-      update: { connected: true, metadata: { googleId, email } },
-      create: { userId: user.id, provider: 'google', connected: true, metadata: { googleId, email } },
-    });
-
-    // Link mode: user is already logged in, just record integration and redirect back
-    if (state.link) {
-      const existingSession = await getSession(request);
-      if (existingSession) {
-        // Check for email conflict: OAuth user may belong to a different account
-        if (user && user.id !== existingSession.userId && email) {
-          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-          const mergeToken = await signMergeToken({
-            provider: 'google',
-            providerId: googleId,
-            email,
-            name: name || email,
-            photoUrl,
-            existingUserId: user.id,
-          });
-          // Undo the googleId we set on the wrong user above
-          await prisma.user.update({ where: { id: user.id }, data: { googleId: null } }).catch(() => {});
-          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
-          clearOauthStateCookie(res, request);
-          return res;
-        }
-        await prisma.integration.upsert({
-          where: { userId_provider: { userId: existingSession.userId, provider: 'google' } },
-          update: { connected: true, metadata: { googleId, email } },
-          create: { userId: existingSession.userId, provider: 'google', connected: true, metadata: { googleId, email } },
-        });
-        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=google`);
-        clearOauthStateCookie(res, request);
-        return res;
-      }
-      // Not logged in — fall through to normal login
-    }
-
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const target = oauthPostLoginTarget(user, redirectTo, 'google');
-    const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken, request);
-    clearOauthStateCookie(res, request);
-    return res;
+    return finishProviderSignIn(request, 'google', {
+      providerId: profile.id as string,
+      email: profile.email as string,
+      name: profile.name as string,
+      photoUrl: profile.picture as string | undefined,
+    }, state);
   } catch (err: any) {
     console.error('[GOOGLE CALLBACK]', err?.message || err);
     return new NextResponse('Google OAuth callback failed', { status: 500 });
@@ -1566,6 +1774,7 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     const cfg = await getOauthProviderConfig('github');
     const clientId = cfg.clientId;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
+    console.info(`[OAUTH:github] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GITHUB_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('GitHub OAuth not configured', { status: 500 });
     }
@@ -1610,6 +1819,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
     const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      console.warn('[OAUTH:github] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce });
       return new NextResponse('Invalid OAuth state', { status: 400 });
     }
     if (!code) {
@@ -1633,97 +1843,42 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!userInfoRes.ok) {
+      console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
       return new NextResponse('Failed to fetch user info', { status: 500 });
     }
     const profile: any = await userInfoRes.json();
-    const githubId = String(profile.id);
-    let email = profile.email;
-    const name = profile.name || profile.login;
-    const photoUrl = profile.avatar_url as string | undefined;
+    let email = profile.email as string | undefined;
 
+    // GitHub keeps the account email private by default — fetch it explicitly.
+    // One retry: transient DNS/network failures here would silently drop the email.
     if (!email) {
-      const emailsRes = await fetch('https://api.github.com/user/emails', {
+      let emailsRes = await fetch('https://api.github.com/user/emails', {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
+      if (!emailsRes.ok) {
+        await new Promise((r) => setTimeout(r, 400));
+        emailsRes = await fetch('https://api.github.com/user/emails', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+      }
       if (emailsRes.ok) {
-        const emails: any = await emailsRes.json();
-        const primary = emails.find((e: any) => e.primary) || emails[0];
+        const emails: any[] = await emailsRes.json();
+        const primary = emails.find((e) => e.primary) || emails[0];
         if (primary) email = primary.email;
-      }
-    }
-
-    let user = await prisma.user.findUnique({ where: { githubId: githubId } });
-    if (!user && email) {
-      user = await prisma.user.findUnique({ where: { email } });
-      if (user) {
-        await prisma.user.update({
-          where: { id: user.id },
-          data: { githubId: githubId, photoUrl: user.photoUrl || photoUrl || undefined },
-        });
       } else {
-        user = await prisma.user.create({
-          data: {
-            email: email || `${githubId}@github.user`, name, githubId: githubId,
-            photoUrl: photoUrl || undefined,
-          },
-        });
-        await prisma.auditEvent.create({
-          data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'github', email } },
-        });
-      }
-    } else if (user) {
-      if (!user.photoUrl && photoUrl) {
-        await prisma.user.update({ where: { id: user.id }, data: { photoUrl } });
-      }
-    } else {
-      return new NextResponse('GitHub email not available', { status: 400 });
-    }
-
-    await prisma.integration.upsert({
-      where: { userId_provider: { userId: user.id, provider: 'github' } },
-      update: { connected: true, metadata: { githubId, email } },
-      create: { userId: user.id, provider: 'github', connected: true, metadata: { githubId, email } },
-    });
-
-    // Link mode: user is already logged in, just record integration and redirect back
-    if (state.link) {
-      const existingSession = await getSession(request);
-      if (existingSession) {
-        if (user && user.id !== existingSession.userId && email) {
-          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-          const mergeToken = await signMergeToken({
-            provider: 'github',
-            providerId: githubId,
-            email,
-            name: name || email,
-            photoUrl,
-            existingUserId: user.id,
-          });
-          await prisma.user.update({ where: { id: user.id }, data: { githubId: null } }).catch(() => {});
-          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
-          clearOauthStateCookie(res, request);
-          return res;
-        }
-        await prisma.integration.upsert({
-          where: { userId_provider: { userId: existingSession.userId, provider: 'github' } },
-          update: { connected: true, metadata: { githubId, email } },
-          create: { userId: existingSession.userId, provider: 'github', connected: true, metadata: { githubId, email } },
-        });
-        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=github`);
-        clearOauthStateCookie(res, request);
-        return res;
+        console.error('[GITHUB EMAILS] Fetch failed after retry:', emailsRes.status);
       }
     }
+    if (!email) {
+      console.warn('[OAUTH:github] No email resolved — will 400. profile.email:', profile.email, 'emailsFetchFailed: see [GITHUB EMAILS] above');
+    }
 
-    const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const target = oauthPostLoginTarget(user, redirectTo, 'github');
-    const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken, request);
-    clearOauthStateCookie(res, request);
-    return res;
+    return finishProviderSignIn(request, 'github', {
+      providerId: String(profile.id),
+      ...(email ? { email } : {}),
+      name: (profile.name as string) || (profile.login as string),
+      photoUrl: profile.avatar_url as string | undefined,
+    }, state);
   } catch (err: any) {
     console.error('[GITHUB CALLBACK]', err?.message || err);
     return new NextResponse('GitHub OAuth callback failed', { status: 500 });
@@ -1736,6 +1891,7 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     const cfg = await getOauthProviderConfig('discord');
     const clientId = cfg.clientId;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
+    console.info(`[OAUTH:discord] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.DISCORD_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
       return new NextResponse('Discord OAuth not configured', { status: 500 });
     }
@@ -1814,79 +1970,18 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     }
     const profile: any = await userInfoRes.json();
     const discordId = profile.id as string;
-    const email = profile.email as string | undefined;
-    const name = profile.global_name || profile.username as string;
-    const photoUrl = profile.avatar
-      ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
-      : undefined;
-
-    let user = await prisma.user.findUnique({ where: { discordId: discordId } });
-    if (!user && email) {
-      user = await prisma.user.findUnique({ where: { email } });
-    }
-    if (user) {
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { discordId: discordId, photoUrl: user.photoUrl || photoUrl || undefined },
-      });
-    } else if (email) {
-      user = await prisma.user.create({
-        data: {
-          email, name, discordId: discordId, photoUrl: photoUrl || undefined,
-        },
-      });
-      await prisma.auditEvent.create({
-        data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: 'discord', email } },
-      });
-    } else {
-      return new NextResponse('Discord email not available', { status: 400 });
+    if (!profile.email) {
+      console.warn('[OAUTH:discord] No email on profile — user must have a VERIFIED email on their Discord account');
     }
 
-    await prisma.integration.upsert({
-      where: { userId_provider: { userId: user.id, provider: 'discord' } },
-      update: { connected: true, metadata: { discordId, email } },
-      create: { userId: user.id, provider: 'discord', connected: true, metadata: { discordId, email } },
-    });
-
-    // Link mode: user is already logged in, just record integration and redirect back
-    if (state.link) {
-      const existingSession = await getSession(request);
-      if (existingSession) {
-        if (user && user.id !== existingSession.userId && email) {
-          const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-          const mergeToken = await signMergeToken({
-            provider: 'discord',
-            providerId: discordId,
-            email,
-            name: name || email,
-            photoUrl,
-            existingUserId: user.id,
-          });
-          await prisma.user.update({ where: { id: user.id }, data: { discordId: null } }).catch(() => {});
-          const res = NextResponse.redirect(`${dashboardBase}/account/apps?merge_token=${mergeToken}`);
-          clearOauthStateCookie(res, request);
-          return res;
-        }
-        await prisma.integration.upsert({
-          where: { userId_provider: { userId: existingSession.userId, provider: 'discord' } },
-          update: { connected: true, metadata: { discordId, email } },
-          create: { userId: existingSession.userId, provider: 'discord', connected: true, metadata: { discordId, email } },
-        });
-        const dashboardBase = `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
-        const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=discord`);
-        clearOauthStateCookie(res, request);
-        return res;
-      }
-    }
-
-    const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
-    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
-    const target = oauthPostLoginTarget(user, redirectTo, 'discord');
-    const res = NextResponse.redirect(target);
-    setSessionCookie(res, token, refreshToken, request);
-    clearOauthStateCookie(res, request);
-    return res;
+    return finishProviderSignIn(request, 'discord', {
+      providerId: discordId,
+      ...(profile.verified && profile.email ? { email: profile.email as string } : {}),
+      name: (profile.global_name as string) || (profile.username as string),
+      photoUrl: profile.avatar
+        ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
+        : undefined,
+    }, state);
   } catch (err: any) {
     console.error('[DISCORD CALLBACK]', err?.message || err);
     return new NextResponse('Discord OAuth callback failed', { status: 500 });
@@ -1959,13 +2054,23 @@ export async function profileHandler(request: NextRequest) {
           timeFormat: true,
           isBanned: true,
           isSuspended: true,
+          googleId: true,
+          githubId: true,
+          discordId: true,
         },
       });
       if (!user) return new NextResponse('User not found', { status: 404 });
-      const { passwordHash, ...safeUser } = user as any;
+      const { passwordHash, googleId, githubId, discordId, ...safeUser } = user as any;
 
       const backupCodeCount = await prisma.recoveryCode.count({ where: { userId: session.userId } });
-      const result = { ...safeUser, hasPassword: !!passwordHash, hasBackupCodes: backupCodeCount > 0 };
+      const result = {
+        ...safeUser,
+        hasPassword: !!passwordHash,
+        hasBackupCodes: backupCodeCount > 0,
+        hasGoogle: !!googleId,
+        hasGithub: !!githubId,
+        hasDiscord: !!discordId,
+      };
       profileCache.set(session.userId, result);
       return NextResponse.json(result);
     }

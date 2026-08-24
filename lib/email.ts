@@ -87,28 +87,6 @@ export function renderTemplate(html: string, vars: Record<string, string>, rawKe
   return result;
 }
 
-async function getThemeColors(): Promise<Record<string, string>> {
-  try {
-    const theme = await prisma.themeConfig.findFirst({ where: { isActive: true } });
-    if (!theme) return {};
-    return {
-      ACCENT_PRIMARY: theme.accentPrimary,
-      ACCENT_SECONDARY: theme.accentSecondary,
-      BG_PRIMARY: theme.bgPrimary,
-      BG_CARD: theme.bgCard,
-      TEXT_PRIMARY: theme.textPrimary,
-      TEXT_SECONDARY: theme.textSecondary,
-      EMAIL_HEADER_BG: theme.emailHeaderBg,
-      EMAIL_BUTTON_COLOR: theme.emailButtonColor,
-      EMAIL_TEXT_COLOR: theme.emailTextColor,
-      SUCCESS: theme.success,
-      BORDER_COLOR: theme.borderColor,
-    };
-  } catch {
-    return {};
-  }
-}
-
 export async function sendEmail(
   to: string,
   subject: string,
@@ -229,23 +207,6 @@ async function buildFallbackTemplates(): Promise<Record<string, { subject: strin
 }
 
 
-function applyThemeColors(html: string, colors: Record<string, string>): string {
-  const colorMap: Record<string, string> = {};
-  if (colors.BG_PRIMARY) colorMap['#08150F'] = colors.BG_PRIMARY;
-  if (colors.BG_CARD) colorMap['#12271D'] = colors.BG_CARD;
-  if (colors.BG_PRIMARY) colorMap['#101C13'] = colors.BG_PRIMARY;
-  if (colors.ACCENT_SECONDARY) colorMap['#4285F4'] = colors.ACCENT_SECONDARY;
-  if (colors.ACCENT_PRIMARY) colorMap['#8AB4F8'] = colors.ACCENT_PRIMARY;
-  if (colors.TEXT_SECONDARY) colorMap['#B7C6BE'] = colors.TEXT_SECONDARY;
-  if (colors.ACCENT_SECONDARY) colorMap['#214434'] = colors.ACCENT_SECONDARY;
-  if (colors.ACCENT_SECONDARY) colorMap['#173124'] = colors.ACCENT_SECONDARY;
-  let result = html;
-  for (const [from, to] of Object.entries(colorMap)) {
-    result = result.split(from).join(to);
-  }
-  return result;
-}
-
 export async function sendTemplateEmail(
   to: string,
   templateName: string,
@@ -253,13 +214,12 @@ export async function sendTemplateEmail(
   options?: { fromEmail?: string; fromName?: string; rawVars?: string[] }
 ): Promise<EmailResult> {
   const rawKeys = new Set(options?.rawVars || []);
-  const themeColors = await getThemeColors();
   const branding = await getBranding();
   const logoUrl = branding.logoUrl;
-  const mergedVars = { ...themeColors, ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
+  const mergedVars = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
 
   // Set default from addresses based on email type
-  const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert'];
+  const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert', 'product_update', 'weekly_summary', 'account_tip'];
   const config = await getEmailConfig();
   
   let defaultFromEmail = branding.emailFromAddress || 'noreply@send.tirbeo.app';
@@ -295,6 +255,9 @@ export async function sendTemplateEmail(
           defaultFromName = config.formsFromName || 'Tirbeo Forms';
           break;
         case 'notification_digest':
+        case 'product_update':
+        case 'weekly_summary':
+        case 'account_tip':
           defaultFromEmail = config.notifyFromEmail || config.alertFromEmail || config.defaultFromEmail;
           defaultFromName = config.notifyFromName || config.alertFromName || config.defaultFromName;
           break;
@@ -310,6 +273,20 @@ export async function sendTemplateEmail(
     fromName: options?.fromName || defaultFromName,
   };
 
+  // Always prefer built-in templates (clean light design) over DB templates
+  const fallbacks = await buildFallbackTemplates();
+  const fallback = fallbacks[templateName];
+  if (fallback) {
+    if (!fallbackLoggedTemplates.has(templateName)) {
+      fallbackLoggedTemplates.add(templateName);
+      console.warn(`[EMAIL] Using built-in template: '${templateName}'`);
+    }
+    const subject = renderTemplate(fallback.subject, mergedVars, rawKeys);
+    const htmlBody = renderTemplate(fallback.html, mergedVars, rawKeys);
+    return sendEmail(to, subject, htmlBody, { ...finalOptions, templateName });
+  }
+
+  // Fall back to DB-stored templates only if no built-in exists
   const template = await getEmailTemplate(templateName);
   if (template) {
     const subject = renderTemplate(template.subject, mergedVars, rawKeys);
@@ -319,22 +296,6 @@ export async function sendTemplateEmail(
       fromName: finalOptions.fromName,
       templateName,
     });
-  }
-
-  const fallbacks = await buildFallbackTemplates();
-  const fallback = fallbacks[templateName];
-  if (fallback) {
-    if (!fallbackLoggedTemplates.has(templateName)) {
-      fallbackLoggedTemplates.add(templateName);
-      console.warn(`[EMAIL] Template '${templateName}' not in DB, using built-in fallback`);
-    }
-    let subject = renderTemplate(fallback.subject, mergedVars, rawKeys);
-    let htmlBody = renderTemplate(fallback.html, mergedVars, rawKeys);
-    if (Object.keys(themeColors).length > 0) {
-      htmlBody = applyThemeColors(htmlBody, themeColors);
-      subject = applyThemeColors(subject, themeColors);
-    }
-    return sendEmail(to, subject, htmlBody, { ...finalOptions, templateName });
   }
 
   return { success: false, error: `Template '${templateName}' not found` };

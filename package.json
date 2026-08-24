@@ -3,16 +3,13 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "NODE_ENV=development NODE_OPTIONS=--no-deprecation npx tsx --env-file=.env.local server.ts",
+    "dev": "NODE_ENV=development NODE_OPTIONS='--no-deprecation --dns-result-order=ipv4first' npx tsx --env-file=.env.local server.ts",
     "build": "prisma generate && next build",
     "start": "node server.js",
     "lint": "eslint .",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
-    "seed": "tsx scripts/seedRoutes.ts",
     "seed:defaults": "tsx scripts/seed-defaults.ts",
-    "seed:org-rbac": "tsx scripts/seed-org-rbac.ts",
-    "seed:flows": "tsx scripts/seed-flows.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

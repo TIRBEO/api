@@ -1,4 +1,5 @@
 import { recordRateLimitHit } from './suspicious-activity';
+import type Redis from 'ioredis';
 
 const WINDOW_MS = 60 * 1000;
 const MAX_REQUESTS = 30;
@@ -350,9 +351,7 @@ const ROUTE_LIMITS: Record<string, number> = {
 };
 
 import { getCachedRedisClient } from '../db/redis';
-import type Redis from 'ioredis';
-
-let redis: Redis | false | null = null;
+let redis: any = null; // Redis or false or null
 const REDIS_URL = process.env.REDIS_URL;
 
 async function getRedis(): Promise<Redis | false> {

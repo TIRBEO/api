@@ -164,6 +164,7 @@ const CSRF_EXEMPT_PATHS = [
   '/api/passkey/auth/options', '/api/passkey/auth/verify',
   '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
   '/auth/discord', '/auth/discord/callback',
+  '/api/auth/oauth/merge',
   '/api/captcha/', '/api/health',
   '/api/security/log',
 ];
@@ -318,6 +319,7 @@ export async function proxy(request: NextRequest) {
     '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
     '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
     '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback', '/api/auth/discord', '/api/auth/discord/callback',
+    '/api/auth/oauth/merge', // login-merge: authorized by signed short-lived token in body, no session involved
     '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
     '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
     '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
@@ -339,7 +341,9 @@ export async function proxy(request: NextRequest) {
     '/api/debug/',
   ];
 
-const isPublicPath = publicPaths.some(p => pathname.startsWith(p));
+// Public form submission: POST /api/forms/{slug}/submit (auth via access_key in body)
+const isPublicFormSubmit = /^\/api\/forms\/[^/]+\/submit\/?$/.test(pathname) && request.method === 'POST';
+const isPublicPath = publicPaths.some(p => pathname.startsWith(p)) || isPublicFormSubmit;
 if (isPublicPath) return response;
 
 // ── Authentication check ──
@@ -348,7 +352,7 @@ const cookie = request.cookies.get('__session')?.value;
 const hasCookie = !!cookie;
 
 if (!hasCookie && !hasAuthHeader) {
-  return jsonResponse(allowedOrigin, { error: 'Authentication required. Provide a session cookie or Authorization: Bearer <api_key> header.' }, 401);
+  return jsonResponse(allowedOrigin, { error: 'Not authenticated' }, 401);
 }
 
 if (hasAuthHeader) {
@@ -361,7 +365,7 @@ if (hasAuthHeader) {
 
   // ── CSRF validation for cookie-authed state-changing requests ──
   if (hasCookie && STATE_METHODS.has(request.method)) {
-    const isCsrfExempt = CSRF_EXEMPT_PATHS.some(p => pathname.startsWith(p));
+    const isCsrfExempt = CSRF_EXEMPT_PATHS.some(p => pathname.startsWith(p)) || isPublicFormSubmit;
     if (!isCsrfExempt) {
       if (!validateCsrf(request)) {
         return jsonResponse(allowedOrigin, {

@@ -1,16 +1,30 @@
 /**
  * Shared Redis factory with reconnection logic, keep-alive, and cold start detection.
- * 
+ *
  * Upstash (and similar serverless Redis providers) aggressively close idle
  * connections after ~30-60 seconds. This module handles:
- * 
+ *
  * 1. Automatic reconnection with exponential backoff when connections drop
  * 2. Keep-alive pings to prevent idle timeout
  * 3. Cold start detection for Upstash wake-up scenarios
  * 4. Connection state tracking for diagnostics
  */
 
-import Redis from 'ioredis';
+// Lazy-loaded Redis class to avoid Turbopack bundling issues
+import type Redis from 'ioredis';
+
+let _Redis: any = null;
+function getRedisClass(): any {
+  if (_Redis) return _Redis;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    _Redis = require('ioredis').default || require('ioredis');
+  } catch {
+    console.warn('[REDIS] ioredis not available, Redis features disabled');
+    _Redis = class { constructor() { throw new Error('ioredis not available'); } };
+  }
+  return _Redis;
+}
 
 // ─── Log Throttling ───
 // Upstash (serverless Redis) drops idle connections regularly, so reconnect
@@ -107,7 +121,7 @@ function getState(name: string): RedisConnectionState {
 // ─── Keep-Alive Management ───
 const keepAliveTimers: Map<string, NodeJS.Timeout> = new Map();
 
-function startKeepAlive(name: string, client: Redis): void {
+function startKeepAlive(name: string, client: any): void {
   if (keepAliveTimers.has(name)) return;
 
   const timer = setInterval(async () => {
@@ -168,7 +182,7 @@ interface CreateRedisOptions {
 /**
  * Create a Redis client with automatic reconnection and keep-alive.
  */
-export function createRedisClient(options: CreateRedisOptions): Redis {
+export function createRedisClient(options: CreateRedisOptions): any {
   const {
     name,
     url = process.env.REDIS_URL,
@@ -188,7 +202,7 @@ export function createRedisClient(options: CreateRedisOptions): Redis {
     keepAliveInterval: keepAliveInterval || REDIS_CONFIG.keepAliveInterval,
   };
 
-  const client = new Redis(url, {
+  const client = new (getRedisClass())(url, {
     retryStrategy: config.retryStrategy,
     connectTimeout: config.connectTimeout,
     maxRetriesPerRequest: config.maxRetriesPerRequest,
@@ -249,7 +263,7 @@ export function createRedisClient(options: CreateRedisOptions): Redis {
 // Singleton clients that survive HMR in development
 const g2 = globalThis as any;
 if (!g2.__tirbeoRedisClients) {
-  g2.__tirbeoRedisClients = new Map<string, Redis>();
+  g2.__tirbeoRedisClients = new Map<string, any>();
 }
 const cachedClients: Map<string, Redis> = g2.__tirbeoRedisClients;
 
@@ -257,7 +271,7 @@ const cachedClients: Map<string, Redis> = g2.__tirbeoRedisClients;
  * Get or create a cached Redis client with reconnection support.
  * Clients are cached globally to survive HMR in development.
  */
-export function getCachedRedisClient(name: string, options?: Partial<CreateRedisOptions>): Redis {
+export function getCachedRedisClient(name: string, options?: Partial<CreateRedisOptions>): any {
   if (cachedClients.has(name)) {
     return cachedClients.get(name)!;
   }
@@ -277,7 +291,7 @@ export function getCachedRedisClient(name: string, options?: Partial<CreateRedis
 /**
  * Check if a Redis client is healthy by running PING.
  */
-export async function checkRedisHealth(client: Redis): Promise<{
+export async function checkRedisHealth(client: any): Promise<{
   ok: boolean;
   latencyMs: number;
   error?: string;
