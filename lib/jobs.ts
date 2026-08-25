@@ -82,7 +82,7 @@ export async function sendEmailDigests() {
           if (now.getTime() - lastSent >= freqMs) {
             const cutoff = new Date(Math.max(lastSent, now.getTime() - freqMs));
             const notifs = await prisma.notification.findMany({
-              where: { userId: u.id, isRead: false, createdAt: { gte: cutoff } },
+              where: { userId: u.id, isRead: false, createdAt: { gte: cutoff }, type: { notIn: ['product'] } },
               orderBy: { createdAt: 'desc' },
               take: 50,
               select: { id: true, title: true, body: true, createdAt: true },

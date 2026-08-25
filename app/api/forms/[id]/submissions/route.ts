@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db/prisma';
 import { getSessionFromRequest } from '@/lib/auth/session';
+import { trackQuery } from '@/lib/queryMonitor';
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -21,9 +22,10 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     const where: any = { formId: id };
     if (status) where.status = status;
 
-    // Export mode — fetch all submissions
+    // Export mode — cap at 10k rows to prevent OOM on huge forms
     if (format === 'csv' || format === 'json') {
-      const submissions = await prisma.formSubmission.findMany({ where, orderBy: { createdAt: 'desc' }, take: 10000 });
+      const EXPORT_LIMIT = 10_000;
+      const submissions = await prisma.formSubmission.findMany({ where, orderBy: { createdAt: 'desc' }, take: EXPORT_LIMIT });
       const fields = form.fields;
 
       if (format === 'json') {
@@ -74,7 +76,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     // Paginated mode (default)
     const [submissions, total] = await Promise.all([
-      prisma.formSubmission.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+      trackQuery('form_submissions_by_form_created', () => prisma.formSubmission.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit })),
       prisma.formSubmission.count({ where }),
     ]);
 

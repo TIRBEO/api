@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, roles: { include: { role: true } } },
+      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true },
     });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
       return new NextResponse('2FA not enabled', { status: 400 });

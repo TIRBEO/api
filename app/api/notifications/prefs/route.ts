@@ -8,32 +8,31 @@ export const runtime = 'nodejs';
 const ALLOWED_FIELDS = [
   'type',
   // Global channels
-  'email', 'push', 'inApp',
+  'email', 'push',
   // Category toggles
   'security', 'forms', 'product', 'support',
   // Per-category x channel matrix
-  'securityEmail', 'securityPush', 'securityInApp',
-  'formsEmail', 'formsPush', 'formsInApp',
-  'productEmail', 'productPush', 'productInApp',
-  'supportEmail', 'supportPush', 'supportInApp',
+  'securityEmail', 'securityPush',
+  'formsEmail', 'formsPush',
+  'productEmail', 'productPush',
+  'supportEmail', 'supportPush',
   // Quiet hours
   'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
   // Digest & email summaries
   'digestEnabled', 'digestFrequency',
-  'tipsEmail', 'weeklySummary',
+  'productEmail', 'weeklySummary',
 ] as const;
 
 const DEFAULT_PREFS: Record<string, unknown> = {
   type: null,
-  email: true, push: true, inApp: true,
+  email: true, push: true,
   security: true, forms: true, product: true, support: true,
-  securityEmail: true, securityPush: true, securityInApp: true,
-  formsEmail: true, formsPush: true, formsInApp: true,
-  productEmail: true, productPush: true, productInApp: true,
-  supportEmail: true, supportPush: true, supportInApp: true,
+  securityEmail: true, securityPush: true,
+  formsEmail: true, formsPush: true,
+  productEmail: true, productPush: true,
+  supportEmail: true, supportPush: true,
   quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
-  digestEnabled: false, digestFrequency: 'daily',
-  tipsEmail: true, weeklySummary: false,
+  digestEnabled: false, digestFrequency: 'daily', weeklySummary: false,
 };
 
 const DIGEST_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);

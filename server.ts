@@ -37,6 +37,14 @@ app.prepare().then(() => {
     startPeriodicDeletionSweep();
     startPeriodicTips();
 
+    // Enable query performance latency alerts
+    try {
+      const { setupQueryAlerts } = require('./lib/queryAlertSetup');
+      setupQueryAlerts();
+    } catch (e: any) {
+      console.warn('[QUERY-ALERT] Setup skipped:', e?.message || e);
+    }
+
     // Start embedded WS server only if WS_PORT is set and port is available.
     // In production the realtime service runs separately at ws.tirbeo.app.
     if (wsPort && wsPort > 0) {

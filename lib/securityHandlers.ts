@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession } from './session';
 import { revokeSessionState } from './auth/redis';
+import { trackQuery } from './queryMonitor';
 import { revokeSessionFamilyByUser, bustSessionCache } from './auth/session';
 import { jsonUnauthorized, jsonError } from './response';
 import { logSecurityEvent } from './security';
@@ -84,16 +85,26 @@ export async function phonesVerifyOtpHandler(request: NextRequest) {
   }
 }
 
-// ─── POST /api/security/phones (add directly) ───────────────
+// ─── POST /api/security/phones (add directly — requires OTP verification) ───
 export async function phonesAddHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { number } = (await request.json()) as any;
+    const { number, code } = (await request.json()) as any;
     if (!number || typeof number !== 'string') {
       return new NextResponse('Phone number required', { status: 400 });
     }
+    if (!code || typeof code !== 'string') {
+      return new NextResponse('Verification code required', { status: 400 });
+    }
     const clean = number.replace(/[\s\-()]/g, '');
+    if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
+      return new NextResponse('Invalid phone number format', { status: 400 });
+    }
+    // Verify the OTP before accepting the phone
+    const { verifyOtpCode } = await import('./auth/otp');
+    const ok = await verifyOtpCode(session.userId, 'phone', code);
+    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
     await prisma.user.update({
       where: { id: session.userId },
       data: { phoneNumber: clean, phoneVerified: true },
@@ -214,8 +225,9 @@ export async function totpSetupHandler(request: NextRequest) {
     const secret = generateSecret();
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
     const uri = generateTotpUri(secret, user?.email || 'user');
-    // Don't save to DB yet — only save after user verifies the 6-digit code
-    return NextResponse.json({ secret, uri });
+    // Save secret to DB immediately (is2FAEnabled stays false until verify)
+    await prisma.user.update({ where: { id: session.userId }, data: { totpSecret: secret } });
+    return NextResponse.json({ uri });
   } catch (err: any) {
     console.error('[TOTP SETUP]', err?.message || err);
     return new NextResponse('Failed to setup TOTP', { status: 500 });
@@ -229,16 +241,14 @@ export async function totpVerifyHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const body = (await request.json()) as any;
     const code = body?.code || body?.token;
-    const clientSecret = body?.secret; // Secret from setup step (not yet in DB)
     if (!code || typeof code !== 'string' || code.length !== 6) {
       return NextResponse.json({ error: 'Invalid code. Enter a 6-digit code.' }, { status: 400 });
     }
-    // Try client-provided secret first, then fall back to DB (for re-verification)
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { totpSecret: true },
     });
-    const secretToVerify = clientSecret || user?.totpSecret;
+    const secretToVerify = user?.totpSecret;
     if (!secretToVerify) {
       return NextResponse.json({ error: 'TOTP not set up. Please start setup again.' }, { status: 400 });
     }
@@ -246,16 +256,11 @@ export async function totpVerifyHandler(request: NextRequest) {
     if (!valid) {
       return NextResponse.json({ error: 'Invalid code. Please try again.' }, { status: 400 });
     }
-    // Only NOW save the secret to DB — after user verified the code
-    await prisma.user.update({
-      where: { id: session.userId },
-      data: { totpSecret: secretToVerify },
-    });
     const recoveryCodes = generateRecoveryCodes(8);
     const backupCodesJson = recoveryCodes.map(rc => ({ code: hashRecoveryCode(rc), used: false }));
     await prisma.user.update({
       where: { id: session.userId },
-      data: { is2FAEnabled: true, backupCodes: backupCodesJson },
+      data: { totpSecret: secretToVerify, is2FAEnabled: true, backupCodes: backupCodesJson },
     });
     await createAuditEvent({
       actorId: session.userId,
@@ -383,14 +388,35 @@ export async function recoveryEmailHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const { email } = (await request.json()) as any;
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
+
+    // Allow null to remove the recovery email
+    if (email === null || email === undefined || email === '') {
+      await prisma.user.update({
+        where: { id: session.userId },
+        data: { secondaryEmail: null, secondaryEmailVerified: false },
+      });
+      await createAuditEvent({
+        actorId: session.userId,
+        action: 'recovery_email.removed',
+        targetType: 'user',
+        targetId: session.userId,
+        metadata: {},
+        severity: 'info',
+      });
+      await notify(session.userId, 'Recovery email removed', 'Your recovery email has been removed from your account.');
+      return NextResponse.json({ ok: true });
+    }
+
+    if (typeof email !== 'string' || !email.includes('@')) {
       return new NextResponse('Valid email required', { status: 400 });
     }
-    // Check if the email is already set and verified — don't reset verification status
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { secondaryEmail: true, secondaryEmailVerified: true },
+      select: { email: true, secondaryEmail: true, secondaryEmailVerified: true },
     });
+    if (user?.email && user.email.toLowerCase() === email.toLowerCase()) {
+      return NextResponse.json({ error: 'Recovery email cannot be the same as your primary email' }, { status: 400 });
+    }
     const emailChanged = user?.secondaryEmail?.toLowerCase() !== email.toLowerCase();
     await prisma.user.update({
       where: { id: session.userId },
@@ -412,6 +438,7 @@ export async function recoveryEmailHandler(request: NextRequest) {
       metadata: { email, verified: false },
       severity: 'info',
     });
+    await notify(session.userId, 'Recovery email updated', `Your recovery email was changed to ${email}. Please verify it.`);
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL]', err?.message || err);
@@ -425,8 +452,18 @@ export async function recoveryEmailSendCodeHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const { email } = (await request.json()) as any;
+    console.log('[RECOVERY EMAIL SEND] email:', email, 'typeof:', typeof email);
     if (!email || typeof email !== 'string' || !email.includes('@')) {
+      console.warn('[RECOVERY EMAIL SEND] Rejected: invalid email', { email });
       return new NextResponse('Valid email required', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { email: true },
+    });
+    if (user?.email && user.email.toLowerCase() === email.toLowerCase()) {
+      console.warn('[RECOVERY EMAIL SEND] Rejected: same as primary');
+      return NextResponse.json({ error: 'Recovery email cannot be the same as your primary email' }, { status: 400 });
     }
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
@@ -449,8 +486,15 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const { email, code } = (await request.json()) as any;
-    if (!email || !code || typeof code !== 'string') {
+    if (!email || typeof email !== 'string' || !email.includes('@') || !code || typeof code !== 'string') {
       return new NextResponse('Email and code required', { status: 400 });
+    }
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { email: true },
+    });
+    if (user?.email && user.email.toLowerCase() === email.toLowerCase()) {
+      return NextResponse.json({ error: 'Recovery email cannot be the same as your primary email' }, { status: 400 });
     }
     const ok = await verifyOtpCode(session.userId, 'email', code);
     if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
@@ -577,7 +621,7 @@ export async function loginHistoryHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const url = new URL(request.url);
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
-    const logs = await prisma.login_history.findMany({
+    const logs = await trackQuery('login_history_by_user_created', () => prisma.login_history.findMany({
       where: { userId: session.userId },
       orderBy: { createdAt: 'desc' },
       take: limit,
@@ -590,7 +634,7 @@ export async function loginHistoryHandler(request: NextRequest) {
         method: true,
         createdAt: true,
       },
-    });
+    }));
     return NextResponse.json({ logs });
   } catch (err: any) {
     console.error('[LOGIN HISTORY]', err?.message || err);

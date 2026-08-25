@@ -36,7 +36,7 @@ export async function GET(request: NextRequest) {
         { name: { contains: q, mode: 'insensitive' } },
       ],
     },
-    select: { id: true, email: true, name: true, roles: { include: { role: true } } },
+    select: { id: true, email: true, name: true, adminRole: true },
     take: 5,
   });
 

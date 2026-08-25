@@ -128,7 +128,7 @@ export async function sendNextTipForUser(userId: string): Promise<boolean> {
     }).catch(() => null);
     // Default ON; respect explicit opt-outs in the jsonb column.
     const prefs: any = (u as any)?.notificationPreferences;
-    if (prefs && typeof prefs === 'object' && (prefs.email === false || prefs.tipsEmail === false)) return false;
+    if (prefs && typeof prefs === 'object' && (prefs.email === false || prefs.productEmail === false)) return false;
 
     const tip = await nextUnsentTip(userId);
     if (!tip) return false;
@@ -172,7 +172,7 @@ export async function runAutoTipsSweep() {
       SELECT "id" FROM "users"
       WHERE "deleted_at" IS NULL AND "is_banned" = false
         AND ("notification_preferences"->>'email')::boolean IS NOT FALSE
-        AND ("notification_preferences"->>'tipsEmail')::boolean IS NOT FALSE
+        AND ("notification_preferences"->>'productEmail')::boolean IS NOT FALSE
       LIMIT 5000`;
     if (eligible.length === 0) return;
 

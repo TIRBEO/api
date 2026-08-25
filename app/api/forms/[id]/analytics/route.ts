@@ -18,10 +18,22 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     startDate.setDate(startDate.getDate() - days);
     startDate.setHours(0, 0, 0, 0);
 
-    const analytics = await prisma.formAnalytic.findMany({
-      where: { formId: id, date: { gte: startDate } },
-      orderBy: { date: 'asc' },
-    });
+    // Parallelize all three queries instead of sequential awaits
+    const [analytics, recentSubmissions, totalCounts] = await Promise.all([
+      prisma.formAnalytic.findMany({
+        where: { formId: id, date: { gte: startDate } },
+        orderBy: { date: 'asc' },
+      }),
+      prisma.formSubmission.findMany({
+        where: { formId: id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+      prisma.formSubmission.aggregate({
+        where: { formId: id },
+        _count: true,
+      }),
+    ]);
 
     const totals = analytics.reduce(
       (acc, day) => ({
@@ -35,17 +47,6 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 
     const conversionRate = totals.views > 0 ? (totals.submissions / totals.views) * 100 : 0;
     const completionRate = totals.starts > 0 ? (totals.submissions / totals.starts) * 100 : 0;
-
-    const recentSubmissions = await prisma.formSubmission.findMany({
-      where: { formId: id },
-      orderBy: { createdAt: 'desc' },
-      take: 10,
-    });
-
-    const totalCounts = await prisma.formSubmission.aggregate({
-      where: { formId: id },
-      _count: true,
-    });
 
     return NextResponse.json({
       analytics, totals,

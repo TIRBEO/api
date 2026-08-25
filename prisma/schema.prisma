@@ -57,6 +57,7 @@ model User {
   deletionReason          String?         @map("deletion_reason")
   adminRole               String?         @map("admin_role")
   notificationPreferences Json?           @default("{\"email\":true,\"push\":true,\"inApp\":true,\"security\":true,\"forms\":true,\"product\":true,\"support\":true,\"quietHoursEnabled\":false,\"quietHoursStart\":\"22:00\",\"quietHoursEnd\":\"08:00\",\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
+  emailUnsubscribed       Json?           @default("{}") @map("email_unsubscribed")
   createdAt               DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt               DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
   apiKeys                 ApiKey[]
@@ -239,6 +240,8 @@ model SecurityEvent {
   @@index([createdAt], map: "idx_security_events_created")
   @@index([eventType], map: "idx_security_events_type")
   @@index([userId], map: "idx_security_events_user")
+  @@index([userId, createdAt(sort: Desc)], map: "idx_security_events_user_created")
+  @@index([severity, createdAt(sort: Desc)], map: "idx_security_events_severity_created")
   @@map("security_events")
 }
 
@@ -275,6 +278,7 @@ model login_history {
 
   @@index([userId])
   @@index([email])
+  @@index([userId, createdAt(sort: Desc)], map: "idx_login_history_user_created")
   @@map("login_history")
 }
 
@@ -294,6 +298,8 @@ model Notification {
   @@index([createdAt(sort: Desc)], map: "idx_notifications_created")
   @@index([isRead], map: "idx_notifications_read")
   @@index([userId], map: "idx_notifications_user")
+  @@index([userId, isRead], map: "idx_notifications_user_read")
+  @@index([userId, createdAt(sort: Desc)], map: "idx_notifications_user_created")
   @@map("notifications")
 }
 
@@ -608,7 +614,7 @@ model FormSubmission {
 
   @@index([formId])
   @@index([createdAt])
-  @@index([formId, createdAt])
+  @@index([formId, createdAt(sort: Desc)])
   @@map("form_submissions")
 }
 
@@ -672,6 +678,8 @@ model Ticket {
   @@index([assignedId])
   @@index([createdAt])
   @@index([priority])
+  @@index([status, createdAt(sort: Desc)], map: "idx_tickets_status_created")
+  @@index([customerId, createdAt(sort: Desc)], map: "idx_tickets_customer_created")
   @@map("tickets")
 }
 

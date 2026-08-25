@@ -171,6 +171,8 @@ import {
 } from '../../../lib/health';
 import {
   cacheDebugHandler, cacheResetDebugHandler,
+  queryPerfDebugHandler, queryPerfResetDebugHandler,
+  queryPerfConfigDebugHandler, queryPerfConfigUpdateDebugHandler,
 } from '../../../lib/debugHandlers';
 
 // jobs module removed
@@ -208,7 +210,7 @@ const INTERNAL_ROUTES = [
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
   'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
   'admin/heartbeat',
-  'email/config', 'email/templates', 'email/test', 'admin/emails', 'admin/emails/reply',
+  'email/config', 'email/templates', 'email/test', 'email/unsubscribe', 'admin/emails', 'admin/emails/reply',
   'districts',
   'developer/api-keys',
   'user/mailbox', 'user/mailbox/check', 'user/mailbox/dns',
@@ -233,6 +235,9 @@ const INTERNAL_ROUTES = [
     'health/pool',
     'debug/cache',
     'debug/cache/reset',
+    'debug/query-perf',
+    'debug/query-perf/reset',
+    'debug/query-perf/config',
     'debug/rate-limits/reset',
   // Support
   'support/tickets', 'support/tickets/create',  'support/tickets/appeals',
@@ -309,14 +314,17 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
 
 // connected-accounts routes removed (LinkedAccount model removed)
 
-  // Handle passkey/{id} dynamic route
+  // Handle passkey/{id} dynamic route (only DELETE/PATCH on non-static subpaths)
   if (slug.length === 2 && slug[0] === 'passkey') {
     const passkeyId = slug[1];
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'passkey/[id]', method: 'DELETE', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
-    }
-    if (method.toUpperCase() === 'PATCH') {
-      return { path: 'passkey/[id]', method: 'PATCH', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
+    const PASSKEY_STATIC = ['register', 'auth', 'list'];
+    if (!PASSKEY_STATIC.includes(passkeyId)) {
+      if (method.toUpperCase() === 'DELETE') {
+        return { path: 'passkey/[id]', method: 'DELETE', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
+      }
+      if (method.toUpperCase() === 'PATCH') {
+        return { path: 'passkey/[id]', method: 'PATCH', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
+      }
     }
   }
 
@@ -445,6 +453,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/config': ['GET', 'PATCH'],
       'email/templates': ['GET', 'POST'],
       'email/test': ['POST'],
+      'email/unsubscribe': ['GET', 'POST'],
       'admin/emails': ['GET'],
       'admin/emails/reply': ['POST'],
       'districts': ['GET'],
@@ -478,7 +487,10 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'health/pool': ['GET'],
       'debug/cache': ['GET'],
       'debug/cache/reset': ['POST'],
-      'debug/rate-limits/reset': ['GET'],
+      'debug/query-perf': ['GET'],
+      'debug/query-perf/reset': ['POST'],
+      'debug/query-perf/config': ['GET', 'PUT'],
+      'debug/rate-limits/reset': ['POST'],
       // Content
 
       'content/health': ['GET'],
@@ -572,21 +584,24 @@ async function handler(request: NextRequest, slug: string[], method: string) {
 
   // Redirect user-facing paths to the dashboard instead of returning 404.
   // The API server only serves /api/* routes; pages live on dashboard.tirbeo.app.
+  // Skip paths that are registered internal API routes (e.g. support/tickets).
   if (!pathStr || pathStr.startsWith('account') || pathStr.startsWith('settings') || pathStr.startsWith('overview') || pathStr.startsWith('support')) {
-    const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
-    const dashboardBase = `https://dashboard.${appDomain}`;
-    if (!pathStr) {
-      // Root — return helpful JSON
-      return NextResponse.json({
-        service: 'Tirbeo API',
-        status: 'healthy',
-        docs: '/api/health',
-        dashboard: dashboardBase,
-        accounts: `https://accounts.${appDomain}`,
-      });
+    const isInternal = INTERNAL_ROUTES.some((r) => pathStr === r || pathStr.startsWith(r + '/'));
+    if (!isInternal) {
+      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+      const dashboardBase = `https://dashboard.${appDomain}`;
+      if (!pathStr) {
+        return NextResponse.json({
+          service: 'Tirbeo API',
+          status: 'healthy',
+          docs: '/api/health',
+          dashboard: dashboardBase,
+          accounts: `https://accounts.${appDomain}`,
+        });
+      }
+      const target = `${dashboardBase}/${pathStr}`;
+      return NextResponse.redirect(target);
     }
-    const target = `${dashboardBase}/${pathStr}`;
-    return NextResponse.redirect(target);
   }
 
   const route = matchRoute(slug, method, routes);
@@ -885,6 +900,24 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'email/test':
         resp = await emailTestHandler(request);
         break;
+      case 'email/unsubscribe': {
+        const url = new URL(request.url);
+        const token = url.searchParams.get('token') || '';
+        if (!token) {
+          resp = NextResponse.json({ error: 'Missing token' }, { status: 400 });
+          break;
+        }
+        const { verifyUnsubscribeToken, processUnsubscribe } = await import('../../../lib/emailPrefs');
+        const decoded = verifyUnsubscribeToken(token);
+        if (!decoded) {
+          resp = NextResponse.json({ error: 'Invalid or expired token' }, { status: 400 });
+          break;
+        }
+        await processUnsubscribe(decoded.userId, decoded.category);
+        const dashBase = (await import('../../../lib/app-urls')).getDashboardBaseUrl();
+        resp = NextResponse.redirect(`${dashBase}/account/notifications?unsubscribed=${decoded.category}`);
+        break;
+      }
       case 'admin/emails':
         resp = await adminEmailsHandler(request);
         break;
@@ -1095,6 +1128,17 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'debug/cache/reset':
         resp = await cacheResetDebugHandler(request);
+        break;
+      case 'debug/query-perf':
+        resp = await queryPerfDebugHandler(request);
+        break;
+      case 'debug/query-perf/reset':
+        resp = await queryPerfResetDebugHandler(request);
+        break;
+      case 'debug/query-perf/config':
+        resp = (method.toUpperCase() === 'PUT')
+          ? await queryPerfConfigUpdateDebugHandler(request)
+          : await queryPerfConfigDebugHandler(request);
         break;
       case 'debug/rate-limits/reset': {
         const { clearRateLimits } = await import('../../../lib/captcha/risk');

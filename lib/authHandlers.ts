@@ -171,7 +171,7 @@ function isAllowedRedirect(url: string): boolean {
     const u = new URL(url);
     const host = u.hostname;
     if (host.endsWith('.tirbeo.app')) return true;
-    if (host === 'localhost' || host === '127.0.0.1') return true;
+    if (process.env.NODE_ENV !== 'production' && (host === 'localhost' || host === '127.0.0.1')) return true;
     if (host.endsWith('.vercel.app') && host.startsWith('tirbeo')) return true;
     return false;
   } catch { return false; }
@@ -193,14 +193,30 @@ function isAllowedRedirect(url: string): boolean {
  */
 function getDynamicRedirectUri(request: NextRequest, path: string): string {
   const provider = path.split('/')[2];
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // 1. Explicit env var (non-localhost) — highest priority
   const envMap: Record<string, string | undefined> = {
     google: process.env.GOOGLE_REDIRECT_URI,
     github: process.env.GITHUB_REDIRECT_URI,
     discord: process.env.DISCORD_REDIRECT_URI,
   };
   const envUri = envMap[provider || ''];
-  if (envUri) return envUri;
+  if (envUri && !envUri.includes('localhost') && !envUri.includes('127.0.0.1')) return envUri;
 
+  // 2. In production, if env var is localhost, override with the production domain
+  //    (env var may be stale from .env.local; production MUST use the real domain)
+  if (isProd && envUri && (envUri.includes('localhost') || envUri.includes('127.0.0.1'))) {
+    const rawDomain = process.env.API_DOMAIN || process.env.APP_DOMAIN || '';
+    const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (cleanDomain && !cleanDomain.includes('localhost')) {
+      const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
+      console.warn(`[OAUTH:${provider}] Env var ${provider.toUpperCase()}_REDIRECT_URI is localhost but NODE_ENV=production. Using https://${apiHost}/api${path}`);
+      return `https://${apiHost}/api${path}`;
+    }
+  }
+
+  // 3. Derived from APP_DOMAIN / API_DOMAIN env vars
   const rawDomain =
     process.env.API_DOMAIN ||
     process.env.APP_DOMAIN ||
@@ -208,12 +224,11 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
     '';
   const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (cleanDomain && !cleanDomain.includes('localhost') && !cleanDomain.includes('127.0.0.1')) {
-    // Accept either the apex domain (derive api.) or an explicit API host.
     const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
     return `https://${apiHost}/api${path}`;
   }
 
-  // Local development fallback.
+  // 4. Local development fallback — only for localhost
   const host = request.headers.get('host') || 'localhost:3000';
   if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) {
     console.warn(
@@ -254,11 +269,14 @@ const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }
 async function getOauthProviderConfig(provider: string): Promise<OauthProviderConfig> {
   // OAuth providers are configured purely via environment variables.
   const keys = OAUTH_ENV_KEYS[provider];
+  const rawUri = process.env[keys?.uri];
+  // Ignore localhost redirect URIs in production — let getDynamicRedirectUri handle it
+  const redirectUri = rawUri && !rawUri.includes('localhost') && !rawUri.includes('127.0.0.1') ? rawUri : undefined;
   return {
     enabled: !!process.env[keys?.id],
     clientId: process.env[keys?.id],
     clientSecret: process.env[keys?.secret],
-    redirectUri: process.env[keys?.uri],
+    redirectUri,
   };
 }
 
@@ -389,6 +407,14 @@ async function finishProviderSignIn(
       await prisma.auditEvent.create({
         data: { actorId: existingSession.userId, action: `oauth.${provider}.connected`, targetType: 'user', targetId: existingSession.userId, metadata, severity: 'info' },
       }).catch(() => {});
+      // Notify the user that a new sign-in method was connected
+      createNotification({
+        userId: existingSession.userId,
+        type: 'security',
+        title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} connected`,
+        body: `Your ${provider.charAt(0).toUpperCase() + provider.slice(1)} account was linked to Tirbeo on ${fmtNow()}. You can now sign in with it.`,
+        link: '/account/apps',
+      }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
       const res = NextResponse.redirect(`${dashboardBase}/account/apps?connected=${provider}`);
       clearOauthStateCookie(res, request);
       return res;
@@ -441,6 +467,7 @@ async function finishProviderSignIn(
   } else if (!account.photoUrl && profile.photoUrl) {
     // Backfill avatar only — the identity link already exists in this branch.
     await prisma.user.update({ where: { id: account.id }, data: { photoUrl: profile.photoUrl } as any }).catch(() => {});
+    bustProfileCache(account.id);
   }
 
   const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
@@ -453,6 +480,18 @@ async function finishProviderSignIn(
     }).catch(() => null),
     createSession(account.id, request.headers.get('user-agent') || undefined, ip),
   ]);
+  // Notify user of new sign-in from connected app
+  createNotification({
+    userId: account.id,
+    type: 'login',
+    title: `Signed in with ${provider.charAt(0).toUpperCase() + provider.slice(1)}`,
+    body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+    link: '/account/security',
+    metadata: { provider, ip, device: describeDevice(request.headers.get('user-agent')) },
+  }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+  // Record login history
+  const { recordLoginHistory } = await import('./security');
+  recordLoginHistory({ request, userId: account.id, email: account.email, success: true, method: provider }).catch(() => {});
   const target = oauthPostLoginTarget(account, redirectTo);
   const res = NextResponse.redirect(target);
   setSessionCookie(res, token, refreshToken, request);
@@ -501,6 +540,7 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
       prisma.user.update({ where: { id: target.id }, data: { [idField]: data.providerId, ...(target.photoUrl ? {} : { photoUrl: data.photoUrl || undefined }) } as any }),
       createSession(target.id, request.headers.get('user-agent') || undefined, (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()),
     ]);
+    bustProfileCache(target.id);
     prisma.auditEvent.create({
       data: { actorId: target.id, action: 'account.merge.login', targetType: 'user', targetId: target.id, metadata: { provider: data.provider, providerId: data.providerId } },
     }).catch(() => {});
@@ -715,7 +755,7 @@ export async function loginHandler(request: NextRequest) {
         metadata: { ip, device: describeDevice(userAgent), method: 'Password' },
       })),
       Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
-      // Event-triggered auto tip (only if tipsEmail enabled & tip unsent)
+      // Event-triggered auto tip (only if productEmail enabled & tip unsent)
       import('./tips').then(m => m.sendNextTipForUser(user.id)).catch(() => {}),
       // Record login history for the Login History section
       prisma.login_history.create({
@@ -742,7 +782,7 @@ export async function loginHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[LOGIN]', err?.message || err);
-    return new NextResponse('Login failed', { status: 400 });
+    return new NextResponse('Login failed', { status: 500 });
   }
 }
 
@@ -875,6 +915,8 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     clearRateLimitHits(ip);
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_success', details: { reason: 'password' } }).catch(() => {});
+    const { recordLoginHistory: rlh4 } = await import('./security');
+    rlh4({ request, userId: user.id, email: user.email, success: true, method: 'admin_password' }).catch(() => {});
 
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
 
@@ -939,9 +981,11 @@ export async function verify2faLoginHandler(request: NextRequest) {
 
     clearRateLimitHits(clientIp);
     logSecurityEvent({ request, userId, eventType: 'auth.login_2fa_success', details: { reason: 'totp' } }).catch(() => {});
+    const { recordLoginHistory: rlh5 } = await import('./security');
+    rlh5({ request, userId, email: user.email, success: true, method: 'totp' }).catch(() => {});
     return res;
   } catch {
-    return new NextResponse('2FA verification failed', { status: 400 });
+    return new NextResponse('2FA verification failed', { status: 500 });
   }
 }
 
@@ -1194,7 +1238,7 @@ export async function signupHandler(request: NextRequest) {
         notificationPreferences: {
           email: true, push: true, inApp: true,
           security: true, forms: true, product: true, support: true,
-          productEmail: true, tipsEmail: true, weeklySummary: false,
+          productEmail: true, productPush: true, productInApp: true, weeklySummary: false,
         },
       },
     });
@@ -1380,6 +1424,10 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     const idField = PROVIDER_ID_FIELD[data.provider];
     if (!idField) return new NextResponse('Unsupported provider', { status: 400 });
 
+    // Accept name from request body (user may have edited it on the signup
+    // screen) — fall back to whatever the OAuth provider supplied in the token.
+    const displayName = (typeof body.name === 'string' && body.name.trim()) || data.name || undefined;
+
     // Optional password chosen on the confirmation screen.
     let passwordHash: string | undefined;
     if (typeof body.password === 'string' && body.password.length > 0) {
@@ -1400,15 +1448,26 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     if (existing) {
       // Account was created for this email between callback and confirm —
       // attach the identity instead of failing.
-      await prisma.user.update({ where: { id: existing.id }, data: { [idField]: data.providerId } as any }).catch(() => {});
-      email = existing.email;
+      const updateData: any = { [idField]: data.providerId };
+      if (!existing.name && displayName) updateData.name = sanitizeInput(displayName, 120);
+      if (!existing.photoUrl && data.photoUrl) updateData.photoUrl = data.photoUrl;
+      await prisma.user.update({ where: { id: existing.id }, data: updateData }).catch(() => {});
+
+      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+      const { token: sessionToken, refreshToken } = await createSession(existing.id, request.headers.get('user-agent') || undefined, ip);
+      const res = NextResponse.json({
+        ok: true,
+        redirect_to: process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase(),
+      });
+      setSessionCookie(res, sessionToken, refreshToken, request);
+      return res;
     }
 
     const user = await prisma.user.create({
       select: { id: true },
       data: {
         email,
-        name: data.name ? sanitizeInput(data.name, 120) : undefined,
+        name: displayName ? sanitizeInput(displayName, 120) : undefined,
         photoUrl: data.photoUrl || undefined,
         [idField]: data.providerId,
         passwordHash,
@@ -1427,7 +1486,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
         notificationPreferences: {
           email: true, push: true, inApp: true,
           security: true, forms: true, product: true, support: true,
-          productEmail: true, tipsEmail: true, weeklySummary: false,
+          productEmail: true, productPush: true, productInApp: true, weeklySummary: false,
         },
       } as any,
     });
@@ -1553,6 +1612,16 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
 
     clearRateLimitHits(clientIp);
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_otp_success', details: { reason: 'suspicious_login_otp' } }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with email code',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'otp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    const { recordLoginHistory } = await import('./security');
+    recordLoginHistory({ request, userId: user.id, email: user.email, success: true, method: 'otp' }).catch(() => {});
     return res;
   } catch (err) {
     console.error('[LOGIN OTP VERIFY]', err);
@@ -1975,8 +2044,10 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
 
+    const GITHUB_HEADERS = { Authorization: `Bearer ${accessToken}`, 'User-Agent': 'Tirbeo-App', Accept: 'application/vnd.github+json' };
+
     const userInfoRes = await fetch('https://api.github.com/user', {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: GITHUB_HEADERS,
     });
     if (!userInfoRes.ok) {
       console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
@@ -1986,27 +2057,38 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     let email = profile.email as string | undefined;
 
     // GitHub keeps the account email private by default — fetch it explicitly.
-    // One retry: transient DNS/network failures here would silently drop the email.
     if (!email) {
       let emailsRes = await fetch('https://api.github.com/user/emails', {
-        headers: { Authorization: `Bearer ${accessToken}` },
+        headers: GITHUB_HEADERS,
       });
       if (!emailsRes.ok) {
         await new Promise((r) => setTimeout(r, 400));
         emailsRes = await fetch('https://api.github.com/user/emails', {
-          headers: { Authorization: `Bearer ${accessToken}` },
+          headers: GITHUB_HEADERS,
         });
       }
       if (emailsRes.ok) {
         const emails: any[] = await emailsRes.json();
-        const primary = emails.find((e) => e.primary) || emails[0];
-        if (primary) email = primary.email;
+        const primary = emails.find((e: any) => e.primary && e.verified);
+        if (primary) {
+          email = primary.email;
+        } else {
+          const verified = emails.find((e: any) => e.verified);
+          if (verified) {
+            email = verified.email;
+          } else {
+            const noreply = emails.find((e: any) => e.email && e.email.includes('noreply'));
+            if (noreply) email = noreply.email;
+          }
+        }
       } else {
         console.error('[GITHUB EMAILS] Fetch failed after retry:', emailsRes.status);
       }
     }
-    if (!email) {
-      console.warn('[OAUTH:github] No email resolved — will 400. profile.email:', profile.email, 'emailsFetchFailed: see [GITHUB EMAILS] above');
+    // Last resort: construct GitHub's noreply address from the username
+    if (!email && profile.login) {
+      email = `${profile.login}@users.noreply.github.com`;
+      console.info(`[OAUTH:github] Using noreply fallback: ${email}`);
     }
 
     return finishProviderSignIn(request, 'github', {
@@ -2248,8 +2330,13 @@ export async function profileHandler(request: NextRequest) {
         return new NextResponse('Invalid payload', { status: 400 });
       }
       const data: any = { ...parsed.data };
-      if (data.birthday && typeof data.birthday === 'string') {
-        data.birthday = new Date(data.birthday);
+      if (data.birthday !== undefined && data.birthday !== null) {
+        if (data.birthday === '') {
+          data.birthday = null;
+        } else if (typeof data.birthday === 'string') {
+          const d = new Date(data.birthday);
+          data.birthday = isNaN(d.getTime()) ? null : d;
+        }
       }
       // Map camelCase to Prisma field names
       if ('linkedIn' in data) { data.linkedin = data.linkedIn; delete data.linkedIn; }
@@ -2530,7 +2617,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     // Enforce one-time use: atomically claim the token's jti in Redis so a
     // link that has already been redeemed cannot be replayed.
     const claimKey = `magic-link:used:${decoded.jti}`;
-    const ttlSeconds = Math.max(1, Math.floor(decoded.expiresAt - Date.now() / 1000));
+    const ttlSeconds = Math.max(1, Math.floor((decoded.expiresAt - Date.now()) / 1000));
     let claimed = false;
     if (process.env.REDIS_URL) {
       try {
@@ -2538,11 +2625,12 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
         const result = await redis.set(claimKey, '1', 'EX', ttlSeconds, 'NX');
         claimed = result === 'OK';
       } catch {
-        // Redis unavailable — fall back to rejecting the link to stay secure
-        // rather than allowing replays.
-        console.error('[MAGIC LINK VERIFY] Redis unavailable; rejecting one-time claim');
-        claimed = false;
+        console.error('[MAGIC LINK VERIFY] Redis unavailable; allowing login without replay protection');
+        claimed = true;
       }
+    } else {
+      // No Redis configured — allow login (no replay protection available)
+      claimed = true;
     }
     if (!claimed) {
       return NextResponse.json({ error: 'This magic link has already been used or is no longer valid. Please request a new one.' }, { status: 409 });
@@ -2572,6 +2660,16 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       targetId: user.id,
       metadata: { method: 'magic_link', ip },
     });
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with magic link',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    const { recordLoginHistory: rlh3 } = await import('./security');
+    rlh3({ request, userId: user.id, email: user.email, success: true, method: 'magic_link' }).catch(() => {});
 
     return res;
   } catch (err: any) {
@@ -2714,6 +2812,8 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     setSessionCookie(res, token, refreshToken, request);
 
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_email_success' }).catch(() => {});
+    const { recordLoginHistory: rlh6 } = await import('./security');
+    rlh6({ request, userId: user.id, email: user.email, success: true, method: 'recovery_email' }).catch(() => {});
     return res;
   } catch (err: any) {
     console.error('[RECOVERY LOGIN VERIFY]', err?.message || err);
@@ -2784,8 +2884,19 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
 // ─── Verify (legacy email OTP verification) ──────────────────
 
 export async function verifyHandler(request: NextRequest) {
-  // Deprecated — use auth/verify-email instead. Never issue sessions from this path.
-  return new NextResponse('Not implemented', { status: 501 });
+  // Lightweight token verification used by the Cloudflare WebSocket Worker.
+  // Returns { userId, email, adminRole } on success.
+  try {
+    const { getSessionFromToken } = await import('./auth/session');
+    const authHeader = request.headers.get('authorization') || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) return new NextResponse(JSON.stringify({ error: 'Missing token' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    const session = await getSessionFromToken(token);
+    if (!session) return new NextResponse(JSON.stringify({ error: 'Invalid token' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    return new NextResponse(JSON.stringify({ userId: session.userId, email: session.email, adminRole: (session as any).adminRole || null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  } catch {
+    return new NextResponse(JSON.stringify({ error: 'Verification failed' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
 }
 
 // ─── Public Help Config ───

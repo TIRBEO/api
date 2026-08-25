@@ -12,6 +12,7 @@ import { verifyMergeToken } from './auth/jwt';
 import { bustProfileCache } from './authHandlers';
 import { createTtlCache } from './cache';
 import { logPerformance } from './perf';
+import { trackQuery } from './queryMonitor';
 import { logSecurityEvent } from './security';
 import { withRetry } from './db/prisma';
 
@@ -69,7 +70,8 @@ export async function extendedProfileHandler(request: NextRequest) {
            createdAt: true, updatedAt: true,
            lastLoginAt: true, lastLoginIp: true, lastActiveAt: true,
            passwordHash: true, googleId: true, githubId: true, discordId: true,
-           mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true,
+            mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true,
+            consents: true, backupCodes: true,
          },
        });
       if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
@@ -100,7 +102,7 @@ export async function extendedProfileHandler(request: NextRequest) {
       const schema = z.object({
         name: z.string().min(1).optional(),
         username: z.string().optional().nullable(),
-        photoUrl: z.string().url().optional().nullable(),
+        photoUrl: z.string().optional().nullable(),
         phoneNumber: z.string().optional().nullable(),
         occupation: z.string().optional().nullable(),
         bio: z.string().optional().nullable(),
@@ -150,8 +152,13 @@ export async function extendedProfileHandler(request: NextRequest) {
       if (raw.industry !== undefined) data.industry = raw.industry;
       if (raw.companySize !== undefined) data.companySize = raw.companySize;
       if (raw.gender !== undefined) data.gender = raw.gender;
-      if (raw.birthday) {
-        data.birthday = typeof raw.birthday === 'string' ? new Date(raw.birthday) : raw.birthday;
+      if (raw.birthday !== undefined) {
+        if (!raw.birthday || raw.birthday === '') {
+          data.birthday = null;
+        } else {
+          const d = new Date(raw.birthday);
+          data.birthday = isNaN(d.getTime()) ? null : d;
+        }
       }
       if (raw.username !== undefined) data.username = raw.username;
        if (raw.secondaryEmail !== undefined) {
@@ -182,6 +189,7 @@ export async function extendedProfileHandler(request: NextRequest) {
 
       const changed = Object.keys(data).filter((k) => data[k] !== undefined && data[k] !== null);
       if (changed.some((k) => ['name', 'username', 'photoUrl'].includes(k))) {
+        bustProfileCache(session.userId);
         createNotification({
           userId: session.userId,
           type: 'system',
@@ -265,7 +273,7 @@ export async function changePasswordHandler(request: NextRequest) {
       metadata: { ip: loginIp, device: loginDevice, method: 'Password' },
     }).catch((e) => console.error('[NOTIFICATION]', (e as Error)?.message));
 
-    // Event-triggered auto tip (only if tipsEmail enabled & tip unsent)
+    // Event-triggered auto tip (only if productEmail enabled & tip unsent)
     import('./tips').then(m => m.sendNextTipForUser(session.userId)).catch(() => {});
 
     return new NextResponse('Password changed', { status: 200 });
@@ -351,15 +359,15 @@ export async function notificationsHandler(request: NextRequest) {
         try {
           // Parallel queries for better performance with retry
           const [notifications, unread, total] = await Promise.all([
-            withRetry(() => prisma.notification.findMany({
+            withRetry(() => trackQuery('notifications_by_user_created', () => prisma.notification.findMany({
               where: { userId: session.userId },
               orderBy: { createdAt: 'desc' },
               take: limit,
               skip: offset,
               select: { id: true, type: true, title: true, body: true, link: true, icon: true, isRead: true, metadata: true, createdAt: true },
-            })),
-            withRetry(() => prisma.notification.count({ where: { userId: session.userId, isRead: false } })),
-            withRetry(() => prisma.notification.count({ where: { userId: session.userId } })),
+            }))),
+            withRetry(() => trackQuery('notifications_by_user_read_count', () => prisma.notification.count({ where: { userId: session.userId, isRead: false } }))),
+            withRetry(() => trackQuery('notifications_by_user_count', () => prisma.notification.count({ where: { userId: session.userId } }))),
           ]);
           const items = notifications.map((n: any) => ({ ...n, read: n.isRead }));
           const body = { notifications: items, unread, total };
@@ -428,11 +436,11 @@ export async function notificationPrefsHandler(request: NextRequest) {
       security: true, forms: true, product: true, support: true,
       quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
       digestEnabled: false, digestFrequency: 'daily',
-      tipsEmail: true, weeklySummary: false,
       securityEmail: true, securityPush: true, securityInApp: true,
       formsEmail: true, formsPush: true, formsInApp: true,
       productEmail: true, productPush: true, productInApp: true,
       supportEmail: true, supportPush: true, supportInApp: true,
+      weeklySummary: false,
     };
 
     if (request.method === 'GET') {
@@ -530,25 +538,32 @@ export async function integrationsHandler(request: NextRequest) {
       return NextResponse.json(await readConnections());
     }
 
-    // POST/DELETE only manage real sign-in links on the user row.
-    if (request.method !== 'POST' && request.method !== 'DELETE') {
-      return new NextResponse('Method not allowed', { status: 405 });
-    }
     const body: any = await request.json().catch(() => ({}));
-    const provider = body?.provider;
+    const provider = body?.provider || request.nextUrl.searchParams.get('provider');
     const field = PROVIDERS[provider];
     if (!field) return new NextResponse('Unsupported provider', { status: 400 });
 
-    await prisma.user.update({ where: { id: session.userId }, data: { [field]: null } }).catch(() => {});
+    if (request.method === 'DELETE') {
+      // Disconnect: remove the sign-in link
+      await prisma.user.update({ where: { id: session.userId }, data: { [field]: null } }).catch(() => {});
+      createNotification({
+        userId: session.userId,
+        type: 'security',
+        title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} disconnected`,
+        body: `Your ${provider} sign-in link was removed on ${fmtNow()}.`,
+        link: '/account/apps',
+      }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+      return NextResponse.json({ ok: true, connections: await readConnections() });
+    }
 
-    createNotification({
-      userId: session.userId,
-      type: 'security',
-      title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} disconnected`,
-      body: `Your ${provider} sign-in link was removed on ${fmtNow()}.`,
-    }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+    if (request.method === 'POST') {
+      // Connect: redirect to OAuth flow
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+      const redirectUrl = `${baseUrl}/api/auth/${provider}?link=1`;
+      return NextResponse.json({ ok: true, redirectUrl });
+    }
 
-    return NextResponse.json({ ok: true, connections: await readConnections() });
+    return new NextResponse('Method not allowed', { status: 405 });
   } catch (err: any) {
     console.error('[INTEGRATIONS]', err?.message || err);
     return new NextResponse('Failed to process request', { status: 500 });
@@ -607,16 +622,7 @@ export async function mergeAccountsHandler(request: NextRequest) {
         ...(currentUser.name ? {} : { name: name || undefined }),
       },
     });
-
-    // Set the provider ID on the current user
-    await prisma.user.update({
-      where: { id: session.userId },
-      data: {
-        [providerField]: providerId,
-        photoUrl: photoUrl || undefined,
-        name: name || undefined,
-      },
-    });
+    bustProfileCache(session.userId);
 
 
 
@@ -651,17 +657,22 @@ export async function userActivityHandler(request: NextRequest) {
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
     const offset = parseInt(url.searchParams.get('offset') || '0');
 
+    // Fetch limit + offset to ensure we have enough for post-sort slicing
+    // but cap at a sane maximum to prevent fetching unbounded data
+    const fetchLimit = Math.min(limit + offset, 200);
     const [auditEvents, securityEvents] = await Promise.all([
-      prisma.auditEvent.findMany({
+      trackQuery('audit_events_by_actor_created', () => prisma.auditEvent.findMany({
         where: { actorId: session.userId },
         orderBy: { createdAt: 'desc' },
-        take: limit + offset,
-      }),
-      prisma.securityEvent.findMany({
+        take: fetchLimit,
+        select: { id: true, action: true, targetType: true, targetId: true, metadata: true, severity: true, createdAt: true },
+      })),
+      trackQuery('security_events_by_user_created', () => prisma.securityEvent.findMany({
         where: { userId: session.userId },
         orderBy: { createdAt: 'desc' },
-        take: limit + offset,
-      }),
+        take: fetchLimit,
+        select: { id: true, eventType: true, metadata: true, severity: true, createdAt: true },
+      })),
     ]);
 
     // Merge into a single flat array sorted by date — dashboard expects this format
@@ -747,8 +758,12 @@ export async function setPasswordHandler(request: NextRequest) {
     // can set their first password directly — email is provider-verified.
     if (user.passwordHash) {
       if (!currentPassword) return NextResponse.json({ error: 'Current password required' }, { status: 400 });
-      const valid = await verifyPassword(currentPassword, user.passwordHash);
+      const valid = await verifyPassword(user.passwordHash, currentPassword);
       if (!valid) return NextResponse.json({ error: 'Current password is incorrect' }, { status: 400 });
+    }
+
+    if (password.length > 128) {
+      return NextResponse.json({ error: 'Password must be at most 128 characters' }, { status: 400 });
     }
 
     const hash = await hashPassword(password);
@@ -815,14 +830,37 @@ export async function avatarUploadHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const body = await request.json().catch(() => ({}));
-    const { url } = body as { url?: string };
+    const ct = request.headers.get('content-type') || '';
+    let photoUrl: string | null = null;
 
-    if (!url) return NextResponse.json({ error: 'URL required' }, { status: 400 });
+    if (ct.includes('multipart/form-data')) {
+      const formData = await request.formData();
+      const file = formData.get('avatar') || formData.get('file');
+      if (file && file instanceof File) {
+        if (file.size > 5 * 1024 * 1024) {
+          return NextResponse.json({ error: 'Image must be less than 5MB' }, { status: 400 });
+        }
+        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (!allowed.includes(file.type)) {
+          return NextResponse.json({ error: 'Unsupported image type' }, { status: 400 });
+        }
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const base64 = buffer.toString('base64');
+        const ext = file.type.split('/')[1] || 'jpeg';
+        photoUrl = `data:${file.type};base64,${base64}`;
+      }
+    } else {
+      const body = await request.json().catch(() => ({}));
+      const { url } = body as { url?: string };
+      if (url) photoUrl = url;
+    }
 
-    await prisma.user.update({ where: { id: session.userId }, data: { photoUrl: url } });
+    if (!photoUrl) return NextResponse.json({ error: 'No image provided' }, { status: 400 });
 
-    return NextResponse.json({ ok: true, photoUrl: url });
+    await prisma.user.update({ where: { id: session.userId }, data: { photoUrl } });
+    bustProfileCache(session.userId);
+
+    return NextResponse.json({ ok: true, photoUrl });
   } catch (err: any) {
     console.error('[AVATAR UPLOAD]', err?.message || err);
     return NextResponse.json({ error: 'Failed to update avatar' }, { status: 500 });
@@ -838,8 +876,8 @@ export async function heartbeatHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     await prisma.session.updateMany({
-      where: { userId: session.userId, revoked: false },
-      data: { lastActiveAt: new Date() },
+      where: { userId: session.userId, status: 'active' },
+      data: { updatedAt: new Date() },
     }).catch(() => {});
 
     return NextResponse.json({ ok: true });
@@ -900,9 +938,10 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
     const user = await prisma.user.findUnique({ where: { id: session.userId } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-    // If user has password, verify it
-    if (user.passwordHash && password) {
-      const valid = await verifyPassword(password, user.passwordHash);
+    // If user has password, it must be provided for deletion
+    if (user.passwordHash) {
+      if (!password) return NextResponse.json({ error: 'Password is required to delete account' }, { status: 400 });
+      const valid = await verifyPassword(user.passwordHash, password);
       if (!valid) return NextResponse.json({ error: 'Password is incorrect' }, { status: 400 });
     }
 

@@ -118,11 +118,10 @@ export async function createNotification(input: CreateNotifInput) {
     if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = null;
   } catch { /* fall through with defaults */ }
 
-  const inAppOn = on(prefs?.inApp) && on(prefs?.[`${category}InApp`]) && on(prefs?.[category]);
+  // In-app notifications are ALWAYS ON — they are the core in-app inbox.
+  // Email and push are configurable; in-app is compulsory.
   const emailOn = on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category]);
   const pushOn = on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category]);
-
-  if (!inAppOn) return null; // user opted out of in-app for this category entirely
 
   const notif = await prisma.notification.create({
     data: {
@@ -165,6 +164,10 @@ export async function createNotification(input: CreateNotifInput) {
   }
 
   if (emailOn) {
+    // Suppress product-type notifications from individual emails
+    const emailCategory = notifCategory(input.type);
+    if (emailCategory === 'product') return notif;
+
     const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
     if (user) {
       let dash = 'https://tirbeo.app';
@@ -207,8 +210,13 @@ export async function markAsRead(userId: string, notifId?: string) {
 }
 
 const DEFAULT_PREFS: Record<string, unknown> = {
-  email: true, push: true, inApp: true,
+  email: true, push: true,
   security: true, forms: true, product: true, support: true,
+  // Category-level email toggles (individual opt-out per category)
+  securityEmail: true, formsEmail: true, productEmail: true, supportEmail: true,
+  securityPush: true, formsPush: true, productPush: true, supportPush: true,
+  digestEnabled: false, digestFrequency: 'daily', weeklySummary: false,
+  quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
 };
 
 /** Read a user's notification preferences from their jsonb column. */

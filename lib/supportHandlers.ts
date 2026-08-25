@@ -6,6 +6,7 @@ import { createAuditEvent } from './audit';
 import { sendTemplateEmail } from './email';
 import { sendToUser } from './ws/server';
 import { sanitizeInput } from './security';
+import { trackQuery } from './queryMonitor';
 
 function isAdmin(user: any): boolean {
   return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
@@ -14,34 +15,39 @@ function isAdmin(user: any): boolean {
 export async function ticketListHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
-  const { searchParams } = new URL(req.url);
-  const page = parseInt(searchParams.get('page') || '1');
-  const limit = parseInt(searchParams.get('limit') || '20');
-  const status = searchParams.get('status');
-  const q = searchParams.get('q')?.trim();
-  const where: any = {};
-  if (status) where.status = status;
-  if (q) {
-    where.OR = [
-      { subject: { contains: q, mode: 'insensitive' } },
-      { description: { contains: q, mode: 'insensitive' } },
-    ];
+  try {
+    const { searchParams } = new URL(req.url);
+    const page = Math.max(1, parseInt(searchParams.get('page') || '1') || 1);
+    const limit = Math.min(Math.max(1, parseInt(searchParams.get('limit') || '20') || 20), 100);
+    const status = searchParams.get('status');
+    const q = searchParams.get('q')?.trim();
+    const where: any = {};
+    if (status) where.status = status;
+    if (q) {
+      where.OR = [
+        { subject: { contains: q, mode: 'insensitive' } },
+        { description: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+    // scope=all is only available to admins; default is scope=mine (own tickets only)
+    const scope = searchParams.get('scope');
+    if (scope === 'all' && isAdmin(user)) {
+      // Admin: show all tickets
+    } else {
+      where.customerId = user.userId;
+    }
+    const [data, total] = await Promise.all([
+      trackQuery('tickets_by_customer_created', () => prisma.ticket.findMany({
+        where, skip: (page - 1) * limit, take: limit, orderBy: { createdAt: 'desc' },
+        include: { customer: { select: { id: true, name: true, email: true } }, assigned: { select: { id: true, name: true } }, messages: { take: 1, orderBy: { createdAt: 'desc' } } },
+      })),
+      prisma.ticket.count({ where }),
+    ]);
+    return NextResponse.json({ data, total, page, limit });
+  } catch (err: any) {
+    console.error('[TICKET LIST]', err?.message || err);
+    return NextResponse.json({ data: [], total: 0, page: 1, limit: 20 });
   }
-  // scope=all is only available to admins; default is scope=mine (own tickets only)
-  const scope = searchParams.get('scope');
-  if (scope === 'all' && isAdmin(user)) {
-    // Admin: show all tickets
-  } else {
-    where.customerId = user.userId;
-  }
-  const [data, total] = await Promise.all([
-    prisma.ticket.findMany({
-      where, skip: (page - 1) * limit, take: limit, orderBy: { createdAt: 'desc' },
-      include: { customer: { select: { id: true, name: true, email: true } }, assigned: { select: { id: true, name: true } }, queue: true, messages: { take: 1, orderBy: { createdAt: 'desc' } } },
-    }),
-    prisma.ticket.count({ where }),
-  ]);
-  return NextResponse.json({ data, total, page, limit });
 }
 
 export async function ticketCreateHandler(req: NextRequest) {
@@ -61,7 +67,6 @@ export async function ticketCreateHandler(req: NextRequest) {
       category: body.category ? sanitizeInput(String(body.category), 50) : 'general',
       priority: body.priority,
       status: body.status,
-      queueId: body.queueId,
       customerId: user.userId,
       // Captcha appeal tickets are tagged with the source form's public ID
       // (e.g. "captcha-appeal:<publicId>") so admins can review them from the
@@ -153,7 +158,6 @@ export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
       description: body.description,
       priority: body.priority,
       status: body.status,
-      queueId: body.queueId,
       assignedId: body.assignedId,
       // Match the standalone PUT behavior: resolving/closing stamps closedAt
       // (the close/reopen endpoints own clearing it on reopen).
@@ -205,7 +209,7 @@ export async function ticketMessageHandler(req: NextRequest, ticketId: string) {
   let content = sanitizeInput(String(body.content || body.message || ''), 20000);
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) content = `${content}![tirbeo-img](${url})`;
-  const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: body.isInternal || false } });
+  const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: isAdmin(user) ? !!body.isInternal : false } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_REPLIED', targetType: 'ticket', targetId: ticketId });
 
   // Send real-time WebSocket notification to ticket customer

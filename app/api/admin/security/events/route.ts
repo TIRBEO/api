@@ -15,9 +15,10 @@ export async function GET(request: NextRequest) {
   const userId = url.searchParams.get('userId') || undefined;
   const from = url.searchParams.get('from') || undefined;
   const to = url.searchParams.get('to') || undefined;
+  const includeUser = url.searchParams.get('includeUser') !== 'false';
 
   const [data, stats] = await Promise.all([
-    listSecurityEvents({ page, limit, eventType, severity, ip, userId, from, to }),
+    listSecurityEvents({ page, limit, eventType, severity, ip, userId, from, to, includeUser }),
     getSecurityStats(),
   ]);
 

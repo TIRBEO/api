@@ -141,6 +141,18 @@ export async function sendEmail(
   htmlBody: string,
   options?: { fromEmail?: string; fromName?: string; replyTo?: string; threadId?: string; templateName?: string; metadata?: Record<string, unknown> }
 ): Promise<EmailResult> {
+  // ─── Email suppression check (lowest level) ───
+  // If the user disabled email or unsubscribed from this category, block non-essential sends.
+  if (options?.templateName) {
+    try {
+      const { shouldSuppressEmail } = await import('./emailPrefs');
+      if (await shouldSuppressEmail(to, options.templateName)) {
+        console.log(`[EMAIL] Suppressed '${options.templateName}' to ${to} (user prefs)`);
+        return { success: true };
+      }
+    } catch { /* best-effort */ }
+  }
+
   let config: any = null;
   try {
     config = await getEmailConfig();
@@ -269,10 +281,41 @@ export async function sendTemplateEmail(
   variables: Record<string, string>,
   options?: { fromEmail?: string; fromName?: string; rawVars?: string[]; replyTo?: string; threadId?: string }
 ): Promise<EmailResult> {
+  // ─── Email suppression check ───
+  // Non-essential emails respect the user's notification preferences.
+  // Essential emails (OTPs, password resets, etc.) always go through.
+  try {
+    const { shouldSuppressEmail } = await import('./emailPrefs');
+    if (await shouldSuppressEmail(to, templateName)) {
+      console.log(`[EMAIL] Suppressed '${templateName}' to ${to} (user prefs)`);
+      return { success: true }; // pretend success — don't throw
+    }
+  } catch { /* suppression check is best-effort */ }
+
   const rawKeys = new Set(options?.rawVars || []);
   const branding = await getBranding();
   const logoUrl = branding.logoUrl;
   const mergedVars = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
+
+  // ─── Unsubscribe URLs ───
+  // Every email gets a category-specific unsubscribe link and a manage-preferences link.
+  try {
+    const { generateUnsubscribeToken, getManagePreferencesUrl, TEMPLATE_CATEGORY } = await import('./emailPrefs');
+    const category = TEMPLATE_CATEGORY[templateName] || null;
+    // Look up user by email for token generation
+    const user = await prisma.user.findUnique({ where: { email: to }, select: { id: true } });
+    if (user && category) {
+      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+      mergedVars['unsubscribeUrl'] = `${apiBase}/api/email/unsubscribe?token=${generateUnsubscribeToken(user.id, category)}`;
+    } else {
+      mergedVars['unsubscribeUrl'] = getManagePreferencesUrl();
+    }
+    mergedVars['managePreferencesUrl'] = getManagePreferencesUrl();
+  } catch {
+    const fallbackApi = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+    mergedVars['unsubscribeUrl'] = `${fallbackApi}/api/email/unsubscribe`;
+    mergedVars['managePreferencesUrl'] = 'https://tirbeo.app/account/notifications';
+  }
 
   // Set default from addresses based on email type
   const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert', 'product_update', 'weekly_summary', 'account_tip', 'account_suspended', 'account_deleted'];

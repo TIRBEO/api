@@ -165,6 +165,7 @@ const CSRF_EXEMPT_PATHS = [
   '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
   '/auth/discord', '/auth/discord/callback',
   '/api/auth/oauth/merge',
+  '/api/auth/oauth/pending', '/api/auth/oauth/complete', '/api/auth/oauth-consent', '/api/auth/oauth/consent',
   '/api/captcha/', '/api/health',
   '/api/security/log',
 ];
@@ -191,7 +192,8 @@ export async function proxy(request: NextRequest) {
     addCorsHeaders(response, origin);
   }
 
-  const ip = request.headers.get('x-forwarded-for') || 'unknown';
+  const rawIp = request.headers.get('x-forwarded-for') || 'unknown';
+  const ip = rawIp.split(',')[0].trim() || 'unknown';
   const pathname = request.nextUrl.pathname;
 
   // ── Early cookie extraction for maintenance check and admin detection ──
@@ -221,9 +223,13 @@ export async function proxy(request: NextRequest) {
     }
   }
   
-  // Also check for admin API key header
-  if (!isAdminUser && request.headers.get('x-admin-key')) {
-    isAdminUser = true;
+  // Admin API key check — requires a valid ADMIN_KEY env var to match against
+  if (!isAdminUser) {
+    const adminKey = request.headers.get('x-admin-key');
+    const expectedKey = process.env.ADMIN_KEY || process.env.ADMIN_API_KEY;
+    if (adminKey && expectedKey && adminKey === expectedKey) {
+      isAdminUser = true;
+    }
   }
   
   // ── Maintenance mode check ──
@@ -320,6 +326,7 @@ export async function proxy(request: NextRequest) {
     '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
     '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback', '/api/auth/discord', '/api/auth/discord/callback',
     '/api/auth/oauth/merge', // login-merge: authorized by signed short-lived token in body, no session involved
+    '/api/auth/oauth/pending', '/api/auth/oauth/complete', '/api/auth/oauth-consent', '/api/auth/oauth/consent',
     '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
     '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
     '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',

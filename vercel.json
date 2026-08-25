@@ -6,7 +6,14 @@
     "NEXT_PUBLIC_APP_DOMAIN": "tirbeo.app",
     "NEXT_PUBLIC_COOKIE_DOMAIN": "tirbeo.app",
     "NEXT_PUBLIC_TURNSTILE_SITE_KEY": "",
+    "APP_DOMAIN": "tirbeo.app",
+    "API_DOMAIN": "api.tirbeo.app",
+    "GOOGLE_REDIRECT_URI": "https://api.tirbeo.app/api/auth/google/callback",
+    "GITHUB_REDIRECT_URI": "https://api.tirbeo.app/api/auth/github/callback",
+    "DISCORD_REDIRECT_URI": "https://api.tirbeo.app/api/auth/discord/callback",
     "PORT": "3000",
-    "WS_PORT": "3001"
+    "WS_PORT": "3001",
+    "RT_API_TOKEN": "dd0ec3b810f5d099ec49e0c5746d0307665c7a204168ec363d97f7fe25660d74",
+    "RT_PUBLISH_URL": "https://ws.tirbeo.app/api/publish"
   }
 }

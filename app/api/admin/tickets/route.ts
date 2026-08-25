@@ -3,6 +3,7 @@ import { requireRole } from '@/lib/session';
 import { prisma } from '@/lib/db/prisma';
 import { createAuditEvent } from '@/lib/audit';
 import { sendTemplateEmail } from '@/lib/email';
+import { trackQuery } from '@/lib/queryMonitor';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'manager');
@@ -23,14 +24,14 @@ export async function GET(request: NextRequest) {
   if (assigned) where.assignedId = assigned;
   if (search) {
     where.OR = [
-      { title: { contains: search, mode: 'insensitive' } },
+      { subject: { contains: search, mode: 'insensitive' } },
       { description: { contains: search, mode: 'insensitive' } },
       { customer: { email: { contains: search, mode: 'insensitive' } } },
     ];
   }
 
   const [tickets, total] = await Promise.all([
-    prisma.ticket.findMany({
+    trackQuery('tickets_admin_by_status_created', () => prisma.ticket.findMany({
       where,
       orderBy: { createdAt: 'desc' },
       skip,
@@ -38,11 +39,10 @@ export async function GET(request: NextRequest) {
       include: {
         customer: { select: { id: true, name: true, email: true, photoUrl: true } },
         assigned: { select: { id: true, name: true, email: true } },
-        queue: { select: { id: true, name: true } },
         messages: { take: 1, orderBy: { createdAt: 'desc' } },
         _count: { select: { messages: true } },
       },
-    }),
+    })),
     prisma.ticket.count({ where }),
   ]);
 

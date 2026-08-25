@@ -377,6 +377,7 @@ export async function listSecurityEvents(options: {
   userId?: string;
   from?: string;
   to?: string;
+  includeUser?: boolean;
 }) {
   const page = Math.max(1, options.page || 1);
   const limit = Math.min(200, options.limit || 50);
@@ -392,14 +393,22 @@ export async function listSecurityEvents(options: {
     where.createdAt = createdAt;
   }
 
+  const queryOptions: any = {
+    where: where as any,
+    orderBy: { createdAt: 'desc' },
+    skip: (page - 1) * limit,
+    take: limit,
+  };
+  // Skip the user join when not needed — saves a DB round-trip
+  // for list pages that don't render user info per-row.
+  if (options.includeUser === false) {
+    queryOptions.select = { id: true, userId: true, eventType: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true };
+  } else {
+    queryOptions.include = { user: { select: { id: true, email: true, name: true } } };
+  }
+
   const [events, total] = await Promise.all([
-    prisma.securityEvent.findMany({
-      where: where as any,
-      orderBy: { createdAt: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
-      include: { user: { select: { id: true, email: true, name: true } } },
-    }),
+    prisma.securityEvent.findMany(queryOptions),
     prisma.securityEvent.count({ where: where as any }),
   ]);
 
@@ -430,4 +439,30 @@ export async function getSecurityStats() {
     activeBlocks,
     recent: recentEvents,
   };
+}
+
+// ─── Record login history ────────────────────────────────────────
+export async function recordLoginHistory(input: {
+  request?: Request;
+  userId: string;
+  email: string;
+  success: boolean;
+  method: string;
+}): Promise<void> {
+  try {
+    const ip = input.request ? getClientIp(input.request) : undefined;
+    const userAgent = input.request ? getUserAgent(input.request) : undefined;
+    await prisma.login_history.create({
+      data: {
+        userId: input.userId,
+        email: input.email,
+        ipAddress: ip || null,
+        userAgent: userAgent || null,
+        success: input.success,
+        method: input.method,
+      },
+    });
+  } catch (e) {
+    console.error('[LOGIN_HISTORY] Failed to record:', e instanceof Error ? e.message : e);
+  }
 }

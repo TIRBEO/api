@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '../../../../../lib/db/prisma';
 import { requireRole } from '../../../../../lib/session';
+import { trackQuery } from '../../../../../lib/queryMonitor';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'admin');
@@ -11,6 +12,23 @@ export async function GET(request: NextRequest) {
     const factors = [];
     let totalScore = 0;
     const maxScore = 100;
+
+    // Parallelize all count queries instead of sequential awaits
+    const [
+      totalUsers,
+      usersWith2FA,
+      activeSessions,
+      revokedSessions,
+      blockedIPs,
+      blockedUsers,
+    ] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { is2FAEnabled: true } }),
+      prisma.session.count({ where: { status: 'active' } }),
+      prisma.session.count({ where: { status: 'revoked' } }),
+      prisma.blocklist.count({ where: { targetType: 'ip' } }),
+      prisma.blocklist.count({ where: { targetType: 'user' } }),
+    ]);
 
     // 1. Password Policy (20 points)
     const passwordScore = 18; // Assuming strong password policy
@@ -24,8 +42,6 @@ export async function GET(request: NextRequest) {
     totalScore += passwordScore;
 
     // 2. 2FA Adoption (20 points)
-    const totalUsers = await prisma.user.count();
-    const usersWith2FA = await prisma.user.count({ where: { is2FAEnabled: true } });
     const twoFAAdoption = totalUsers > 0 ? (usersWith2FA / totalUsers) * 100 : 0;
     const twoFAScore = Math.min(20, Math.round(twoFAAdoption / 5));
     factors.push({
@@ -38,8 +54,6 @@ export async function GET(request: NextRequest) {
     totalScore += twoFAScore;
 
     // 3. Session Security (20 points)
-    const activeSessions = await prisma.session.count({ where: { status: 'active' } });
-    const revokedSessions = await prisma.session.count({ where: { status: 'revoked' } });
     const sessionScore = 18; // Assuming good session management
     factors.push({
       name: 'Session Security',
@@ -62,8 +76,6 @@ export async function GET(request: NextRequest) {
     totalScore += rateLimitScore;
 
     // 5. Blocklist Coverage (20 points)
-    const blockedIPs = await prisma.blocklist.count({ where: { targetType: 'ip' } });
-    const blockedUsers = await prisma.blocklist.count({ where: { targetType: 'user' } });
     const blocklistScore = Math.min(20, 10 + Math.floor((blockedIPs + blockedUsers) / 5));
     factors.push({
       name: 'Blocklist Coverage',
@@ -80,41 +92,43 @@ export async function GET(request: NextRequest) {
     else if (totalScore < 60) threatLevel = 'high';
     else if (totalScore < 80) threatLevel = 'medium';
 
-    // Get recent critical events
-    const recentCritical = await prisma.securityEvent.findMany({
-      where: { severity: 'critical' },
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-      include: { user: { select: { email: true, name: true } } },
-    });
-
-    // Get top threat IPs
+    // Parallelize the remaining heavy queries
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const ipCounts = await prisma.securityEvent.groupBy({
-      by: ['ipAddress'],
-      where: {
-        createdAt: { gte: thirtyDaysAgo },
-        ipAddress: { not: null },
-      },
-      _count: { id: true },
-      orderBy: { _count: { id: 'desc' } },
-      take: 10,
-    });
+    const [
+      recentCritical,
+      ipCounts,
+      eventTypes,
+    ] = await Promise.all([
+      trackQuery('security_events_by_severity_created', () => prisma.securityEvent.findMany({
+        where: { severity: 'critical' },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        include: { user: { select: { email: true, name: true } } },
+      })),
+      trackQuery('security_events_group_by_ip', () => prisma.securityEvent.groupBy({
+        by: ['ipAddress'],
+        where: {
+          createdAt: { gte: thirtyDaysAgo },
+          ipAddress: { not: null },
+        },
+        _count: { id: true },
+        orderBy: { _count: { id: 'desc' } },
+        take: 10,
+      })),
+      trackQuery('security_events_group_by_type', () => prisma.securityEvent.groupBy({
+        by: ['eventType'],
+        where: { createdAt: { gte: thirtyDaysAgo } },
+        _count: { id: true },
+        orderBy: { _count: { id: 'desc' } },
+        take: 10,
+      })),
+    ]);
 
     const topIPs = ipCounts.map(ip => ({
       ip: ip.ipAddress || 'Unknown',
       count: ip._count.id,
-      lastSeen: new Date().toISOString(), // Would need to query actual last seen
+      lastSeen: new Date().toISOString(),
     }));
-
-    // Get top event types
-    const eventTypes = await prisma.securityEvent.groupBy({
-      by: ['eventType'],
-      where: { createdAt: { gte: thirtyDaysAgo } },
-      _count: { id: true },
-      orderBy: { _count: { id: 'desc' } },
-      take: 10,
-    });
 
     const topEventTypes = eventTypes.map(et => ({
       type: et.eventType,

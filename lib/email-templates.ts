@@ -77,7 +77,7 @@ function divider(): string {
 }
 
 function footer(appName: string = 'Tirbeo'): string {
-  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:24px 0;text-align:center;"><p style="margin:0;font-size:12px;color:${MUTED};">&copy; 2026 ${appName}. All rights reserved.</p><p style="margin:8px 0 0;font-size:12px;color:${MUTED};"><a href="https://tirbeo.app/privacy" style="color:${BLUE};text-decoration:none;">Privacy</a> &middot; <a href="https://tirbeo.app/terms" style="color:${BLUE};text-decoration:none;">Terms</a> &middot; <a href="https://tirbeo.app/settings/notifications" style="color:${BLUE};text-decoration:none;">Email Preferences</a></p></td></tr></table>`;
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:24px 0;text-align:center;"><p style="margin:0;font-size:12px;color:${MUTED};">&copy; 2026 ${appName}. All rights reserved.</p><p style="margin:8px 0 0;font-size:12px;color:${MUTED};"><a href="https://tirbeo.app/privacy" style="color:${BLUE};text-decoration:none;">Privacy</a> &middot; <a href="https://tirbeo.app/terms" style="color:${BLUE};text-decoration:none;">Terms</a> &middot; <a href="{{managePreferencesUrl}}" style="color:${BLUE};text-decoration:none;">Email Preferences</a></p><p style="margin:8px 0 0;font-size:11px;color:${MUTED};"><a href="{{unsubscribeUrl}}" style="color:${MUTED};text-decoration:underline;">Unsubscribe from these emails</a></p></td></tr></table>`;
 }
 
 // ═══ APP-SPECIFIC BRANDING ═══

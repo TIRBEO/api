@@ -14,6 +14,7 @@ name = "tirbeo-ws-production"
 
 [env.production.vars]
 ENVIRONMENT = "production"
+RT_API_TOKEN = "dd0ec3b810f5d099ec49e0c5746d0307665c7a204168ec363d97f7fe25660d74"
 
 [[env.production.migrations]]
 tag = "v2"

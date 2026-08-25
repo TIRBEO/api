@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAllCacheStats, resetAllCacheStats } from './cache';
 import { getPoolStatus, getDetailedPoolStatus } from './db/prisma';
 import { getSession } from './session';
+import { getQueryPerformanceStats, resetQueryStats, updateAlertConfig, getAlertConfig } from './queryMonitor';
 
 function isAdmin(user: any): boolean {
   return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
@@ -83,4 +84,76 @@ function formatTtl(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
   return `${Math.round(ms / 60_000)}m`;
+}
+
+/**
+ * GET /api/debug/query-perf
+ * Returns performance stats for all tracked index-backed queries.
+ * Shows p50/p95/p99 latencies, query counts, and recent samples.
+ * Admin-only endpoint.
+ */
+export async function queryPerfDebugHandler(req: NextRequest) {
+  const session = await getSession(req).catch(() => null);
+  if (process.env.NODE_ENV !== 'development' && !session?.userId) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  return NextResponse.json(getQueryPerformanceStats());
+}
+
+/**
+ * POST /api/debug/query-perf/reset
+ * Resets all tracked query performance stats.
+ */
+export async function queryPerfResetDebugHandler(req: NextRequest) {
+  const session = await getSession(req).catch(() => null);
+  if (!session?.userId) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  resetQueryStats();
+  return NextResponse.json({ message: 'Query performance stats reset', timestamp: new Date().toISOString() });
+}
+
+/**
+ * GET /api/debug/query-perf/config
+ * Returns current alert configuration.
+ */
+export async function queryPerfConfigDebugHandler(req: NextRequest) {
+  const session = await getSession(req).catch(() => null);
+  if (process.env.NODE_ENV !== 'development' && !session?.userId) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  return NextResponse.json({ config: getAlertConfig() });
+}
+
+/**
+ * PUT /api/debug/query-perf/config
+ * Update alert thresholds at runtime.
+ * Body: { warningThresholdMs?, criticalThresholdMs?, minSamples?, cooldownMs? }
+ */
+export async function queryPerfConfigUpdateDebugHandler(req: NextRequest) {
+  const session = await getSession(req).catch(() => null);
+  if (!session?.userId) {
+    return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
+  }
+
+  try {
+    const body: any = await req.json();
+    const config: Record<string, number> = {};
+    if (typeof body.warningThresholdMs === 'number' && body.warningThresholdMs > 0) config.warningThresholdMs = body.warningThresholdMs;
+    if (typeof body.criticalThresholdMs === 'number' && body.criticalThresholdMs > 0) config.criticalThresholdMs = body.criticalThresholdMs;
+    if (typeof body.minSamples === 'number' && body.minSamples > 0) config.minSamples = body.minSamples;
+    if (typeof body.cooldownMs === 'number' && body.cooldownMs > 0) config.cooldownMs = body.cooldownMs;
+
+    if (Object.keys(config).length === 0) {
+      return NextResponse.json({ error: 'No valid config fields provided' }, { status: 400 });
+    }
+
+    updateAlertConfig(config);
+    return NextResponse.json({ message: 'Alert config updated', config: getAlertConfig() });
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
 }

@@ -41,7 +41,6 @@ export async function GET(req: NextRequest) {
       prisma.form.findMany({
         where,
         include: {
-          fields: { orderBy: { order: 'asc' } },
           _count: { select: { submissions: true } },
         },
         orderBy: { updatedAt: 'desc' },

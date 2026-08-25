@@ -15,7 +15,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     include: {
       customer: { select: { id: true, name: true, email: true, photoUrl: true } },
       assigned: { select: { id: true, name: true, email: true } },
-      queue: { select: { id: true, name: true } },
       messages: { orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, name: true, email: true, photoUrl: true } } } },
       attachments: true,
     },
@@ -42,7 +41,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       description: body.description,
       priority: body.priority,
       status: body.status,
-      queueId: body.queueId,
+
       assignedId: body.assignedId,
       closedAt: body.status === 'closed' || body.status === 'resolved' ? new Date() : (body.status === 'open' ? null : ticket.closedAt),
     },
