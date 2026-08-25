@@ -77,7 +77,7 @@ function divider(): string {
 }
 
 function footer(appName: string = 'Tirbeo'): string {
-  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:24px 0;text-align:center;"><p style="margin:0;font-size:12px;color:${MUTED};">&copy; 2026 ${appName}. All rights reserved.</p><p style="margin:8px 0 0;font-size:12px;color:${MUTED};"><a href="https://tirbeo.app/privacy" style="color:${BLUE};text-decoration:none;">Privacy</a> &middot; <a href="https://tirbeo.app/terms" style="color:${BLUE};text-decoration:none;">Terms</a> &middot; <a href="{{managePreferencesUrl}}" style="color:${BLUE};text-decoration:none;">Email Preferences</a></p><p style="margin:8px 0 0;font-size:11px;color:${MUTED};"><a href="{{unsubscribeUrl}}" style="color:${MUTED};text-decoration:underline;">Unsubscribe from these emails</a></p></td></tr></table>`;
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="padding:24px 0;text-align:center;"><p style="margin:0;font-size:12px;color:${MUTED};">&copy; 2026 ${appName}. All rights reserved.</p><p style="margin:8px 0 0;font-size:12px;color:${MUTED};"><a href="https://tirbeo.app/privacy" style="color:${BLUE};text-decoration:none;">Privacy</a> &middot; <a href="https://tirbeo.app/terms" style="color:${BLUE};text-decoration:none;">Terms</a></p>{{unsubscribeSection}}</td></tr></table>`;
 }
 
 // ═══ APP-SPECIFIC BRANDING ═══
@@ -214,44 +214,11 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, imageBase: string) =
     `${head('System Alert')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('⚙️', 'System Alert', '{{message}}')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello,</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">{{message}}</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Service:</strong> {{service}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Time:</strong> {{alertTime}}</p>`)}${appFooter('admin')}${wrapperEnd()}`
   ),
 
-  admin_account_created: (logo) => tpl(
-    'Your admin account has been created',
-    `${head('Admin Account Created')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('🛡️', 'Admin Account', 'Your admin account is ready.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">An admin account has been created with <strong style="color:${TEXT};">{{adminRole}}</strong> access.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Temporary password:</strong></p><p style="margin:8px 0 0;font-size:18px;letter-spacing:1px;color:${TEXT};font-family:monospace;">{{temporaryPassword}}</p>`)}${buttonBlock('{{loginUrl}}', 'Sign In')}${divider()}${`<p style="margin:0;font-size:14px;line-height:22px;color:${MUTED};">If you did not expect this email, contact your administrator.</p>`}${appFooter('admin')}${wrapperEnd()}`
+  admin_crash_report: (logo) => tpl(
+    '[Crash] {{severity}}: {{type}}',
+    `${head('Crash Report')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('🔴', '{{severity}} Crash', '{{type}}')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">A user crash has been reported and requires attention.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Severity:</strong> <span style="color:{{severityColor}}">{{severity}}</span></p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Type:</strong> {{type}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Message:</strong> {{message}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">User:</strong> {{userEmail}} ({{username}})</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Page:</strong> {{url}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Source:</strong> {{source}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">User Agent:</strong> {{userAgent}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Time:</strong> {{timestamp}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Event ID:</strong> {{eventId}}</p>`)}${infoBox(`<p style="margin:0;font-size:13px;color:${MUTED};font-family:monospace;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto">{{stack}}</p>`)}${buttonBlock('{{dashboardUrl}}', 'View Crash Details')}${appFooter('admin')}${wrapperEnd()}`
   ),
 
-  admin_request_received: (logo) => tpl(
-    'Your admin request has been received',
-    `${head('Admin Request Received')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('📋', 'Admin Request', 'Your request is under review.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">We have received your admin access request for <strong style="color:${TEXT};">{{companyName}}</strong>.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Request ID:</strong> {{requestId}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Role:</strong> {{requestedRole}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Submitted:</strong> {{submittedAt}}</p>`)}${buttonBlock('{{dashboardUrl}}', 'View Request')}${divider()}${`<p style="margin:0;font-size:14px;line-height:22px;color:${MUTED};">You will receive an email when your request has been reviewed.</p>`}${appFooter('admin')}${wrapperEnd()}`
-  ),
-
-  admin_request_approved: (logo) => tpl(
-    'Your admin request has been approved',
-    `${head('Admin Request Approved')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('✅', 'Admin Request Approved', 'Your admin access has been approved.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your admin access request for <strong style="color:${TEXT};">{{companyName}}</strong> has been approved. You now have <strong style="color:${TEXT};">{{requestedRole}}</strong> access.</p>`}${buttonBlock('{{dashboardUrl}}', 'Go to Dashboard')}${appFooter('admin')}${wrapperEnd()}`
-  ),
-
-  admin_request_rejected: (logo) => tpl(
-    'Your admin request has been declined',
-    `${head('Admin Request Declined')}${wrapperStart()}${appHeader('admin', logo)}${heroBlock('❌', 'Admin Request Declined', 'Your request has been reviewed.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your admin access request for <strong style="color:${TEXT};">{{companyName}}</strong> has been declined.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Reason:</strong> {{rejectionReason}}</p>`)}${buttonBlock('{{dashboardUrl}}', 'Submit New Request')}${appFooter('admin')}${wrapperEnd()}`
-  ),
-
-  // ─── FLOWS TEMPLATES ───
-
-  flow_execution_failed: (logo) => tpl(
-    'Flow execution failed: {{flowName}}',
-    `${head('Flow Execution Failed')}${wrapperStart()}${appHeader('flows', logo)}${heroBlock('❌', 'Flow Failed', 'A flow execution encountered an error.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your flow <strong style="color:${TEXT};">{{flowName}}</strong> failed during execution.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Flow:</strong> {{flowName}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Error:</strong> {{errorMessage}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Time:</strong> {{failedAt}}</p>`)}${buttonBlock('{{flowsUrl}}', 'View Flow')}${appFooter('flows')}${wrapperEnd()}`
-  ),
-
-  flow_execution_success: (logo) => tpl(
-    'Flow completed: {{flowName}}',
-    `${head('Flow Completed')}${wrapperStart()}${appHeader('flows', logo)}${heroBlock('✅', 'Flow Completed', 'Your flow ran successfully.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello {{name}},</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your flow <strong style="color:${TEXT};">{{flowName}}</strong> completed successfully.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Duration:</strong> {{duration}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Steps:</strong> {{stepsExecuted}}</p>`)}${buttonBlock('{{flowsUrl}}', 'View Execution')}${appFooter('flows')}${wrapperEnd()}`
-  ),
-
-  // ─── SHARED / GENERAL ───
-
-  invoice: (logo) => tpl(
-    'Your Tirbeo receipt — {{plan}}',
-    `${head('Receipt')}${wrapperStart()}${appHeader('dashboard', logo)}${heroBlock('🧾', 'Receipt', 'Thank you for your payment.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Thank you for your payment, {{name}}.</p>`}${`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:20px 0;border-collapse:collapse;"><tr style="border-bottom:1px solid ${BORDER};"><td style="padding:12px 0;font-size:14px;color:${TEXT2};">Plan</td><td style="padding:12px 0;font-size:14px;color:${TEXT};font-weight:600;text-align:right;">{{plan}}</td></tr><tr style="border-bottom:1px solid ${BORDER};"><td style="padding:12px 0;font-size:14px;color:${TEXT2};">Amount</td><td style="padding:12px 0;font-size:14px;color:${TEXT};font-weight:600;text-align:right;">{{amount}}</td></tr><tr><td style="padding:12px 0;font-size:14px;color:${TEXT2};">Date</td><td style="padding:12px 0;font-size:14px;color:${TEXT};font-weight:600;text-align:right;">{{date}}</td></tr></table>`}${appFooter('dashboard')}${wrapperEnd()}`
-  ),
 
   export_ready: (logo) => tpl(
     'Your data export is ready',
@@ -325,18 +292,6 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, imageBase: string) =
   ticket_closed: (logo) => tpl(
     'Your support ticket {{ticketId}} has been closed',
     `${head('Ticket Closed')}${wrapperStart()}${appHeader('dashboard', logo)}${heroBlock('✅', 'Ticket closed', 'Your ticket has been resolved.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello,</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your ticket <strong style="color:${TEXT};">{{ticketId}}</strong> has been closed.</p>`}${`<p style="margin:0;font-size:14px;line-height:22px;color:${MUTED};">If you still need help, feel free to open a new ticket.</p>`}${appFooter('dashboard')}${wrapperEnd()}`
-  ),
-
-  // ─── FLOWS-SPECIFIC ───
-
-  flow_published: (logo) => tpl(
-    'Your flow "{{flowName}}" is now live',
-    `${head('Flow Published')}${wrapperStart()}${appHeader('flows', logo)}${heroBlock('⚡', 'Flow Published', 'Your flow is now active.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello,</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your flow <strong style="color:${TEXT};">{{flowName}}</strong> has been published and is now running.</p>`}${buttonBlock('{{flowsUrl}}', 'View Flow')}${appFooter('flows')}${wrapperEnd()}`
-  ),
-
-  connection_expiring: (logo) => tpl(
-    'Connection "{{connectionName}}" expires soon',
-    `${head('Connection Expiring')}${wrapperStart()}${appHeader('flows', logo)}${heroBlock('⚠️', 'Connection Expiring', 'A connection needs attention.')}${`<p style="margin:0;font-size:15px;line-height:26px;color:${TEXT2};">Hello,</p><p style="margin:16px 0;font-size:15px;line-height:26px;color:${TEXT2};">Your connection <strong style="color:${TEXT};">{{connectionName}}</strong> will expire on <strong style="color:${TEXT};">{{expiresAt}}</strong>.</p>`}${infoBox(`<p style="margin:0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Connection:</strong> {{connectionName}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Expires:</strong> {{expiresAt}}</p><p style="margin:8px 0 0;font-size:14px;color:${TEXT2};"><strong style="color:${TEXT};">Affected flows:</strong> {{affectedFlows}}</p>`)}${buttonBlock('{{connectionsUrl}}', 'Reconnect')}${appFooter('flows')}${wrapperEnd()}`
   ),
 };
 

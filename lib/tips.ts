@@ -196,10 +196,30 @@ export async function runAutoTipsSweep() {
   }
 }
 
-let tipsInterval: ReturnType<typeof setInterval> | null = null;
+let tipsTimeout: ReturnType<typeof setTimeout> | null = null;
+
+/** Random delay between min and max milliseconds. */
+function randomDelay(minMs: number, maxMs: number): number {
+  return Math.floor(Math.random() * (maxMs - minMs)) + minMs;
+}
+
+/** Schedule the next sweep at a random time in the future. */
+function scheduleNextSweep() {
+  if (tipsTimeout) clearTimeout(tipsTimeout);
+  // Random time between 1 and 6 hours from now
+  const delay = randomDelay(1 * 3_600_000, 6 * 3_600_000);
+  const nextAt = new Date(Date.now() + delay);
+  console.log(`[TIPS] Next sweep scheduled at ${nextAt.toISOString()} (in ${Math.round(delay / 60_000)}min)`);
+  tipsTimeout = setTimeout(() => {
+    runAutoTipsSweep().catch(() => {}).finally(() => scheduleNextSweep());
+  }, delay);
+}
+
 export function startPeriodicTips() {
-  if (tipsInterval) return;
-  setTimeout(() => { runAutoTipsSweep().catch(() => {}); }, 5 * 60_000); // first run 5 min after boot
-  tipsInterval = setInterval(() => { runAutoTipsSweep().catch(() => {}); }, 24 * 3_600_000); // daily
-  console.log('[TIPS] Periodic auto-tips started (daily)');
+  if (tipsTimeout) return;
+  // First run: random delay 2-10 min after boot (not predictable)
+  setTimeout(() => { runAutoTipsSweep().catch(() => {}); }, randomDelay(2 * 60_000, 10 * 60_000));
+  // Then schedule each subsequent sweep at a random time
+  scheduleNextSweep();
+  console.log('[TIPS] Periodic auto-tips started (randomized schedule)');
 }

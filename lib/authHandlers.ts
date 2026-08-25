@@ -270,6 +270,16 @@ async function getOauthProviderConfig(provider: string): Promise<OauthProviderCo
   // OAuth providers are configured purely via environment variables.
   const keys = OAUTH_ENV_KEYS[provider];
   const rawUri = process.env[keys?.uri];
+  // In development, always ignore env redirect URIs — getDynamicRedirectUri
+  // will derive a localhost URI so the OAuth state cookie domain matches.
+  if (process.env.NODE_ENV !== 'production') {
+    return {
+      enabled: !!process.env[keys?.id],
+      clientId: process.env[keys?.id],
+      clientSecret: process.env[keys?.secret],
+      redirectUri: undefined,
+    };
+  }
   // Ignore localhost redirect URIs in production — let getDynamicRedirectUri handle it
   const redirectUri = rawUri && !rawUri.includes('localhost') && !rawUri.includes('127.0.0.1') ? rawUri : undefined;
   return {
@@ -755,8 +765,6 @@ export async function loginHandler(request: NextRequest) {
         metadata: { ip, device: describeDevice(userAgent), method: 'Password' },
       })),
       Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
-      // Event-triggered auto tip (only if productEmail enabled & tip unsent)
-      import('./tips').then(m => m.sendNextTipForUser(user.id)).catch(() => {}),
       // Record login history for the Login History section
       prisma.login_history.create({
         data: {
@@ -917,6 +925,14 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_success', details: { reason: 'password' } }).catch(() => {});
     const { recordLoginHistory: rlh4 } = await import('./security');
     rlh4({ request, userId: user.id, email: user.email, success: true, method: 'admin_password' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in to admin panel',
+      body: `Signed in from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'admin_password', ip, device: describeDevice(userAgent) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
 
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
 
@@ -983,6 +999,14 @@ export async function verify2faLoginHandler(request: NextRequest) {
     logSecurityEvent({ request, userId, eventType: 'auth.login_2fa_success', details: { reason: 'totp' } }).catch(() => {});
     const { recordLoginHistory: rlh5 } = await import('./security');
     rlh5({ request, userId, email: user.email, success: true, method: 'totp' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with authenticator',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'totp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch {
     return new NextResponse('2FA verification failed', { status: 500 });
@@ -1025,6 +1049,17 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_2fa_success', details: { method: 'backup_code' } }).catch(() => {});
+    const { recordLoginHistory: rlh7 } = await import('./security');
+    rlh7({ request, userId: user.id, email: user.email, success: true, method: 'backup_code' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with backup code',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'backup_code', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch {
     return new NextResponse('Recovery code verification failed', { status: 400 });
@@ -1236,9 +1271,12 @@ export async function signupHandler(request: NextRequest) {
           allowCrashReports: true,
         },
         notificationPreferences: {
-          email: true, push: true, inApp: true,
-          security: true, forms: true, product: true, support: true,
-          productEmail: true, productPush: true, productInApp: true, weeklySummary: false,
+          email: true, push: true,
+          security: true, forms: false, product: false, support: true,
+          formsEmail: false, formsPush: false,
+          productEmail: false, productPush: false,
+          supportEmail: true, supportPush: true,
+          digestEnabled: false, digestFrequency: 'daily',
         },
       },
     });
@@ -1482,11 +1520,15 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
             adminDataAccess: false,
             oauth: true,
           },
+          allowCrashReports: true,
         },
         notificationPreferences: {
-          email: true, push: true, inApp: true,
-          security: true, forms: true, product: true, support: true,
-          productEmail: true, productPush: true, productInApp: true, weeklySummary: false,
+          email: true, push: true,
+          security: true, forms: false, product: false, support: true,
+          formsEmail: false, formsPush: false,
+          productEmail: false, productPush: false,
+          supportEmail: true, supportPush: true,
+          digestEnabled: false, digestFrequency: 'daily',
         },
       } as any,
     });
@@ -2814,6 +2856,14 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_email_success' }).catch(() => {});
     const { recordLoginHistory: rlh6 } = await import('./security');
     rlh6({ request, userId: user.id, email: user.email, success: true, method: 'recovery_email' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with recovery email',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+      link: '/account/security',
+      metadata: { method: 'recovery_email', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch (err: any) {
     console.error('[RECOVERY LOGIN VERIFY]', err?.message || err);

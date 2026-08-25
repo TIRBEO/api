@@ -13,7 +13,7 @@ async function sendToUserWs(userId: string, data: unknown) {
 
 export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert' | 'login' | 'forms' | 'product' | 'support' | 'ticket';
 
-/** Which preference category a notification type belongs to. */
+/** Which preference category a notification type belongs to. Security/login are always compulsory. */
 export type NotifCategory = 'security' | 'forms' | 'product' | 'support';
 
 const CATEGORY_BY_TYPE: Record<string, NotifCategory> = {
@@ -54,7 +54,6 @@ async function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quiet
     if (!prefs?.quietHoursEnabled) return false;
 
     const now = new Date();
-    // Convert to user's local hour using their timezone offset
     const startStr = prefs.quietHoursStart || '22:00';
     const endStr = prefs.quietHoursEnd || '08:00';
 
@@ -65,13 +64,12 @@ async function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quiet
     const startMinutes = startH * 60 + startM;
     const endMinutes = endH * 60 + endM;
 
-    // Handle overnight quiet hours (e.g., 22:00 → 08:00)
     if (startMinutes > endMinutes) {
       return currentMinutes >= startMinutes || currentMinutes < endMinutes;
     }
     return currentMinutes >= startMinutes && currentMinutes < endMinutes;
   } catch {
-    return false; // fail open — don't block notifications on errors
+    return false;
   }
 }
 
@@ -118,10 +116,12 @@ export async function createNotification(input: CreateNotifInput) {
     if (!prefs || typeof prefs !== 'object' || Array.isArray(prefs)) prefs = null;
   } catch { /* fall through with defaults */ }
 
-  // In-app notifications are ALWAYS ON — they are the core in-app inbox.
-  // Email and push are configurable; in-app is compulsory.
-  const emailOn = on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category]);
-  const pushOn = on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category]);
+  // Security/login notifications are ALWAYS ON — compulsory, no user toggle.
+  // In-app (DB + WebSocket) is always ON.
+  // Email and push are configurable per category.
+  const isSecurity = category === 'security';
+  const emailOn = isSecurity || (on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category]));
+  const pushOn = isSecurity || (on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category]));
 
   const notif = await prisma.notification.create({
     data: {
@@ -145,10 +145,12 @@ export async function createNotification(input: CreateNotifInput) {
     bustNotificationsCache(input.userId);
   } catch { /* non-fatal */ }
 
-  // External channels (email / push) respect quiet hours.
+  // External channels (email / push) respect quiet hours (but NOT security).
   if (!emailOn && !pushOn) return notif;
-  const quiet = await isInQuietHours(prefs);
-  if (quiet) return notif;
+  if (!isSecurity) {
+    const quiet = await isInQuietHours(prefs);
+    if (quiet) return notif;
+  }
 
   if (pushOn) {
     try {
@@ -157,7 +159,7 @@ export async function createNotification(input: CreateNotifInput) {
         title: input.title,
         body: input.body || '',
         icon: input.icon || undefined,
-        url: input.link || '/dashboard/notifications',
+        url: input.link || '/account/inbox',
         tag: input.type,
       });
     } catch { /* push is best-effort */ }
@@ -165,8 +167,7 @@ export async function createNotification(input: CreateNotifInput) {
 
   if (emailOn) {
     // Suppress product-type notifications from individual emails
-    const emailCategory = notifCategory(input.type);
-    if (emailCategory === 'product') return notif;
+    if (category === 'product') return notif;
 
     const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
     if (user) {
@@ -209,14 +210,18 @@ export async function markAsRead(userId: string, notifId?: string) {
   }
 }
 
+// ─── Default preferences ──────────────────────────────────────────
+// Security is compulsory (no toggle). Only forms/product/support have toggles.
 const DEFAULT_PREFS: Record<string, unknown> = {
   email: true, push: true,
-  security: true, forms: true, product: true, support: true,
-  // Category-level email toggles (individual opt-out per category)
-  securityEmail: true, formsEmail: true, productEmail: true, supportEmail: true,
-  securityPush: true, formsPush: true, productPush: true, supportPush: true,
-  digestEnabled: false, digestFrequency: 'daily', weeklySummary: false,
-  quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
+  // Category toggles — security is compulsory (always true, not configurable)
+  forms: false, product: false, support: true,
+  // Per-category channel toggles
+  formsEmail: false, formsPush: false,
+  productEmail: false, productPush: false,
+  supportEmail: true, supportPush: true,
+  // Digest
+  digestEnabled: false, digestFrequency: 'daily',
 };
 
 /** Read a user's notification preferences from their jsonb column. */

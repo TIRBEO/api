@@ -62,16 +62,10 @@ function deriveThreadId(to: string, subject: string, explicit?: string): string 
 
 const TRACKED_TEMPLATES_WITHOUT_PIXEL = new Set(['signup_otp', 'login_otp', 'password_reset_otp']);
 
-/** Wrap links for click tracking and append the open-tracking pixel. */
+/** Append the open-tracking pixel. Links are kept as direct URLs. */
 function injectTracking(htmlBody: string, logId: string, templateName?: string): string {
   const base = getApiOrigin();
   let html = htmlBody;
-
-  // Click tracking: rewrite http(s) anchors through /api/e/c/<id>?u=<b64>
-  html = html.replace(/href="(https?:\/\/[^"]+)"/gi, (_m, url: string) => {
-    const wrapped = `${base}/api/e/c/${logId}?u=${Buffer.from(url).toString('base64url')}`;
-    return `href="${wrapped}"`;
-  });
 
   // Open tracking pixel (skip OTP-style emails where images are usually blocked)
   if (!templateName || !TRACKED_TEMPLATES_WITHOUT_PIXEL.has(templateName)) {
@@ -92,7 +86,7 @@ export async function getEmailConfig() {
         defaultFromEmail: 'noreply@send.tirbeo.app',
         defaultFromName: 'Tirbeo',
         alertFromEmail: 'alerts@send.tirbeo.app',
-        alertFromName: 'Tirbeo Alerts',
+        alertFromName: 'Tirbeo',
         welcomeFromEmail: null,
         welcomeFromName: null,
         otpFromEmail: null,
@@ -148,6 +142,17 @@ export async function sendEmail(
       const { shouldSuppressEmail } = await import('./emailPrefs');
       if (await shouldSuppressEmail(to, options.templateName)) {
         console.log(`[EMAIL] Suppressed '${options.templateName}' to ${to} (user prefs)`);
+        return { success: true };
+      }
+    } catch { /* best-effort */ }
+  } else {
+    // Safety net: even without templateName, check if user globally disabled email
+    try {
+      const { prisma: p } = await import('./db/prisma');
+      const u = await p.user.findUnique({ where: { email: to }, select: { notificationPreferences: true } });
+      const prefs: any = (u as any)?.notificationPreferences;
+      if (prefs && typeof prefs === 'object' && prefs.email === false) {
+        console.log(`[EMAIL] Suppressed (no template) to ${to} — user disabled email`);
         return { success: true };
       }
     } catch { /* best-effort */ }
@@ -219,6 +224,7 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
       to: [to],
       subject,
       html,
+      tracking: { click: { enable: false }, open: { enable: true } },
     };
     if (replyTo) body.replyTo = replyTo;
     const res = await fetch('https://api.resend.com/emails', {
@@ -292,29 +298,32 @@ export async function sendTemplateEmail(
     }
   } catch { /* suppression check is best-effort */ }
 
-  const rawKeys = new Set(options?.rawVars || []);
+  const rawKeys = new Set([...(options?.rawVars || []), 'unsubscribeSection']);
   const branding = await getBranding();
   const logoUrl = branding.logoUrl;
   const mergedVars = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
 
   // ─── Unsubscribe URLs ───
-  // Every email gets a category-specific unsubscribe link and a manage-preferences link.
+  // Essential/security emails NEVER get unsubscribe links — they are compulsory.
+  // Other emails get a single unsubscribe page link.
   try {
-    const { generateUnsubscribeToken, getManagePreferencesUrl, TEMPLATE_CATEGORY } = await import('./emailPrefs');
-    const category = TEMPLATE_CATEGORY[templateName] || null;
-    // Look up user by email for token generation
-    const user = await prisma.user.findUnique({ where: { email: to }, select: { id: true } });
-    if (user && category) {
-      const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
-      mergedVars['unsubscribeUrl'] = `${apiBase}/api/email/unsubscribe?token=${generateUnsubscribeToken(user.id, category)}`;
+    const { TEMPLATE_CATEGORY, ESSENTIAL_TEMPLATES } = await import('./emailPrefs');
+    const isEssential = (ESSENTIAL_TEMPLATES as Set<string>).has(templateName);
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+    if (!isEssential) {
+      mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
+      mergedVars['managePreferencesUrl'] = `${apiBase}/api/emails/unsubscribe`;
+      mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#6b7280"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a></p>`;
     } else {
-      mergedVars['unsubscribeUrl'] = getManagePreferencesUrl();
+      mergedVars['unsubscribeUrl'] = '';
+      mergedVars['unsubscribeSection'] = '';
+      mergedVars['managePreferencesUrl'] = '';
     }
-    mergedVars['managePreferencesUrl'] = getManagePreferencesUrl();
   } catch {
-    const fallbackApi = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
-    mergedVars['unsubscribeUrl'] = `${fallbackApi}/api/email/unsubscribe`;
-    mergedVars['managePreferencesUrl'] = 'https://tirbeo.app/account/notifications';
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+    mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
+    mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#6b7280"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a></p>`;
+    mergedVars['managePreferencesUrl'] = '';
   }
 
   // Set default from addresses based on email type

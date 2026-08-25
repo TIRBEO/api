@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '../../../lib/db/prisma';
-import { getSession, isAdmin } from '@/lib/session';
+import { getSession, requireSession, isAdmin } from '@/lib/session';
 import { logRequest } from '../../../lib/logger';
 import { jsonError, jsonForbidden, jsonUnauthorized } from '../../../lib/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '../../../lib/auth/rate-limit';
@@ -150,6 +150,7 @@ import {
 } from '../../../lib/contentHandlers';
 
 import { adminAnalyticsOverviewHandler } from '../../../lib/adminAnalytics';
+import { adminAnalyticsConsentedUsersHandler } from '../../../lib/adminAnalyticsHandlers';
 import { adminMaintenanceHandler } from '../../../lib/adminHandlers';
 
 import {
@@ -210,7 +211,8 @@ const INTERNAL_ROUTES = [
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
   'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
   'admin/heartbeat',
-  'email/config', 'email/templates', 'email/test', 'email/unsubscribe', 'admin/emails', 'admin/emails/reply',
+  'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
+  'emails', 'emails/unsubscribe', 'pushes',
   'districts',
   'developer/api-keys',
   'user/mailbox', 'user/mailbox/check', 'user/mailbox/dns',
@@ -218,7 +220,7 @@ const INTERNAL_ROUTES = [
   'admin/reserved-addresses',
   'admin/groups',
   'admin/ous', 'admin/security/score',
-  'admin/settings', 'admin/analytics/overview', 'admin/maintenance',
+  'admin/settings', 'admin/analytics/overview', 'admin/analytics/consented-users', 'admin/maintenance',
   'passkey/register/options', 'passkey/register/verify',
   'passkey/auth/options', 'passkey/auth/verify',
   'passkey/list',
@@ -456,6 +458,10 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'email/unsubscribe': ['GET', 'POST'],
       'admin/emails': ['GET'],
       'admin/emails/reply': ['POST'],
+      'admin/email-preview': ['GET'],
+      'emails': ['GET'],
+      'emails/unsubscribe': ['GET', 'POST'],
+      'pushes': ['GET'],
       'districts': ['GET'],
       'developer/api-keys': ['GET', 'POST'],
       'user/mailbox': ['GET', 'POST', 'PUT', 'DELETE'],
@@ -469,6 +475,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'admin/settings': ['GET', 'PATCH'],
       'admin/maintenance': ['GET', 'POST'],
       'admin/analytics/overview': ['GET'],
+      'admin/analytics/consented-users': ['GET'],
       'passkey/register/options': ['POST'],
       'passkey/register/verify': ['POST'],
       'passkey/auth/options': ['POST'],
@@ -914,8 +921,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           break;
         }
         await processUnsubscribe(decoded.userId, decoded.category);
-        const dashBase = (await import('../../../lib/app-urls')).getDashboardBaseUrl();
-        resp = NextResponse.redirect(`${dashBase}/account/notifications?unsubscribed=${decoded.category}`);
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+        resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
         break;
       }
       case 'admin/emails':
@@ -924,6 +931,171 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'admin/emails/reply':
         resp = await adminEmailReplyHandler(request);
         break;
+      case 'admin/email-preview': {
+        const adminSess = await requireSession(request);
+        if (adminSess instanceof NextResponse) { resp = adminSess; break; }
+        const { isAdmin: checkAdmin } = await import('@/lib/session');
+        const admUser = await prisma.user.findUnique({ where: { id: adminSess.userId }, select: { adminRole: true } });
+        if (!admUser?.adminRole) { resp = jsonForbidden('Admin only'); break; }
+        const epUrl = new URL(request.url);
+        const epTemplate = epUrl.searchParams.get('template') || 'welcome';
+        const { getFallbackTemplates } = await import('@/lib/email');
+        const templates = await getFallbackTemplates();
+        const tmpl = templates[epTemplate];
+        if (tmpl) {
+          const { renderTemplate } = await import('@/lib/email');
+          const sampleVars: Record<string, string> = {
+            name: 'John Doe', email: 'john@example.com', otp: '123456',
+            dashboardUrl: 'https://tirbeo.app', adminUrl: 'https://admin.tirbeo.app',
+            loginUrl: 'https://accounts.tirbeo.app/login', resetUrl: 'https://accounts.tirbeo.app/reset',
+            magicLink: 'https://accounts.tirbeo.app/auth/magic/abc',
+            recoveryUrl: 'https://accounts.tirbeo.app/recover/abc',
+            formTitle: 'Contact Form', formUrl: 'https://forms.tirbeo.app/form/abc',
+            respondentName: 'Jane Doe', submittedAt: 'Aug 25, 2026, 2:05 PM UTC',
+            ticketId: 'TKT-001', ticketSubject: 'Login issue', ticketStatus: 'open',
+            ticketUrl: 'https://tirbeo.app/support/tickets/abc',
+            subject: 'Test Alert', message: 'This is a test alert.', details: '<p>Details here</p>',
+            service: 'PostgreSQL', alertTime: 'Aug 25, 2026, 2:05 PM UTC',
+            location: 'New York, US', device: 'Chrome on macOS', loginTime: 'Aug 25, 2026, 2:05 PM UTC',
+            ipAddress: '192.168.1.1', revokeUrl: 'https://tirbeo.app/account/sessions',
+            changedAt: 'Aug 25, 2026, 2:05 PM UTC',
+            company: 'Acme Inc', companyName: 'Acme Inc',
+            adminRole: 'admin', temporaryPassword: 'Temp123!',
+            title: 'New Feature: Real-time Notifications',
+            ctaUrl: 'https://tirbeo.app/overview', ctaLabel: 'Try it now',
+            count: '5', digestItems: '<div style="padding:12px;background:#f8f9fa;border-radius:8px;"><strong>New submission</strong></div>',
+            periodLabel: 'Aug 19 – Aug 25, 2026',
+            statRows: '<div style="padding:12px 0;"><strong>Logins:</strong> 12<br/><strong>Submissions:</strong> 47</div>',
+            suspiciousSection: '',
+            tipTitle: 'Enable Two-Factor Authentication', tipBody: 'Secure your account.',
+            actionUrl: 'https://tirbeo.app/account/security',
+            statusType: 'suspended', reason: 'Violation of terms', untilLabel: 'Until further notice.',
+            dateLabel: 'Sep 25, 2026',
+            updateMessage: "We're looking into your issue.",
+            responseId: 'resp_abc', answers: '<div><strong>Name:</strong> Jane</div>',
+            submissionData: '<div><strong>Name:</strong> Jane<br/><strong>Email:</strong> jane@example.com</div>',
+            rejectionReason: 'Insufficient documentation',
+            requestId: 'REQ-001', requestedRole: 'admin',
+            flowsUrl: 'https://flows.tirbeo.app',
+            flowName: 'My Flow', errorMessage: 'Connection timeout', failedAt: 'Aug 25, 2026',
+            duration: '2.3s', stepsExecuted: '5',
+            connectionName: 'Google OAuth', expiresAt: 'Sep 25, 2026', affectedFlows: 'My Flow',
+            connectionsUrl: 'https://flows.tirbeo.app/connections',
+            plan: 'Pro', amount: '$29/mo', date: 'Aug 25, 2026',
+            exportedAt: 'Aug 25, 2026', downloadUrl: 'https://tirbeo.app/download',
+            milestone: '100',
+            responseCount: '23', totalResponses: '156',
+            webhookUrl: 'https://example.com/webhook', httpStatus: '500',
+            webhookFailedReason: 'Connection timeout',
+            role: 'editor', addedByName: 'Admin',
+            limit: '1000', settingsUrl: 'https://tirbeo.app/account/preferences',
+            logins: '12', submissions: '47',
+          };
+          const html = renderTemplate(tmpl.html, sampleVars);
+          resp = NextResponse.json({ html });
+        } else {
+          resp = NextResponse.json({ error: `Template '${epTemplate}' not found` }, { status: 404 });
+        }
+        break;
+      }
+      case 'emails': {
+        const emSession = await requireSession(request);
+        if (emSession instanceof NextResponse) { resp = emSession; break; }
+        const { prisma: emPrisma } = await import('@/lib/db/prisma');
+        const emUrl = new URL(request.url);
+        const emLimit = Math.min(parseInt(emUrl.searchParams.get('limit') || '50', 10), 200);
+        const emOffset = parseInt(emUrl.searchParams.get('offset') || '0', 10);
+        const emUser = await emPrisma.user.findUnique({ where: { id: emSession.userId }, select: { email: true, role: true } });
+        const emWhere: any = emUser?.role === 'admin' ? {} : { toEmail: emUser?.email };
+        const [emItems, emTotal] = await Promise.all([
+          emPrisma.email_logs.findMany({ where: emWhere, orderBy: { createdAt: 'desc' }, take: emLimit, skip: emOffset }),
+          emPrisma.email_logs.count({ where: emWhere }),
+        ]);
+        resp = NextResponse.json({ items: emItems, total: emTotal, limit: emLimit, offset: emOffset });
+        break;
+      }
+      case 'emails/unsubscribe': {
+        const euUrl = new URL(request.url);
+        const euSuccess = euUrl.searchParams.get('success') === '1';
+        const euError = euUrl.searchParams.get('error') || '';
+        const euPrefill = euUrl.searchParams.get('email') || '';
+        if (request.method === 'GET') {
+          const escH = (s: string) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+          const checkIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>`;
+          const mailIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
+
+          let bodyContent = '';
+          if (euSuccess) {
+            bodyContent = `
+              <div style="margin-bottom:20px">${checkIcon}</div>
+              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribed</h1>
+              <p style="font-size:13px;color:#71717a;line-height:1.7;margin-bottom:0">You won't receive non-essential emails anymore.<br/>Security alerts are always sent.</p>`;
+          } else {
+            bodyContent = `
+              <div style="margin-bottom:20px">${mailIcon}</div>
+              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribe from emails</h1>
+              <p style="font-size:13px;color:#71717a;line-height:1.7;margin-bottom:28px">Enter your email to stop receiving non-essential emails.</p>
+              ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}
+              <form method="POST" action="/api/emails/unsubscribe">
+                <input id="eu-email" type="email" name="email" placeholder="you@example.com" value="${escH(euPrefill)}" required autocomplete="email" style="width:100%;padding:11px 14px;background:#09090b;border:1px solid #27272a;border-radius:8px;font-size:14px;color:#fafafa;outline:none;transition:border-color .15s;margin-bottom:14px" onfocus="this.style.borderColor='#3f3f46'" onblur="this.style.borderColor='#27272a'" />
+                <button type="submit" style="width:100%;padding:11px;background:#fafafa;color:#000;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">Unsubscribe</button>
+              </form>`;
+          }
+
+          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #18181b;font-size:11px;color:#3f3f46;line-height:1.7"><a href="https://tirbeo.app" style="color:#52525b;text-decoration:none">tirbeo.app</a></div></div></body></html>`;
+          resp = new NextResponse(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        } else {
+          // POST — process email-based unsubscribe
+          try {
+            const ct = request.headers.get('content-type') || '';
+            let euAddr = '';
+            if (ct.includes('application/json')) {
+              const body: any = await request.json();
+              euAddr = (body.email || '').trim().toLowerCase();
+            } else if (ct.includes('multipart/form-data')) {
+              const fd = await request.formData();
+              euAddr = (fd.get('email') as string || '').trim().toLowerCase();
+            } else {
+              const txt = await request.text();
+              const m = txt.match(/email=([^&]+)/);
+              if (m) euAddr = decodeURIComponent(m[1]).trim().toLowerCase();
+            }
+            if (!euAddr || !euAddr.includes('@')) {
+              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=Please+enter+a+valid+email+address`, 302);
+            } else {
+              const euUser = await prisma.user.findUnique({ where: { email: euAddr }, select: { id: true, notificationPreferences: true, emailUnsubscribed: true } });
+              if (euUser) {
+                const prefs: any = (euUser as any).notificationPreferences || {};
+                const eu: any = (euUser as any).emailUnsubscribed || {};
+                prefs.email = false; prefs.productEmail = false; prefs.formsEmail = false; prefs.supportEmail = false;
+                eu.all = true; eu.product = true; eu.forms = true; eu.support = true;
+                await prisma.$executeRaw`UPDATE "users" SET "notification_preferences" = ${JSON.stringify(prefs)}::jsonb, "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb WHERE "id" = ${euUser.id}`;
+                console.log(`[EMAIL/UNSUBSCRIBE] ${euAddr} unsubscribed from all non-essential emails`);
+              }
+              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?success=1&email=${encodeURIComponent(euAddr)}`, 302);
+            }
+          } catch (err: any) {
+            console.error('[EMAIL/UNSUBSCRIBE] Error:', err?.message);
+            resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=Something+went+wrong.+Please+try+again.`, 302);
+          }
+        }
+        break;
+      }
+      case 'pushes': {
+        const psSession = await requireSession(request);
+        if (psSession instanceof NextResponse) { resp = psSession; break; }
+        const { prisma: psPrisma } = await import('@/lib/db/prisma');
+        const psUser = await psPrisma.user.findUnique({ where: { id: psSession.userId }, select: { notificationPreferences: true } });
+        const psPrefs: any = (psUser as any)?.notificationPreferences || {};
+        const psSubs = psPrefs.pushSubscriptions || [];
+        const psItems = psSubs.map((sub: any, i: number) => ({
+          id: i, endpoint: sub.endpoint ? `${sub.endpoint.slice(0, 30)}...` : 'unknown',
+          createdAt: sub.createdAt || null, userAgent: sub.userAgent || null, enabled: sub.enabled !== false,
+        }));
+        resp = NextResponse.json({ items: psItems, total: psItems.length });
+        break;
+      }
       case 'public/help-config':
       case 'public/faq':
         resp = NextResponse.json({ articles: [] });
@@ -967,6 +1139,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
 
       case 'admin/analytics/overview':
         resp = await adminAnalyticsOverviewHandler(request);
+        break;
+      case 'admin/analytics/consented-users':
+        resp = await adminAnalyticsConsentedUsersHandler(request);
         break;
       case 'admin/settings':
         resp = NextResponse.json({ error: 'Settings are code-owned defaults now' }, { status: 410 });

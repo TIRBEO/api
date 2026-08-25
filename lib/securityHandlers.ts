@@ -210,10 +210,24 @@ function formatAuditAction(action: string, meta: Record<string, any>): string {
   if (action.includes('backup_codes.regenerated')) return 'Backup codes regenerated';
   if (action.includes('recovery_email.verified')) return 'Recovery email verified';
   if (action.includes('recovery_email.updated')) return 'Recovery email updated';
+  if (action.includes('recovery_email.removed')) return 'Recovery email removed';
+  if (action.includes('session.revoked_all') || action.includes('sessions.revoked_all')) return 'All other sessions signed out';
   if (action.includes('session.revoked')) return 'A session was signed out';
-  if (action.includes('sessions.revoked_all')) return 'All other sessions signed out';
   if (action.includes('password')) return 'Password was changed';
+  if (action.includes('passkey.deleted')) return 'Passkey removed';
   if (action.includes('passkey')) return 'Passkey registered';
+  if (action.includes('oauth.connected') || action.includes('oauth_client.connected')) return 'OAuth provider connected';
+  if (action.includes('oauth.disconnected') || action.includes('oauth_client.disconnected')) return 'OAuth provider disconnected';
+  if (action.includes('merge')) return 'Accounts merged';
+  if (action.includes('user.created')) return 'Account created';
+  if (action.includes('user.updated') || action.includes('profile.updated')) return 'Profile updated';
+  if (action.includes('user.deleted')) return 'Account deletion requested';
+  if (action.includes('user.export')) return 'Data export requested';
+  if (action.includes('user.login')) return 'Signed in to your account';
+  if (action.includes('account.merge')) return 'Accounts merged';
+  if (action.includes('ticket')) return 'Support ticket activity';
+  if (action.includes('form')) return 'Form activity';
+  if (action.includes('notification')) return 'Notification preference changed';
   return action.replace(/[._-]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 

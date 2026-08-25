@@ -163,11 +163,8 @@ export async function createUser(request: NextRequest) {
 
   if (sendEmail) {
     const { sendTemplateEmail } = await import('./email');
-    const res = await sendTemplateEmail(normalizedEmail, 'admin_account_created', {
+    const res = await sendTemplateEmail(normalizedEmail, 'welcome', {
       name: name || normalizedEmail.split('@')[0],
-      temporaryPassword,
-      adminRole: adminRole || 'member',
-      loginUrl: 'https://admin.tirbeo.app',
     });
     if (!res.success) {
       console.error(`[ADMIN CREATE USER] Email failed for ${normalizedEmail}: ${res.error}`);

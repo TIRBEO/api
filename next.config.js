@@ -14,7 +14,7 @@ const nextConfig = {
           { key: 'X-Frame-Options', value: 'DENY' },
           { key: 'Referrer-Policy', value: 'no-referrer' },
           { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=(), interest-cohort=(), payment=(), usb=(), serial=(), midi=(), sync-xhr=(), autoplay=(), display-capture=(), fullscreen=(), picture-in-picture=(), screen-wake-lock=(), clipboard-read=(), clipboard-write=()' },
-          { key: 'Content-Security-Policy', value: "default-src 'none'; script-src 'none'; style-src 'none'; img-src 'none'; connect-src 'self' https://admin.tirbeo.app https://accounts.tirbeo.app https://dashboard.tirbeo.app https://forms.tirbeo.app https://support.tirbeo.app https://tirbeo.app https://www.tirbeo.app; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none';" },
+          { key: 'Content-Security-Policy', value: "default-src 'none'; script-src 'none'; style-src 'none'; img-src 'none'; connect-src 'self' https://admin.tirbeo.app https://accounts.tirbeo.app https://dashboard.tirbeo.app https://forms.tirbeo.app https://support.tirbeo.app https://tirbeo.app https://www.tirbeo.app; form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none';" },
         ],
       },
     ];

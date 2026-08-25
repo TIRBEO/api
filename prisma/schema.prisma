@@ -56,7 +56,7 @@ model User {
   scheduledDeletionAt     DateTime?       @map("scheduled_deletion_at") @db.Timestamptz(6)
   deletionReason          String?         @map("deletion_reason")
   adminRole               String?         @map("admin_role")
-  notificationPreferences Json?           @default("{\"email\":true,\"push\":true,\"inApp\":true,\"security\":true,\"forms\":true,\"product\":true,\"support\":true,\"quietHoursEnabled\":false,\"quietHoursStart\":\"22:00\",\"quietHoursEnd\":\"08:00\",\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
+  notificationPreferences Json?           @default("{\"email\":true,\"push\":true,\"security\":true,\"forms\":false,\"product\":false,\"support\":true,\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
   emailUnsubscribed       Json?           @default("{}") @map("email_unsubscribed")
   createdAt               DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt               DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)

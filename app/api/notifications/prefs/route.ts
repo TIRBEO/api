@@ -5,38 +5,30 @@ import { prisma } from '@/lib/db/prisma';
 export const runtime = 'nodejs';
 
 // Preferences live directly on users.notification_preferences (jsonb).
+// Security is compulsory — no toggle for it.
 const ALLOWED_FIELDS = [
-  'type',
   // Global channels
   'email', 'push',
-  // Category toggles
-  'security', 'forms', 'product', 'support',
+  // Category toggles (forms, product, support only — security is compulsory)
+  'forms', 'product', 'support',
   // Per-category x channel matrix
-  'securityEmail', 'securityPush',
   'formsEmail', 'formsPush',
   'productEmail', 'productPush',
   'supportEmail', 'supportPush',
-  // Quiet hours
-  'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
-  // Digest & email summaries
+  // Digest
   'digestEnabled', 'digestFrequency',
-  'productEmail', 'weeklySummary',
 ] as const;
 
 const DEFAULT_PREFS: Record<string, unknown> = {
-  type: null,
   email: true, push: true,
-  security: true, forms: true, product: true, support: true,
-  securityEmail: true, securityPush: true,
+  forms: true, product: false, support: true,
   formsEmail: true, formsPush: true,
-  productEmail: true, productPush: true,
+  productEmail: false, productPush: true,
   supportEmail: true, supportPush: true,
-  quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
-  digestEnabled: false, digestFrequency: 'daily', weeklySummary: false,
+  digestEnabled: false, digestFrequency: 'daily',
 };
 
 const DIGEST_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);
-const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 function readPrefs(raw: unknown): Record<string, any> {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...DEFAULT_PREFS, ...(raw as object) } : { ...DEFAULT_PREFS };
@@ -85,15 +77,34 @@ export async function PUT(request: NextRequest) {
     if (data.digestFrequency !== undefined && !DIGEST_FREQUENCIES.has(data.digestFrequency)) {
       return NextResponse.json({ error: 'Invalid digestFrequency' }, { status: 400 });
     }
-    for (const t of ['quietHoursStart', 'quietHoursEnd']) {
-      if (data[t] !== undefined && !TIME_RE.test(String(data[t]))) {
-        return NextResponse.json({ error: `Invalid ${t} (HH:mm expected)` }, { status: 400 });
-      }
-    }
 
     const prefs = await loadPrefs(session.userId);
     Object.assign(prefs, data);
     await savePrefs(session.userId, prefs);
+
+    // If the user re-enabled email globally, clear the emailUnsub flags
+    // AND re-enable all category email toggles that were disabled by the global unsubscribe.
+    if (data.email === true) {
+      // Re-enable category email toggles (formsEmail, productEmail, supportEmail)
+      // so the user gets all emails back after re-subscribing.
+      if (data.formsEmail === undefined) data.formsEmail = true;
+      if (data.productEmail === undefined) data.productEmail = true;
+      if (data.supportEmail === undefined) data.supportEmail = true;
+      try {
+        const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { emailUnsubscribed: true } });
+        const eu: any = (user as any)?.emailUnsubscribed || {};
+        if (eu.all || eu.product || eu.forms || eu.support) {
+          eu.all = false;
+          eu.product = false;
+          eu.forms = false;
+          eu.support = false;
+          await prisma.$executeRaw`
+            UPDATE "users" SET "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb
+            WHERE "id" = ${session.userId}`;
+          console.log(`[NOTIFICATIONS] Cleared emailUnsub flags for user ${session.userId} (email re-enabled)`);
+        }
+      } catch { /* non-fatal */ }
+    }
 
     return NextResponse.json(prefs);
   } catch (err: any) {

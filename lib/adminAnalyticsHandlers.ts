@@ -76,3 +76,77 @@ export async function analyticsHandler(request: NextRequest) {
     activityByDay,
   });
 }
+
+// ─── Admin: Get users who consented to analytics + their data ─────
+export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) {
+  const session = await requireAdmin(request);
+  if (session instanceof NextResponse) return session;
+
+  const url = new URL(request.url);
+  const take = Math.min(parseInt(url.searchParams.get('take') || '50', 10) || 50, 200);
+  const skip = parseInt(url.searchParams.get('skip') || '0', 10) || 0;
+
+  // Find all users with allowAnalytics=true
+  const users = await prisma.user.findMany({
+    where: {
+      OR: [
+        { consents: { path: ['allowAnalytics'], equals: true } },
+      ],
+    },
+    select: {
+      id: true,
+      email: true,
+      username: true,
+      name: true,
+      createdAt: true,
+      lastLoginAt: true,
+      consents: true,
+      theme: true,
+      language: true,
+      timezone: true,
+      _count: {
+        select: {
+          sessions: true,
+          notifications: true,
+        },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    take,
+    skip,
+  });
+
+  const total = await prisma.user.count({
+    where: {
+      OR: [
+        { consents: { path: ['allowAnalytics'], equals: true } },
+      ],
+    },
+  });
+
+  // Enrich with login history summary for consented users
+  const userIds = users.map(u => u.id);
+  const recentLogins = userIds.length ? await prisma.loginHistory.groupBy({
+    by: ['userId'],
+    where: { userId: { in: userIds } },
+    _count: { id: true },
+  }) : [];
+  const loginMap = new Map(recentLogins.map(r => [r.userId, r._count.id]));
+
+  const enriched = users.map(u => ({
+    id: u.id,
+    email: u.email,
+    username: u.username,
+    name: u.name,
+    createdAt: u.createdAt,
+    lastLoginAt: u.lastLoginAt,
+    theme: u.theme,
+    language: u.language,
+    timezone: u.timezone,
+    sessionCount: u._count.sessions,
+    notificationCount: u._count.notifications,
+    totalLogins: loginMap.get(u.id) || 0,
+  }));
+
+  return NextResponse.json({ users: enriched, total });
+}

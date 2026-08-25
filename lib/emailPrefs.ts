@@ -5,8 +5,11 @@ import { getDashboardBaseUrl } from './app-urls';
 // ─── Email classification ──────────────────────────────────────────
 // Essential emails are NEVER suppressed — they are security-critical
 // (OTPs, password resets, magic links, account recovery, account status).
+// Security emails (login_alert, suspicious_login) are ALSO essential —
+// users cannot unsubscribe from security notifications.
 
-const ESSENTIAL_TEMPLATES = new Set([
+export const ESSENTIAL_TEMPLATES = new Set([
+  // Auth / OTPs
   'signup_otp',
   'login_otp',
   'verify_email',
@@ -15,24 +18,22 @@ const ESSENTIAL_TEMPLATES = new Set([
   'magic_link',
   'password_changed',
   'welcome',
+  // Security (compulsory — no unsubscribe)
+  'login_alert',
+  'suspicious_login',
+  // Account
   'account_recovery',
   'account_suspended',
   'account_deleted',
-  'admin_account_created',
-  'admin_request_received',
-  'admin_request_approved',
-  'admin_request_rejected',
+  // Admin
   'export_ready',
   'admin_alert',
   'system_alert',
 ]);
 
 // Map template → notification preference category.
-// A template can only be suppressed by its matching category toggle.
+// Only suppressible templates belong here — security/essential are excluded.
 export const TEMPLATE_CATEGORY: Record<string, string> = {
-  // Security
-  login_alert: 'security',
-  suspicious_login: 'security',
   // Forms
   form_submission_confirmation: 'forms',
   form_notification: 'forms',
@@ -54,15 +55,20 @@ export const TEMPLATE_CATEGORY: Record<string, string> = {
   response_limit_reached: 'forms',
   webhook_failed: 'forms',
   collaborator_added: 'forms',
+  form_auto_reply: 'forms',
+  form_submission_notification: 'forms',
+  
   // Product
   product_update: 'product',
   weekly_summary: 'product',
   account_tip: 'product',
   notification_digest: 'product',
+  
   // Support
   ticket_created: 'support',
   ticket_updated: 'support',
   ticket_closed: 'support',
+  admin_reply: 'support',
 };
 
 // ─── Unsubscribe tokens ──────────────────────────────────────────
@@ -101,10 +107,9 @@ export function verifyUnsubscribeToken(token: string): { userId: string; categor
   }
 }
 
-/** Build the full unsubscribe URL for a user+category. */
+/** Build the full unsubscribe URL — redirects to dashboard notification settings. */
 export function getUnsubscribeUrl(userId: string, category: string): string {
   const token = generateUnsubscribeToken(userId, category);
-  // Use API domain (api.tirbeo.app in prod, localhost:3000 in dev)
   const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
   return `${apiBase}/api/email/unsubscribe?token=${token}`;
 }
@@ -121,13 +126,13 @@ export function getManagePreferencesUrl(): string {
  * Returns true if the email should be BLOCKED (not sent).
  *
  * Rules:
- * 1. Essential emails (OTP, password reset, etc.) → NEVER suppressed
+ * 1. Essential emails (OTP, password reset, security alerts, etc.) → NEVER suppressed
  * 2. If user's global email toggle is off → suppressed (except essential)
  * 3. If category-specific email toggle is off → suppressed
  * 4. If user has unsubscribed from category via token → suppressed
  */
 export async function shouldSuppressEmail(to: string, templateName: string): Promise<boolean> {
-  // Essential emails always go through
+  // Essential emails always go through (includes all security emails)
   if (ESSENTIAL_TEMPLATES.has(templateName)) return false;
 
   // Look up user by email
@@ -153,11 +158,8 @@ export async function shouldSuppressEmail(to: string, templateName: string): Pro
   // Category-specific check
   const category = TEMPLATE_CATEGORY[templateName];
   if (category) {
-    // Check category-level email toggle (e.g., productEmail, formsEmail, securityEmail, supportEmail)
     const categoryEmailKey = `${category}Email`;
     if (prefs[categoryEmailKey] === false) return true;
-
-    // Check if user unsubscribed from this specific category
     if (globalUnsub?.[category] === true) return true;
   }
 
@@ -166,9 +168,18 @@ export async function shouldSuppressEmail(to: string, templateName: string): Pro
 
 /**
  * Process an unsubscribe action. Returns the updated prefs.
+ * Security emails cannot be unsubscribed from — they are compulsory.
  */
 export async function processUnsubscribe(userId: string, category: string): Promise<Record<string, unknown>> {
-  // Load current prefs
+  // Security is compulsory — ignore attempts to unsubscribe
+  if (category === 'security') {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { notificationPreferences: true },
+    });
+    return (user as any)?.notificationPreferences || {};
+  }
+
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: { notificationPreferences: true, emailUnsubscribed: true },
@@ -177,19 +188,15 @@ export async function processUnsubscribe(userId: string, category: string): Prom
   let prefs: any = (user as any)?.notificationPreferences || {};
   let emailUnsub: any = (user as any)?.emailUnsubscribed || {};
 
-  // Unsubscribe = disable email for that category only.
-  // "all" disables global email toggle; per-category disables just that category.
   if (category === 'all') {
     prefs.email = false;
     emailUnsub.all = true;
   } else {
-    // Disable the category-specific email toggle (e.g., securityEmail, formsEmail)
     const categoryEmailKey = `${category}Email`;
     prefs[categoryEmailKey] = false;
     emailUnsub[category] = true;
   }
 
-  // Persist
   await prisma.$executeRaw`
     UPDATE "users"
     SET "notification_preferences" = ${JSON.stringify(prefs)}::jsonb,

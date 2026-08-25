@@ -344,8 +344,10 @@ export async function proxy(request: NextRequest) {
      '/api/captcha/challenge', '/api/captcha/status', '/api/captcha/verify', '/api/captcha/image/',
      '/api/image/',
      '/api/health',
-    '/api/security/log',
-    '/api/debug/',
+     '/api/security/log',
+     '/api/debug/',
+     '/api/email/unsubscribe',
+     '/api/emails/unsubscribe',
   ];
 
 // Public form submission: POST /api/forms/{slug}/submit (auth via access_key in body)
@@ -378,9 +380,23 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
       const { prisma } = await import('./lib/db/prisma');
       const su = await prisma.user.findUnique({
         where: { id: String(tokenPayload.sub) },
-        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true },
+        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true, scheduledDeletionAt: true, deletedAt: true },
       });
-      if (su?.isBanned) {
+      if (su?.deletedAt) {
+        statusResponse = jsonResponse(allowedOrigin, {
+          error: 'ACCOUNT_DELETED', deleted: true,
+          message: 'Your account has been deleted.',
+        }, 403);
+      } else if (su?.scheduledDeletionAt) {
+        const isCancel = pathname.includes('delete-account') && (method === 'DELETE' || url.searchParams.get('cancel') === '1');
+        if (!isCancel) {
+          statusResponse = jsonResponse(allowedOrigin, {
+            error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true,
+            scheduledAt: su.scheduledDeletionAt.toISOString(),
+            message: `Your account is scheduled for deletion on ${new Date(su.scheduledDeletionAt).toLocaleDateString()}. Cancel to regain access.`,
+          }, 403);
+        }
+      } else if (su?.isBanned) {
         await prisma.session.deleteMany({ where: { userId: tokenPayload.sub } }).catch(() => {});
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_BANNED', banned: true,

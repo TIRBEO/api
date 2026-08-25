@@ -273,8 +273,6 @@ export async function changePasswordHandler(request: NextRequest) {
       metadata: { ip: loginIp, device: loginDevice, method: 'Password' },
     }).catch((e) => console.error('[NOTIFICATION]', (e as Error)?.message));
 
-    // Event-triggered auto tip (only if productEmail enabled & tip unsent)
-    import('./tips').then(m => m.sendNextTipForUser(session.userId)).catch(() => {});
 
     return new NextResponse('Password changed', { status: 200 });
   } catch (err: any) {
@@ -436,7 +434,6 @@ export async function notificationPrefsHandler(request: NextRequest) {
       security: true, forms: true, product: true, support: true,
       quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
       digestEnabled: false, digestFrequency: 'daily',
-      securityEmail: true, securityPush: true, securityInApp: true,
       formsEmail: true, formsPush: true, formsInApp: true,
       productEmail: true, productPush: true, productInApp: true,
       supportEmail: true, supportPush: true, supportInApp: true,
@@ -660,7 +657,7 @@ export async function userActivityHandler(request: NextRequest) {
     // Fetch limit + offset to ensure we have enough for post-sort slicing
     // but cap at a sane maximum to prevent fetching unbounded data
     const fetchLimit = Math.min(limit + offset, 200);
-    const [auditEvents, securityEvents] = await Promise.all([
+    const [auditEvents, securityEvents, loginHistoryRecords] = await Promise.all([
       trackQuery('audit_events_by_actor_created', () => prisma.auditEvent.findMany({
         where: { actorId: session.userId },
         orderBy: { createdAt: 'desc' },
@@ -672,6 +669,12 @@ export async function userActivityHandler(request: NextRequest) {
         orderBy: { createdAt: 'desc' },
         take: fetchLimit,
         select: { id: true, eventType: true, metadata: true, severity: true, createdAt: true },
+      })),
+      trackQuery('login_history_by_user_created', () => prisma.login_history.findMany({
+        where: { userId: session.userId },
+        orderBy: { createdAt: 'desc' },
+        take: fetchLimit,
+        select: { id: true, success: true, method: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true },
       })),
     ]);
 
@@ -685,6 +688,13 @@ export async function userActivityHandler(request: NextRequest) {
       ...securityEvents.map(e => ({
         id: e.id, source: 'security', action: e.eventType, targetType: null as string | null,
         targetId: null as string | null, metadata: e.metadata, severity: e.severity,
+        createdAt: e.createdAt,
+      })),
+      ...loginHistoryRecords.map(e => ({
+        id: e.id, source: 'login', action: e.success ? `auth.login_${e.method}_success` : 'auth.login_failed',
+        targetType: 'session' as string | null, targetId: null as string | null,
+        metadata: { ...((e.metadata as Record<string, any>) || {}), ip: e.ipAddress, userAgent: e.userAgent, method: e.method, success: e.success },
+        severity: e.success ? ('info' as const) : ('warning' as const),
         createdAt: e.createdAt,
       })),
     ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime()).slice(offset, offset + limit);
@@ -708,12 +718,17 @@ export async function preferencesHandler(request: NextRequest) {
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     if (request.method === 'GET') {
+      const consents: any = (user as any).consents ?? {};
       return NextResponse.json({
         ok: true,
         preferences: {
           theme: user.theme || 'system',
           language: user.language || 'en',
           timezone: user.timezone || 'UTC',
+          privacy: {
+            allowAnalytics: consents.allowAnalytics ?? false,
+            allowCrashReports: consents.allowCrashReports ?? true,
+          },
         },
       });
     }
@@ -724,6 +739,26 @@ export async function preferencesHandler(request: NextRequest) {
       if (body.theme) update.theme = body.theme;
       if (body.language) update.language = body.language;
       if (body.timezone) update.timezone = body.timezone;
+
+      if (body.privacy && typeof body.privacy === 'object') {
+        const currentConsents: any = (user as any).consents ?? {};
+        const newConsents: Record<string, unknown> = { ...currentConsents };
+        if (typeof body.privacy.allowAnalytics === 'boolean') newConsents.allowAnalytics = body.privacy.allowAnalytics;
+        if (typeof body.privacy.allowCrashReports === 'boolean') newConsents.allowCrashReports = body.privacy.allowCrashReports;
+        newConsents.updatedAt = new Date().toISOString();
+        update.consents = newConsents;
+        // Record consent change in audit log
+        prisma.auditEvent.create({
+          data: {
+            actorId: session.userId,
+            action: 'consent.updated',
+            targetType: 'user',
+            targetId: session.userId,
+            metadata: { privacy: body.privacy, previous: { allowAnalytics: currentConsents.allowAnalytics, allowCrashReports: currentConsents.allowCrashReports } },
+            severity: 'info',
+          },
+        }).catch(() => {});
+      }
 
       await prisma.user.update({ where: { id: session.userId }, data: update });
       return NextResponse.json({ ok: true });
@@ -897,25 +932,83 @@ export async function exportDataHandler(request: NextRequest) {
     const user = await prisma.user.findUnique({ where: { id: session.userId } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-    // Export user data (excluding sensitive fields)
+    // Export ALL user data (excluding sensitive fields)
     const { passwordHash, totpSecret, backupCodes, ...userData } = user as any;
-    const [sessions, auditEvents, securityEvents, loginHistory, notifications] = await Promise.all([
-      prisma.session.findMany({ where: { userId: session.userId } }),
-      prisma.auditEvent.findMany({ where: { actorId: session.userId } }),
+    const [
+      sessions, auditEvents, securityEvents, loginHistory,
+      notifications, emailLogs, tipLogs, media, tickets, ticketMessages,
+      apiKeyCount, forms, formsSubmissions,
+    ] = await Promise.all([
+      prisma.session.findMany({ where: { userId: session.userId }, select: { id: true, userAgent: true, ipAddress: true, location: true, deviceName: true, createdAt: true, lastUsedAt: true, revokedAt: true } }),
+      prisma.auditEvent.findMany({ where: { actorId: session.userId }, select: { id: true, action: true, targetType: true, targetId: true, severity: true, metadata: true, createdAt: true } }),
       prisma.securityEvent.findMany({ where: { userId: session.userId } }),
       prisma.login_history.findMany({ where: { userId: session.userId } }),
-      prisma.notification.findMany({ where: { userId: session.userId } }),
+      prisma.notification.findMany({ where: { userId: session.userId }, select: { id: true, title: true, body: true, type: true, read: true, createdAt: true } }),
+      prisma.email_logs.findMany({ where: { toEmail: user.email }, take: 1000, select: { id: true, subject: true, templateName: true, status: true, createdAt: true } }).catch(() => []),
+      prisma.userTipLog.findMany({ where: { userId: session.userId } }).catch(() => []),
+      prisma.media.findMany({ where: { userId: session.userId }, select: { id: true, filename: true, mimeType: true, size: true, createdAt: true } }).catch(() => []),
+      prisma.ticket.findMany({ where: { customerId: session.userId }, select: { id: true, subject: true, status: true, priority: true, createdAt: true } }).catch(() => []),
+      prisma.ticketMessage.findMany({ where: { authorId: session.userId }, select: { id: true, body: true, createdAt: true } }).catch(() => []),
+      prisma.apiKey.count({ where: { userId: session.userId } }).catch(() => 0),
+      prisma.form.findMany({ where: { userId: session.userId }, select: { id: true, name: true, slug: true, createdAt: true } }).catch(() => []),
+      prisma.formSubmission.count({ where: { form: { userId: session.userId } } }).catch(() => 0),
     ]);
 
-    return NextResponse.json({
-      ok: true,
-      export: {
-        user: userData,
-        sessions: sessions.map(s => ({ id: s.id, userAgent: s.userAgent, ip: s.ipAddress, createdAt: s.createdAt })),
-        auditEvents,
-        securityEvents,
-        loginHistory,
-        notifications: notifications.map(n => ({ title: n.title, message: n.body, type: n.type, createdAt: n.createdAt })),
+    const exportData = {
+      exportedAt: new Date().toISOString(),
+      user: {
+        id: userData.id,
+        email: userData.email,
+        name: userData.name,
+        username: userData.username,
+        role: userData.role,
+        photoUrl: userData.photoUrl,
+        bio: userData.bio,
+        phone: userData.phone,
+        country: userData.country,
+        timezone: userData.timezone,
+        language: userData.language,
+        theme: userData.theme,
+        dateFormat: userData.dateFormat,
+        timeFormat: userData.timeFormat,
+        createdAt: userData.createdAt,
+        updatedAt: userData.updatedAt,
+        lastActiveAt: userData.lastActiveAt,
+        lastLoginAt: userData.lastLoginAt,
+        loginCount: userData.loginCount,
+        notificationPreferences: userData.notificationPreferences,
+        consents: userData.consents,
+        emailUnsubscribed: userData.emailUnsubscribed,
+      },
+      sessions,
+      auditEvents,
+      securityEvents,
+      loginHistory,
+      notifications,
+      emailLogs,
+      tipLogs,
+      media,
+      tickets,
+      ticketMessages,
+      forms,
+      formsSubmissions,
+      apiKeys: apiKeyCount,
+    };
+
+    // Send notification email — data has been downloaded, no link
+    const { sendTemplateEmail } = await import('./email');
+    sendTemplateEmail(user.email, 'export_ready', {
+      name: user.name || user.email,
+      exportedAt: new Date().toLocaleString(),
+    }).catch(() => {});
+
+    // Return as downloadable JSON file
+    const filename = `tirbeo-data-${user.username || user.email.split('@')[0]}-${new Date().toISOString().slice(0, 10)}.json`;
+    return new NextResponse(JSON.stringify(exportData, null, 2), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${filename}"`,
       },
     });
   } catch (err: any) {
@@ -932,11 +1025,29 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
+    const url = new URL(request.url);
+
+    // DELETE ?cancel=1 → cancel scheduled deletion
+    if (request.method === 'DELETE' || url.searchParams.get('cancel') === '1') {
+      await prisma.$executeRaw`
+        UPDATE "users" SET "scheduled_deletion_at" = NULL, "deletion_reason" = NULL
+        WHERE "id" = ${session.userId}`;
+      await prisma.auditEvent.create({
+        data: { actorId: session.userId, action: 'account.deletion-cancelled', targetType: 'user', targetId: session.userId, severity: 'info' },
+      }).catch(() => {});
+      return NextResponse.json({ ok: true, message: 'Deletion cancelled' });
+    }
+
     const body = await request.json().catch(() => ({}));
     const { password, reason } = body as { password?: string; reason?: string };
 
     const user = await prisma.user.findUnique({ where: { id: session.userId } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    // If user already has scheduled deletion, don't allow another
+    if (user.scheduledDeletionAt) {
+      return NextResponse.json({ error: 'Account deletion already scheduled', scheduledAt: user.scheduledDeletionAt }, { status: 409 });
+    }
 
     // If user has password, it must be provided for deletion
     if (user.passwordHash) {
@@ -945,10 +1056,19 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
       if (!valid) return NextResponse.json({ error: 'Password is incorrect' }, { status: 400 });
     }
 
-    // Send confirmation email
-    const code = generateOtpCode();
-    await storeOtp(session.userId, 'delete-account' as any, code);
-    await sendEmailOtp(user.email, code);
+    // Schedule deletion in 30 days (user can cancel within this window)
+    const scheduledAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await prisma.$executeRaw`
+      UPDATE "users" SET "scheduled_deletion_at" = ${scheduledAt}, "deletion_reason" = ${reason || null}
+      WHERE "id" = ${session.userId}`;
+
+    // Send deletion scheduled email
+    const { sendTemplateEmail } = await import('./email');
+    sendTemplateEmail(user.email, 'account_deleted', {
+      name: user.name || user.email,
+      dateLabel: scheduledAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+      dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
+    }).catch(() => {});
 
     // Log the request
     await prisma.auditEvent.create({
@@ -957,12 +1077,12 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
         action: 'account.delete-request',
         targetType: 'user',
         targetId: session.userId,
-        metadata: { reason },
+        metadata: { reason, scheduledAt: scheduledAt.toISOString() },
         severity: 'critical',
       },
     }).catch(() => {});
 
-    return NextResponse.json({ ok: true, message: 'Confirmation code sent to your email' });
+    return NextResponse.json({ ok: true, message: 'Account scheduled for deletion in 30 days. You can cancel this at any time.', scheduledAt });
   } catch (err: any) {
     console.error('[DELETE ACCOUNT]', err?.message || err);
     return NextResponse.json({ error: 'Failed to process deletion request' }, { status: 500 });
