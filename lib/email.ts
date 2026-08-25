@@ -313,7 +313,7 @@ export async function sendTemplateEmail(
     if (!isEssential) {
       mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
       mergedVars['managePreferencesUrl'] = `${apiBase}/api/emails/unsubscribe`;
-      mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#6b7280"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a></p>`;
+      mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#555555"><a href="${apiBase}/api/emails/unsubscribe" style="color:#555555;text-decoration:underline;">Unsubscribe</a></p>`;
     } else {
       mergedVars['unsubscribeUrl'] = '';
       mergedVars['unsubscribeSection'] = '';
@@ -322,7 +322,7 @@ export async function sendTemplateEmail(
   } catch {
     const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
     mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
-    mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#6b7280"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6b7280;text-decoration:underline;">Unsubscribe</a></p>`;
+    mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#555555"><a href="${apiBase}/api/emails/unsubscribe" style="color:#555555;text-decoration:underline;">Unsubscribe</a></p>`;
     mergedVars['managePreferencesUrl'] = '';
   }
 

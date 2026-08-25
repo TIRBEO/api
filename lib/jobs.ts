@@ -206,9 +206,9 @@ export async function sendWeeklySummary(
           .sort((a, b) => b[1] - a[1])
           .slice(0, 7)
           .map(([label, n]) =>
-            `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:14px;color:#334155;"><span>${esc(label)}</span><strong>${n}</strong></div>`
+            `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e0e0e0;font-size:14px;color:#333333;"><span>${esc(label)}</span><strong>${n}</strong></div>`
           ).join('') +
-          `<div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#0f172a;"><span><strong>Total events</strong></span><strong>${total}</strong></div>`;
+          `<div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#000000;"><span><strong>Total events</strong></span><strong>${total}</strong></div>`;
 
     const suspiciousSection = suspicious > 0
       ? `<div style="margin:0 0 20px;padding:14px 18px;background:#fff7ed;border-radius:10px;border:1px solid #fed7aa;"><p style="margin:0;font-size:14px;line-height:22px;color:#9a3412;">⚠️ <strong>${suspicious} event${suspicious === 1 ? '' : 's'} need your attention</strong> — failed sign-ins or other security warnings. <a href="${dashboardUrlOverride}/activity/history" style="color:#c2410c;text-decoration:none;">Review them</a>.</p></div>`

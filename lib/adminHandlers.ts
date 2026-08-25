@@ -485,7 +485,10 @@ export async function adminMaintenanceHandler(request: NextRequest) {
   const { getMaintenanceState, setMaintenanceMode } = await import('./ws/server');
 
   if (request.method === 'GET') {
-    return NextResponse.json(getMaintenanceState());
+    // Also process expired scheduled deletions on maintenance check
+    const { processScheduledDeletions } = await import('./userHandlers');
+    const deletionResult = await processScheduledDeletions().catch(() => ({ deleted: 0 }));
+    return NextResponse.json({ ...getMaintenanceState(), deletedUsers: deletionResult.deleted });
   }
 
   try {

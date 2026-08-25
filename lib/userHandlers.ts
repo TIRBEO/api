@@ -946,7 +946,7 @@ export async function exportDataHandler(request: NextRequest) {
       prisma.notification.findMany({ where: { userId: session.userId }, select: { id: true, title: true, body: true, type: true, read: true, createdAt: true } }),
       prisma.email_logs.findMany({ where: { toEmail: user.email }, take: 1000, select: { id: true, subject: true, templateName: true, status: true, createdAt: true } }).catch(() => []),
       prisma.userTipLog.findMany({ where: { userId: session.userId } }).catch(() => []),
-      prisma.media.findMany({ where: { userId: session.userId }, select: { id: true, filename: true, mimeType: true, size: true, createdAt: true } }).catch(() => []),
+      prisma.media.findMany({ where: { uploadedBy: session.userId }, select: { id: true, filename: true, mimeType: true, sizeBytes: true, createdAt: true } }).catch(() => []),
       prisma.ticket.findMany({ where: { customerId: session.userId }, select: { id: true, subject: true, status: true, priority: true, createdAt: true } }).catch(() => []),
       prisma.ticketMessage.findMany({ where: { authorId: session.userId }, select: { id: true, body: true, createdAt: true } }).catch(() => []),
       prisma.apiKey.count({ where: { userId: session.userId } }).catch(() => 0),
@@ -1018,7 +1018,7 @@ export async function exportDataHandler(request: NextRequest) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// DELETE ACCOUNT REQUEST HANDLER
+// DELETE ACCOUNT REQUEST HANDLER (OTP-based)
 // ═══════════════════════════════════════════════════════════════════
 export async function deleteAccountRequestHandler(request: NextRequest) {
   try {
@@ -1032,6 +1032,8 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
       await prisma.$executeRaw`
         UPDATE "users" SET "scheduled_deletion_at" = NULL, "deletion_reason" = NULL
         WHERE "id" = ${session.userId}`;
+      await prisma.session.updateMany({ where: { userId: session.userId, status: 'revoked' as any }, data: { status: 'active' as any } }).catch(() => {});
+      try { const { bustProfileCache } = await import('./authHandlers'); bustProfileCache(session.userId); } catch {}
       await prisma.auditEvent.create({
         data: { actorId: session.userId, action: 'account.deletion-cancelled', targetType: 'user', targetId: session.userId, severity: 'info' },
       }).catch(() => {});
@@ -1039,54 +1041,123 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
     }
 
     const body = await request.json().catch(() => ({}));
-    const { password, reason } = body as { password?: string; reason?: string };
+    const { step, code, reason } = body as { step?: string; code?: string; reason?: string };
 
     const user = await prisma.user.findUnique({ where: { id: session.userId } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-    // If user already has scheduled deletion, don't allow another
     if (user.scheduledDeletionAt) {
       return NextResponse.json({ error: 'Account deletion already scheduled', scheduledAt: user.scheduledDeletionAt }, { status: 409 });
     }
 
-    // If user has password, it must be provided for deletion
-    if (user.passwordHash) {
-      if (!password) return NextResponse.json({ error: 'Password is required to delete account' }, { status: 400 });
-      const valid = await verifyPassword(user.passwordHash, password);
-      if (!valid) return NextResponse.json({ error: 'Password is incorrect' }, { status: 400 });
+    // Step 1: Request OTP — send code to email
+    if (!step || step === 'request') {
+      const { generateOtpCode, storeOtp } = await import('./auth/otp');
+      const { sendTemplateEmail } = await import('./email');
+
+      const otpCode = generateOtpCode();
+      await storeOtp(session.userId, 'email', otpCode);
+
+      sendTemplateEmail(user.email, 'delete_account_otp', {
+        name: user.name || user.email,
+        otp: otpCode,
+      }).catch(() => {});
+
+      return NextResponse.json({ ok: true, step: 'request', message: `Verification code sent to ${user.email}` });
     }
 
-    // Schedule deletion in 30 days (user can cancel within this window)
-    const scheduledAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    await prisma.$executeRaw`
-      UPDATE "users" SET "scheduled_deletion_at" = ${scheduledAt}, "deletion_reason" = ${reason || null}
-      WHERE "id" = ${session.userId}`;
+    // Step 2: Verify OTP → schedule deletion
+    if (step === 'verify') {
+      if (!code) return NextResponse.json({ error: 'Verification code is required' }, { status: 400 });
 
-    // Send deletion scheduled email
-    const { sendTemplateEmail } = await import('./email');
-    sendTemplateEmail(user.email, 'account_deleted', {
-      name: user.name || user.email,
-      dateLabel: scheduledAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-      dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
-    }).catch(() => {});
+      const { verifyOtpCode } = await import('./auth/otp');
+      const valid = await verifyOtpCode(session.userId, 'email', code);
+      if (!valid) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
 
-    // Log the request
-    await prisma.auditEvent.create({
-      data: {
-        actorId: session.userId,
-        action: 'account.delete-request',
-        targetType: 'user',
-        targetId: session.userId,
-        metadata: { reason, scheduledAt: scheduledAt.toISOString() },
-        severity: 'critical',
-      },
-    }).catch(() => {});
+      const scheduledAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      await prisma.$executeRaw`
+        UPDATE "users" SET "scheduled_deletion_at" = ${scheduledAt}, "deletion_reason" = ${reason || null}
+        WHERE "id" = ${session.userId}`;
 
-    return NextResponse.json({ ok: true, message: 'Account scheduled for deletion in 30 days. You can cancel this at any time.', scheduledAt });
+      await prisma.session.updateMany({
+        where: { userId: session.userId, id: { not: session.sessionId || '' }, status: 'active' as any },
+        data: { status: 'revoked' as any, revokedAt: new Date() },
+      }).catch(() => {});
+
+      try { const { bustProfileCache } = await import('./authHandlers'); bustProfileCache(session.userId); } catch {}
+
+      const { sendTemplateEmail } = await import('./email');
+      sendTemplateEmail(user.email, 'account_deleted', {
+        name: user.name || user.email,
+        dateLabel: scheduledAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+        dashboardUrl: (await import('./app-urls')).getDashboardBaseUrl(),
+      }).catch(() => {});
+
+      await prisma.auditEvent.create({
+        data: {
+          actorId: session.userId,
+          action: 'account.delete-request',
+          targetType: 'user',
+          targetId: session.userId,
+          metadata: { reason, scheduledAt: scheduledAt.toISOString() },
+          severity: 'critical',
+        },
+      }).catch(() => {});
+
+      return NextResponse.json({ ok: true, step: 'verify', scheduledAt, message: 'Account scheduled for deletion in 30 days' });
+    }
+
+    return NextResponse.json({ error: 'Invalid step. Use "request" or "verify".' }, { status: 400 });
   } catch (err: any) {
     console.error('[DELETE ACCOUNT]', err?.message || err);
     return NextResponse.json({ error: 'Failed to process deletion request' }, { status: 500 });
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PROCESS SCHEDULED DELETIONS (hard-delete past scheduledDeletionAt)
+// ═══════════════════════════════════════════════════════════════════
+export async function processScheduledDeletions(): Promise<{ deleted: number }> {
+  const now = new Date();
+  const expired = await prisma.user.findMany({
+    where: { scheduledDeletionAt: { not: null, lte: now } },
+    select: { id: true, email: true, name: true },
+  });
+  if (!expired.length) return { deleted: 0 };
+
+  let deleted = 0;
+  for (const u of expired) {
+    try {
+      // Set deletedAt first so proxy blocks immediately
+      await prisma.user.update({
+        where: { id: u.id },
+        data: { deletedAt: now },
+      }).catch(() => {});
+
+      // Cascade-delete related data
+      await prisma.session.deleteMany({ where: { userId: u.id } });
+      await prisma.notification.deleteMany({ where: { userId: u.id } });
+      await prisma.securityEvent.deleteMany({ where: { userId: u.id } });
+      await prisma.login_history.deleteMany({ where: { userId: u.id } });
+      await prisma.auditEvent.deleteMany({ where: { actorId: u.id } });
+      await prisma.userTipLog.deleteMany({ where: { userId: u.id } }).catch(() => {});
+      await prisma.ticketMessage.deleteMany({ where: { authorId: u.id } }).catch(() => {});
+      await prisma.ticket.updateMany({ where: { customerId: u.id }, data: { customerId: null as any } }).catch(() => {});
+      await prisma.media.deleteMany({ where: { uploadedBy: u.id } }).catch(() => {});
+      await prisma.apiKey.deleteMany({ where: { userId: u.id } }).catch(() => {});
+      await prisma.email_logs.deleteMany({ where: { toEmail: u.email } }).catch(() => {});
+      await prisma.otp.deleteMany({ where: { userId: u.id } }).catch(() => {});
+      await prisma.blocklist.deleteMany({ where: { targetId: u.id } }).catch(() => {});
+
+      // Hard-delete the user
+      await prisma.user.delete({ where: { id: u.id } });
+      deleted++;
+      console.log(`[DELETION] Hard-deleted user ${u.id} (${u.email})`);
+    } catch (err: any) {
+      console.error(`[DELETION] Failed to hard-delete user ${u.id}:`, err?.message || err);
+    }
+  }
+  return { deleted };
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -1023,27 +1023,27 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           const escH = (s: string) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
           const checkIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>`;
-          const mailIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
+          const mailIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
 
           let bodyContent = '';
           if (euSuccess) {
             bodyContent = `
               <div style="margin-bottom:20px">${checkIcon}</div>
               <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribed</h1>
-              <p style="font-size:13px;color:#71717a;line-height:1.7;margin-bottom:0">You won't receive non-essential emails anymore.<br/>Security alerts are always sent.</p>`;
+              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:0">You won't receive non-essential emails anymore.<br/>Security alerts are always sent.</p>`;
           } else {
             bodyContent = `
               <div style="margin-bottom:20px">${mailIcon}</div>
               <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribe from emails</h1>
-              <p style="font-size:13px;color:#71717a;line-height:1.7;margin-bottom:28px">Enter your email to stop receiving non-essential emails.</p>
+              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:28px">Enter your email to stop receiving non-essential emails.</p>
               ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}
               <form method="POST" action="/api/emails/unsubscribe">
-                <input id="eu-email" type="email" name="email" placeholder="you@example.com" value="${escH(euPrefill)}" required autocomplete="email" style="width:100%;padding:11px 14px;background:#09090b;border:1px solid #27272a;border-radius:8px;font-size:14px;color:#fafafa;outline:none;transition:border-color .15s;margin-bottom:14px" onfocus="this.style.borderColor='#3f3f46'" onblur="this.style.borderColor='#27272a'" />
-                <button type="submit" style="width:100%;padding:11px;background:#fafafa;color:#000;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">Unsubscribe</button>
+                <input id="eu-email" type="email" name="email" placeholder="you@example.com" value="${escH(euPrefill)}" required autocomplete="email" style="width:100%;padding:11px 14px;background:#000000;border:1px solid #222222;border-radius:8px;font-size:14px;color:#ffffff;outline:none;transition:border-color .15s;margin-bottom:14px" onfocus="this.style.borderColor='#444444'" onblur="this.style.borderColor='#222222'" />
+                <button type="submit" style="width:100%;padding:11px;background:#ffffff;color:#000000;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">Unsubscribe</button>
               </form>`;
           }
 
-          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #18181b;font-size:11px;color:#3f3f46;line-height:1.7"><a href="https://tirbeo.app" style="color:#52525b;text-decoration:none">tirbeo.app</a></div></div></body></html>`;
+          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #111111;font-size:11px;color:#444444;line-height:1.7"><a href="https://tirbeo.app" style="color:#666666;text-decoration:none">tirbeo.app</a></div></div></body></html>`;
           resp = new NextResponse(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         } else {
           // POST — process email-based unsubscribe

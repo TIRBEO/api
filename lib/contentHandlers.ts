@@ -141,8 +141,8 @@ async function notifyAdminsOfCrash(event: any, data: {
   severity: string; source: string; userAgent: string | null;
 }) {
   try {
-    const { sendEmail } = await import('./email');
-    const admins = await prisma.admin.findMany({ select: { email: true } });
+    const { sendTemplateEmail } = await import('./email');
+    const admins = await prisma.user.findMany({ where: { adminRole: { not: null } }, select: { email: true } });
     if (!admins.length) return;
 
     const sevColor: Record<string, string> = { info: '#3b82f6', warning: '#f59e0b', error: '#ef4444', critical: '#7c3aed' };
@@ -150,13 +150,12 @@ async function notifyAdminsOfCrash(event: any, data: {
     const adminBase = process.env.ADMIN_URL || 'https://admin.tirbeo.app';
 
     for (const admin of admins) {
-      await sendEmail({
-        to: admin.email,
-        subject: `[Crash] ${data.severity.toUpperCase()}: ${data.type || 'Unknown Error'}`,
-        template: 'admin_crash_report',
-        variables: {
+      await sendTemplateEmail(
+        admin.email,
+        'admin_crash_report',
+        {
           severity: data.severity.toUpperCase(),
-          type: data.type || 'Unknown Error',
+          errorType: data.severity.toUpperCase(),
           message: data.message || 'No message',
           userEmail: data.userEmail,
           username: data.username,
@@ -167,8 +166,8 @@ async function notifyAdminsOfCrash(event: any, data: {
           eventId: event.id,
           timestamp: event.createdAt?.toISOString?.() || new Date().toISOString(),
           dashboardUrl: `${adminBase}/admin/operations/crashes`,
-        },
-      });
+        }
+      );
     }
   } catch {}
 }

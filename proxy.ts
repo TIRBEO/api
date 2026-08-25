@@ -380,19 +380,24 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
       const { prisma } = await import('./lib/db/prisma');
       const su = await prisma.user.findUnique({
         where: { id: String(tokenPayload.sub) },
-        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true, scheduledDeletionAt: true, deletedAt: true },
+        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true, scheduledDeletionAt: true, deletedAt: true, deletionReason: true },
       });
       if (su?.deletedAt) {
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_DELETED', deleted: true,
+          deletedAt: su.deletedAt?.toISOString() || null,
+          deletionReason: su.deletionReason || null,
           message: 'Your account has been deleted.',
         }, 403);
       } else if (su?.scheduledDeletionAt) {
-        const isCancel = pathname.includes('delete-account') && (method === 'DELETE' || url.searchParams.get('cancel') === '1');
-        if (!isCancel) {
+        const isRead = request.method === 'GET' || request.method === 'HEAD';
+        const safePaths = ['delete-account', 'auth/logout', 'auth/refresh', 'users/me', 'users/me/profile', 'users/me/preferences', 'notifications', 'users/me/security', 'export-data', 'email-config'];
+        const isAllowed = isRead || safePaths.some(p => pathname.includes(p));
+        if (!isAllowed) {
           statusResponse = jsonResponse(allowedOrigin, {
             error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true,
             scheduledAt: su.scheduledDeletionAt.toISOString(),
+            deletionReason: su.deletionReason || null,
             message: `Your account is scheduled for deletion on ${new Date(su.scheduledDeletionAt).toLocaleDateString()}. Cancel to regain access.`,
           }, 403);
         }
@@ -459,21 +464,25 @@ if (hasAuthHeader) {
         }, 403);
       }
       // Check banned/suspended inline (cached per-user, 30s TTL, max 2000 entries)
-      const _banCache: Map<string, { banned: boolean; suspended: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
+      const _banCache: Map<string, { banned: boolean; suspended: boolean; deleted: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
       const _bcKey = cachedPayload.sub;
       const _bcHit = _banCache.get(_bcKey);
       if (!_bcHit || Date.now() - _bcHit.ts > 30_000) {
         const { prisma } = await import('./lib/db/prisma');
-        const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { isBanned: true, isSuspended: true } });
+        const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { isBanned: true, isSuspended: true, deletedAt: true } });
         const banned = !!user?.isBanned;
         const suspended = !!user?.isSuspended;
-        _banCache.set(_bcKey, { banned, suspended, ts: Date.now() });
+        const deleted = !!user?.deletedAt;
+        _banCache.set(_bcKey, { banned, suspended, deleted, ts: Date.now() });
         if (_banCache.size > 2000) {
           const now = Date.now();
           for (const [k, v] of _banCache) { if (now - v.ts > 30_000) _banCache.delete(k); }
         }
+        if (deleted) return jsonResponse(allowedOrigin, { error: 'Account has been deleted' }, 403);
         if (banned) return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
         if (suspended) return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
+      } else if (_bcHit.deleted) {
+        return jsonResponse(allowedOrigin, { error: 'Account has been deleted' }, 403);
       } else if (_bcHit.banned) {
         return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
       } else if (_bcHit.suspended) {

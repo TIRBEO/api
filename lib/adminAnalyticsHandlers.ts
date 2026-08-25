@@ -126,7 +126,7 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
 
   // Enrich with login history summary for consented users
   const userIds = users.map(u => u.id);
-  const recentLogins = userIds.length ? await prisma.loginHistory.groupBy({
+  const recentLogins = userIds.length ? await prisma.login_history.groupBy({
     by: ['userId'],
     where: { userId: { in: userIds } },
     _count: { id: true },
