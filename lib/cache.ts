@@ -87,6 +87,9 @@ function createTtlCacheInternal<T>(ttlMs: number, max = 1000) {
     delete(key: string) {
       map.delete(key);
     },
+    deleteByPrefix(prefix: string) {
+      for (const k of map.keys()) if (k.startsWith(prefix)) map.delete(k);
+    },
     clear() {
       map.clear();
     },

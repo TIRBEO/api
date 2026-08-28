@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/lib/session';
 import { subscribeToPush, isPushConfigured, getVapidPublicKey } from '@/lib/push-notifications';
+import { hasConsent } from '@/lib/consent';
 
 export const runtime = 'nodejs';
 
@@ -22,6 +23,12 @@ export async function POST(request: NextRequest) {
 
     if (!isPushConfigured()) {
       return NextResponse.json({ error: 'Push notifications not configured' }, { status: 503 });
+    }
+
+    // Consent gate: check if user has opted into push notifications
+    const pushAllowed = await hasConsent(session.userId, 'analytics');
+    if (!pushAllowed) {
+      return NextResponse.json({ error: 'Push notifications not enabled in your privacy settings' }, { status: 403 });
     }
 
     const body: any = await request.json();

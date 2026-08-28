@@ -60,7 +60,7 @@ export async function sessionHandler(request: NextRequest) {
       },
     });
     if (!user) return jsonUnauthorized();
-    const adminRole = user.adminRole || null;
+    const adminRole = user.adminRole || undefined;
     const userData = {
       id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl,
       is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified,
@@ -159,10 +159,10 @@ function isTransientError(err: any): boolean {
          msg.includes('too many');
 }
 
-function getIp(request: NextRequest): string | null {
+function getIp(request: NextRequest): string | undefined {
   const xff = request.headers.get('x-forwarded-for');
   if (xff) return xff.split(',')[0].trim();
-  return request.headers.get('x-real-ip') || null;
+  return request.headers.get('x-real-ip') || undefined;
 }
 
 
@@ -202,6 +202,17 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
     discord: process.env.DISCORD_REDIRECT_URI,
   };
   const envUri = envMap[provider || ''];
+
+  // ── Local development: ALWAYS callback to localhost over http ──
+  // Never derive production URIs from *_DOMAIN env vars while developing.
+  if (!isProd) {
+    if (envUri && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(envUri)) return envUri;
+    const host = request.headers.get('host') || '';
+    if (/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) return `http://${host}/api${path}`;
+    console.warn(`[OAUTH:${provider}] Non-local host "${host}" in dev — forcing http://localhost:3000/api${path}`);
+    return `http://localhost:3000/api${path}`;
+  }
+
   if (envUri && !envUri.includes('localhost') && !envUri.includes('127.0.0.1')) return envUri;
 
   // 2. In production, if env var is localhost, override with the production domain
@@ -270,14 +281,15 @@ async function getOauthProviderConfig(provider: string): Promise<OauthProviderCo
   // OAuth providers are configured purely via environment variables.
   const keys = OAUTH_ENV_KEYS[provider];
   const rawUri = process.env[keys?.uri];
-  // In development, always ignore env redirect URIs — getDynamicRedirectUri
-  // will derive a localhost URI so the OAuth state cookie domain matches.
+  // In development, only allow localhost redirect URIs — getDynamicRedirectUri
+  // derives one otherwise so the OAuth state cookie domain matches.
   if (process.env.NODE_ENV !== 'production') {
+    const redirectUri = rawUri && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(rawUri) ? rawUri : undefined;
     return {
       enabled: !!process.env[keys?.id],
       clientId: process.env[keys?.id],
       clientSecret: process.env[keys?.secret],
-      redirectUri: undefined,
+      redirectUri,
     };
   }
   // Ignore localhost redirect URIs in production — let getDynamicRedirectUri handle it
@@ -745,7 +757,7 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ needsOtp: true });
     }
 
-    const adminRole = user.adminRole || null;
+    const adminRole = user.adminRole || undefined;
     const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
@@ -916,7 +928,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       return NextResponse.json({ needsPasswordChange: true, tempToken });
     }
 
-    const adminRole = user.adminRole || null;
+    const adminRole = user.adminRole || undefined;
     const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
@@ -3026,11 +3038,11 @@ export async function faqHandler(request: NextRequest) {
   const category = request.nextUrl.searchParams.get('category') || '';
   const search = request.nextUrl.searchParams.get('search') || '';
   const help = await helpConfigHandler(request);
-  const articles = (await help.json() as any).articles;
+  const articles: any[] = (await help.json() as any).articles;
   let filtered = articles;
-  if (category) filtered = filtered.filter(a => a.category === category);
-  if (search) filtered = filtered.filter(a => a.title.toLowerCase().includes(search.toLowerCase()) || a.content.toLowerCase().includes(search.toLowerCase()));
-  const categories = Array.from(new Set(articles.map(a => a.category)));
+  if (category) filtered = filtered.filter((a: any) => a.category === category);
+  if (search) filtered = filtered.filter((a: any) => a.title.toLowerCase().includes(search.toLowerCase()) || a.content.toLowerCase().includes(search.toLowerCase()));
+  const categories = Array.from(new Set(articles.map((a: any) => a.category)));
   return NextResponse.json({ articles: filtered, categories });
 }
 

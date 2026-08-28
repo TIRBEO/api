@@ -1,6 +1,7 @@
 import { prisma } from './db/prisma';
 import type { Prisma } from '@prisma/client';
 import { sendToUser } from './ws/server';
+import { hasConsent } from './consent';
 
 type Severity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -14,6 +15,26 @@ interface AuditInput {
 }
 
 export async function createAuditEvent(input: AuditInput) {
+  // Server-side consent check: skip audit logging if user opted out of analytics
+  if (input.actorId) {
+    const analyticsAllowed = await hasConsent(input.actorId, 'analytics');
+    if (!analyticsAllowed) {
+      // Still create the audit event (it's a security record), but skip WebSocket broadcast
+      // The event is stored for compliance but not surfaced in real-time
+      await prisma.auditEvent.create({
+        data: {
+          actorId: input.actorId || null,
+          action: input.action,
+          targetType: input.targetType || null,
+          targetId: input.targetId || null,
+          metadata: (input.metadata || {}) as Prisma.InputJsonValue,
+          severity: input.severity || 'info',
+        },
+      });
+      return;
+    }
+  }
+
   const event = await prisma.auditEvent.create({
     data: {
       actorId: input.actorId || null,
@@ -25,7 +46,7 @@ export async function createAuditEvent(input: AuditInput) {
     },
   });
 
-  // Send real-time WebSocket notification to the user
+  // Send real-time WebSocket notification to the user (only if analytics consented)
   if (input.actorId) {
     try {
       sendToUser(input.actorId, {

@@ -5,7 +5,7 @@ interface RateLimitHit {
   timestamp: number;
 }
 
-const hitHistory = (globalThis as any).__suspiciousActivity ?? new Map<string, RateLimitHit[]>();
+const hitHistory: Map<string, RateLimitHit[]> = (globalThis as any).__suspiciousActivity ?? new Map<string, RateLimitHit[]>();
 (globalThis as any).__suspiciousActivity = hitHistory;
 
 export function recordRateLimitHit(ip: string): void {

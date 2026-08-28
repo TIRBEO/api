@@ -431,7 +431,7 @@ export function startWsServer(port: number): WebSocketServer {
     }
     
     const clientId = crypto.randomUUID();
-    let userId: string | null = null;
+    let userId: string | undefined = undefined;
     let email: string = 'unknown';
     let authenticated = false;
 
@@ -445,16 +445,16 @@ export function startWsServer(port: number): WebSocketServer {
             ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid token' }));
             return;
           }
-          userId = session.userId;
-          email = session.email;
+          userId = session.userId ?? undefined;
+          email = session.email ?? 'unknown';
           authenticated = true;
 
           const adminRole = (session as any).adminRole;
-          clients.set(clientId, { ws, userId, email, alive: true, adminRole });
-          if (!userConnections.has(userId)) userConnections.set(userId, new Set());
-          userConnections.get(userId)!.add(clientId);
+          clients.set(clientId, { ws, userId: userId!, email, alive: true, adminRole });
+          if (!userConnections.has(userId!)) userConnections.set(userId!, new Set());
+          userConnections.get(userId!)!.add(clientId);
 
-          ws.send(JSON.stringify({ type: 'auth_ok', userId, adminRole }));
+          ws.send(JSON.stringify({ type: 'auth_ok', userId: userId!, adminRole }));
           return;
         }
 

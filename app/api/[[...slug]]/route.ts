@@ -72,6 +72,7 @@ import {
   mergeAccountsHandler,
   userActivityHandler,
   preferencesHandler,
+  consentHistoryHandler,
   setPasswordHandler,
   requestProfileEditOtpHandler,
   verifyProfileEditOtpHandler,
@@ -158,6 +159,7 @@ import {
   ticketMessageHandler, ticketAssignHandler, ticketCloseHandler, ticketReopenHandler,
   ticketAppealsHandler, ticketAppealUnblockHandler,
   ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
+  ticketAttachmentDownloadHandler,
   ticketMarkReadHandler,
 } from '../../../lib/supportHandlers';
 
@@ -209,7 +211,7 @@ const INTERNAL_ROUTES = [
   'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
   'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences',
+  'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
   'emails', 'emails/unsubscribe', 'pushes',
@@ -227,8 +229,8 @@ const INTERNAL_ROUTES = [
   // connected-accounts removed — OAuth IDs stored on users table directly
   'user/export-data', 'user/delete-account', 'profile/public',
   'content/incident-events', 'content/health', 'content/jobs', 'content/jobs/create', 'content/retry-job',
-  'support/tickets/[id]/read', 'support/tickets/[id]/attachments',
-   'auth/cli-token',
+  'support/tickets/[id]/read', 'support/tickets/[id]/attachments', 'support/tickets/[id]/attachments/[attachmentId]',
+    'auth/cli-token',
    'waitlist',
    'feedback',
    'chat',
@@ -344,6 +346,11 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
     }
   }
 
+  // Handle support/tickets/{id}/attachments/{attachmentId} — signed download (auth + Content-Disposition)
+  if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[3] === 'attachments') {
+    return { path: 'support/tickets/[id]/attachments/[attachmentId]', method, internal: true, allowedRoles: ['guest'], meta: { ticketId: slug[2], attachmentId: slug[4] } };
+  }
+
   // Handle support/tickets/{id}/messages, reply, read, assign, close, reopen, attachments
   if (slug.length === 4 && slug[0] === 'support' && slug[1] === 'tickets') {
     const action = slug[3];
@@ -451,6 +458,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
 
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
+      'consent-history': ['GET'],
       'admin/heartbeat': ['POST'],
       'email/config': ['GET', 'PATCH'],
       'email/templates': ['GET', 'POST'],
@@ -510,6 +518,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'support/tickets/create': ['POST'],
       'support/tickets/[id]/read': ['POST'],
       'support/tickets/[id]/attachments': ['GET', 'POST'],
+      'support/tickets/[id]/attachments/[attachmentId]': ['GET'],
       'support/tickets/appeals': ['GET'],
 
 
@@ -894,6 +903,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'preferences':
         resp = await preferencesHandler(request);
+        break;
+      case 'consent-history':
+        resp = await consentHistoryHandler(request);
         break;
       case 'admin/heartbeat':
         resp = await heartbeatHandler(request);
@@ -1287,6 +1299,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         if (method === 'GET') resp = await ticketAttachmentsListHandler(request, (route as any).meta.ticketId);
         else if (method === 'POST') resp = await ticketAttachmentsUploadHandler(request, (route as any).meta.ticketId);
         else resp = new NextResponse('Method not allowed', { status: 405 });
+        break;
+      case 'support/tickets/[id]/attachments/[attachmentId]':
+        resp = await ticketAttachmentDownloadHandler(request, (route as any).meta.ticketId, (route as any).meta.attachmentId);
         break;
       case 'support/queues':
       case 'support/queues/create':

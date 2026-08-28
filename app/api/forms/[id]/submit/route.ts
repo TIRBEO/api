@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db/prisma';
-import { sendEmail, renderTemplate, escapeHtml } from '@/lib/email';
+import { sendEmail, sendTemplateEmail, renderTemplate, escapeHtml } from '@/lib/email';
 
 // POST /api/forms/:id/submit — Public form submission
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -138,31 +138,34 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
             }
           }
 
-          // Default auto-reply if no custom body
-          const defaultSubject = `Thanks for submitting to ${form.name}`;
-          const defaultBody = `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:24px">
-  <h2 style="color:#09090b;margin-bottom:16px">Thank you!</h2>
-  <p style="color:#444444;line-height:1.6">We received your submission to <strong>${escapeHtml(form.name)}</strong>.</p>
-  <div style="background:#f4f4f5;border-radius:8px;padding:16px;margin:16px 0">
-    ${form.fields.filter((f: any) => f.type !== 'hidden' && !f.hidden).map((f: any) => {
-      const val = submissionData[f.name];
-      return val ? `<p style="margin:4px 0"><strong>${escapeHtml(f.label)}:</strong> ${escapeHtml(String(val))}</p>` : '';
-    }).filter(Boolean).join('\n    ')}
-  </div>
-  <p style="color:#666666;font-size:13px;margin-top:24px">Submission ID: ${submission.id}</p>
-</div>`;
+          // Shared row builder — one styled <p> per answered field
+          const rowsHtml = form.fields
+            .filter((f: any) => f.type !== 'hidden' && !f.hidden)
+            .map((f: any) => {
+              const val = submissionData[f.name];
+              return val ? `<p style="margin:0 0 8px;font-size:14px;color:#9a9a9a;line-height:22px;"><strong style="color:#ffffff;">${escapeHtml(f.label)}:</strong> ${escapeHtml(String(val))}</p>` : '';
+            })
+            .filter(Boolean).join('');
 
-          const subject = form.autoReplySubject
-            ? renderTemplate(form.autoReplySubject, vars)
-            : defaultSubject;
-          const body = form.autoReplyBody
-            ? renderTemplate(form.autoReplyBody, vars)
-            : defaultBody;
+          const submittedAtStr = new Date().toLocaleString();
 
-          // Send asynchronously (don't block the response)
-          sendEmail(submitterEmail, subject, body, {
-            templateName: 'form_auto_reply',
-          }).catch((e: any) => console.error('[FORMS] Auto-reply email failed:', e?.message));
+          if (form.autoReplySubject || form.autoReplyBody) {
+            // Custom auto-reply copy supplied by the form owner
+            const subject = renderTemplate(form.autoReplySubject || `Thanks for submitting to ${form.name}`, vars);
+            const body = renderTemplate(form.autoReplyBody || '', vars);
+            sendEmail(submitterEmail, subject, body, {
+              templateName: 'form_auto_reply',
+            }).catch((e: any) => console.error('[FORMS] Auto-reply email failed:', e?.message));
+          } else {
+            // Default themed auto-reply
+            sendTemplateEmail(submitterEmail, 'form_auto_reply', {
+              formTitle: form.name,
+              fieldsRows: rowsHtml,
+              submissionId: submission.id,
+              submittedAt: submittedAtStr,
+            }, { rawVars: ['fieldsRows'] })
+              .catch((e: any) => console.error('[FORMS] Auto-reply email failed:', e?.message));
+          }
         }
       } catch (e: any) {
         console.error('[FORMS] Auto-reply error:', e?.message);
@@ -196,32 +199,22 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
           .filter((f: any) => f.type !== 'hidden' && !f.hidden)
           .map((f: any) => {
             const val = submissionData[f.name];
-            return val ? `<tr><td style="padding:8px 12px;font-weight:500;color:#333333;border-bottom:1px solid #e0e0e0;width:140px;vertical-align:top">${escapeHtml(f.label)}</td><td style="padding:8px 12px;color:#000000;border-bottom:1px solid #e0e0e0">${escapeHtml(String(val))}</td></tr>` : '';
+            return val ? `<p style="margin:0 0 8px;font-size:14px;color:#9a9a9a;line-height:22px;"><strong style="color:#ffffff;">${escapeHtml(f.label)}:</strong> ${escapeHtml(String(val))}</p>` : '';
           }).filter(Boolean).join('');
 
-        const notifyBody = `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#ffffff">
-  <div style="border-bottom:2px solid #09090b;padding-bottom:16px;margin-bottom:24px">
-    <h1 style="margin:0;font-size:20px;font-weight:600;color:#09090b">New form submission</h1>
-    <p style="margin:4px 0 0;color:#555555;font-size:14px">${escapeHtml(form.name)}</p>
-  </div>
-  <table style="width:100%;border-collapse:collapse;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
-    ${fieldRows}
-  </table>
-  <div style="margin-top:20px;padding:12px 16px;background:#f0f0f0;border-radius:8px;font-size:12px;color:#555555">
-    <p style="margin:0">Submission ID: <code style="background:#e0e0e0;padding:2px 6px;border-radius:4px">${submission.id}</code></p>
-    <p style="margin:4px 0 0">Time: ${new Date().toLocaleString()}${ip ? ` · IP: ${escapeHtml(ip)}` : ''}</p>
-  </div>
-  <div style="margin-top:16px;text-align:center">
-    <a href="${process.env.NEXT_PUBLIC_DASHBOARD_URL || 'http://localhost:3004'}/forms/${form.id}" style="display:inline-block;padding:10px 20px;background:#09090b;color:#ffffff;text-decoration:none;border-radius:6px;font-size:14px;font-weight:500">View submission</a>
-  </div>
-</div>`;
-
-        // Send to all notification recipients
+        // Send to all notification recipients via the themed template
         for (const email of notifyEmails) {
           if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            sendEmail(email, subject, notifyBody, {
+            sendTemplateEmail(email, 'form_submission_notification', {
+              formTitle: form.name,
+              fieldRows: fieldRows,
+              submissionId: submission.id,
+              submittedAt: new Date().toLocaleString(),
+              ip: ip || 'Unknown',
+              viewUrl: `${process.env.NEXT_PUBLIC_DASHBOARD_URL || 'http://localhost:3004'}/forms/${form.id}`,
+            }, {
+              rawVars: ['fieldRows'],
               replyTo: form.replyToEmail || undefined,
-              templateName: 'form_submission_notification',
             }).catch((e: any) => console.error('[FORMS] Notification email failed:', e?.message));
           }
         }

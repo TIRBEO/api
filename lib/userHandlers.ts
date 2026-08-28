@@ -25,8 +25,12 @@ const notificationsCache = createTtlCache<{ notifications: any[]; unread: number
 const inFlightNotifications = new Map<string, Promise<{ notifications: any[]; unread: number; total: number }>>();
 
 export function bustNotificationsCache(userId: string) {
-  notificationsCache.clear();
-  inFlightNotifications.clear();
+  // Per-user bust — keep other users' cache hot for fast reads
+  const prefix = `notif:${userId}:`;
+  (notificationsCache as any).deleteByPrefix?.(prefix);
+  // Fallback if deleteByPrefix missing (old cache)
+  if (!(notificationsCache as any).deleteByPrefix) notificationsCache.clear();
+  for (const k of Array.from(inFlightNotifications.keys())) if (k.startsWith(prefix)) inFlightNotifications.delete(k);
 }
 
 // Cache for GET /api/preferences — dashboard polls this on every page load.
@@ -747,15 +751,25 @@ export async function preferencesHandler(request: NextRequest) {
         if (typeof body.privacy.allowCrashReports === 'boolean') newConsents.allowCrashReports = body.privacy.allowCrashReports;
         newConsents.updatedAt = new Date().toISOString();
         update.consents = newConsents;
-        // Record consent change in audit log
+        // Record consent change in audit log with full details
         prisma.auditEvent.create({
           data: {
             actorId: session.userId,
             action: 'consent.updated',
             targetType: 'user',
             targetId: session.userId,
-            metadata: { privacy: body.privacy, previous: { allowAnalytics: currentConsents.allowAnalytics, allowCrashReports: currentConsents.allowCrashReports } },
+            metadata: {
+              privacy: body.privacy,
+              previous: {
+                allowAnalytics: currentConsents.allowAnalytics ?? null,
+                allowCrashReports: currentConsents.allowCrashReports ?? null,
+              },
+              changedAt: new Date().toISOString(),
+              changedFields: Object.keys(body.privacy).filter(k => typeof body.privacy[k] === 'boolean'),
+            },
             severity: 'info',
+            ipAddress: (request as any)?.headers?.get?.('x-forwarded-for')?.split(',')[0]?.trim() || (request as any)?.headers?.get?.('x-real-ip') || null,
+            userAgent: (request as any)?.headers?.get?.('user-agent')?.slice(0, 200) || null,
           },
         }).catch(() => {});
       }
@@ -1180,5 +1194,78 @@ export async function publicProfileHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[PUBLIC PROFILE]', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch profile' }, { status: 500 });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CONSENT HISTORY HANDLER — GET /api/consent-history
+// Returns all consent change events for the current user
+// ═══════════════════════════════════════════════════════════════════
+export async function consentHistoryHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
+    const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
+
+    const [events, total] = await Promise.all([
+      prisma.auditEvent.findMany({
+        where: {
+          actorId: session.userId,
+          action: 'consent.updated',
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        select: {
+          id: true,
+          action: true,
+          metadata: true,
+          ipAddress: true,
+          userAgent: true,
+          createdAt: true,
+        },
+      }),
+      prisma.auditEvent.count({
+        where: {
+          actorId: session.userId,
+          action: 'consent.updated',
+        },
+      }),
+    ]);
+
+    // Format events for frontend consumption
+    const formattedEvents = events.map((event: any) => {
+      const meta = (event.metadata as Record<string, any>) || {};
+      const previous = meta.previous || {};
+      const current = meta.privacy || {};
+      const changedFields = meta.changedFields || [];
+
+      return {
+        id: event.id,
+        timestamp: event.createdAt.toISOString(),
+        ipAddress: event.ipAddress,
+        userAgent: event.userAgent,
+        changes: changedFields.map((field: string) => ({
+          field,
+          oldValue: previous[field] ?? null,
+          newValue: current[field] ?? null,
+        })),
+        previous,
+        current,
+      };
+    });
+
+    return NextResponse.json({
+      events: formattedEvents,
+      total,
+      limit,
+      offset,
+    });
+  } catch (err: any) {
+    console.error('[CONSENT HISTORY]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to fetch consent history' }, { status: 500 });
   }
 }

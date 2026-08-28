@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/lib/session';
 import { prisma } from '@/lib/db/prisma';
+import { checkRateLimit } from '@/lib/notifications';
 
 export const runtime = 'nodejs';
 
@@ -63,6 +64,12 @@ export async function PUT(request: NextRequest) {
   try {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
+
+    // Per-user rate-limit: 20 prefs updates/min (matrix has 7 toggles + digest)
+    const { allowed, remaining } = await checkRateLimit(`prefs:${session.userId}`, 20, 60);
+    if (!allowed) {
+      return NextResponse.json({ error: 'Too many updates — try in 60s' }, { status: 429, headers: { 'Retry-After': '60', 'X-RateLimit-Remaining': String(remaining) } });
+    }
 
     const body: any = await request.json();
 

@@ -43,7 +43,7 @@ export async function POST(request: NextRequest) {
         message: 'A user without admin privileges attempted to access the admin panel.',
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
         dashboardUrl: 'https://admin.tirbeo.app',
-      }).catch(() => {});
+      }, { rawVars: ['details'] }).catch(() => {});
       return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
     }
 

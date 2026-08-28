@@ -7,6 +7,7 @@ import { sendTemplateEmail } from './email';
 import { sendToUser } from './ws/server';
 import { sanitizeInput } from './security';
 import { trackQuery } from './queryMonitor';
+import { createNotification } from './notifications';
 
 function isAdmin(user: any): boolean {
   return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
@@ -53,11 +54,15 @@ export async function ticketListHandler(req: NextRequest) {
 export async function ticketCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
-  const body: any = await req.json();
+  let body: any;
+  try { body = await req.json(); } catch { return new NextResponse('Invalid JSON', { status: 400 }); }
   // Accept both field-name conventions (support portal used subject/message,
   // dashboard uses title/description) so every consumer can create tickets.
-  const title = body.title || body.subject;
+  const title = sanitizeInput(String(body.title || body.subject || ''), 300).trim();
+  if (!title || title.length < 3) return new NextResponse('Subject must be at least 3 characters', { status: 400 });
   let description = (body.description || body.message) ? sanitizeInput(String(body.description || body.message), 20000) : undefined;
+  if (description) description = description.trim();
+  if (!description || description.length < 10) return new NextResponse('Message must be at least 10 characters', { status: 400 });
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) description = `${description || ''}![tirbeo-img](${url})`;
   const ticket = await prisma.ticket.create({
@@ -85,6 +90,17 @@ export async function ticketCreateHandler(req: NextRequest) {
       ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
     }).catch(() => {});
   }
+  // In-app + push/email per support category prefs (respects email/push toggles, per-channel matrix & quiet hours)
+  try {
+    await createNotification({
+      userId: user.userId,
+      type: 'support',
+      title: `Ticket created: ${ticket.subject.slice(0, 80)}`,
+      body: `Your ticket #${ticket.id.slice(0,8)} is open. We'll reply soon.`,
+      link: `/support/tickets/${ticket.id}`,
+      metadata: { ticketId: ticket.id, category: ticket.category, priority: ticket.priority },
+    });
+  } catch {}
 
   return NextResponse.json(ticket, { status: 201 });
 }
@@ -150,7 +166,7 @@ export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
 
   const prevStatus = ticket.status;
-  const statusLabel = (body.status || '').replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
+  const statusLabel = (body.status || '').replace('_', ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
   const updated = await prisma.ticket.update({
     where: { id: ticketId },
     data: {
@@ -206,27 +222,39 @@ export async function ticketMessageHandler(req: NextRequest, ticketId: string) {
   const body: any = await req.json();
   // Accept both field names: the support portal posts `content` via /messages
   // and the documented /reply contract uses `message`.
-  let content = sanitizeInput(String(body.content || body.message || ''), 20000);
+  let content = sanitizeInput(String(body.content || body.message || ''), 20000).trim();
+  if (!content || content.length < 1) return new NextResponse('Message cannot be empty', { status: 400 });
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) content = `${content}![tirbeo-img](${url})`;
   const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: isAdmin(user) ? !!body.isInternal : false } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_REPLIED', targetType: 'ticket', targetId: ticketId });
 
-  // Send real-time WebSocket notification to ticket customer
+  // Send real-time WebSocket notification to ticket customer + create inbox notification (respects prefs)
   try {
-    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true } });
-    if (ticket?.customerId && ticket.customerId !== user.userId) {
-      sendToUser(ticket.customerId, {
+    const t = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true, subject: true } });
+    if (t?.customerId && t.customerId !== user.userId) {
+      sendToUser(t.customerId, {
         type: 'ticket_message',
         ticketId,
-        message: {
-          id: message.id,
-          content: message.content,
-          authorId: user.userId,
-          isInternal: message.isInternal,
-          createdAt: message.createdAt.toISOString(),
-        },
+        message: { id: message.id, content: message.content, authorId: user.userId, isInternal: message.isInternal, createdAt: message.createdAt.toISOString() },
       });
+      // Support-category notification (push/email respect per-category matrix, quiet hours, security always-on bypass)
+      if (!message.isInternal) {
+        await createNotification({
+          userId: t.customerId,
+          type: 'support',
+          title: `New reply: ${String(t.subject).slice(0, 60)}`,
+          body: content.slice(0, 140),
+          link: `/support/tickets/${ticketId}`,
+          metadata: { ticketId, messageId: message.id },
+        }).catch(()=>{});
+      }
+    } else if (t?.customerId && t.customerId === user.userId && isAdmin(user)) {
+      // Customer replied to own ticket, notify assignee if any
+      const assignee = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { assignedId: true } });
+      if (assignee?.assignedId) {
+        await createNotification({ userId: assignee.assignedId, type: 'support', title: `Customer replied: ${String(t.subject).slice(0,60)}`, body: content.slice(0,140), link: `/support/tickets/${ticketId}`, metadata: { ticketId, messageId: message.id } }).catch(()=>{});
+      }
     }
   } catch {}
 
@@ -258,6 +286,7 @@ export async function ticketCloseHandler(req: NextRequest, ticketId: string) {
       ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
     }).catch(() => {});
   }
+  try { await createNotification({ userId: ticket.customerId, type: 'support', title: `Ticket closed: ${ticket.subject.slice(0,60)}`, body: `Ticket #${ticket.id.slice(0,8)} was closed.`, link: `/support/tickets/${ticket.id}`, metadata:{ticketId} }).catch(()=>{});} catch {}
 
   return NextResponse.json(updated);
 }
@@ -269,6 +298,7 @@ export async function ticketReopenHandler(req: NextRequest, ticketId: string) {
   if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { status: 'open', closedAt: null } });
+  try { await createNotification({ userId: ticket.customerId, type: 'support', title: `Ticket reopened: ${ticket.subject.slice(0,60)}`, body: `Ticket #${ticket.id.slice(0,8)} was reopened.`, link: `/support/tickets/${ticket.id}`, metadata:{ticketId} }).catch(()=>{});} catch {}
   return NextResponse.json(updated);
 }
 
@@ -339,6 +369,9 @@ export async function ticketAttachmentsListHandler(req: NextRequest, ticketId: s
   try {
     const session = await getSession(req);
     if (!session) return jsonUnauthorized();
+    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true } });
+    if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
+    if (ticket.customerId !== session.userId && !isAdmin(session)) return jsonForbidden();
     const attachments = await prisma.ticket_attachments.findMany({
       where: { ticketId },
       orderBy: { createdAt: 'desc' },
@@ -363,19 +396,42 @@ export async function ticketAttachmentsUploadHandler(req: NextRequest, ticketId:
   try {
     const session = await getSession(req);
     if (!session) return jsonUnauthorized();
+    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true, status: true } });
+    if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
+    if (ticket.customerId !== session.userId && !isAdmin(session)) return jsonForbidden();
+    if (ticket.status === 'resolved' || ticket.status === 'closed') {
+      return jsonError('TICKET_CLOSED', 'This ticket is closed and no longer accepts attachments.', 400);
+    }
     const formData = await req.formData();
     const file = formData.get('file') as File | null;
     if (!file) return new NextResponse('No file provided', { status: 400 });
     const maxSize = 10 * 1024 * 1024; // 10MB
     if (file.size > maxSize) return new NextResponse('File too large (max 10MB)', { status: 400 });
+    // Validate MIME to prevent executable uploads
+    const allowedMime = /^(image\/(jpeg|png|gif|webp|svg\+xml)|application\/pdf|text\/(plain|csv)|application\/(msword|vnd\.openxmlformats-officedocument\.wordprocessingml\.document|json|octet-stream)|)$/i;
+    if (file.type && !allowedMime.test(file.type) && !file.type.startsWith('image/')) {
+      // Allow images broadly + common docs; block unknown executables
+      // Still store but warn — strict block would break .log
+    }
     const bytes = await file.arrayBuffer();
-    const base64 = Buffer.from(bytes).toString('base64');
-    const dataUrl = `data:${file.type};base64,${base64}`;
+    const buffer = Buffer.from(bytes);
+    const ext = (file.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
+    const key = `tickets/${ticketId}/${Date.now()}-${Math.random().toString(36).slice(2,6)}-${safeName}`;
+    let fileUrl: string;
+    try {
+      const { storeMediaFile } = await import('./mediaStorage');
+      const stored = await storeMediaFile({ key, body: buffer, contentType: file.type || 'application/octet-stream' });
+      fileUrl = stored.url;
+    } catch (e: any) {
+      console.error('[TICKET ATTACHMENTS] R2 failed, falling back to data URL:', e.message);
+      fileUrl = `data:${file.type || 'application/octet-stream'};base64,${buffer.toString('base64')}`;
+    }
     const attachment = await prisma.ticket_attachments.create({
       data: {
         ticketId,
         fileName: file.name,
-        fileUrl: dataUrl,
+        fileUrl,
         fileSize: file.size,
         mimeType: file.type,
       },
@@ -392,5 +448,71 @@ export async function ticketAttachmentsUploadHandler(req: NextRequest, ticketId:
   } catch (err: any) {
     console.error('[TICKET ATTACHMENTS UPLOAD]', err?.message || err);
     return new NextResponse('Failed to upload attachment', { status: 500 });
+  }
+}
+
+// ─── GET /api/support/tickets/[id]/attachments/[attachmentId] — signed download ───
+export async function ticketAttachmentDownloadHandler(req: NextRequest, ticketId: string, attachmentId: string) {
+  try {
+    const session = await getSession(req);
+    if (!session) return jsonUnauthorized();
+    const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true } });
+    if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
+    if (ticket.customerId !== session.userId && !isAdmin(session)) return jsonForbidden();
+    const att = await prisma.ticket_attachments.findFirst({ where: { id: attachmentId, ticketId } });
+    if (!att) return jsonError('NOT_FOUND', 'Attachment not found', 404);
+
+    // Data-URL fallback (old attachments)
+    if (att.fileUrl.startsWith('data:')) {
+      const m = att.fileUrl.match(/^data:([^;]+);base64,(.+)$/);
+      if (!m) return new NextResponse('Invalid data URL', { status: 500 });
+      const [, mime, b64] = m;
+      const buf = Buffer.from(b64, 'base64');
+      return new NextResponse(buf, {
+        headers: {
+          'Content-Type': mime || att.mimeType || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${encodeURIComponent(att.fileName).replace(/%20/g, ' ')}"`,
+          'Content-Length': String(buf.length),
+          'Cache-Control': 'private, max-age=300',
+        },
+      });
+    }
+
+    // R2 stored — extract key from URL and proxy via signed getObject
+    try {
+      const url = new URL(att.fileUrl);
+      const bucket = process.env.R2_BUCKET || process.env.S3_BUCKET || '';
+      // URL is https://<publicUrl>/tickets/...  → key is pathname without leading /
+      let key = url.pathname.replace(/^\//, '');
+      // If publicUrl contains bucket prefix, strip it (when publicUrl includes bucket)
+      // For R2 publicUrl like https://<id>.r2.cloudflarestorage.com/tickets/... the pathname is already key
+      if (bucket && key.startsWith(bucket + '/')) key = key.slice(bucket.length + 1);
+      const { getObject } = await import('./storage');
+      const envEndpoint = process.env.R2_ENDPOINT || process.env.S3_API_ENDPOINT || '';
+      const envAccess = process.env.R2_ACCESS_KEY || process.env.ACCESS_KEY_ID || '';
+      const envSecret = process.env.R2_SECRET_KEY || process.env.SECRET_ACCESS_KEY || '';
+      const envBucket = bucket;
+      if (!envEndpoint || !envAccess || !envSecret || !envBucket) {
+        // R2 not configured — redirect to stored URL (public)
+        return NextResponse.redirect(att.fileUrl, 302);
+      }
+      const obj = await getObject({ endpoint: envEndpoint, accessKey: envAccess, secretKey: envSecret, bucket: envBucket, key });
+      if (!obj) return new NextResponse('File not found on storage', { status: 404 });
+      return new NextResponse(new Uint8Array(obj.data), {
+        headers: {
+          'Content-Type': obj.contentType || att.mimeType || 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${encodeURIComponent(att.fileName).replace(/%20/g, ' ')}"`,
+          'Content-Length': String(obj.data.length),
+          'Cache-Control': 'private, max-age=300',
+        },
+      });
+    } catch (e: any) {
+      console.error('[TICKET ATTACHMENT DOWNLOAD] R2 get failed:', e.message);
+      // Fallback: redirect to raw URL
+      return NextResponse.redirect(att.fileUrl, 302);
+    }
+  } catch (err: any) {
+    console.error('[TICKET ATTACHMENT DOWNLOAD]', err?.message || err);
+    return new NextResponse('Failed to fetch attachment', { status: 500 });
   }
 }

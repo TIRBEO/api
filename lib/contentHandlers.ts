@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from './db/prisma';
 import { getSession, requireAdmin } from './session';
 import { jsonUnauthorized, jsonForbidden, jsonError, jsonTooManyRequests } from './response';
+import { hasConsent } from './consent';
 
 // ─── Incident events (crash / error receiver) ─────────────────────
 // Single consolidated table. Client crash reports are accepted from
@@ -65,18 +66,19 @@ export async function incidentEventsCreateHandler(req: NextRequest) {
   if (!session) return jsonUnauthorized();
 
   // Consent gate: crash reports only leave the browser if the user opted in.
-  let consents: any = null;
+  const crashAllowed = await hasConsent(session.userId, 'crashReports');
+  if (!crashAllowed) {
+    return jsonError('CRASH_REPORTS_DISABLED', 403);
+  }
+
+  // Fetch user info for admin notification
   let user: any = null;
   try {
     user = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { consents: true, email: true, username: true },
+      select: { email: true, username: true },
     });
-    consents = (user as any)?.consents ?? null;
   } catch {}
-  if (!consents?.allowCrashReports) {
-    return jsonError('CRASH_REPORTS_DISABLED', 403);
-  }
 
   // Light abuse guard
   const recent = await prisma.incident_events.count({

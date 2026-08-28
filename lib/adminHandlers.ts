@@ -500,7 +500,7 @@ export async function adminMaintenanceHandler(request: NextRequest) {
     if (typeof enabled !== 'boolean') {
       return NextResponse.json({ error: 'enabled (boolean) is required' }, { status: 400 });
     }
-    setMaintenanceMode(enabled, message, estimatedEnd, allowedUsers, scheduledStart, scheduledEnd);
+    setMaintenanceMode(enabled, message, estimatedEnd ?? undefined, allowedUsers, scheduledStart, scheduledEnd);
     createAuditEvent({
       action: enabled ? 'maintenance.enabled' : 'maintenance.disabled',
       actorId: session.userId,

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAdmin } from '../../../../../lib/session';
-import { sendEmail } from '../../../../../lib/email';
+import { sendTemplateEmail } from '../../../../../lib/email';
 
 export async function POST(request: NextRequest) {
   const session = await requireAdmin(request);
@@ -11,11 +11,7 @@ export async function POST(request: NextRequest) {
 
   if (!to) return NextResponse.json({ error: 'Missing recipient email' }, { status: 400 });
 
-  const result = await sendEmail(
-    to,
-    'Test Email from Tirbeo Admin',
-    "<h2>Test Email</h2><p>If you're reading this, your email configuration works!</p><p>Sent from <strong>Tirbeo Admin</strong></p>"
-  );
+  const result = await sendTemplateEmail(to, 'admin_test', { sentFor: 'Tirbeo Admin' });
 
   if (result.success) return NextResponse.json({ ok: true, messageId: result.messageId });
   return NextResponse.json({ error: result.error }, { status: 500 });

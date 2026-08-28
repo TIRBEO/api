@@ -67,9 +67,11 @@ function injectTracking(htmlBody: string, logId: string, templateName?: string):
   const base = getApiOrigin();
   let html = htmlBody;
 
-  // Open tracking pixel (skip OTP-style emails where images are usually blocked)
-  if (!templateName || !TRACKED_TEMPLATES_WITHOUT_PIXEL.has(templateName)) {
-    const pixel = `<img src="${base}/api/e/o/${logId}" width="1" height="1" alt="" style="display:none;border:0;" />`;
+  // Open tracking pixel — disabled for now: the 1×1 hidden image triggers
+  // Gmail's "Show trimmed content ..." inside the email (Image 1) and
+  // contributes to clipping. Re-enable with a visible tracking method later.
+  if (false && templateName && !TRACKED_TEMPLATES_WITHOUT_PIXEL.has(templateName!)) {
+    const pixel = `<img src="${base}/api/e/o/${logId}" width="1" height="1" alt="" style="border:0;" />`;
     html = html.includes('</body>') ? html.replace('</body>', `${pixel}</body>`) : html + pixel;
   }
   return html;
@@ -301,7 +303,7 @@ export async function sendTemplateEmail(
   const rawKeys = new Set([...(options?.rawVars || []), 'unsubscribeSection']);
   const branding = await getBranding();
   const logoUrl = branding.logoUrl;
-  const mergedVars = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
+  const mergedVars: Record<string, string> = { ...variables, logoUrl, brandName: branding.brandName, brandTagline: branding.brandTagline };
 
   // ─── Unsubscribe URLs ───
   // Essential/security emails NEVER get unsubscribe links — they are compulsory.
@@ -313,7 +315,7 @@ export async function sendTemplateEmail(
     if (!isEssential) {
       mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
       mergedVars['managePreferencesUrl'] = `${apiBase}/api/emails/unsubscribe`;
-      mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#555555"><a href="${apiBase}/api/emails/unsubscribe" style="color:#555555;text-decoration:underline;">Unsubscribe</a></p>`;
+      mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#4d4d4d"><a href="${apiBase}/api/emails/unsubscribe" style="color:#4d4d4d;text-decoration:underline;">Unsubscribe</a></p>`;
     } else {
       mergedVars['unsubscribeUrl'] = '';
       mergedVars['unsubscribeSection'] = '';
@@ -322,66 +324,58 @@ export async function sendTemplateEmail(
   } catch {
     const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
     mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
-    mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#555555"><a href="${apiBase}/api/emails/unsubscribe" style="color:#555555;text-decoration:underline;">Unsubscribe</a></p>`;
+    mergedVars['unsubscribeSection'] = `<p style="margin:8px 0 0;font-size:11px;color:#4d4d4d"><a href="${apiBase}/api/emails/unsubscribe" style="color:#4d4d4d;text-decoration:underline;">Unsubscribe</a></p>`;
     mergedVars['managePreferencesUrl'] = '';
   }
 
-  // Set default from addresses based on email type
-  const alertTemplates = ['notification_digest', 'admin_alert', 'system_alert', 'product_update', 'weekly_summary', 'account_tip', 'account_suspended', 'account_deleted'];
+  // ─── Three-domain sending split ───
+  // send.tirbeo.app → casual/transactional (forms, digests, tips, tickets)
+  // mails.tirbeo.app → security (OTPs, resets, alerts about account safety)
+  // tirbeo.app → admin/internal + human mailbox (admin@)
+  const SECURITY_TEMPLATES = new Set([
+    'signup_otp', 'login_otp', 'verify_email', 'password_reset_otp', 'password_reset_link',
+    'magic_link', 'account_recovery', 'delete_account_otp', 'password_changed',
+    'suspicious_login', 'login_alert', 'account_suspended', 'account_deleted', 'export_ready',
+  ]);
+  const ADMIN_TEMPLATES = new Set(['admin_alert', 'system_alert', 'admin_crash_report', 'admin_test']);
+  const humanMailboxTemplates = ['welcome'];
+
+  // Root domain (tirbeo.app) is mailbox-only via Zoho — NEVER send from it.
+  // Admin mail goes through the verified mails. subdomain unless overridden.
+  const adminFrom = process.env.ADMIN_FROM_EMAIL || 'admin@mails.tirbeo.app';
+
+  const DOMAIN_FROM = {
+    casual: { email: 'noreply@send.tirbeo.app', name: branding.brandName || 'Tirbeo' },
+    security: { email: 'security@mails.tirbeo.app', name: 'Tirbeo Security' },
+    admin: { email: adminFrom, name: 'Tirbeo Admin' },
+  };
+  const category = ADMIN_TEMPLATES.has(templateName) ? 'admin'
+    : SECURITY_TEMPLATES.has(templateName) ? 'security'
+    : humanMailboxTemplates.includes(templateName) ? 'admin'
+    : 'casual';
+
   const config = await getEmailConfig();
-  
-  let defaultFromEmail = branding.emailFromAddress || 'noreply@send.tirbeo.app';
-  let defaultFromName = branding.emailFromName || branding.brandName || 'Tirbeo';
-  
-  if (config) {
-    if (alertTemplates.includes(templateName)) {
-      defaultFromEmail = config.alertFromEmail || config.defaultFromEmail || 'alerts@send.tirbeo.app';
-      defaultFromName = config.alertFromName || config.defaultFromName || 'Tirbeo Alerts';
-    } else {
-      // Check for per-type overrides
-      switch (templateName) {
-        case 'welcome':
-          defaultFromEmail = config.welcomeFromEmail || config.defaultFromEmail || branding.emailFromAddress;
-          defaultFromName = config.welcomeFromName || config.defaultFromName || branding.emailFromName;
-          break;
-        case 'signup_otp':
-        case 'login_otp':
-        case 'verify_email':
-          defaultFromEmail = config.otpFromEmail || config.defaultFromEmail || branding.emailFromAddress;
-          defaultFromName = config.otpFromName || config.defaultFromName || branding.emailFromName;
-          break;
-        case 'password_reset':
-        case 'password_reset_otp':
-        case 'password_reset_link':
-          defaultFromEmail = config.resetFromEmail || config.defaultFromEmail || branding.emailFromAddress;
-          defaultFromName = config.resetFromName || config.defaultFromName || branding.emailFromName;
-          break;
-        case 'form_submission_confirmation':
-        case 'form_notification':
-        case 'form_response':
-          defaultFromEmail = config.formsFromEmail || 'forms@send.tirbeo.app';
-          defaultFromName = config.formsFromName || 'Tirbeo Forms';
-          break;
-        case 'notification_digest':
-        case 'product_update':
-        case 'weekly_summary':
-        case 'account_tip':
-        case 'account_suspended':
-        case 'account_deleted':
-          defaultFromEmail = config.notifyFromEmail || config.alertFromEmail || config.defaultFromEmail;
-          defaultFromName = config.notifyFromName || config.alertFromName || config.defaultFromName;
-          break;
-        default:
-          defaultFromEmail = config.defaultFromEmail || branding.emailFromAddress;
-          defaultFromName = config.defaultFromName || branding.emailFromName;
-      }
+
+  let defaultFromEmail = DOMAIN_FROM[category].email;
+  let defaultFromName = DOMAIN_FROM[category].name;
+
+  if (config && category === 'security') {
+    // Explicit DB overrides still win when set (per-type sender customization)
+    const otpSet = ['signup_otp', 'login_otp', 'verify_email'];
+    const resetSet = ['password_reset_otp', 'password_reset_link'];
+    if (otpSet.includes(templateName) && config.otpFromEmail) {
+      defaultFromEmail = config.otpFromEmail;
+      defaultFromName = config.otpFromName || defaultFromName;
+    } else if (resetSet.includes(templateName) && config.resetFromEmail) {
+      defaultFromEmail = config.resetFromEmail;
+      defaultFromName = config.resetFromName || defaultFromName;
     }
   }
 
   const finalOptions = {
     fromEmail: options?.fromEmail || defaultFromEmail,
     fromName: options?.fromName || defaultFromName,
-    replyTo: options?.replyTo,
+    replyTo: options?.replyTo || (humanMailboxTemplates.includes(templateName) ? adminFrom : undefined),
     threadId: options?.threadId,
   };
 

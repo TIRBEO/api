@@ -273,7 +273,7 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
           <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Time:</strong> ${new Date(alert.timestamp).toLocaleString()}</p>
         </div>`,
         dashboardUrl: process.env.NEXT_PUBLIC_ADMIN_URL || 'https://admin.tirbeo.app',
-      }).catch(() => {});
+      }, { rawVars: ['details'] }).catch(() => {});
     }
   } catch (err) {
     console.error('[RATE-LIMIT-ALERT] Failed to send alert email:', err);

@@ -280,7 +280,7 @@ export function getCachedRedisClient(name: string, options?: Partial<CreateRedis
   cachedClients.set(name, client);
 
   // Auto-connect on first use (lazy connect)
-  client.connect().catch((err) => {
+  client.connect().catch((err: any) => {
     console.warn(`[REDIS-${name}] Initial connection failed: ${err?.message}. Will retry on next operation.`);
   });
 

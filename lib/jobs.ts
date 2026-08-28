@@ -81,28 +81,69 @@ export async function sendEmailDigests() {
 
           if (now.getTime() - lastSent >= freqMs) {
             const cutoff = new Date(Math.max(lastSent, now.getTime() - freqMs));
-            const notifs = await prisma.notification.findMany({
-              where: { userId: u.id, isRead: false, createdAt: { gte: cutoff }, type: { notIn: ['product'] } },
-              orderBy: { createdAt: 'desc' },
-              take: 50,
-              select: { id: true, title: true, body: true, createdAt: true },
-            });
 
-            if (notifs.length > 0) {
-              const itemsHtml = notifs.map(n =>
-                `<div style="padding:12px 16px;background:#f8f9fa;border-radius:8px;margin-bottom:8px;"><strong>${esc(n.title)}</strong><br/><span style="color:#666;font-size:13px;">${esc(n.body || '')}</span></div>`
-              ).join('');
+            // Gather notifications + activity in parallel
+            const [notifs, audits, secEvents] = await Promise.all([
+              prisma.notification.findMany({
+                where: { userId: u.id, isRead: false, createdAt: { gte: cutoff }, type: { notIn: ['product'] } },
+                orderBy: { createdAt: 'desc' }, take: 50,
+                select: { id: true, title: true, body: true, createdAt: true },
+              }),
+              prisma.auditEvent.findMany({
+                where: { actorId: u.id, createdAt: { gte: cutoff } },
+                select: { action: true, severity: true, createdAt: true },
+                take: 200,
+              }),
+              prisma.securityEvent.findMany({
+                where: { userId: u.id, createdAt: { gte: cutoff } },
+                select: { eventType: true, severity: true, createdAt: true },
+                take: 200,
+              }),
+            ]);
 
+            const totalCount = notifs.length + audits.length + secEvents.length;
+            if (totalCount > 0) {
+              // Build notification items HTML
+              const itemsHtml = notifs.length > 0
+                ? notifs.map(n =>
+                    `<div style="padding:12px 16px;background:#f8f9fa;border-radius:8px;margin-bottom:8px;"><strong>${esc(n.title)}</strong><br/><span style="color:#666;font-size:13px;">${esc(n.body || '')}</span></div>`
+                  ).join('')
+                : '<p style="margin:0;font-size:14px;color:#64748b;">No new notifications.</p>';
+
+              // Build activity summary HTML
+              const allEvents = [
+                ...audits.map(a => ({ action: a.action, severity: a.severity, at: a.createdAt })),
+                ...secEvents.map(s => ({ action: s.eventType, severity: s.severity, at: s.createdAt })),
+              ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+              const activityCounts = new Map<string, number>();
+              for (const e of allEvents) {
+                const label = labelFor(e.action);
+                activityCounts.set(label, (activityCounts.get(label) || 0) + 1);
+              }
+
+              const activityHtml = activityCounts.size > 0
+                ? `<div style="margin-top:20px;">
+                    <p style="margin:0 0 10px;font-size:14px;font-weight:600;color:#1a1a1a;">Activity Summary</p>
+                    ${[...activityCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label, n]) =>
+                      `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e5e7eb;font-size:14px;color:#374151;"><span>${esc(label)}</span><strong>${n}</strong></div>`
+                    ).join('')}
+                    <div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#111827;"><span><strong>Total events</strong></span><strong>${allEvents.length}</strong></div>
+                  </div>`
+                : '';
+
+              const freqLabel = prefs.digestFrequency || 'daily';
               await sendTemplateEmail(u.email, 'notification_digest', {
                 name: u.name || u.email,
-                count: String(notifs.length),
+                count: String(totalCount),
                 digestItems: itemsHtml,
+                activitySection: activityHtml,
                 dashboardUrl,
-              }).catch(() => {});
+              }, { rawVars: ['digestItems', 'activitySection'] }).catch(() => {});
 
-              savePrefsSnapshot(u.id, { ...prefs, email: true, digestEnabled, digestFrequency: prefs.digestFrequency || 'daily', weeklySummary, lastDigestSentAt: now.toISOString(), lastWeeklySentAt: prefs.lastWeeklySentAt ?? null }).catch(() => {});
+              savePrefsSnapshot(u.id, { ...prefs, email: true, digestEnabled, digestFrequency: freqLabel, weeklySummary, lastDigestSentAt: now.toISOString(), lastWeeklySentAt: prefs.lastWeeklySentAt ?? null }).catch(() => {});
 
-              console.log(`[DIGEST] Sent ${notifs.length} notifications to ${u.email} (${prefs.digestFrequency || 'daily'})`);
+              console.log(`[DIGEST] Sent ${totalCount} items (${notifs.length} notifs + ${allEvents.length} activity) to ${u.email} (${freqLabel})`);
             }
           }
         }
@@ -291,9 +332,8 @@ export async function processScheduledDeletions() {
           githubId: null,
           discordId: null,
           totpSecret: null,
-          scheduledDeletionAt: null,
           is2FAEnabled: false,
-        },
+        } as any,
       });
 
       await prisma.auditEvent.create({
@@ -310,4 +350,13 @@ let deletionInterval: ReturnType<typeof setInterval> | null = null;
 export function startPeriodicDeletionSweep() {
   if (deletionInterval) return;
   deletionInterval = setInterval(() => { processScheduledDeletions().catch(() => {}); }, 3_600_000);
+}
+
+let pushPruneInterval: ReturnType<typeof setInterval> | null = null;
+export function startPeriodicPushPrune() {
+  if (pushPruneInterval) return;
+  // Run once after 5m, then nightly (24h)
+  setTimeout(() => { import('./push-notifications').then(m=> m.pruneStalePushSubscriptions().catch(()=>{}) ) }, 5*60_000);
+  pushPruneInterval = setInterval(() => { import('./push-notifications').then(m=> m.pruneStalePushSubscriptions().catch(()=>{}) ) }, 86_400_000);
+  console.log('[PUSH] periodic prune started (nightly, >60d stale)');
 }

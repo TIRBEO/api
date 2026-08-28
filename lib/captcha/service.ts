@@ -315,13 +315,13 @@ const CAPTCHA_SETTINGS_TTL = 15_000;
 
 export async function getCaptchaSettings(): Promise<CaptchaSettings> {
   if (cachedCaptchaSettings && Date.now() - cachedCaptchaSettingsAt < CAPTCHA_SETTINGS_TTL) {
-    return cachedCaptchaSettings;
+    return cachedCaptchaSettings!;
   }
   try {
     const record = await prisma.captchaSettings.findFirst({ where: { key: 'global', isActive: true } });
     cachedCaptchaSettings = record ? { ...DEFAULT_SETTINGS, ...record.value as any } : DEFAULT_SETTINGS;
     cachedCaptchaSettingsAt = Date.now();
-    return cachedCaptchaSettings;
+    return cachedCaptchaSettings!;
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -612,9 +612,9 @@ export async function verifyChallenge(input: {
   });
 
   if (!isValid) {
-    await logCaptchaEvent(challenge.userId, challenge.sessionId || input.sessionId, input.ipAddress, 'attempt_failed', challenge.difficulty, challenge.rayId);
+    await logCaptchaEvent(challenge.userId ?? undefined, challenge.sessionId ?? input.sessionId, input.ipAddress ?? undefined, 'attempt_failed', challenge.difficulty, challenge.rayId);
     if (challenge.attempts + 1 >= settings.maxAttemptsPerChallenge) {
-      await recordBlock(challenge.userId, challenge.sessionId || input.sessionId, input.ipAddress, 'too_many_attempts', {
+      await recordBlock(challenge.userId ?? undefined, challenge.sessionId ?? input.sessionId, input.ipAddress ?? undefined, 'too_many_attempts', {
         challengeId: challenge.id,
         attempts: challenge.attempts,
         rayId: challenge.rayId,
@@ -626,7 +626,7 @@ export async function verifyChallenge(input: {
 
   await recordDeviceSeen({
     fingerprint: input.fingerprint,
-    userId: challenge.userId || undefined,
+    userId: challenge.userId ?? undefined,
     ip: input.ipAddress,
     ua: input.userAgent,
     sessionId: input.sessionId,
@@ -637,9 +637,9 @@ export async function verifyChallenge(input: {
     : undefined;
 
   await logCaptchaEvent(
-    challenge.userId,
-    challenge.sessionId || input.sessionId,
-    input.ipAddress,
+    challenge.userId ?? undefined,
+    challenge.sessionId ?? input.sessionId,
+    input.ipAddress ?? undefined,
     'challenge_solved',
     challenge.difficulty,
     challenge.rayId,
@@ -671,10 +671,10 @@ export async function recordBlock(userId: string | undefined, sessionId: string 
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   await prisma.captchaBlock.create({
-    data: { userId, sessionId, ipAddress: ipAddress || 'unknown', reason, rayId, expiresAt, metadata },
+    data: { userId: userId ?? null, sessionId: sessionId || '', ipAddress: ipAddress || 'unknown', reason, rayId, expiresAt, metadata },
   });
   invalidateBlockedCache([userId, sessionId, ipAddress || 'unknown']);
-  await logCaptchaEvent(userId, sessionId, ipAddress, 'blocked', 'hard', rayId, metadata);
+  await logCaptchaEvent(userId, sessionId, ipAddress ?? undefined, 'blocked', 'hard', rayId, metadata);
 
   const warningCount = userId ? (await getUserWarningCount(userId, ipAddress)).count : 0;
   if (warningCount >= settings.adminNotifyThreshold) {
@@ -690,8 +690,8 @@ export async function unblockUser(rayId: string, adminId?: string): Promise<bool
     where: { rayId },
     data: { unblockedAt: new Date(), unblockedBy: adminId },
   });
-  invalidateBlockedCache([block.userId, block.sessionId, block.ipAddress]);
-  await logCaptchaEvent(block.userId, block.sessionId, block.ipAddress, 'unblocked', undefined, rayId);
+  invalidateBlockedCache([block.userId ?? undefined, block.sessionId ?? undefined, block.ipAddress ?? undefined]);
+  await logCaptchaEvent(block.userId ?? undefined, block.sessionId ?? undefined, block.ipAddress ?? undefined, 'unblocked', undefined, rayId);
   return true;
 }
 

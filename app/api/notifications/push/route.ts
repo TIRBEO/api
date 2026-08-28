@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
     const subscriptions = await getUserPushSubscriptions(session.userId);
     
     return NextResponse.json({
-      subscriptions: subscriptions.map(s => ({
+      subscriptions: subscriptions.map((s: { id: string; endpoint: string; userAgent: string | null; lastUsedAt: Date | null; createdAt: Date }) => ({
         id: s.id,
         endpoint: s.endpoint.substring(0, 50) + '...',
         userAgent: s.userAgent,

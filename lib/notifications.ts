@@ -100,6 +100,36 @@ export function getClientIpFromRequest(request: { headers: Headers }): string {
   try { return request.headers.get('cf-connecting-ip') || ''; } catch { return ''; }
 }
 
+/** Per-user notification rate-limit: 10/min via Redis `notif:${userId}:` (Upstash). Falls back to allow if Redis unavailable. */
+let _notifRedis: any = null;
+let _notifRedisFailed = false;
+async function getNotifRedis(): Promise<any | null> {
+  if (_notifRedisFailed) return null;
+  if (_notifRedis) return _notifRedis;
+  const url = process.env.REDIS_URL;
+  if (!url) return null;
+  try {
+    const { Redis } = await import('ioredis');
+    _notifRedis = new Redis(url, { maxRetriesPerRequest: 1, enableReadyCheck: false, lazyConnect: true });
+    // Test connection lazily
+    return _notifRedis;
+  } catch { _notifRedisFailed = true; return null; }
+}
+export async function checkNotifRateLimit(userId: string, limit = 10, windowSec = 60): Promise<{ allowed: boolean; remaining: number }> {
+  return checkRateLimit(`notif:${userId}`, limit, windowSec);
+}
+export async function checkRateLimit(prefix: string, limit = 20, windowSec = 60): Promise<{ allowed: boolean; remaining: number }> {
+  // Generic per-prefix rate-limit helper for UI feedback (e.g. prefs:${userId})
+  const redis = await getNotifRedis();
+  if (!redis) return { allowed: true, remaining: limit };
+  const key = `${prefix}:${Math.floor(Date.now() / (windowSec*1000))}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, windowSec);
+    return { allowed: count <= limit, remaining: Math.max(0, limit - count) };
+  } catch { return { allowed: true, remaining: limit }; }
+}
+
 /** Consistent timestamp for notification bodies, e.g. "Aug 24, 2026, 2:05 PM UTC". */
 export function fmtNow(): string {
   return new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC' }) + ' UTC';
@@ -122,6 +152,15 @@ export async function createNotification(input: CreateNotifInput) {
   const isSecurity = category === 'security';
   const emailOn = isSecurity || (on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category]));
   const pushOn = isSecurity || (on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category]));
+
+  // Per-user rate-limit 10/min for non-security — prevents ticket loops / spam
+  if (!isSecurity) {
+    const { allowed } = await checkNotifRateLimit(input.userId, 10, 60);
+    if (!allowed) {
+      console.warn(`[NOTIFICATIONS] rate-limited notif:${input.userId} type=${input.type} title="${input.title.slice(0,40)}"`);
+      return null as any;
+    }
+  }
 
   const notif = await prisma.notification.create({
     data: {
@@ -152,34 +191,25 @@ export async function createNotification(input: CreateNotifInput) {
     if (quiet) return notif;
   }
 
+  // Push/email are best-effort and must NOT block the in-app response — fire-and-forget for per-user speed
   if (pushOn) {
-    try {
-      const { sendPushNotification } = await import('./push-notifications');
-      await sendPushNotification(input.userId, {
-        title: input.title,
-        body: input.body || '',
-        icon: input.icon || undefined,
-        url: input.link || '/account/inbox',
-        tag: input.type,
-      });
-    } catch { /* push is best-effort */ }
+    void import('./push-notifications').then(m=> m.sendPushNotification(input.userId, {
+      title: input.title, body: input.body || '', icon: input.icon || undefined, url: input.link || '/account/inbox', tag: input.type,
+    }).catch(()=>{})).catch(()=>{});
   }
-
-  if (emailOn) {
-    // Suppress product-type notifications from individual emails
-    if (category === 'product') return notif;
-
-    const user = await prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } });
-    if (user) {
-      let dash = 'https://tirbeo.app';
-      try { const { getDashboardBaseUrl } = await import('./app-urls'); dash = getDashboardBaseUrl(); } catch { /* keep fallback */ }
-      await sendTemplateEmail(user.email, 'notification_digest', {
-        name: user.name || user.email,
-        count: '1',
-        digestItems: `<div class="item"><strong>${escapeHtml(input.title)}</strong><br/>${escapeHtml(input.body || '')}</div>`,
-        dashboardUrl: input.link ? `${dash}${input.link}` : dash,
-      }, { rawVars: ['digestItems'] }).catch(() => {});
-    }
+  if (emailOn && category !== 'product') {
+    void prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } }).then(user=>{
+      if(!user) return;
+      import('./app-urls').then(mod=> mod.getDashboardBaseUrl()).catch(()=> 'https://tirbeo.app').then(dash=>{
+        const base = typeof dash === 'string' ? dash : 'https://tirbeo.app';
+        return sendTemplateEmail(user.email, 'notification_digest', {
+          name: user.name || user.email, count: '1',
+          digestItems: `<div class="item"><strong>${escapeHtml(input.title)}</strong><br/>${escapeHtml(input.body || '')}</div>`,
+          activitySection: '',
+          dashboardUrl: input.link ? `${base}${input.link}` : base,
+        }, { rawVars: ['digestItems', 'activitySection'] }).catch(()=>{});
+      }).catch(()=>{});
+    }).catch(()=>{});
   }
 
   return notif;
@@ -212,13 +242,14 @@ export async function markAsRead(userId: string, notifId?: string) {
 
 // ─── Default preferences ──────────────────────────────────────────
 // Security is compulsory (no toggle). Only forms/product/support have toggles.
+// Keep in sync with app/api/notifications/prefs/route.ts DEFAULT_PREFS
 const DEFAULT_PREFS: Record<string, unknown> = {
   email: true, push: true,
   // Category toggles — security is compulsory (always true, not configurable)
-  forms: false, product: false, support: true,
+  forms: true, product: false, support: true,
   // Per-category channel toggles
-  formsEmail: false, formsPush: false,
-  productEmail: false, productPush: false,
+  formsEmail: true, formsPush: true,
+  productEmail: false, productPush: true,
   supportEmail: true, supportPush: true,
   // Digest
   digestEnabled: false, digestFrequency: 'daily',

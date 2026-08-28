@@ -52,14 +52,14 @@ export async function POST(request: NextRequest) {
   let sent = 0;
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const batch = await prisma.user.findMany({
+    const batch: { id: string }[] = await prisma.user.findMany({
       where: { ...(cursor ? { id: { gt: cursor } } : {}) },
       orderBy: { id: 'asc' },
       take: BATCH,
       select: { id: true },
     });
     if (!batch.length) break;
-    await Promise.all(batch.map(u =>
+    await Promise.all(batch.map((u: { id: string }) =>
       createNotification({ userId: u.id, type: 'admin_alert', title, body: msg, link }).catch(() => {})
     ));
     sent += batch.length;

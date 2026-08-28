@@ -51,7 +51,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
   const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true } });
   if (customer?.email) {
-    const statusLabel = (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+    const statusLabel = (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
     const isSolved = body.status === 'closed' || body.status === 'resolved';
     sendTemplateEmail(customer.email, isSolved ? 'ticket_closed' : 'ticket_updated', {
       ticketId: ticket.id,
@@ -68,7 +68,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       sendTemplateEmail(agent.email, 'ticket_updated', {
         ticketId: ticket.id,
         ticketSubject: updated.subject,
-        ticketStatus: (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+        ticketStatus: (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
         ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
         updateMessage: `You have been assigned ticket #${ticket.id}. Please review and take action.`,
       }).catch(() => {});

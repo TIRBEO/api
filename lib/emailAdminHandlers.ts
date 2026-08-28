@@ -173,7 +173,10 @@ export async function emailTestHandler(request: NextRequest) {
       envApiKey: process.env.RESEND_API_KEY ? '••••' + process.env.RESEND_API_KEY.slice(-4) : null,
     };
 
-    const result = await sendEmail(parsed.data.to, 'Tirbeo Test Email', '<p style="font-family:system-ui;padding:24px">This is a test email from Tirbeo. If you received this, your email configuration is working.</p>');
+    const result = await (async () => {
+      const { sendTemplateEmail } = await import('./email');
+      return sendTemplateEmail(parsed.data.to, 'admin_test', { sentFor: 'the admin panel email settings' });
+    })();
     return NextResponse.json({ ...result, diagnostics });
   } catch (err: any) {
     console.error('[EMAIL TEST]', err?.message || err);
