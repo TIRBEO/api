@@ -1,7 +1,7 @@
 node_modules/
 .next/
 .turbo/
-.vercel
+.vercel/
 .env*
 .env.local
 .env.*.local
