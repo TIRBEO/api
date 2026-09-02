@@ -18,14 +18,14 @@ export async function POST(request: NextRequest) {
 
   const formData = await request.formData();
   const file = formData.get('file') as File | null;
-  if (!file) return new NextResponse('No file uploaded', { status: 400 });
+  if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
 
   if (file.size > 10 * 1024 * 1024) {
-    return new NextResponse('File too large. Max 10MB', { status: 400 });
+    return NextResponse.json({ error: 'File too large. Max 10MB' }, { status: 400 });
   }
 
   if (!ALLOWED_MIME_TYPES.has(file.type)) {
-    return new NextResponse('Only image files are allowed (JPEG, PNG, GIF, WebP)', { status: 400 });
+    return NextResponse.json({ error: 'Only image files are allowed (JPEG, PNG, GIF, WebP)' }, { status: 400 });
   }
 
   const fileName = `${uuidv4()}${EXT_MAP[file.type]}`;

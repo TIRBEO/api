@@ -35,11 +35,11 @@ export async function phonesSendOtpHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const { number } = (await request.json()) as any;
     if (!number || typeof number !== 'string') {
-      return new NextResponse('Phone number required', { status: 400 });
+      return NextResponse.json({ error: 'Phone number required' }, { status: 400 });
     }
     const clean = number.replace(/[\s\-()]/g, '');
     if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
-      return new NextResponse('Invalid phone number format', { status: 400 });
+      return NextResponse.json({ error: 'Invalid phone number format' }, { status: 400 });
     }
     const code = generateOtpCode();
     await storeOtp(session.userId, 'phone', code);
@@ -47,7 +47,7 @@ export async function phonesSendOtpHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, message: 'Verification code sent' });
   } catch (err: any) {
     console.error('[PHONES SEND OTP]', err?.message || err);
-    return new NextResponse('Failed to send OTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send OTP' }, { status: 500 });
   }
 }
 
@@ -58,14 +58,14 @@ export async function phonesVerifyOtpHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const { number, code } = (await request.json()) as any;
     if (!number || typeof number !== 'string' || !code || typeof code !== 'string' || code.length !== 6) {
-      return new NextResponse('Invalid request', { status: 400 });
+      return NextResponse.json({ error: 'Invalid request' }, { status: 400 });
     }
     const clean = number.replace(/[\s\-()]/g, '');
     if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
-      return new NextResponse('Invalid phone number format', { status: 400 });
+      return NextResponse.json({ error: 'Invalid phone number format' }, { status: 400 });
     }
     const ok = await verifyOtpCode(session.userId, 'phone', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     await prisma.user.update({
       where: { id: session.userId },
       data: { phoneNumber: clean, phoneVerified: true },
@@ -81,7 +81,7 @@ export async function phonesVerifyOtpHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[PHONES VERIFY]', err?.message || err);
-    return new NextResponse('Failed to verify OTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to verify OTP' }, { status: 500 });
   }
 }
 
@@ -92,19 +92,19 @@ export async function phonesAddHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const { number, code } = (await request.json()) as any;
     if (!number || typeof number !== 'string') {
-      return new NextResponse('Phone number required', { status: 400 });
+      return NextResponse.json({ error: 'Phone number required' }, { status: 400 });
     }
     if (!code || typeof code !== 'string') {
-      return new NextResponse('Verification code required', { status: 400 });
+      return NextResponse.json({ error: 'Verification code required' }, { status: 400 });
     }
     const clean = number.replace(/[\s\-()]/g, '');
     if (!/^(\+?\d{7,15}|\d{10})$/.test(clean)) {
-      return new NextResponse('Invalid phone number format', { status: 400 });
+      return NextResponse.json({ error: 'Invalid phone number format' }, { status: 400 });
     }
     // Verify the OTP before accepting the phone
     const { verifyOtpCode } = await import('./auth/otp');
     const ok = await verifyOtpCode(session.userId, 'phone', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     await prisma.user.update({
       where: { id: session.userId },
       data: { phoneNumber: clean, phoneVerified: true },
@@ -120,7 +120,7 @@ export async function phonesAddHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, number: clean });
   } catch (err: any) {
     console.error('[PHONES ADD]', err?.message || err);
-    return new NextResponse('Failed to add phone', { status: 500 });
+    return NextResponse.json({ error: 'Failed to add phone' }, { status: 500 });
   }
 }
 
@@ -145,7 +145,7 @@ export async function phonesRemoveHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[PHONES REMOVE]', err?.message || err);
-    return new NextResponse('Failed to remove phone', { status: 500 });
+    return NextResponse.json({ error: 'Failed to remove phone' }, { status: 500 });
   }
 }
 
@@ -196,7 +196,7 @@ export async function securityEventsHandler(request: NextRequest) {
     return NextResponse.json({ events });
   } catch (err: any) {
     console.error('[SECURITY EVENTS]', err?.message || err);
-    return new NextResponse('Failed to fetch events', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch events' }, { status: 500 });
   }
 }
 
@@ -244,7 +244,7 @@ export async function totpSetupHandler(request: NextRequest) {
     return NextResponse.json({ uri });
   } catch (err: any) {
     console.error('[TOTP SETUP]', err?.message || err);
-    return new NextResponse('Failed to setup TOTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to setup TOTP' }, { status: 500 });
   }
 }
 
@@ -299,7 +299,7 @@ export async function totpVerifyHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, backupCodes: recoveryCodes });
   } catch (err: any) {
     console.error('[TOTP VERIFY]', err?.message || err);
-    return new NextResponse('Failed to verify TOTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to verify TOTP' }, { status: 500 });
   }
 }
 
@@ -308,7 +308,10 @@ export async function totpDisableHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    const { totpCode } = (await request.json()) as any;
+    // Accept code from body or query param (frontend sends via query string)
+    let totpCode: string | undefined;
+    try { const body: any = await request.json(); totpCode = body?.totpCode || body?.code; } catch { /* no body */ }
+    if (!totpCode) totpCode = request.nextUrl.searchParams.get('code') || undefined;
     if (!totpCode || typeof totpCode !== 'string' || totpCode.length !== 6) {
       return NextResponse.json({ error: 'Invalid code. Enter a 6-digit code.' }, { status: 400 });
     }
@@ -352,7 +355,7 @@ export async function totpDisableHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[TOTP DISABLE]', err?.message || err);
-    return new NextResponse('Failed to disable TOTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to disable TOTP' }, { status: 500 });
   }
 }
 
@@ -367,7 +370,7 @@ export async function backupCodesListHandler(request: NextRequest) {
     return NextResponse.json({ codes: [], count, enabled: count > 0 });
   } catch (err: any) {
     console.error('[BACKUP CODES LIST]', err?.message || err);
-    return new NextResponse('Failed to fetch backup codes', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch backup codes' }, { status: 500 });
   }
 }
 
@@ -392,7 +395,7 @@ export async function backupCodesRegenerateHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, codes });
   } catch (err: any) {
     console.error('[BACKUP CODES REGEN]', err?.message || err);
-    return new NextResponse('Failed to regenerate codes', { status: 500 });
+    return NextResponse.json({ error: 'Failed to regenerate codes' }, { status: 500 });
   }
 }
 
@@ -422,7 +425,7 @@ export async function recoveryEmailHandler(request: NextRequest) {
     }
 
     if (typeof email !== 'string' || !email.includes('@')) {
-      return new NextResponse('Valid email required', { status: 400 });
+      return NextResponse.json({ error: 'Valid email required' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
@@ -456,7 +459,7 @@ export async function recoveryEmailHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL]', err?.message || err);
-    return new NextResponse('Failed to update recovery email', { status: 500 });
+    return NextResponse.json({ error: 'Failed to update recovery email' }, { status: 500 });
   }
 }
 
@@ -469,7 +472,7 @@ export async function recoveryEmailSendCodeHandler(request: NextRequest) {
     console.log('[RECOVERY EMAIL SEND] email:', email, 'typeof:', typeof email);
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       console.warn('[RECOVERY EMAIL SEND] Rejected: invalid email', { email });
-      return new NextResponse('Valid email required', { status: 400 });
+      return NextResponse.json({ error: 'Valid email required' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
@@ -490,7 +493,7 @@ export async function recoveryEmailSendCodeHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, message: 'Verification code sent', delivered: true, messageId: result.messageId });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL SEND]', err?.message || err);
-    return new NextResponse('Failed to send code', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send code' }, { status: 500 });
   }
 }
 
@@ -501,7 +504,7 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
     const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !email.includes('@') || !code || typeof code !== 'string') {
-      return new NextResponse('Email and code required', { status: 400 });
+      return NextResponse.json({ error: 'Email and code required' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
@@ -511,7 +514,7 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Recovery email cannot be the same as your primary email' }, { status: 400 });
     }
     const ok = await verifyOtpCode(session.userId, 'email', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     await prisma.user.update({
       where: { id: session.userId },
       data: {
@@ -540,7 +543,7 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[RECOVERY EMAIL VERIFY]', err?.message || err);
-    return new NextResponse('Failed to verify email', { status: 500 });
+    return NextResponse.json({ error: 'Failed to verify email' }, { status: 500 });
   }
 }
 
@@ -565,7 +568,7 @@ export async function passwordCheckHandler(request: NextRequest) {
     });
   } catch (err: any) {
     console.error('[PASSWORD CHECK]', err?.message || err);
-    return new NextResponse('Failed to check password', { status: 500 });
+    return NextResponse.json({ error: 'Failed to check password' }, { status: 500 });
   }
 }
 
@@ -597,7 +600,7 @@ export async function sessionsRevokeAllHandler(request: NextRequest) {
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[SESSIONS REVOKE ALL]', err?.message || err);
-    return new NextResponse('Failed to revoke sessions', { status: 500 });
+    return NextResponse.json({ error: 'Failed to revoke sessions' }, { status: 500 });
   }
 }
 
@@ -606,7 +609,7 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
-    if (!sessionId) return new NextResponse('Session ID required', { status: 400 });
+    if (!sessionId) return NextResponse.json({ error: 'Session ID required' }, { status: 400 });
     await prisma.session.updateMany({
       where: { id: sessionId, userId: session.userId },
       data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
@@ -624,7 +627,7 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
     return NextResponse.json({ ok: true });
   } catch (err: any) {
     console.error('[SESSION REVOKE]', err?.message || err);
-    return new NextResponse('Failed to revoke session', { status: 500 });
+    return NextResponse.json({ error: 'Failed to revoke session' }, { status: 500 });
   }
 }
 
@@ -652,6 +655,6 @@ export async function loginHistoryHandler(request: NextRequest) {
     return NextResponse.json({ logs });
   } catch (err: any) {
     console.error('[LOGIN HISTORY]', err?.message || err);
-    return new NextResponse('Failed to fetch login history', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch login history' }, { status: 500 });
   }
 }

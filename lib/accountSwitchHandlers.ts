@@ -40,7 +40,7 @@ export async function knownAccountsHandler(request: NextRequest) {
     return NextResponse.json({ accounts, current });
   } catch (err: any) {
     console.error('[AUTH/ACCOUNTS]', err?.message || err);
-    return new NextResponse('Failed to list accounts', { status: 500 });
+    return NextResponse.json({ error: 'Failed to list accounts' }, { status: 500 });
   }
 }
 
@@ -96,7 +96,7 @@ export async function switchAccountHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[SWITCH-ACCOUNT]', err?.message || err);
-    return new NextResponse('Failed to switch account', { status: 500 });
+    return NextResponse.json({ error: 'Failed to switch account' }, { status: 500 });
   }
 }
 
@@ -114,6 +114,6 @@ export async function removeKnownAccountHandler(request: NextRequest) {
     return NextResponse.json({ removed: true });
   } catch (err: any) {
     console.error('[REMOVE-ACCOUNT]', err?.message || err);
-    return new NextResponse('Failed to remove account', { status: 500 });
+    return NextResponse.json({ error: 'Failed to remove account' }, { status: 500 });
   }
 }

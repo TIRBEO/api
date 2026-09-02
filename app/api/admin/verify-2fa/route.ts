@@ -15,25 +15,25 @@ const verifySchema = z.object({
 export async function POST(request: NextRequest) {
   try {
     const parsed = verifySchema.safeParse(await request.json());
-    if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+    if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
     const { tempToken } = parsed.data;
     const totpCode = parsed.data.code || parsed.data.token || '';
-    if (!totpCode) return new NextResponse('Invalid payload', { status: 400 });
+    if (!totpCode) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
     const userId = await verifyTemp2faToken(tempToken);
-    if (!userId) return new NextResponse('Invalid or expired temp token', { status: 401 });
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired temp token' }, { status: 401 });
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true },
     });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
-      return new NextResponse('2FA not enabled', { status: 400 });
+      return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
     }
 
     if (!await verifyTotp(totpCode, user.totpSecret)) {
-      return new NextResponse('Invalid 2FA code', { status: 401 });
+      return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 });
     }
 
     const adminRole = user.adminRole || null;
@@ -44,7 +44,7 @@ export async function POST(request: NextRequest) {
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
         dashboardUrl: 'https://admin.tirbeo.app',
       }, { rawVars: ['details'] }).catch(() => {});
-      return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
+      return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
     const ip = request.headers.get('x-forwarded-for') || '';
@@ -54,6 +54,6 @@ export async function POST(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[ADMIN LOGIN] 2FA error:', err?.message || err);
-    return new NextResponse('2FA verification failed', { status: 500 });
+    return NextResponse.json({ error: '2FA verification failed' }, { status: 500 });
   }
 }

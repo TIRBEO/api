@@ -218,7 +218,7 @@ export function createRedisClient(options: CreateRedisOptions): any {
     state.isConnected = true;
     state.lastConnectedAt = Date.now();
     if (state.reconnectCount > 0) {
-      console.log(`[REDIS-${name}] ✅ Reconnected (attempt #${state.reconnectCount})`);
+      console.log(`[REDIS-${name}] Reconnected (attempt #${state.reconnectCount})`);
     }
   });
 
@@ -245,15 +245,15 @@ export function createRedisClient(options: CreateRedisOptions): any {
     if (isConnectionError(err)) {
       state.reconnectCount++;
       state.lastReconnectAt = Date.now();
-      throttledLog(`redis:error:${name}`, 60_000, () => console.warn(`[REDIS-${name}] ⚠️  Connection error (reconnect #${state.reconnectCount}): ${err?.message}`));
+      throttledLog(`redis:error:${name}`, 60_000, () => console.warn(`[REDIS-${name}] Connection error (reconnect #${state.reconnectCount}): ${err?.message}`));
     } else {
-      console.error(`[REDIS-${name}] ❌ Non-reconnectable error: ${err?.message}`);
+      console.error(`[REDIS-${name}] Non-reconnectable error: ${err?.message}`);
     }
   });
 
   client.on('reconnecting', (delay: number) => {
     state.isConnected = false;
-    throttledLog(`redis:reconnecting:${name}`, 60_000, () => console.warn(`[REDIS-${name}] 🔄 Reconnecting in ${delay}ms...`));
+    throttledLog(`redis:reconnecting:${name}`, 60_000, () => console.warn(`[REDIS-${name}] Reconnecting in ${delay}ms...`));
   });
 
   return client;
@@ -330,6 +330,61 @@ export function getAllRedisStates(): Record<string, RedisConnectionState> {
 export function getRedisState(name: string): RedisConnectionState | null {
   const state = connectionStates.get(name);
   return state ? { ...state } : null;
+}
+
+// ─── Health Summary ───
+/**
+ * Get a consolidated Redis health summary across all named clients.
+ */
+export function getRedisHealthSummary(): {
+  configured: boolean;
+  totalClients: number;
+  connectedClients: number;
+  totalReconnects: number;
+  totalFailedRequests: number;
+  clients: Record<string, {
+    connected: boolean;
+    reconnectCount: number;
+    failedRequests: number;
+    lastError: string;
+    lastKeepAliveAt: number;
+    keepAliveFailures: number;
+  }>;
+} {
+  const states = getAllRedisStates();
+  const names = Object.keys(states);
+  const connected = names.filter((n) => states[n].isConnected);
+  return {
+    configured: !!process.env.REDIS_URL,
+    totalClients: names.length,
+    connectedClients: connected.length,
+    totalReconnects: names.reduce((s, n) => s + states[n].reconnectCount, 0),
+    totalFailedRequests: names.reduce((s, n) => s + states[n].failedRequests, 0),
+    clients: Object.fromEntries(
+      names.map((n) => [n, {
+        connected: states[n].isConnected,
+        reconnectCount: states[n].reconnectCount,
+        failedRequests: states[n].failedRequests,
+        lastError: states[n].lastError,
+        lastKeepAliveAt: states[n].lastKeepAliveAt,
+        keepAliveFailures: states[n].keepAliveFailures,
+      }])
+    ),
+  };
+}
+
+/**
+ * PING all named Redis clients and return individual latencies.
+ */
+export async function pingAllRedisClients(): Promise<Record<string, { ok: boolean; latencyMs: number; error?: string }>> {
+  const clients = Array.from(cachedClients.entries());
+  const results: Record<string, { ok: boolean; latencyMs: number; error?: string }> = {};
+  await Promise.all(
+    clients.map(async ([name, client]) => {
+      results[name] = await checkRedisHealth(client);
+    })
+  );
+  return results;
 }
 
 /**

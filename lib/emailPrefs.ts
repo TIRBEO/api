@@ -25,6 +25,7 @@ export const ESSENTIAL_TEMPLATES = new Set([
   'account_recovery',
   'account_suspended',
   'account_deleted',
+  'delete_account_otp',
   // Admin
   'export_ready',
   'admin_alert',
@@ -63,11 +64,15 @@ export const TEMPLATE_CATEGORY: Record<string, string> = {
   weekly_summary: 'product',
   account_tip: 'product',
   notification_digest: 'product',
+  reactivation: 'product',
   
-  // Support
+  // Support — all ticket lifecycle emails respect supportEmail + email prefs
   ticket_created: 'support',
   ticket_updated: 'support',
   ticket_closed: 'support',
+  ticket_reopened: 'support',
+  ticket_replied: 'support',
+  ticket_assigned: 'support',
   admin_reply: 'support',
 };
 

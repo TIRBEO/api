@@ -8,16 +8,16 @@ export async function GET(request: NextRequest) {
   const authHeader = request.headers.get('authorization');
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
   const token = cookieToken || bearerToken;
-  if (!token) return new NextResponse('Unauthorized', { status: 401 });
+  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const session = await getSessionFromToken(token);
-  if (!session) return new NextResponse('Unauthorized', { status: 401 });
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const user = await prisma.user.findUnique({
     where: { id: session.userId },
     select: { adminRole: true, isBanned: true, isSuspended: true },
   });
-  if (!user) return new NextResponse('Unauthorized', { status: 401 });
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   return NextResponse.json({
     adminRole: user.adminRole || null,

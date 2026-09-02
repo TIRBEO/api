@@ -40,17 +40,17 @@ function resolveImagePath(relativePath: string): { filePath: string; contentType
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ path: string[] }> }) {
   const { path: pathSegments } = await params;
-  if (!pathSegments || pathSegments.length === 0) return new NextResponse('Not Found', { status: 404 });
+  if (!pathSegments || pathSegments.length === 0) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
   const relative = sanitizeSegments(pathSegments);
-  if (!relative) return new NextResponse('Not Found', { status: 404 });
+  if (!relative) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
   const resolved = resolveImagePath(relative);
-  if (!resolved) return new NextResponse('Not Found', { status: 404 });
+  if (!resolved) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
   try {
     const isValid = await validateImageFile(resolved.filePath, resolved.contentType);
-    if (!isValid) return new NextResponse('Not Found', { status: 404 });
+    if (!isValid) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
     const data = await readFile(resolved.filePath);
     return new NextResponse(new Uint8Array(data), {
@@ -64,6 +64,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       },
     });
   } catch {
-    return new NextResponse('Not Found', { status: 404 });
+    return NextResponse.json({ error: 'Not Found' }, { status: 404 });
   }
 }

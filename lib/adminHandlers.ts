@@ -85,7 +85,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       },
     },
   });
-  if (!user) return new NextResponse('User not found', { status: 404 });
+  if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
   return NextResponse.json({
     ...user,
     status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
@@ -123,13 +123,13 @@ export async function createUser(request: NextRequest) {
 
   const body: any = await request.json();
   const parsed = createUserSchema.safeParse(body);
-  if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+  if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
   const { email, name, adminRole, sendEmail = true } = parsed.data;
   const normalizedEmail = email.toLowerCase();
 
   const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
-  if (existing) return new NextResponse('A user with this email already exists', { status: 409 });
+  if (existing) return NextResponse.json({ error: 'A user with this email already exists' }, { status: 409 });
 
   if (adminRole === 'super_admin' && session.adminRole !== 'super_admin') {
     return jsonForbidden();
@@ -189,15 +189,15 @@ export async function updateUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   const body: any = await request.json();
   const parsed = updateUserSchema.safeParse(body);
-  if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+  if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
   if (parsed.data.adminRole !== undefined) {
     if (!canManageRole(session.adminRole, existing.adminRole)) {
-      return new NextResponse('Cannot change role of this user', { status: 403 });
+      return NextResponse.json({ error: 'Cannot change role of this user' }, { status: 403 });
     }
   }
 
@@ -252,7 +252,7 @@ export async function deleteUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   await prisma.user.delete({ where: { id: userId } });
 
@@ -264,7 +264,7 @@ export async function deleteUser(request: NextRequest, userId: string) {
     metadata: { email: existing.email, displayName: existing.name },
   });
 
-  return new NextResponse('User deleted', { status: 200 });
+  return NextResponse.json({ error: 'User deleted' }, { status: 200 });
 }
 
 
@@ -274,8 +274,8 @@ export async function banUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
-  if (existing.adminRole === 'super_admin') return new NextResponse('Cannot ban a super admin', { status: 403 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+  if (existing.adminRole === 'super_admin') return NextResponse.json({ error: 'Cannot ban a super admin' }, { status: 403 });
 
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
@@ -309,7 +309,7 @@ export async function unbanUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   await prisma.user.update({ where: { id: userId }, data: { isBanned: false, isSuspended: false, suspendedUntil: null, suspendReason: null } });
 
@@ -330,8 +330,8 @@ export async function suspendUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
-  if (existing.adminRole === 'super_admin') return new NextResponse('Cannot suspend a super admin', { status: 403 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+  if (existing.adminRole === 'super_admin') return NextResponse.json({ error: 'Cannot suspend a super admin' }, { status: 403 });
 
   const body: any = await request.json().catch(() => ({}));
   const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : 'No reason provided';
@@ -368,7 +368,7 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   await prisma.user.update({ where: { id: userId }, data: { isSuspended: false, suspendedUntil: null, suspendReason: null } });
 
@@ -396,11 +396,11 @@ export async function seedAdminHandler(request: NextRequest) {
   const { email, adminRole, password } = body;
 
   if (!email || !adminRole) {
-    return new NextResponse('email and adminRole required', { status: 400 });
+    return NextResponse.json({ error: 'email and adminRole required' }, { status: 400 });
   }
 
   if (!process.env.ADMIN_SEED_EMAIL) {
-    return new NextResponse('Seed endpoint is disabled. Set ADMIN_SEED_EMAIL env var.', { status: 403 });
+    return NextResponse.json({ error: 'Seed endpoint is disabled. Set ADMIN_SEED_EMAIL env var.' }, { status: 403 });
   }
   if (email !== process.env.ADMIN_SEED_EMAIL) {
     return jsonForbidden();
@@ -431,11 +431,11 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
   const body: any = await request.json();
   const { password } = body;
   if (!password || typeof password !== 'string' || password.length < 8) {
-    return new NextResponse('Password must be at least 8 characters', { status: 400 });
+    return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
   }
 
   const existing = await prisma.user.findUnique({ where: { id: userId } });
-  if (!existing) return new NextResponse('User not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   const { hashPassword } = await import('./auth/password');
   const passwordHash = await hashPassword(password);

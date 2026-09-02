@@ -87,14 +87,14 @@ export async function uploadMediaHandler(request: NextRequest) {
 
   const formData = await request.formData();
   const file = formData.get('file') as File | null;
-  if (!file) return new NextResponse('No file uploaded', { status: 400 });
+  if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
 
   if (file.size > 50 * 1024 * 1024) {
-    return new NextResponse('File too large. Max 50MB', { status: 400 });
+    return NextResponse.json({ error: 'File too large. Max 50MB' }, { status: 400 });
   }
 
   if (!ALLOWED_MIME_TYPES.has(file.type)) {
-    return new NextResponse('File type not allowed', { status: 400 });
+    return NextResponse.json({ error: 'File type not allowed' }, { status: 400 });
   }
 
   const folder = (formData.get('folder') as string) || 'general';
@@ -107,7 +107,7 @@ export async function uploadMediaHandler(request: NextRequest) {
   const buffer = Buffer.from(await file.arrayBuffer());
 
   if (!validateMagicNumber(buffer, file.type)) {
-    return new NextResponse('Invalid file format', { status: 400 });
+    return NextResponse.json({ error: 'Invalid file format' }, { status: 400 });
   }
 
   const { storeMediaFile } = await import('./mediaStorage');
@@ -182,7 +182,7 @@ export async function getMediaHandler(request: NextRequest, id: string) {
     where: { id },
     include: { user: { select: { id: true, email: true, name: true } } },
   });
-  if (!media) return new NextResponse('Media not found', { status: 404 });
+  if (!media) return NextResponse.json({ error: 'Media not found' }, { status: 404 });
 
   return NextResponse.json(media);
 }
@@ -195,7 +195,7 @@ export async function updateMediaHandler(request: NextRequest, id: string) {
   const { altText, folder, tags } = body;
 
   const existing = await prisma.media.findUnique({ where: { id } });
-  if (!existing) return new NextResponse('Media not found', { status: 404 });
+  if (!existing) return NextResponse.json({ error: 'Media not found' }, { status: 404 });
 
   const data: Record<string, unknown> = {};
   if (altText !== undefined) data.altText = altText;
@@ -223,7 +223,7 @@ export async function deleteMediaHandler(request: NextRequest, id: string) {
   if (session instanceof NextResponse) return session;
 
   const media = await prisma.media.findUnique({ where: { id } });
-  if (!media) return new NextResponse('Media not found', { status: 404 });
+  if (!media) return NextResponse.json({ error: 'Media not found' }, { status: 404 });
 
   await prisma.media.delete({ where: { id } });
 

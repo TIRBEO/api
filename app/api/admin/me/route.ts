@@ -6,13 +6,13 @@ import { getEffectivePermissions } from '../../../../lib/roles';
 
 export async function GET(request: Request) {
   const session = await getSessionFromRequest(request as any);
-  if (!session) return new NextResponse('Unauthorized', { status: 401 });
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const user = await prisma.user.findUnique({
     where: { id: session.userId },
     select: { id: true, email: true, name: true, adminRole: true },
   });
-  if (!user || !user.adminRole) return new NextResponse('Forbidden', { status: 403 });
+  if (!user || !user.adminRole) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
 
   const permissions = await getEffectivePermissions(user.id);
 

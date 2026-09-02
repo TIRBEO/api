@@ -43,6 +43,20 @@ export async function getSession(request: NextRequest) {
     }
   }
 
+  // Fall back to Bearer token auth (dashboard sends Authorization: Bearer <jwt> with credentials: include)
+  const authHeader = request.headers.get('authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    const bearerToken = authHeader.slice(7).trim();
+    if (bearerToken) {
+      try {
+        const session = await getSessionFromToken(bearerToken);
+        if (session) return session;
+      } catch (e: any) {
+        console.error('[SESSION] Bearer auth failed:', e?.message || e);
+      }
+    }
+  }
+
   // Fall back to API key auth — also wrapped in try/catch
   try {
     const apiKeyAuth = await authenticateApiKey(request);

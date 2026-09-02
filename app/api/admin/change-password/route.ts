@@ -8,33 +8,33 @@ export async function POST(request: NextRequest) {
   try {
     const { tempToken, newPassword } = (await request.json()) as any;
     if (!tempToken || !newPassword || typeof newPassword !== 'string') {
-      return new NextResponse('Invalid payload', { status: 400 });
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
     if (newPassword.length < 8) {
-      return new NextResponse('Password must be at least 8 characters', { status: 400 });
+      return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
     }
 
     const userId = await verifyTempPasswordChangeToken(tempToken);
-    if (!userId) return new NextResponse('Invalid or expired session. Please sign in again.', { status: 401 });
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired session. Please sign in again.' }, { status: 401 });
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { id: true, email: true, passwordHash: true, adminRole: true, mustChangePassword: true },
     });
-    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
     if (!user.adminRole) {
-      return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
+      return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
     const { checkPasswordBreach } = await import('@/lib/auth/breach');
     const breach = await checkPasswordBreach(newPassword);
     if (breach.breached) {
-      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
+      return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
     }
 
     const sameAsTemp = await verifyPassword(user.passwordHash, newPassword);
     if (sameAsTemp) {
-      return new NextResponse('New password must be different from the temporary password.', { status: 400 });
+      return NextResponse.json({ error: 'New password must be different from the temporary password.' }, { status: 400 });
     }
 
     const newHash = await hashPassword(newPassword);
@@ -55,6 +55,6 @@ export async function POST(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[ADMIN CHANGE PASSWORD]', err?.message || err);
-    return new NextResponse('Failed to set new password', { status: 500 });
+    return NextResponse.json({ error: 'Failed to set new password' }, { status: 500 });
   }
 }

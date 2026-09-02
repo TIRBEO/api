@@ -102,15 +102,16 @@ export async function sendEmailDigests() {
             ]);
 
             const totalCount = notifs.length + audits.length + secEvents.length;
-            if (totalCount > 0) {
-              // Build notification items HTML
+            // Always send when enabled — even if quiet, user gets a summary of the period (per PRD: daily/weekly/monthly even without login/activity)
+            {
+              // Build notification items HTML — show last activity even when 0
               const itemsHtml = notifs.length > 0
                 ? notifs.map(n =>
                     `<div style="padding:12px 16px;background:#f8f9fa;border-radius:8px;margin-bottom:8px;"><strong>${esc(n.title)}</strong><br/><span style="color:#666;font-size:13px;">${esc(n.body || '')}</span></div>`
                   ).join('')
-                : '<p style="margin:0;font-size:14px;color:#64748b;">No new notifications.</p>';
+                : '<p style="margin:0;font-size:14px;color:#64748b;">No new notifications — everything is quiet. Here’s your activity for this period.</p>';
 
-              // Build activity summary HTML
+              // Build activity summary HTML — always show, even when 0
               const allEvents = [
                 ...audits.map(a => ({ action: a.action, severity: a.severity, at: a.createdAt })),
                 ...secEvents.map(s => ({ action: s.eventType, severity: s.severity, at: s.createdAt })),
@@ -130,7 +131,7 @@ export async function sendEmailDigests() {
                     ).join('')}
                     <div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#111827;"><span><strong>Total events</strong></span><strong>${allEvents.length}</strong></div>
                   </div>`
-                : '';
+                : `<div style="margin-top:20px;padding:12px 14px;background:#f8f9fa;border-radius:8px;border:1px solid #e5e7eb;"><p style="margin:0;font-size:13px;color:#64748b;">No account activity in this period — no logins, changes, or security events. We’ll keep watching.</p></div>`;
 
               const freqLabel = prefs.digestFrequency || 'daily';
               await sendTemplateEmail(u.email, 'notification_digest', {
@@ -359,4 +360,111 @@ export function startPeriodicPushPrune() {
   setTimeout(() => { import('./push-notifications').then(m=> m.pruneStalePushSubscriptions().catch(()=>{}) ) }, 5*60_000);
   pushPruneInterval = setInterval(() => { import('./push-notifications').then(m=> m.pruneStalePushSubscriptions().catch(()=>{}) ) }, 86_400_000);
   console.log('[PUSH] periodic prune started (nightly, >60d stale)');
+}
+
+// ─── REACTIVATION EMAILS ───
+// Sends a "we miss you" email to users who haven't been active for 7+ days.
+// Rate-limited: one reactivation email per user per 30 days.
+
+export async function sendReactivationEmails() {
+  try {
+    const cutoff7d = new Date(Date.now() - 7 * 86400_000);
+    const cutoff30d = new Date(Date.now() - 30 * 86400_000);
+
+    // Find users inactive for 7+ days who are eligible
+    const users = await prisma.user.findMany({
+      where: {
+        deletedAt: null,
+        isBanned: false,
+        lastActiveAt: { lt: cutoff7d },
+        // Must have opted into product/tips emails
+        // We filter in JS below since it's a JSONB column
+      },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        lastActiveAt: true,
+        createdAt: true,
+        notificationPreferences: true,
+      },
+      take: 2000,
+    });
+
+    if (users.length === 0) return;
+
+    const { sendTemplateEmail } = await import('./email');
+    const { getDashboardBaseUrl } = await import('./app-urls');
+    const dashboardUrl = getDashboardBaseUrl();
+
+    // Check recent reactivation logs to avoid re-sending within 30 days
+    const userIds = users.map(u => u.id);
+    const recentLogs = await prisma.email_logs.findMany({
+      where: {
+        toEmail: { in: users.map(u => u.email) },
+        template: 'reactivation',
+        createdAt: { gt: cutoff30d },
+      },
+      select: { toEmail: true },
+      distinct: ['toEmail'],
+    }).catch(() => [] as any[]);
+    const alreadySent = new Set(recentLogs.map(r => r.toEmail));
+
+    let sentCount = 0;
+    for (const u of users) {
+      if (!u.email) continue;
+      if (alreadySent.has(u.email)) continue;
+
+      // Check notification preferences
+      const prefs: any = (u as any).notificationPreferences;
+      if (prefs && typeof prefs === 'object') {
+        if (prefs.email === false) continue;
+        // product category covers reactivation emails
+        const productOn = prefs.product !== undefined ? prefs.product !== false : true;
+        const productEmailOn = prefs.productEmail !== undefined ? prefs.productEmail !== false : true;
+        if (!productOn || !productEmailOn) continue;
+      }
+
+      // Calculate days since last active
+      const lastActive = u.lastActiveAt ? new Date(u.lastActiveAt).getTime() : new Date(u.createdAt).getTime();
+      const daysSince = Math.max(1, Math.floor((Date.now() - lastActive) / 86400_000));
+
+      // Build a brief activity summary
+      let activitySummary = '<p style="margin:0;font-size:14px;color:#64748b;">No recent activity recorded. Your workspace is waiting.</p>';
+      try {
+        const recentNotifs = await prisma.notification.findMany({
+          where: { userId: u.id, createdAt: { gte: cutoff7d } },
+          select: { title: true },
+          take: 5,
+        });
+        if (recentNotifs.length > 0) {
+          activitySummary = recentNotifs.map(n =>
+            `<div style="padding:8px 14px;background:#111111;border-radius:8px;margin-bottom:6px;font-size:13px;color:#9a9a9a;">${esc(n.title)}</div>`
+          ).join('');
+        }
+      } catch {}
+
+      const result = await sendTemplateEmail(u.email, 'reactivation', {
+        name: u.name || u.email,
+        daysSince: String(daysSince),
+        activitySummary,
+        dashboardUrl,
+      }, { rawVars: ['activitySummary'] }).catch(() => ({ success: false }));
+
+      if (result?.success) sentCount++;
+    }
+
+    if (sentCount > 0) console.log(`[REACTIVATION] Sent ${sentCount} reactivation emails`);
+  } catch (err: any) {
+    console.error('[REACTIVATION] Sweep error:', err?.message);
+  }
+}
+
+let reactivationInterval: ReturnType<typeof setInterval> | null = null;
+export function startPeriodicReactivation() {
+  if (reactivationInterval) return;
+  // Run once after 10 min, then every 6 hours
+  setTimeout(() => { sendReactivationEmails().catch(() => {}); }, 10 * 60_000);
+  reactivationInterval = setInterval(() => { sendReactivationEmails().catch(() => {}); }, 6 * 3_600_000);
+  console.log('[REACTIVATION] Periodic reactivation emails started (every 6h)');
 }

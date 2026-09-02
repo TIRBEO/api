@@ -31,10 +31,10 @@ export async function POST(request: NextRequest) {
   if (session instanceof NextResponse) return session;
 
   let body: any;
-  try { body = await request.json(); } catch { return new NextResponse('Invalid JSON', { status: 400 }); }
+  try { body = await request.json(); } catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }); }
   const { title, body: msg, link, userIds } = body;
   if (!title || typeof title !== 'string') {
-    return new NextResponse('title is required', { status: 400 });
+    return NextResponse.json({ error: 'title is required' }, { status: 400 });
   }
 
   const targets: string[] = Array.isArray(userIds) && userIds.length ? userIds : [];

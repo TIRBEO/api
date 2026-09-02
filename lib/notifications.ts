@@ -11,10 +11,10 @@ async function sendToUserWs(userId: string, data: unknown) {
   }
 }
 
-export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert' | 'login' | 'forms' | 'product' | 'support' | 'ticket';
+export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert' | 'login' | 'forms' | 'product' | 'support' | 'ticket' | 'tips' | 'tip';
 
 /** Which preference category a notification type belongs to. Security/login are always compulsory. */
-export type NotifCategory = 'security' | 'forms' | 'product' | 'support';
+export type NotifCategory = 'security' | 'forms' | 'product' | 'support' | 'tips';
 
 const CATEGORY_BY_TYPE: Record<string, NotifCategory> = {
   security: 'security',
@@ -27,6 +27,8 @@ const CATEGORY_BY_TYPE: Record<string, NotifCategory> = {
   digest: 'product',
   admin_alert: 'product',
   marketing: 'product',
+  tips: 'tips',
+  tip: 'tips',
 };
 
 export function notifCategory(type: string): NotifCategory {
@@ -42,6 +44,10 @@ interface CreateNotifInput {
   icon?: string;
   /** Structured details (ip, device, method…) shown in the inbox detail view. */
   metadata?: Record<string, unknown>;
+  /** When true, skip the dedicated email even if prefs allow it (use when caller sends a specific template). */
+  skipEmail?: boolean;
+  /** When true, skip push even if prefs allow it. */
+  skipPush?: boolean;
 }
 
 /**
@@ -103,15 +109,20 @@ export function getClientIpFromRequest(request: { headers: Headers }): string {
 /** Per-user notification rate-limit: 10/min via Redis `notif:${userId}:` (Upstash). Falls back to allow if Redis unavailable. */
 let _notifRedis: any = null;
 let _notifRedisFailed = false;
+let _notifRedisErrorLogged = false;
 async function getNotifRedis(): Promise<any | null> {
   if (_notifRedisFailed) return null;
   if (_notifRedis) return _notifRedis;
   const url = process.env.REDIS_URL;
   if (!url) return null;
   try {
-    const { Redis } = await import('ioredis');
-    _notifRedis = new Redis(url, { maxRetriesPerRequest: 1, enableReadyCheck: false, lazyConnect: true });
-    // Test connection lazily
+    // Use the shared Redis factory which includes error handlers, keep-alive,
+    // and reconnection logic — avoids unhandled 'error' events.
+    const { getCachedRedisClient } = await import('./db/redis');
+    _notifRedis = getCachedRedisClient('notif-ratelimit', {
+      url,
+      enableKeepAlive: false, // short-lived rate-limit checks don't need keep-alive
+    });
     return _notifRedis;
   } catch { _notifRedisFailed = true; return null; }
 }
@@ -149,9 +160,15 @@ export async function createNotification(input: CreateNotifInput) {
   // Security/login notifications are ALWAYS ON — compulsory, no user toggle.
   // In-app (DB + WebSocket) is always ON.
   // Email and push are configurable per category.
+  // Tips has dedicated toggle (tips / tipsEmail) falling back to product toggles for backwards compat.
   const isSecurity = category === 'security';
-  const emailOn = isSecurity || (on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category]));
-  const pushOn = isSecurity || (on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category]));
+  const isTips = category === 'tips';
+  const emailOn = isSecurity || (isTips
+    ? (on(prefs?.email) && (prefs?.tipsEmail !== undefined ? on(prefs.tipsEmail) : on(prefs?.productEmail)) && (prefs?.tips !== undefined ? on(prefs.tips) : on(prefs?.product)))
+    : (on(prefs?.email) && on(prefs?.[`${category}Email`]) && on(prefs?.[category])));
+  const pushOn = isSecurity || (isTips
+    ? (on(prefs?.push) && (prefs?.tipsPush !== undefined ? on(prefs.tipsPush) : on(prefs?.productPush)) && (prefs?.tips !== undefined ? on(prefs.tips) : on(prefs?.product)))
+    : (on(prefs?.push) && on(prefs?.[`${category}Push`]) && on(prefs?.[category])));
 
   // Per-user rate-limit 10/min for non-security — prevents ticket loops / spam
   if (!isSecurity) {
@@ -185,19 +202,21 @@ export async function createNotification(input: CreateNotifInput) {
   } catch { /* non-fatal */ }
 
   // External channels (email / push) respect quiet hours (but NOT security).
-  if (!emailOn && !pushOn) return notif;
+  const effectiveEmailOn = emailOn && !input.skipEmail;
+  const effectivePushOn = pushOn && !input.skipPush;
+  if (!effectiveEmailOn && !effectivePushOn) return notif;
   if (!isSecurity) {
     const quiet = await isInQuietHours(prefs);
     if (quiet) return notif;
   }
 
   // Push/email are best-effort and must NOT block the in-app response — fire-and-forget for per-user speed
-  if (pushOn) {
+  if (effectivePushOn) {
     void import('./push-notifications').then(m=> m.sendPushNotification(input.userId, {
       title: input.title, body: input.body || '', icon: input.icon || undefined, url: input.link || '/account/inbox', tag: input.type,
     }).catch(()=>{})).catch(()=>{});
   }
-  if (emailOn && category !== 'product') {
+  if (effectiveEmailOn && category !== 'product') {
     void prisma.user.findUnique({ where: { id: input.userId }, select: { email: true, name: true } }).then(user=>{
       if(!user) return;
       import('./app-urls').then(mod=> mod.getDashboardBaseUrl()).catch(()=> 'https://tirbeo.app').then(dash=>{
@@ -241,16 +260,17 @@ export async function markAsRead(userId: string, notifId?: string) {
 }
 
 // ─── Default preferences ──────────────────────────────────────────
-// Security is compulsory (no toggle). Only forms/product/support have toggles.
+// Security is compulsory (no toggle). Only forms/product/support/tips have toggles.
 // Keep in sync with app/api/notifications/prefs/route.ts DEFAULT_PREFS
 const DEFAULT_PREFS: Record<string, unknown> = {
   email: true, push: true,
   // Category toggles — security is compulsory (always true, not configurable)
-  forms: true, product: false, support: true,
+  forms: true, product: false, support: true, tips: true,
   // Per-category channel toggles
   formsEmail: true, formsPush: true,
   productEmail: false, productPush: true,
   supportEmail: true, supportPush: true,
+  tipsEmail: true, tipsPush: false,
   // Digest
   digestEnabled: false, digestFrequency: 'daily',
 };

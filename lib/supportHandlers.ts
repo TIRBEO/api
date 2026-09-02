@@ -13,6 +13,12 @@ function isAdmin(user: any): boolean {
   return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
 }
 
+// ─── Ticket List Cache ───
+// AppShell polls tickets every 15s — cache the result for 10s to avoid
+// redundant DB round-trips during idle browsing.
+const ticketListCache = new Map<string, { data: any; ts: number }>();
+const TICKET_CACHE_TTL = 10_000;
+
 export async function ticketListHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
@@ -22,6 +28,13 @@ export async function ticketListHandler(req: NextRequest) {
     const limit = Math.min(Math.max(1, parseInt(searchParams.get('limit') || '20') || 20), 100);
     const status = searchParams.get('status');
     const q = searchParams.get('q')?.trim();
+    const scope = searchParams.get('scope');
+    const cacheKey = `${user.userId}:${page}:${limit}:${status || ''}:${q || ''}:${scope || ''}`;
+    const cached = ticketListCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < TICKET_CACHE_TTL) {
+      return NextResponse.json(cached.data);
+    }
+
     const where: any = {};
     if (status) where.status = status;
     if (q) {
@@ -30,21 +43,45 @@ export async function ticketListHandler(req: NextRequest) {
         { description: { contains: q, mode: 'insensitive' } },
       ];
     }
-    // scope=all is only available to admins; default is scope=mine (own tickets only)
-    const scope = searchParams.get('scope');
     if (scope === 'all' && isAdmin(user)) {
-      // Admin: show all tickets
     } else {
       where.customerId = user.userId;
     }
     const [data, total] = await Promise.all([
       trackQuery('tickets_by_customer_created', () => prisma.ticket.findMany({
         where, skip: (page - 1) * limit, take: limit, orderBy: { createdAt: 'desc' },
-        include: { customer: { select: { id: true, name: true, email: true } }, assigned: { select: { id: true, name: true } }, messages: { take: 1, orderBy: { createdAt: 'desc' } } },
+        include: { customer: { select: { id: true, name: true, email: true } }, assigned: { select: { id: true, name: true } } },
       })),
-      prisma.ticket.count({ where }),
+      trackQuery('tickets_by_customer_count', () => prisma.ticket.count({ where })),
     ]);
-    return NextResponse.json({ data, total, page, limit });
+    // Fetch last message for each ticket in a single query (avoids N+1 subqueries)
+    if (data.length > 0) {
+      const ticketIds = data.map((t: any) => t.id);
+      const lastMsgs = await prisma.ticketMessage.findMany({
+        where: { ticketId: { in: ticketIds } },
+        orderBy: { createdAt: 'desc' },
+        select: { ticketId: true, content: true, createdAt: true, authorId: true },
+      });
+      // Deduplicate: keep only the latest per ticket
+      const seen = new Set<string>();
+      for (const msg of lastMsgs) {
+        if (!seen.has(msg.ticketId)) {
+          seen.add(msg.ticketId);
+          const ticket = data.find((t: any) => t.id === msg.ticketId);
+          if (ticket) (ticket as any).messages = [msg];
+        }
+      }
+    }
+    const payload = { data, total, page, limit };
+    ticketListCache.set(cacheKey, { data: payload, ts: Date.now() });
+    // Evict stale cache entries (keep max 50 per user)
+    if (ticketListCache.size > 200) {
+      const now = Date.now();
+      for (const [k, v] of ticketListCache) {
+        if (now - v.ts > TICKET_CACHE_TTL * 3) ticketListCache.delete(k);
+      }
+    }
+    return NextResponse.json(payload);
   } catch (err: any) {
     console.error('[TICKET LIST]', err?.message || err);
     return NextResponse.json({ data: [], total: 0, page: 1, limit: 20 });
@@ -55,14 +92,12 @@ export async function ticketCreateHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user) return jsonUnauthorized();
   let body: any;
-  try { body = await req.json(); } catch { return new NextResponse('Invalid JSON', { status: 400 }); }
-  // Accept both field-name conventions (support portal used subject/message,
-  // dashboard uses title/description) so every consumer can create tickets.
+  try { body = await req.json(); } catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }); }
   const title = sanitizeInput(String(body.title || body.subject || ''), 300).trim();
-  if (!title || title.length < 3) return new NextResponse('Subject must be at least 3 characters', { status: 400 });
+  if (!title || title.length < 3) return NextResponse.json({ error: 'Subject must be at least 3 characters' }, { status: 400 });
   let description = (body.description || body.message) ? sanitizeInput(String(body.description || body.message), 20000) : undefined;
   if (description) description = description.trim();
-  if (!description || description.length < 10) return new NextResponse('Message must be at least 10 characters', { status: 400 });
+  if (!description || description.length < 10) return NextResponse.json({ error: 'Message must be at least 10 characters' }, { status: 400 });
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) description = `${description || ''}![tirbeo-img](${url})`;
   const ticket = await prisma.ticket.create({
@@ -70,18 +105,16 @@ export async function ticketCreateHandler(req: NextRequest) {
       subject: sanitizeInput(String(title || ''), 300),
       description,
       category: body.category ? sanitizeInput(String(body.category), 50) : 'general',
-      priority: body.priority,
-      status: body.status,
+      priority: body.priority || 'normal',
+      status: body.status || 'open',
       customerId: user.userId,
-      // Captcha appeal tickets are tagged with the source form's public ID
-      // (e.g. "captcha-appeal:<publicId>") so admins can review them from the
-      // security console and unblock by Ray ID directly.
       application: body.appealRayId ? `captcha-appeal:${sanitizeInput(String(body.appealRayId), 64)}` : body.application,
     },
   });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_CREATED', targetType: 'ticket', targetId: ticket.id });
 
-  const customer = await prisma.user.findUnique({ where: { id: user.userId }, select: { email: true } });
+  // Email to customer — respects supportEmail + global email prefs via shouldSuppressEmail inside sendTemplateEmail
+  const customer = await prisma.user.findUnique({ where: { id: user.userId }, select: { email: true, name: true } });
   if (customer?.email) {
     sendTemplateEmail(customer.email, 'ticket_created', {
       ticketId: ticket.id,
@@ -90,15 +123,16 @@ export async function ticketCreateHandler(req: NextRequest) {
       ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
     }).catch(() => {});
   }
-  // In-app + push/email per support category prefs (respects email/push toggles, per-channel matrix & quiet hours)
+  // In-app + push (email skipped — we already sent the dedicated ticket_created template)
   try {
     await createNotification({
       userId: user.userId,
       type: 'support',
-      title: `Ticket created: ${ticket.subject.slice(0, 80)}`,
+      title: `Ticket opened: ${ticket.subject.slice(0, 80)}`,
       body: `Your ticket #${ticket.id.slice(0,8)} is open. We'll reply soon.`,
       link: `/support/tickets/${ticket.id}`,
       metadata: { ticketId: ticket.id, category: ticket.category, priority: ticket.priority },
+      skipEmail: true,
     });
   } catch {}
 
@@ -175,27 +209,45 @@ export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
       priority: body.priority,
       status: body.status,
       assignedId: body.assignedId,
-      // Match the standalone PUT behavior: resolving/closing stamps closedAt
-      // (the close/reopen endpoints own clearing it on reopen).
       ...(body.status === 'resolved' || body.status === 'closed' ? { closedAt: new Date() } : {}),
+      ...(body.status === 'open' ? { closedAt: null } : {}),
     },
   });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_UPDATED', targetType: 'ticket', targetId: ticketId, metadata: { prevStatus, newStatus: body.status } });
 
-  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true } });
+  // Notify customer of any status/priority change
+  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true, name: true } });
+  const isClosed = body.status === 'closed' || body.status === 'resolved';
+  const isReopened = prevStatus === 'closed' && body.status === 'open';
+  const template = isClosed ? 'ticket_closed' : isReopened ? 'ticket_reopened' : 'ticket_updated';
+  const notifTitle = isClosed ? `Ticket closed: ${updated.subject.slice(0,60)}` : isReopened ? `Ticket reopened: ${updated.subject.slice(0,60)}` : `Ticket updated: ${updated.subject.slice(0,60)}`;
+  const notifBody = isClosed ? `Ticket #${ticket.id.slice(0,8)} was closed.` : isReopened ? `Ticket #${ticket.id.slice(0,8)} was reopened.` : `Ticket #${ticket.id.slice(0,8)} was updated.`;
+
   if (customer?.email) {
-    const isClosed = body.status === 'closed' || body.status === 'resolved';
-    sendTemplateEmail(customer.email, isClosed ? 'ticket_closed' : 'ticket_updated', {
+    const vars: Record<string, string> = {
       ticketId: ticket.id,
       ticketSubject: updated.subject,
-      ticketStatus: statusLabel,
+      ticketStatus: statusLabel || updated.status,
       ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
-      updateMessage: isClosed ? 'Your ticket has been marked as solved.' : 'Your ticket status has been updated.',
-    }).catch(() => {});
+      updateMessage: isClosed ? 'Your ticket has been marked as solved.' : isReopened ? 'Your ticket is open again and back in our queue.' : 'Your ticket status has been updated.',
+    };
+    sendTemplateEmail(customer.email, template, vars).catch(() => {});
   }
+  // In-app notification (skipEmail since we sent dedicated template)
+  try {
+    await createNotification({
+      userId: ticket.customerId,
+      type: 'support',
+      title: notifTitle,
+      body: notifBody,
+      link: `/support/tickets/${ticket.id}`,
+      metadata: { ticketId, prevStatus, newStatus: body.status },
+      skipEmail: true,
+    });
+  } catch {}
 
   if (isAdmin(user) && body.assignedId && body.assignedId !== ticket.assignedId) {
-    const agent = await prisma.user.findUnique({ where: { id: body.assignedId }, select: { email: true } });
+    const agent = await prisma.user.findUnique({ where: { id: body.assignedId }, select: { email: true, name: true } });
     if (agent?.email) {
       sendTemplateEmail(agent.email, 'ticket_updated', {
         ticketId: ticket.id,
@@ -204,6 +256,17 @@ export async function ticketUpdateHandler(req: NextRequest, ticketId: string) {
         ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
         updateMessage: `You have been assigned ticket #${ticket.id}.`,
       }).catch(() => {});
+      try {
+        await createNotification({
+          userId: body.assignedId,
+          type: 'support',
+          title: `Assigned: ${updated.subject.slice(0,50)}`,
+          body: `You were assigned ticket #${ticket.id.slice(0,8)}`,
+          link: `/support/tickets/${ticket.id}`,
+          metadata: { ticketId },
+          skipEmail: true,
+        });
+      } catch {}
     }
   }
 
@@ -220,41 +283,66 @@ export async function ticketMessageHandler(req: NextRequest, ticketId: string) {
     return jsonError('TICKET_CLOSED', 'This ticket is resolved and no longer accepts messages. Open a new ticket if you need more help.', 400);
   }
   const body: any = await req.json();
-  // Accept both field names: the support portal posts `content` via /messages
-  // and the documented /reply contract uses `message`.
   let content = sanitizeInput(String(body.content || body.message || ''), 20000).trim();
-  if (!content || content.length < 1) return new NextResponse('Message cannot be empty', { status: 400 });
+  if (!content || content.length < 1) return NextResponse.json({ error: 'Message cannot be empty' }, { status: 400 });
   const imageUrls = Array.isArray(body.imageUrls) ? body.imageUrls.filter((u: unknown) => typeof u === 'string' && /^https?:\/\//.test(u)).slice(0, 6) : [];
   for (const url of imageUrls) content = `${content}![tirbeo-img](${url})`;
   const message = await prisma.ticketMessage.create({ data: { ticketId, authorId: user.userId, content, isInternal: isAdmin(user) ? !!body.isInternal : false } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_REPLIED', targetType: 'ticket', targetId: ticketId });
 
-  // Send real-time WebSocket notification to ticket customer + create inbox notification (respects prefs)
+  // Resolve recipient: if author is not customer → customer; if author is customer and ticket has assignee → assignee; otherwise no recipient (internal customer note)
   try {
-    const t = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true, subject: true } });
-    if (t?.customerId && t.customerId !== user.userId) {
-      sendToUser(t.customerId, {
-        type: 'ticket_message',
-        ticketId,
-        message: { id: message.id, content: message.content, authorId: user.userId, isInternal: message.isInternal, createdAt: message.createdAt.toISOString() },
-      });
-      // Support-category notification (push/email respect per-category matrix, quiet hours, security always-on bypass)
-      if (!message.isInternal) {
-        await createNotification({
-          userId: t.customerId,
-          type: 'support',
-          title: `New reply: ${String(t.subject).slice(0, 60)}`,
-          body: content.slice(0, 140),
-          link: `/support/tickets/${ticketId}`,
-          metadata: { ticketId, messageId: message.id },
-        }).catch(()=>{});
+    const fullTicket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { customerId: true, assignedId: true, subject: true } });
+    const author = await prisma.user.findUnique({ where: { id: user.userId }, select: { name: true, email: true } });
+    const replierName = author?.name || author?.email || 'Support';
+    let recipientId: string | null = null;
+    if (user.userId !== fullTicket?.customerId) {
+      recipientId = fullTicket?.customerId || null; // Support/agent replied → notify customer
+    } else if (fullTicket?.assignedId && fullTicket.assignedId !== user.userId) {
+      recipientId = fullTicket.assignedId; // Customer replied → notify assigned agent
+    }
+    // If still no recipient and author is customer and ticket is unassigned, we don't WS-notify anyone, but still create in-app for customer as confirmation? Skipped.
+
+    if (recipientId && !message.isInternal) {
+      // WS real-time
+      try {
+        sendToUser(recipientId, {
+          type: 'ticket_message',
+          ticketId,
+          message: { id: message.id, content: message.content, authorId: user.userId, isInternal: message.isInternal, createdAt: message.createdAt.toISOString() },
+        });
+      } catch {}
+
+      // Email — respects supportEmail / email prefs via shouldSuppressEmail
+      const recipient = await prisma.user.findUnique({ where: { id: recipientId }, select: { email: true, name: true } });
+      if (recipient?.email) {
+        sendTemplateEmail(recipient.email, 'ticket_replied', {
+          ticketId: ticket.id,
+          ticketSubject: String(fullTicket?.subject || ticket.subject).slice(0, 80),
+          replierName,
+          replyContent: content.slice(0, 2000),
+          ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
+        }).catch(() => {});
       }
-    } else if (t?.customerId && t.customerId === user.userId && isAdmin(user)) {
-      // Customer replied to own ticket, notify assignee if any
-      const assignee = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { assignedId: true } });
-      if (assignee?.assignedId) {
-        await createNotification({ userId: assignee.assignedId, type: 'support', title: `Customer replied: ${String(t.subject).slice(0,60)}`, body: content.slice(0,140), link: `/support/tickets/${ticketId}`, metadata: { ticketId, messageId: message.id } }).catch(()=>{});
-      }
+      // In-app + push notification (skipEmail since explicit ticket_replied already sent)
+      await createNotification({
+        userId: recipientId,
+        type: 'support',
+        title: `New reply: ${String(fullTicket?.subject || ticket.subject).slice(0, 60)}`,
+        body: content.slice(0, 140),
+        link: `/support/tickets/${ticketId}`,
+        metadata: { ticketId, messageId: message.id, replierName },
+        skipEmail: true,
+      }).catch(()=>{});
+    } else if (recipientId && message.isInternal) {
+      // Internal note — only notify assignee, no customer email
+      try {
+        sendToUser(recipientId, {
+          type: 'ticket_message',
+          ticketId,
+          message: { id: message.id, content: message.content, authorId: user.userId, isInternal: true, createdAt: message.createdAt.toISOString() },
+        });
+      } catch {}
     }
   } catch {}
 
@@ -267,6 +355,29 @@ export async function ticketAssignHandler(req: NextRequest, ticketId: string) {
   const body: any = await req.json();
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { assignedId: body.agentId } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_ASSIGNED', targetType: 'ticket', targetId: ticketId, metadata: { agentId: body.agentId, assignedBy: user.userId } });
+  if (body.agentId) {
+    const agent = await prisma.user.findUnique({ where: { id: body.agentId }, select: { email: true, name: true } });
+    if (agent?.email) {
+      sendTemplateEmail(agent.email, 'ticket_updated', {
+        ticketId: updated.id,
+        ticketSubject: updated.subject,
+        ticketStatus: updated.status,
+        ticketUrl: `https://support.tirbeo.app/tickets/${ticketId}`,
+        updateMessage: `You have been assigned ticket #${updated.id.slice(0,8)}: ${updated.subject}`,
+      }).catch(()=>{});
+      try {
+        await createNotification({
+          userId: body.agentId,
+          type: 'support',
+          title: `Assigned: ${updated.subject.slice(0,50)}`,
+          body: `You were assigned ticket #${updated.id.slice(0,8)}`,
+          link: `/support/tickets/${ticketId}`,
+          metadata: { ticketId },
+          skipEmail: true,
+        });
+      } catch {}
+    }
+  }
   return NextResponse.json(updated);
 }
 
@@ -279,14 +390,25 @@ export async function ticketCloseHandler(req: NextRequest, ticketId: string) {
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { status: 'closed', closedAt: new Date() } });
   await createAuditEvent({ actorId: user.userId, action: 'TICKET_CLOSED', targetType: 'ticket', targetId: ticketId });
 
-  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true } });
+  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true, name: true } });
   if (customer?.email) {
     sendTemplateEmail(customer.email, 'ticket_closed', {
       ticketId: ticket.id,
+      ticketSubject: ticket.subject,
       ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
     }).catch(() => {});
   }
-  try { await createNotification({ userId: ticket.customerId, type: 'support', title: `Ticket closed: ${ticket.subject.slice(0,60)}`, body: `Ticket #${ticket.id.slice(0,8)} was closed.`, link: `/support/tickets/${ticket.id}`, metadata:{ticketId} }).catch(()=>{});} catch {}
+  try {
+    await createNotification({
+      userId: ticket.customerId,
+      type: 'support',
+      title: `Ticket closed: ${ticket.subject.slice(0,60)}`,
+      body: `Ticket #${ticket.id.slice(0,8)} was closed.`,
+      link: `/support/tickets/${ticket.id}`,
+      metadata:{ticketId},
+      skipEmail: true,
+    });
+  } catch {}
 
   return NextResponse.json(updated);
 }
@@ -298,7 +420,41 @@ export async function ticketReopenHandler(req: NextRequest, ticketId: string) {
   if (!ticket) return jsonError('NOT_FOUND', 'Ticket not found', 404);
   if (ticket.customerId !== user.userId && !isAdmin(user)) return jsonForbidden();
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data: { status: 'open', closedAt: null } });
-  try { await createNotification({ userId: ticket.customerId, type: 'support', title: `Ticket reopened: ${ticket.subject.slice(0,60)}`, body: `Ticket #${ticket.id.slice(0,8)} was reopened.`, link: `/support/tickets/${ticket.id}`, metadata:{ticketId} }).catch(()=>{});} catch {}
+  await createAuditEvent({ actorId: user.userId, action: 'TICKET_REOPENED', targetType: 'ticket', targetId: ticketId });
+
+  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true, name: true } });
+  if (customer?.email) {
+    sendTemplateEmail(customer.email, 'ticket_reopened', {
+      ticketId: ticket.id,
+      ticketSubject: ticket.subject,
+      ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
+    }).catch(()=>{});
+  }
+  try {
+    await createNotification({
+      userId: ticket.customerId,
+      type: 'support',
+      title: `Ticket reopened: ${ticket.subject.slice(0,60)}`,
+      body: `Ticket #${ticket.id.slice(0,8)} was reopened and is active again.`,
+      link: `/support/tickets/${ticket.id}`,
+      metadata:{ticketId},
+      skipEmail: true,
+    });
+  } catch {}
+  // Also notify assignee if reopened by customer
+  if (ticket.assignedId && ticket.assignedId !== user.userId) {
+    try {
+      await createNotification({
+        userId: ticket.assignedId,
+        type: 'support',
+        title: `Ticket reopened: ${ticket.subject.slice(0,60)}`,
+        body: `Ticket #${ticket.id.slice(0,8)} was reopened by ${customer?.name || customer?.email || 'customer'}.`,
+        link: `/support/tickets/${ticket.id}`,
+        metadata:{ticketId},
+        skipEmail: true,
+      });
+    } catch {}
+  }
   return NextResponse.json(updated);
 }
 
@@ -306,7 +462,6 @@ export async function ticketReopenHandler(req: NextRequest, ticketId: string) {
 export async function queuesListHandler(req: NextRequest) {
   const user = await getSession(req);
   if (!user || !isAdmin(user)) return jsonForbidden();
-  // Queues removed — return empty list for backward compatibility
   return NextResponse.json([]);
 }
 
@@ -329,19 +484,17 @@ export async function ticketMarkReadHandler(req: NextRequest, ticketId: string) 
       where: {
         id: { in: messageIds },
         ticketId,
-        authorId: { not: session.userId }, // Don't mark own messages
+        authorId: { not: session.userId },
       },
       data: { readAt: new Date(), readBy: session.userId },
     });
   } else {
-    // Mark all unread messages in the ticket as read
     await prisma.ticketMessage.updateMany({
       where: { ticketId, authorId: { not: session.userId }, readAt: null },
       data: { readAt: new Date(), readBy: session.userId },
     });
   }
 
-  // Notify the other party over WebSocket
   const ticket = await prisma.ticket.findUnique({
     where: { id: ticketId },
     select: { customerId: true, assignedId: true },
@@ -387,7 +540,7 @@ export async function ticketAttachmentsListHandler(req: NextRequest, ticketId: s
     return NextResponse.json({ attachments });
   } catch (err: any) {
     console.error('[TICKET ATTACHMENTS LIST]', err?.message || err);
-    return new NextResponse('Failed to fetch attachments', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch attachments' }, { status: 500 });
   }
 }
 
@@ -404,18 +557,14 @@ export async function ticketAttachmentsUploadHandler(req: NextRequest, ticketId:
     }
     const formData = await req.formData();
     const file = formData.get('file') as File | null;
-    if (!file) return new NextResponse('No file provided', { status: 400 });
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (file.size > maxSize) return new NextResponse('File too large (max 10MB)', { status: 400 });
-    // Validate MIME to prevent executable uploads
+    if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+    const maxSize = 10 * 1024 * 1024;
+    if (file.size > maxSize) return NextResponse.json({ error: 'File too large (max 10MB)' }, { status: 400 });
     const allowedMime = /^(image\/(jpeg|png|gif|webp|svg\+xml)|application\/pdf|text\/(plain|csv)|application\/(msword|vnd\.openxmlformats-officedocument\.wordprocessingml\.document|json|octet-stream)|)$/i;
     if (file.type && !allowedMime.test(file.type) && !file.type.startsWith('image/')) {
-      // Allow images broadly + common docs; block unknown executables
-      // Still store but warn — strict block would break .log
     }
     const bytes = await file.arrayBuffer();
     const buffer = Buffer.from(bytes);
-    const ext = (file.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
     const key = `tickets/${ticketId}/${Date.now()}-${Math.random().toString(36).slice(2,6)}-${safeName}`;
     let fileUrl: string;
@@ -447,7 +596,7 @@ export async function ticketAttachmentsUploadHandler(req: NextRequest, ticketId:
     return NextResponse.json({ attachment }, { status: 201 });
   } catch (err: any) {
     console.error('[TICKET ATTACHMENTS UPLOAD]', err?.message || err);
-    return new NextResponse('Failed to upload attachment', { status: 500 });
+    return NextResponse.json({ error: 'Failed to upload attachment' }, { status: 500 });
   }
 }
 
@@ -462,10 +611,9 @@ export async function ticketAttachmentDownloadHandler(req: NextRequest, ticketId
     const att = await prisma.ticket_attachments.findFirst({ where: { id: attachmentId, ticketId } });
     if (!att) return jsonError('NOT_FOUND', 'Attachment not found', 404);
 
-    // Data-URL fallback (old attachments)
     if (att.fileUrl.startsWith('data:')) {
       const m = att.fileUrl.match(/^data:([^;]+);base64,(.+)$/);
-      if (!m) return new NextResponse('Invalid data URL', { status: 500 });
+      if (!m) return NextResponse.json({ error: 'Invalid data URL' }, { status: 500 });
       const [, mime, b64] = m;
       const buf = Buffer.from(b64, 'base64');
       return new NextResponse(buf, {
@@ -478,14 +626,10 @@ export async function ticketAttachmentDownloadHandler(req: NextRequest, ticketId
       });
     }
 
-    // R2 stored — extract key from URL and proxy via signed getObject
     try {
       const url = new URL(att.fileUrl);
       const bucket = process.env.R2_BUCKET || process.env.S3_BUCKET || '';
-      // URL is https://<publicUrl>/tickets/...  → key is pathname without leading /
       let key = url.pathname.replace(/^\//, '');
-      // If publicUrl contains bucket prefix, strip it (when publicUrl includes bucket)
-      // For R2 publicUrl like https://<id>.r2.cloudflarestorage.com/tickets/... the pathname is already key
       if (bucket && key.startsWith(bucket + '/')) key = key.slice(bucket.length + 1);
       const { getObject } = await import('./storage');
       const envEndpoint = process.env.R2_ENDPOINT || process.env.S3_API_ENDPOINT || '';
@@ -493,11 +637,10 @@ export async function ticketAttachmentDownloadHandler(req: NextRequest, ticketId
       const envSecret = process.env.R2_SECRET_KEY || process.env.SECRET_ACCESS_KEY || '';
       const envBucket = bucket;
       if (!envEndpoint || !envAccess || !envSecret || !envBucket) {
-        // R2 not configured — redirect to stored URL (public)
         return NextResponse.redirect(att.fileUrl, 302);
       }
       const obj = await getObject({ endpoint: envEndpoint, accessKey: envAccess, secretKey: envSecret, bucket: envBucket, key });
-      if (!obj) return new NextResponse('File not found on storage', { status: 404 });
+      if (!obj) return NextResponse.json({ error: 'File not found on storage' }, { status: 404 });
       return new NextResponse(new Uint8Array(obj.data), {
         headers: {
           'Content-Type': obj.contentType || att.mimeType || 'application/octet-stream',
@@ -508,11 +651,10 @@ export async function ticketAttachmentDownloadHandler(req: NextRequest, ticketId
       });
     } catch (e: any) {
       console.error('[TICKET ATTACHMENT DOWNLOAD] R2 get failed:', e.message);
-      // Fallback: redirect to raw URL
       return NextResponse.redirect(att.fileUrl, 302);
     }
   } catch (err: any) {
     console.error('[TICKET ATTACHMENT DOWNLOAD]', err?.message || err);
-    return new NextResponse('Failed to fetch attachment', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch attachment' }, { status: 500 });
   }
 }

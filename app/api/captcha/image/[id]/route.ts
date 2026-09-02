@@ -9,15 +9,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const token = request.nextUrl.searchParams.get('token') || '';
 
   if (!id || !token || !verifyImageToken(token, id)) {
-    return new NextResponse('Not Found', { status: 404 });
+    return NextResponse.json({ error: 'Not Found' }, { status: 404 });
   }
 
   try {
     const challenge = await prisma.captchaChallenge.findUnique({ where: { id } });
-    if (!challenge || !challenge.imageUrl) return new NextResponse('Not Found', { status: 404 });
+    if (!challenge || !challenge.imageUrl) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
     const svg = renderCaptchaSvg(challenge.challengeType as 'count' | 'shape' | 'direction', challenge.id);
-    if (!svg) return new NextResponse('Not Found', { status: 404 });
+    if (!svg) return NextResponse.json({ error: 'Not Found' }, { status: 404 });
 
     return new NextResponse(svg, {
       status: 200,
@@ -29,6 +29,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       },
     });
   } catch {
-    return new NextResponse('Not Found', { status: 404 });
+    return NextResponse.json({ error: 'Not Found' }, { status: 404 });
   }
 }

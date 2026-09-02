@@ -79,6 +79,10 @@ import {
   avatarUploadHandler,
   heartbeatHandler,
   notificationPrefsHandler,
+  notificationChannelsHandler,
+  notificationCategoriesHandler,
+  notificationDigestHandler,
+  notificationTipsHandler,
   exportDataHandler,
   deleteAccountRequestHandler,
   publicProfileHandler,
@@ -210,8 +214,8 @@ const INTERNAL_ROUTES = [
   'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
   'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
   'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
-  'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar',
-  'notifications', 'notifications/prefs', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'consent-history',
+  'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar', 'profile/check-username',
+  'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/digest', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
   'emails', 'emails/unsubscribe', 'pushes',
@@ -382,7 +386,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/login': ['POST'],
       'auth/signup': ['POST'],
       'auth/email-exists': ['POST'],
-      'auth/username-exists': ['POST'],
+      'profile/check-username': ['GET'],
       'auth/verify-email': ['POST'],
       'auth/verify': ['GET'],
       'auth/logout': ['POST'],
@@ -429,7 +433,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
        'auth/accounts/remove': ['POST'],
         'security/session-revoke': ['POST'],
        'users/me': ['GET', 'PATCH'],
-      'profile': ['GET', 'PATCH'],
+      'profile': ['GET', 'PATCH', 'PUT'],
       'security/password': ['POST'],
       'security/sessions': ['GET', 'DELETE'],
       'security/set-password': ['POST'],
@@ -453,6 +457,10 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'profile/avatar': ['POST'],
       'notifications': ['GET', 'PATCH', 'DELETE'],
       'notifications/prefs': ['GET', 'PUT'],
+      'notifications/prefs/channels': ['GET', 'PUT'],
+      'notifications/prefs/categories': ['GET', 'PUT'],
+      'notifications/prefs/digest': ['GET', 'PUT'],
+      'notifications/prefs/tips': ['GET', 'PUT'],
       'integrations': ['GET', 'POST', 'DELETE'],
       'integrations/merge': ['POST'],
 
@@ -651,11 +659,13 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   // Quick cached check — if DB is confirmed down, return 503 immediately
   // without waiting for the query to timeout. Health and auth routes bypass
   // this check since they handle their own DB errors gracefully.
-  const SKIP_DB_CHECK = ['health', 'health/pool', 'captcha/status', 'captcha/challenge',
-    'public/app-config', 'public/help-config', 'public/faq', 'public/theme', 'public/branding',
-    'public/landing', 'public/landing-config', 'admin/check-setup',
+  const SKIP_DB_CHECK = [
+    'health', 'health/pool', 'captcha/status', 'captcha/challenge',
+    'public/app-config', 'public/help-config', 'public/faq', 'public/theme',
+    'public/branding', 'public/landing', 'public/landing-config', 'admin/check-setup',
     'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
-    'auth/discord', 'auth/discord/callback'];
+    'auth/discord', 'auth/discord/callback', 'auth/refresh', 'auth/session',
+  ];
   if (!SKIP_DB_CHECK.includes(pathStr)) {
     const dbOk = await isDbHealthy();
     if (!dbOk) {
@@ -882,6 +892,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'profile/avatar':
         resp = await avatarUploadHandler(request);
         break;
+      case 'profile/check-username':
+        resp = await usernameExistsHandler(request);
+        break;
       case 'profile/oauth/[provider]':
         resp = await oauthUnlinkHandler(request, (route as any).meta.provider);
         break;
@@ -890,6 +903,18 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'notifications/prefs':
         resp = await notificationPrefsHandler(request);
+        break;
+      case 'notifications/prefs/channels':
+        resp = await notificationChannelsHandler(request);
+        break;
+      case 'notifications/prefs/categories':
+        resp = await notificationCategoriesHandler(request);
+        break;
+      case 'notifications/prefs/digest':
+        resp = await notificationDigestHandler(request);
+        break;
+      case 'notifications/prefs/tips':
+        resp = await notificationTipsHandler(request);
         break;
       // notifications/push routes handled by standalone routes at app/api/notifications/push/
       case 'integrations':
@@ -1143,10 +1168,10 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
 
       case 'admin/integrations':
-        resp = new NextResponse('Feature removed', { status: 410 });
+        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
         break;
       case 'admin/security/score':
-        resp = new NextResponse('Handled by standalone route', { status: 200 });
+        resp = NextResponse.json({ error: 'Handled by standalone route' }, { status: 200 });
         break;
 
       case 'admin/analytics/overview':
@@ -1181,7 +1206,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'passkey/[id]':
         if (method === 'DELETE') resp = await passkeyDeleteHandler(request, (route as any).meta.passkeyId);
         else if (method === 'PATCH') resp = await passkeyUpdateHandler(request, (route as any).meta.passkeyId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
+        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
         break;
 // connected-accounts routes removed (LinkedAccount model removed)
       case 'user/export-data':
@@ -1251,7 +1276,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'content/incident-events':
         if (method === 'GET') resp = await incidentEventsListHandler(request);
         else if (method === 'POST') resp = await incidentEventsCreateHandler(request);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
+        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
         break;
       case 'content/jobs':
       case 'content/jobs/create':
@@ -1275,7 +1300,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'support/tickets/[id]':
         if (method === 'GET') resp = await ticketDetailHandler(request, (route as any).meta.ticketId);
         else if (method === 'PATCH' || method === 'PUT') resp = await ticketUpdateHandler(request, (route as any).meta.ticketId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
+        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
         break;
       case 'support/tickets/[id]/messages':
         resp = await ticketMessageHandler(request, (route as any).meta.ticketId);
@@ -1298,7 +1323,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'support/tickets/[id]/attachments':
         if (method === 'GET') resp = await ticketAttachmentsListHandler(request, (route as any).meta.ticketId);
         else if (method === 'POST') resp = await ticketAttachmentsUploadHandler(request, (route as any).meta.ticketId);
-        else resp = new NextResponse('Method not allowed', { status: 405 });
+        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
         break;
       case 'support/tickets/[id]/attachments/[attachmentId]':
         resp = await ticketAttachmentDownloadHandler(request, (route as any).meta.ticketId, (route as any).meta.attachmentId);
@@ -1342,7 +1367,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
 
       // Workspace routes
       default:
-        resp = new NextResponse('Internal route not implemented', { status: 501 });
+        resp = NextResponse.json({ error: 'Internal route not implemented' }, { status: 501 });
     }
     } catch (err: any) {
       console.error(`[HANDLER] Internal route ${route.path} error:`, err?.message || err, err?.stack);

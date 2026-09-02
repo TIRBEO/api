@@ -2,7 +2,7 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import next from 'next';
 import { getPoolStatus } from './lib/db/prisma';
-import { startPeriodicCleanup, startPeriodicDigests, startPeriodicDeletionSweep, startPeriodicPushPrune } from './lib/jobs';
+import { startPeriodicCleanup, startPeriodicDigests, startPeriodicDeletionSweep, startPeriodicPushPrune, startPeriodicReactivation } from './lib/jobs';
 import { startPeriodicTips } from './lib/tips';
 
 const dev = process.env.NODE_ENV !== 'production';
@@ -37,6 +37,7 @@ app.prepare().then(() => {
     startPeriodicDeletionSweep();
     startPeriodicPushPrune();
     startPeriodicTips();
+    startPeriodicReactivation();
 
     // Enable query performance latency alerts
     try {

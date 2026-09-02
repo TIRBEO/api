@@ -48,7 +48,7 @@ export async function emailConfigHandler(request: NextRequest) {
         enabled: z.boolean().optional(),
       });
       const parsed = schema.safeParse(body);
-      if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+      if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
       const existing = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
       if (existing) {
@@ -59,10 +59,10 @@ export async function emailConfigHandler(request: NextRequest) {
       return NextResponse.json(created, { status: 201 });
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     console.error('[EMAIL CONFIG]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -90,19 +90,19 @@ export async function emailTemplatesHandler(request: NextRequest) {
         fromName: z.string().optional(),
       });
       const parsed = schema.safeParse(body);
-      if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+      if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
       const existing = await prisma.emailTemplate.findUnique({ where: { name: parsed.data.name } });
-      if (existing) return new NextResponse('Template name already exists', { status: 409 });
+      if (existing) return NextResponse.json({ error: 'Template name already exists' }, { status: 409 });
 
       const template = await prisma.emailTemplate.create({ data: parsed.data as any });
       return NextResponse.json(template, { status: 201 });
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     console.error('[EMAIL TEMPLATES]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -115,7 +115,7 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
     if (session instanceof NextResponse) return session;
 
     const existing = await prisma.emailTemplate.findUnique({ where: { name } });
-    if (!existing) return new NextResponse('Template not found', { status: 404 });
+    if (!existing) return NextResponse.json({ error: 'Template not found' }, { status: 404 });
 
     if (request.method === 'GET') {
       return NextResponse.json(existing);
@@ -132,7 +132,7 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
         fromName: z.string().optional().nullable(),
       });
       const parsed = schema.safeParse(body);
-      if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+      if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
       const updated = await prisma.emailTemplate.update({ where: { name }, data: parsed.data as any });
       return NextResponse.json(updated);
@@ -140,13 +140,13 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
 
     if (request.method === 'DELETE') {
       await prisma.emailTemplate.delete({ where: { name } });
-      return new NextResponse('Deleted', { status: 200 });
+      return NextResponse.json({ error: 'Deleted' }, { status: 200 });
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     console.error('[EMAIL TEMPLATE DETAIL]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -162,7 +162,7 @@ export async function emailTestHandler(request: NextRequest) {
       templateName: z.string().optional(),
     });
     const parsed = schema.safeParse(body);
-    if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+    if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
     const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
     const diagnostics = {
@@ -180,7 +180,7 @@ export async function emailTestHandler(request: NextRequest) {
     return NextResponse.json({ ...result, diagnostics });
   } catch (err: any) {
     console.error('[EMAIL TEST]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -232,10 +232,10 @@ export async function adminEmailsHandler(request: NextRequest) {
       return NextResponse.json({ emails, total, page, limit });
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     console.error('[ADMIN EMAILS]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -255,7 +255,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
         replyTo: z.string().email().optional(),
       });
       const parsed = schema.safeParse(body);
-      if (!parsed.success) return new NextResponse('Invalid payload', { status: 400 });
+      if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
       const { to, subject, html, threadId, replyTo } = parsed.data;
       const result = await sendEmail(to, subject, html, {
@@ -272,10 +272,10 @@ export async function adminEmailReplyHandler(request: NextRequest) {
       return NextResponse.json({ error: result.error || 'Failed to send reply' }, { status: 500 });
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     console.error('[ADMIN EMAIL REPLY]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
@@ -286,11 +286,11 @@ export async function adminEmailDetailHandler(request: NextRequest, id: string) 
     if (session instanceof NextResponse) return session;
 
     const email = await prisma.email_logs.findUnique({ where: { id } });
-    if (!email) return new NextResponse('Email not found', { status: 404 });
+    if (!email) return NextResponse.json({ error: 'Email not found' }, { status: 404 });
 
     return NextResponse.json(email);
   } catch (err: any) {
     console.error('[ADMIN EMAIL DETAIL]', err?.message || err);
-    return new NextResponse('Internal server error', { status: 500 });
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

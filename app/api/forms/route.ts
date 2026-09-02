@@ -15,13 +15,28 @@ function generateAccessKey(): string {
   return `tb_live_${Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-// GET /api/forms — List all forms for the current user
+// GET /api/forms — List all forms for the current user, or ?stats=true for stats
 export async function GET(req: NextRequest) {
   try {
     const session = await getSessionFromRequest(req);
     if (!session?.userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
     const { searchParams } = new URL(req.url);
+
+    // Stats mode: return user's form stats
+    if (searchParams.get('stats') === 'true') {
+      const [userForms, userSubmissions, totalUsersWithForms] = await Promise.all([
+        prisma.form.count({ where: { userId: session.userId } }),
+        prisma.formSubmission.count({ where: { form: { userId: session.userId } } }),
+        prisma.form.groupBy({ by: ['userId'], _count: true }).then(r => r.length),
+      ]);
+      return NextResponse.json({
+        totalForms: userForms,
+        totalSubmissions: userSubmissions,
+        totalUsers: totalUsersWithForms,
+      });
+    }
+
     const status = searchParams.get('status');
     const search = searchParams.get('search');
     const page = parseInt(searchParams.get('page') || '1');
@@ -64,75 +79,32 @@ export async function POST(req: NextRequest) {
     if (!session?.userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
     const body: any = await req.json();
-    const { name, description, formType, websiteUrl, fields: fieldDefs } = body;
+    const { name, description, fields, settings } = body;
 
-    if (!name || !name.trim()) {
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return NextResponse.json({ error: 'Form name is required' }, { status: 400 });
     }
 
-    let slug = generateSlug(name);
-    const existingSlug = await prisma.form.findUnique({ where: { slug } });
-    if (existingSlug) {
-      const rand = new Uint8Array(3);
-      globalThis.crypto.getRandomValues(rand);
-      slug = `${slug}-${Array.from(rand, b => b.toString(16).padStart(2, '0')).join('')}`;
-    }
-
+    const slug = generateSlug(name.trim());
     const accessKey = generateAccessKey();
-
-    const defaultFields: Record<string, Array<{ label: string; name: string; type: string; required: boolean; placeholder?: string }>> = {
-      contact: [
-        { label: 'Name', name: 'name', type: 'text', required: true, placeholder: 'Your name' },
-        { label: 'Email', name: 'email', type: 'email', required: true, placeholder: 'you@example.com' },
-        { label: 'Subject', name: 'subject', type: 'text', required: true, placeholder: 'How can we help?' },
-        { label: 'Message', name: 'message', type: 'textarea', required: true, placeholder: 'Tell us more...' },
-      ],
-      bug_report: [
-        { label: 'Title', name: 'title', type: 'text', required: true, placeholder: 'Brief summary' },
-        { label: 'Email', name: 'email', type: 'email', required: true, placeholder: 'you@example.com' },
-        { label: 'Description', name: 'description', type: 'textarea', required: true, placeholder: 'Steps to reproduce...' },
-        { label: 'Browser', name: 'browser', type: 'text', required: false, placeholder: 'Chrome 120' },
-        { label: 'OS', name: 'os', type: 'text', required: false, placeholder: 'macOS 14.2' },
-      ],
-      feedback: [
-        { label: 'Name', name: 'name', type: 'text', required: false, placeholder: 'Your name' },
-        { label: 'Email', name: 'email', type: 'email', required: false, placeholder: 'you@example.com' },
-        { label: 'Feedback', name: 'feedback', type: 'textarea', required: true, placeholder: 'Your feedback...' },
-      ],
-      waitlist: [
-        { label: 'Name', name: 'name', type: 'text', required: true, placeholder: 'Your name' },
-        { label: 'Email', name: 'email', type: 'email', required: true, placeholder: 'you@example.com' },
-      ],
-      lead_capture: [
-        { label: 'Name', name: 'name', type: 'text', required: true, placeholder: 'Full name' },
-        { label: 'Email', name: 'email', type: 'email', required: true, placeholder: 'you@company.com' },
-        { label: 'Company', name: 'company', type: 'text', required: false, placeholder: 'Company name' },
-        { label: 'Phone', name: 'phone', type: 'phone', required: false, placeholder: '+1 (555) 000-0000' },
-      ],
-      newsletter: [
-        { label: 'Email', name: 'email', type: 'email', required: true, placeholder: 'you@example.com' },
-      ],
-    };
-
-    const fieldsToCreate = fieldDefs || defaultFields[formType] || defaultFields.contact;
 
     const form = await prisma.form.create({
       data: {
-        userId: session.userId,
         name: name.trim(),
-        slug,
         description: description || null,
-        formType: formType || 'custom',
-        websiteUrl: websiteUrl || null,
+        slug,
         accessKey,
-        notificationEmails: [],
+        userId: session.userId,
+        status: 'draft',
+        settings: settings || {},
         fields: {
-          create: fieldsToCreate.map((f: any, i: number) => ({
-            label: f.label,
-            name: f.name,
+          create: (fields || []).map((f: any, i: number) => ({
+            label: f.label || `Field ${i + 1}`,
+            name: f.name || `field_${i + 1}`,
             type: f.type || 'text',
             required: f.required || false,
             placeholder: f.placeholder || null,
+            options: f.options || null,
             order: i,
           })),
         },

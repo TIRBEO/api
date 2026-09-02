@@ -17,7 +17,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const blocked = await prisma.blocklist.findMany({ orderBy: { createdAt: 'desc' } });
     return NextResponse.json(blocked);
   }
-  return new NextResponse('Not found', { status: 404 });
+  return NextResponse.json({ error: 'Not found' }, { status: 404 });
 }
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
@@ -38,7 +38,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     });
     return NextResponse.json(entry, { status: 201 });
   }
-  return new NextResponse('Not found', { status: 404 });
+  return NextResponse.json({ error: 'Not found' }, { status: 404 });
 }
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
@@ -56,7 +56,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     } else if (body.userId) {
       await prisma.blocklist.deleteMany({ where: { targetType: 'user', targetId: body.userId } });
     }
-    return new NextResponse('Blocked removed', { status: 200 });
+    return NextResponse.json({ error: 'Blocked removed' }, { status: 200 });
   }
-  return new NextResponse('Not found', { status: 404 });
+  return NextResponse.json({ error: 'Not found' }, { status: 404 });
 }

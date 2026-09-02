@@ -3,14 +3,6 @@ import type { IncomingMessage } from 'http';
 import { getSessionFromToken } from '../auth/session';
 import { publishToRealtime } from '../rt-publish';
 
-// Cloudflare Durable Objects integration - use dynamic import instead of top-level await
-let cfDurable: typeof import('../cloudflare-durable') | null = null;
-void (async () => {
-  try {
-    cfDurable = await import('../cloudflare-durable');
-  } catch {}
-})();
-
 interface WsClient {
   ws: WebSocket;
   userId: string;
@@ -725,38 +717,4 @@ export function getLastSeenMap(userIds: string[]): Record<string, { online: bool
   return result;
 }
 
-// Cloudflare Durable Objects Integration
 
-export async function broadcastViaCloudflare(
-  roomId: string,
-  message: unknown
-): Promise<boolean> {
-  if (!cfDurable || !cfDurable.isDurableObjectsConfigured()) {
-    return false;
-  }
-  try {
-    const result = await cfDurable.sendToRoom(roomId, message);
-    return result.success;
-  } catch {
-    return false;
-  }
-}
-
-export async function getCloudflareRoomCount(
-  roomId: string
-): Promise<number> {
-  if (!cfDurable || !cfDurable.isDurableObjectsConfigured()) {
-    return 0;
-  }
-  try {
-    const result = await cfDurable.getRoomConnectionCount(roomId);
-    return result.count;
-  } catch {
-    return 0;
-  }
-}
-
-export function getCloudflareWebSocketUrl(): string {
-  if (!cfDurable) return '';
-  return cfDurable.getWebSocketUrl();
-}

@@ -75,7 +75,7 @@ export async function sessionHandler(request: NextRequest) {
     return NextResponse.json({ user: userData });
   } catch (err: any) {
     console.error('[SESSION]', err?.message || err);
-    return new NextResponse('Failed to fetch session', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch session' }, { status: 500 });
   }
 }
 
@@ -88,7 +88,7 @@ export async function refreshHandler(request: NextRequest) {
     const refreshToken = request.cookies.get(REFRESH_COOKIE_NAME)?.value;
     if (!refreshToken) {
       console.log('[REFRESH] No refresh token in cookie');
-      const res = new NextResponse('Refresh token missing', { status: 401 });
+      const res = NextResponse.json({ error: 'Refresh token missing' }, { status: 401 });
       clearSessionCookie(res, request);
       return res;
     }
@@ -137,7 +137,7 @@ export async function refreshHandler(request: NextRequest) {
     
   } catch (err: any) {
     console.error('[REFRESH] Unhandled error:', err?.message || err);
-    const res = new NextResponse('Refresh failed', { status: 500 });
+    const res = NextResponse.json({ error: 'Refresh failed' }, { status: 500 });
     // On error, try to preserve existing cookies if possible
     // Only clear if we're sure the session is invalid
     if (!isTransientError(err)) {
@@ -471,7 +471,7 @@ async function finishProviderSignIn(
     // short-lived signed token; the account (and consent record) is only
     // created when the user explicitly clicks "Create account".
     if (!profile.email) {
-      return new NextResponse(`${provider[0].toUpperCase()}${provider.slice(1)} email not available`, { status: 400 });
+      return NextResponse.json({ error: `${provider[0].toUpperCase()}${provider.slice(1)} email not available` }, { status: 400 });
     }
     const signupToken = await signPendingSignupToken({
       provider,
@@ -543,7 +543,7 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
       return NextResponse.json({ error: 'This merge request expired. Please sign in again.' }, { status: 400 });
     }
     const idField = PROVIDER_ID_FIELD[data.provider];
-    if (!idField) return new NextResponse('Unsupported provider', { status: 400 });
+    if (!idField) return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
 
     const target = await prisma.user.findUnique({ where: { id: data.existingUserId } });
     if (!target) {
@@ -612,7 +612,7 @@ export async function loginHandler(request: NextRequest) {
   try {
     const parsed = loginSchema.safeParse(await request.json());
     if (!parsed.success) {
-      return new NextResponse('Invalid email or password', { status: 400 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
     }
     const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
 
@@ -627,19 +627,19 @@ export async function loginHandler(request: NextRequest) {
     const sessionId = captchaSession;
 
     if (!checkWindowLimit(`login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`login:ip:${ip}`, 20, 15 * 60 * 1000)) {
-      return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, deletedAt: true, adminRole: true, suspendReason: true, suspendedUntil: true } });
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
     if (user.deletedAt) {
-      return new NextResponse('Account has been deleted', { status: 403 });
+      return NextResponse.json({ error: 'Account has been deleted' }, { status: 403 });
     }
     if (user.isBanned) {
       return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, message: 'Your account has been permanently banned.' }, { status: 403 });
@@ -653,7 +653,7 @@ export async function loginHandler(request: NextRequest) {
       }
     }
     if (!user.passwordHash) {
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     // Progressive friction: if this account/IP has prior failed-attempt history,
@@ -681,7 +681,7 @@ export async function loginHandler(request: NextRequest) {
         requiredDifficulty,
       });
       if (!check.ok) {
-        return new NextResponse(check.error, { status: 403 });
+        return NextResponse.json({ error: check.error }, { status: 403 });
       }
     }
 
@@ -700,7 +700,7 @@ export async function loginHandler(request: NextRequest) {
           metadata: parseLoginMetadata(userAgent),
         },
       }).catch(() => {});
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     const settings = await getCaptchaSettings();
@@ -722,7 +722,7 @@ export async function loginHandler(request: NextRequest) {
           requiredDifficulty,
         });
         if (!check.ok) {
-          return new NextResponse(check.error, { status: 403 });
+          return NextResponse.json({ error: check.error }, { status: 403 });
         }
       }
     }
@@ -802,7 +802,7 @@ export async function loginHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[LOGIN]', err?.message || err);
-    return new NextResponse('Login failed', { status: 500 });
+    return NextResponse.json({ error: 'Login failed' }, { status: 500 });
   }
 }
 
@@ -810,7 +810,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
   try {
     const parsed = preParsed ? { success: true as const, data: preParsed } : loginSchema.safeParse(await request.json());
     if (!parsed.success) {
-      return new NextResponse('Invalid email or password', { status: 400 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
     }
     const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
 
@@ -828,10 +828,10 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     const sessionId = captchaSession;
 
     if (!checkWindowLimit(`admin:login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`admin:login:ip:${ip}`, 20, 15 * 60 * 1000)) {
-      return new NextResponse('Too many sign-in attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
     }
 
     const user = await prisma.user.findUnique({
@@ -840,7 +840,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     });
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
     if (user.isBanned) {
       return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, message: 'Admin accounts cannot be banned users. Contact support.' }, { status: 403 });
@@ -849,7 +849,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: user.suspendReason || 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
     }
     if (!user.passwordHash) {
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     // Progressive friction: if this account/IP has prior failed-attempt history,
@@ -871,14 +871,14 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
         requiredDifficulty,
       });
       if (!check.ok) {
-        return new NextResponse(check.error, { status: 403 });
+        return NextResponse.json({ error: check.error }, { status: 403 });
       }
     }
 
     if (!(await verifyPassword(user.passwordHash, password))) {
       recordRateLimitHit(ip);
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'wrong_password' } }).catch(() => {});
-      return new NextResponse('Invalid email or password', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
     if (!user.adminRole) {
@@ -889,7 +889,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
         dashboardUrl: 'https://admin.tirbeo.app',
       }).catch(() => {});
-      return new NextResponse('Access denied. You do not have admin privileges.', { status: 403 });
+      return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
     const settings = await getCaptchaSettings();
@@ -911,7 +911,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
           requiredDifficulty,
         });
         if (!check.ok) {
-          return new NextResponse(check.error, { status: 403 });
+          return NextResponse.json({ error: check.error }, { status: 403 });
         }
       }
     }
@@ -969,7 +969,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     return res;
   } catch (err: any) {
     console.error('[ADMIN LOGIN]', err?.message || err);
-    return new NextResponse('Login failed', { status: 400 });
+    return NextResponse.json({ error: 'Login failed' }, { status: 400 });
   }
 }
 
@@ -978,29 +978,29 @@ export async function verify2faLoginHandler(request: NextRequest) {
     const { tempToken, token: totpToken, code } = (await request.json()) as any;
     const totpCode = (typeof totpToken === 'string' && totpToken) || (typeof code === 'string' && code) || '';
     if (typeof tempToken !== 'string' || totpCode.length === 0) {
-      return new NextResponse('Invalid payload', { status: 400 });
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`2fa:ip:${clientIp}`, 15, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
     const userId = await verifyTemp2faToken(tempToken);
-    if (!userId) return new NextResponse('Invalid or expired temp token', { status: 401 });
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired temp token' }, { status: 401 });
 
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, totpSecret: true, is2FAEnabled: true } });
     if (!user || !user.totpSecret || !user.is2FAEnabled) {
-      return new NextResponse('2FA not enabled', { status: 400 });
+      return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
     }
 
     if (!checkWindowLimit(`2fa:user:${userId}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
     if (!await verifyTotp(totpCode, user.totpSecret)) {
       logSecurityEvent({ request, userId, eventType: 'auth.2fa_failed', details: { reason: 'invalid_code' } }).catch(() => {});
-      return new NextResponse('Invalid 2FA code', { status: 401 });
+      return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 });
     }
 
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
@@ -1021,7 +1021,7 @@ export async function verify2faLoginHandler(request: NextRequest) {
     }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch {
-    return new NextResponse('2FA verification failed', { status: 500 });
+    return NextResponse.json({ error: '2FA verification failed' }, { status: 500 });
   }
 }
 
@@ -1029,27 +1029,27 @@ export async function recovery2faLoginHandler(request: NextRequest) {
   try {
     const { tempToken, recoveryCode } = (await request.json()) as any;
     if (typeof tempToken !== 'string' || typeof recoveryCode !== 'string') {
-      return new NextResponse('Invalid payload', { status: 400 });
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`2fa-recovery:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
     const userId = await verifyTemp2faToken(tempToken);
-    if (!userId) return new NextResponse('Invalid or expired temp token', { status: 401 });
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired temp token' }, { status: 401 });
 
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, is2FAEnabled: true } });
     if (!user || !user.is2FAEnabled) {
-      return new NextResponse('2FA not enabled', { status: 400 });
+      return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
     }
 
     const fullUser = await prisma.user.findUnique({ where: { id: userId }, select: { backupCodes: true } });
     const backupCodes = Array.isArray((fullUser as any)?.backupCodes) ? (fullUser as any).backupCodes as any[] : [];
     const inputHash = hashRecoveryCode(recoveryCode);
     const idx = backupCodes.findIndex((c: any) => c.code === inputHash && !c.used);
-    if (idx === -1) return new NextResponse('Invalid recovery code', { status: 401 });
+    if (idx === -1) return NextResponse.json({ error: 'Invalid recovery code' }, { status: 401 });
 
     backupCodes[idx].used = true;
     await prisma.user.update({
@@ -1074,7 +1074,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
     }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch {
-    return new NextResponse('Recovery code verification failed', { status: 400 });
+    return NextResponse.json({ error: 'Recovery code verification failed' }, { status: 400 });
   }
 }
 
@@ -1137,31 +1137,40 @@ export async function emailExistsHandler(request: NextRequest) {
 
 export async function usernameExistsHandler(request: NextRequest) {
   try {
-    const body: any = await request.json();
-    const username = (body?.username || '').toString().toLowerCase().trim();
-    
+    // Support both GET (query params from dashboard) and POST (body from signup)
+    let username = '';
+    if (request.method === 'GET') {
+      username = request.nextUrl.searchParams.get('username') || '';
+    } else {
+      const body: any = await request.json().catch(() => ({}));
+      username = (body?.username || '').toString();
+    }
+    username = username.toString().toLowerCase().trim();
+
     // Validate username format: lowercase alphanumeric with hyphens, 3-30 chars
     if (!username || username.length < 3 || username.length > 30) {
-      return NextResponse.json({ exists: false, valid: false }, { status: 200 });
+      return NextResponse.json({ available: false, taken: false, reserved: false, valid: false }, { status: 200 });
     }
-    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(username)) {
-      return NextResponse.json({ exists: false, valid: false }, { status: 200 });
+    if (!/^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/.test(username)) {
+      return NextResponse.json({ available: false, taken: false, reserved: false, valid: false }, { status: 200 });
     }
-    
+
     // Check for reserved words
     const reserved = ['admin', 'api', 'www', 'mail', 'support', 'help', 'info', 'blog', 'docs', 'status', 'app', 'web', 'dev', 'test', 'null', 'undefined', 'true', 'false', 'root', 'system', 'settings', 'config', 'auth', 'login', 'signup', 'dashboard'];
     if (reserved.includes(username)) {
-      return NextResponse.json({ exists: true, valid: true, reserved: true }, { status: 200 });
+      return NextResponse.json({ available: false, taken: false, reserved: true, valid: true }, { status: 200 });
     }
-    
+
     const user = await prisma.user.findUnique({
       where: { username },
       select: { id: true },
     });
     return NextResponse.json({
+      available: !user,
+      taken: !!user,
       exists: !!user,
-      valid: true,
       reserved: false,
+      valid: true,
     }, { status: 200 });
   } catch (err: any) {
     console.error('[USERNAME-EXISTS]', err?.message || err);
@@ -1174,7 +1183,7 @@ export async function signupHandler(request: NextRequest) {
     const parsed = signupSchema.safeParse(await request.json());
     if (!parsed.success) {
       console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
-      return new NextResponse('Invalid request payload', { status: 400 });
+      return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
     }
     const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, role, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, captchaRayId, fingerprint, otpCode } = parsed.data;
     const normalizedEmail = email.toLowerCase().trim();
@@ -1192,26 +1201,26 @@ export async function signupHandler(request: NextRequest) {
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
 
     if (!policyAccepted) {
-      return new NextResponse('Policy acceptance is required', { status: 400 });
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
     }
 
     // Relaxed rate limits for signup - 20 per hour per IP, 10 per hour per email
     if (!checkWindowLimit(`signup:ip:${ip}`, 20, 60 * 60 * 1000)) {
-      return new NextResponse('Too many sign-up attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`signup:email:${email.toLowerCase()}`, 10, 60 * 60 * 1000)) {
-      return new NextResponse('Too many sign-up attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
     }
 
     const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
     if (existing) {
-      return new NextResponse('Email already registered', { status: 409 });
+      return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
     }
 
     if (normalizedUsername) {
       const existingUsername = await prisma.user.findUnique({ where: { username: normalizedUsername } });
       if (existingUsername) {
-        return new NextResponse('Username already taken', { status: 409 });
+        return NextResponse.json({ error: 'Username already taken' }, { status: 409 });
       }
     }
 
@@ -1232,7 +1241,7 @@ export async function signupHandler(request: NextRequest) {
           requiredDifficulty,
         });
         if (!check.ok) {
-          return new NextResponse(check.error, { status: 403 });
+          return NextResponse.json({ error: check.error }, { status: 403 });
         }
       }
     }
@@ -1243,13 +1252,13 @@ export async function signupHandler(request: NextRequest) {
     if (otpCode) {
       preVerifiedEmail = await verifySignupOtp(normalizedEmail, otpCode);
       if (!preVerifiedEmail) {
-        return new NextResponse('Invalid or expired verification code', { status: 400 });
+        return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
       }
     }
 
     const breach = await checkPasswordBreach(password);
     if (breach.breached) {
-      return new NextResponse('This password has been found in known breaches. Please choose a different password.', { status: 400 });
+      return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
     }
 
     const passwordHash = await hashPassword(password);
@@ -1331,7 +1340,7 @@ export async function signupHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[SIGNUP]', err?.message || err, err?.stack);
-    return new NextResponse('Signup failed', { status: 400 });
+    return NextResponse.json({ error: 'Signup failed' }, { status: 400 });
   }
 }
 
@@ -1339,16 +1348,16 @@ export async function requestSignupOtpHandler(request: NextRequest) {
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
     if (!checkWindowLimit(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
 
     const cooldown = enforceResendCooldown(`signup-otp:${email.toLowerCase()}`);
@@ -1361,7 +1370,7 @@ export async function requestSignupOtpHandler(request: NextRequest) {
 
     const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
     if (existing) {
-      return new NextResponse('Email already registered', { status: 409 });
+      return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
     }
 
     const code = genSignupOtp();
@@ -1376,7 +1385,7 @@ export async function requestSignupOtpHandler(request: NextRequest) {
     return NextResponse.json({ message: 'Verification code sent to email' }, { status: 200 });
   } catch (err: any) {
     console.error('[SIGNUP OTP REQUEST]', err?.message || err, err?.stack);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -1385,17 +1394,17 @@ export async function signupOtpVerifyHandler(request: NextRequest) {
   try {
     const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
-      return new NextResponse('Email and code are required', { status: 400 });
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
     }
 
     const ok = await checkSignupOtp(email, code);
     if (!ok) {
-      return new NextResponse('Invalid or expired verification code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
     return NextResponse.json({ verified: true });
   } catch (err: any) {
     console.error('[SIGNUP OTP VERIFY]', err?.message || err);
-    return new NextResponse('Verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -1409,11 +1418,11 @@ export async function oauthConsentHandler(request: NextRequest) {
     const body: any = await request.json();
     const { policyAccepted, adminDataAccess, signatureName } = body;
     if (!policyAccepted) {
-      return new NextResponse('Policy acceptance is required', { status: 400 });
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, consents: true } });
-    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const consentRecord: any = (user.consents as any) || {};
     consentRecord.signupConsent = {
@@ -1432,7 +1441,7 @@ export async function oauthConsentHandler(request: NextRequest) {
     return NextResponse.json({ ok: true, message: 'Consent recorded' });
   } catch (err: any) {
     console.error('[OAUTH CONSENT]', err?.message || err);
-    return new NextResponse('Failed to record consent', { status: 500 });
+    return NextResponse.json({ error: 'Failed to record consent' }, { status: 500 });
   }
 }
 
@@ -1453,7 +1462,7 @@ export async function oauthPendingHandler(request: NextRequest) {
     });
   } catch (err: any) {
     console.error('[OAUTH PENDING]', err?.message || err);
-    return new NextResponse('Failed to load signup info', { status: 500 });
+    return NextResponse.json({ error: 'Failed to load signup info' }, { status: 500 });
   }
 }
 
@@ -1465,18 +1474,37 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
   try {
     const body: any = await request.json();
     if (!body?.policyAccepted) {
-      return new NextResponse('Policy acceptance is required', { status: 400 });
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
     }
     const data = typeof body.token === 'string' ? await verifyPendingSignupToken(body.token) : null;
     if (!data) {
       return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
     }
     const idField = PROVIDER_ID_FIELD[data.provider];
-    if (!idField) return new NextResponse('Unsupported provider', { status: 400 });
+    if (!idField) return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
 
     // Accept name from request body (user may have edited it on the signup
     // screen) — fall back to whatever the OAuth provider supplied in the token.
     const displayName = (typeof body.name === 'string' && body.name.trim()) || data.name || undefined;
+
+    // Accept username from request body — validate and save (required).
+    let username: string;
+    if (typeof body.username !== 'string' || !body.username.trim()) {
+      return NextResponse.json({ error: 'Username is required.' }, { status: 400 });
+    }
+    const uname = body.username.trim().toLowerCase();
+    if (uname.length < 3 || uname.length > 30 || !/^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/.test(uname)) {
+      return NextResponse.json({ error: 'Username must be 3-30 characters, lowercase letters, numbers, hyphens, or underscores.' }, { status: 400 });
+    }
+    const reserved = ['admin','api','www','mail','support','help','info','blog','docs','status','app','web','dev','test','null','undefined','true','false','root','system','settings','config','auth','login','signup','dashboard'];
+    if (reserved.includes(uname)) {
+      return NextResponse.json({ error: 'This username is reserved.' }, { status: 400 });
+    }
+    const existingUname = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } });
+    if (existingUname) {
+      return NextResponse.json({ error: 'This username is already taken.' }, { status: 400 });
+    }
+    username = uname;
 
     // Optional password chosen on the confirmation screen.
     let passwordHash: string | undefined;
@@ -1518,6 +1546,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       data: {
         email,
         name: displayName ? sanitizeInput(displayName, 120) : undefined,
+        username: username || undefined,
         photoUrl: data.photoUrl || undefined,
         [idField]: data.providerId,
         passwordHash,
@@ -1583,16 +1612,16 @@ export async function requestLoginOtpHandler(request: NextRequest) {
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     // Relaxed login OTP rate limits - 10 per hour per IP, 5 per hour per email
     if (!checkWindowLimit(`login-otp:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`login-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
 
     const cooldown = enforceResendCooldown(`login-otp:${email.toLowerCase()}`);
@@ -1620,7 +1649,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     return NextResponse.json({ message: 'Verification code sent to your email' }, { status: 200 });
   } catch (err: any) {
     console.error('[LOGIN OTP REQUEST]', err?.message || err, err?.stack);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -1628,29 +1657,29 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
   try {
     const { email, otpCode } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !otpCode || typeof otpCode !== 'string') {
-      return new NextResponse('Email and code are required', { status: 400 });
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true } });
     if (!user) {
-      return new NextResponse('Invalid email or code', { status: 401 });
+      return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
     }
     if (user.isBanned || user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
     if (!user.emailVerified) {
-      return new NextResponse('Please verify your email before signing in', { status: 403 });
+      return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
     const otpOk = await verifySignupOtp(email, otpCode);
     if (!otpOk) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'invalid_otp' } }).catch(() => {});
-      return new NextResponse('Invalid or expired verification code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
 
     // If 2FA is enabled, always require the authenticator code before issuing
@@ -1679,7 +1708,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     return res;
   } catch (err) {
     console.error('[LOGIN OTP VERIFY]', err);
-    return new NextResponse('Verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -1689,24 +1718,24 @@ export async function logoutHandler(request: NextRequest) {
     if (session && session.sessionId !== 'cli') {
       await revokeSession(session.sessionId);
     }
-    const res = new NextResponse('Logged out', { status: 200 });
+    const res = NextResponse.json({ ok: true }, { status: 200 });
     clearSessionCookie(res);
     return res;
   } catch {
-    return new NextResponse('Logout failed', { status: 400 });
+    return NextResponse.json({ error: 'Logout failed' }, { status: 400 });
   }
 }
 
 export async function sessionRevokeByTokenHandler(request: NextRequest) {
   try {
     const { token } = (await request.json()) as any;
-    if (!token || typeof token !== 'string') return new NextResponse('Token required', { status: 400 });
+    if (!token || typeof token !== 'string') return NextResponse.json({ error: 'Token required' }, { status: 400 });
     const sessionId = await verifySessionRevokeToken(token);
-    if (!sessionId) return new NextResponse('Invalid or expired token', { status: 401 });
+    if (!sessionId) return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
     await revokeSession(sessionId);
-    return new NextResponse('Session revoked', { status: 200 });
+    return NextResponse.json({ error: 'Session revoked' }, { status: 200 });
   } catch {
-    return new NextResponse('Failed to revoke session', { status: 400 });
+    return NextResponse.json({ error: 'Failed to revoke session' }, { status: 400 });
   }
 }
 
@@ -1714,9 +1743,9 @@ export async function sessionRevokeByTokenHandler(request: NextRequest) {
 export async function requestEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
-    if (!user || !user.email) return new NextResponse('User email missing', { status: 400 });
+    if (!user || !user.email) return NextResponse.json({ error: 'User email missing' }, { status: 400 });
     const cooldown = enforceResendCooldown(`email-otp:${user.id}`);
     if (!cooldown.allowed) {
       return NextResponse.json(
@@ -1727,10 +1756,10 @@ export async function requestEmailOtpHandler(request: NextRequest) {
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
     await sendEmailOtp(user.email, code);
-    return new NextResponse('OTP sent to email', { status: 200 });
+    return NextResponse.json({ error: 'OTP sent to email' }, { status: 200 });
   } catch (err: any) {
     console.error('[EMAIL OTP REQUEST]', err?.message || err);
-    return new NextResponse('Failed to send OTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send OTP' }, { status: 500 });
   }
 }
 
@@ -1738,21 +1767,21 @@ export async function requestEmailOtpHandler(request: NextRequest) {
 export async function verifyEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const { code, email } = (await request.json()) as any;
-    if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
+    if (typeof code !== 'string') return NextResponse.json({ error: 'Invalid OTP payload' }, { status: 400 });
     const ok = await verifyOtpCode(session.userId, 'email', code);
-    if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired OTP' }, { status: 400 });
     if (email && typeof email === 'string') {
       await prisma.user.update({
         where: { id: session.userId },
         data: { secondaryEmail: email },
       });
     }
-    return new NextResponse('Email OTP verified', { status: 200 });
+    return NextResponse.json({ error: 'Email OTP verified' }, { status: 200 });
   } catch (err: any) {
     console.error('[EMAIL OTP VERIFY]', err?.message || err);
-    return new NextResponse('OTP verification failed', { status: 500 });
+    return NextResponse.json({ error: 'OTP verification failed' }, { status: 500 });
   }
 }
 
@@ -1762,22 +1791,22 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export async function changeEmailRequestHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const body: any = await request.json();
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
     if (!email || !EMAIL_REGEX.test(email)) {
-      return new NextResponse('Enter a valid email address', { status: 400 });
+      return NextResponse.json({ error: 'Enter a valid email address' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
-    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const isCurrent = user.email?.toLowerCase() === email;
     if (isCurrent && user.emailVerified) {
-      return new NextResponse('Your email is already verified', { status: 400 });
+      return NextResponse.json({ error: 'Your email is already verified' }, { status: 400 });
     }
     if (!isCurrent) {
       const existing = await prisma.user.findUnique({ where: { email } });
-      if (existing) return new NextResponse('That email is already in use', { status: 400 });
+      if (existing) return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
     }
 
     const cooldown = enforceResendCooldown(`change-email:${user.id}`);
@@ -1790,10 +1819,10 @@ export async function changeEmailRequestHandler(request: NextRequest) {
     const code = generateOtpCode();
     await storeOtp(user.id, 'email_verify', code);
     await sendEmailOtp(email, code);
-    return new NextResponse('Verification code sent', { status: 200 });
+    return NextResponse.json({ error: 'Verification code sent' }, { status: 200 });
   } catch (err: any) {
     console.error('[CHANGE EMAIL REQUEST]', err?.message || err);
-    return new NextResponse('Failed to send verification code', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send verification code' }, { status: 500 });
   }
 }
 
@@ -1801,25 +1830,25 @@ export async function changeEmailRequestHandler(request: NextRequest) {
 export async function changeEmailVerifyHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const body: any = await request.json();
     const code = typeof body?.code === 'string' ? body.code.trim() : '';
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
-    if (!code) return new NextResponse('Enter the verification code', { status: 400 });
+    if (!code) return NextResponse.json({ error: 'Enter the verification code' }, { status: 400 });
     if (!email || !EMAIL_REGEX.test(email)) {
-      return new NextResponse('Enter a valid email address', { status: 400 });
+      return NextResponse.json({ error: 'Enter a valid email address' }, { status: 400 });
     }
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
-    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const ok = await verifyOtpCode(user.id, 'email_verify', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
 
     const currentEmail = user.email?.toLowerCase();
     if (currentEmail !== email) {
       const existing = await prisma.user.findUnique({ where: { email } });
       if (existing && existing.id !== user.id) {
-        return new NextResponse('That email is already in use', { status: 400 });
+        return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
       }
       await prisma.user.update({ where: { id: user.id }, data: { email, emailVerified: true } });
     } else if (!user.emailVerified) {
@@ -1836,10 +1865,10 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       link: '/account/profile',
     }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
 
-    return new NextResponse('Email verified', { status: 200 });
+    return NextResponse.json({ error: 'Email verified' }, { status: 200 });
   } catch (err: any) {
     console.error('[CHANGE EMAIL VERIFY]', err?.message || err);
-    return new NextResponse('Verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -1848,14 +1877,14 @@ export async function verifySignupEmailHandler(request: NextRequest) {
   try {
     const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     if (code && typeof code !== 'string') {
-      return new NextResponse('Invalid verification code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid verification code' }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-    if (!user) return new NextResponse('Invalid email or code', { status: 400 });
+    if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 400 });
 
     // Resend request — generate a new OTP and email it again
     if (!code) {
@@ -1876,21 +1905,21 @@ export async function verifySignupEmailHandler(request: NextRequest) {
         fromEmail: 'noreply@send.tirbeo.app',
         fromName: 'Tirbeo',
       }).catch(err => console.error('[SIGNUP] Resend verification email failed:', err?.message));
-      return new NextResponse('Verification code resent', { status: 200 });
+      return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
     }
 
     const ok = await verifyOtpCode(user.id, 'email', code);
-    if (!ok) return new NextResponse('Invalid or expired verification code', { status: 400 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
 
     await prisma.user.update({
       where: { id: user.id },
       data: { emailVerified: true },
     });
 
-    return new NextResponse('Email verified successfully', { status: 200 });
+    return NextResponse.json({ error: 'Email verified successfully' }, { status: 200 });
   } catch (err: any) {
     console.error('[SIGNUP EMAIL VERIFY]', err?.message || err);
-    return new NextResponse('Verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -1898,16 +1927,16 @@ export async function verifySignupEmailHandler(request: NextRequest) {
 export async function requestPhoneOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, phoneNumber: true } });
-    if (!user || !user.phoneNumber) return new NextResponse('User phone missing', { status: 400 });
+    if (!user || !user.phoneNumber) return NextResponse.json({ error: 'User phone missing' }, { status: 400 });
     const code = generateOtpCode();
     await storeOtp(session.userId, 'phone', code);
     await sendPhoneOtp(user.phoneNumber, code);
-    return new NextResponse('OTP sent to phone', { status: 200 });
+    return NextResponse.json({ error: 'OTP sent to phone' }, { status: 200 });
   } catch (err: any) {
     console.error('[PHONE OTP REQUEST]', err?.message || err);
-    return new NextResponse('Failed to send OTP', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send OTP' }, { status: 500 });
   }
 }
 
@@ -1915,15 +1944,15 @@ export async function requestPhoneOtpHandler(request: NextRequest) {
 export async function verifyPhoneOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
-    if (!session) return new NextResponse('Unauthenticated', { status: 401 });
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const { code } = (await request.json()) as any;
-    if (typeof code !== 'string') return new NextResponse('Invalid OTP payload', { status: 400 });
+    if (typeof code !== 'string') return NextResponse.json({ error: 'Invalid OTP payload' }, { status: 400 });
     const ok = await verifyOtpCode(session.userId, 'phone', code);
-    if (!ok) return new NextResponse('Invalid or expired OTP', { status: 400 });
-    return new NextResponse('Phone OTP verified', { status: 200 });
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired OTP' }, { status: 400 });
+    return NextResponse.json({ error: 'Phone OTP verified' }, { status: 200 });
   } catch (err: any) {
     console.error('[PHONE OTP VERIFY]', err?.message || err);
-    return new NextResponse('OTP verification failed', { status: 500 });
+    return NextResponse.json({ error: 'OTP verification failed' }, { status: 500 });
   }
 }
 
@@ -1935,7 +1964,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
     console.info(`[OAUTH:google] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GOOGLE_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return new NextResponse('Google OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
@@ -1959,7 +1988,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[GOOGLE AUTH]', err?.message || err);
-    return new NextResponse('Failed to initiate Google auth', { status: 500 });
+    return NextResponse.json({ error: 'Failed to initiate Google auth' }, { status: 500 });
   }
 }
 
@@ -1968,24 +1997,24 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
     const cfg = await getOauthProviderConfig('google');
     const clientId = cfg.clientId;
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return new NextResponse('Google OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
     const stateParam = request.nextUrl.searchParams.get('state');
     const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
     const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-      return new NextResponse('Invalid OAuth state', { status: 400 });
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
     }
     if (!code) {
-      return new NextResponse('Missing code', { status: 400 });
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -2002,7 +2031,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
       console.error('[GOOGLE TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri, 'client_id:', clientId?.slice(0, 20));
-      return new NextResponse('Failed to exchange token', { status: 500 });
+      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
     }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -2011,7 +2040,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!userInfoRes.ok) {
-      return new NextResponse('Failed to fetch user info', { status: 500 });
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
 
@@ -2023,7 +2052,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     }, state);
   } catch (err: any) {
     console.error('[GOOGLE CALLBACK]', err?.message || err);
-    return new NextResponse('Google OAuth callback failed', { status: 500 });
+    return NextResponse.json({ error: 'Google OAuth callback failed' }, { status: 500 });
   }
 }
 
@@ -2035,7 +2064,7 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
     console.info(`[OAUTH:github] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GITHUB_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return new NextResponse('GitHub OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
@@ -2055,7 +2084,7 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[GITHUB AUTH]', err?.message || err);
-    return new NextResponse('Failed to initiate GitHub auth', { status: 500 });
+    return NextResponse.json({ error: 'Failed to initiate GitHub auth' }, { status: 500 });
   }
 }
 
@@ -2064,14 +2093,14 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
     const cfg = await getOauthProviderConfig('github');
     const clientId = cfg.clientId;
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return new NextResponse('GitHub OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
     const stateParam = request.nextUrl.searchParams.get('state');
@@ -2079,10 +2108,10 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
       console.warn('[OAUTH:github] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce });
-      return new NextResponse('Invalid OAuth state', { status: 400 });
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
     }
     if (!code) {
-      return new NextResponse('Missing code', { status: 400 });
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
     const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
@@ -2093,7 +2122,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
       console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
-      return new NextResponse('Failed to exchange token', { status: 500 });
+      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
     }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -2105,7 +2134,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     });
     if (!userInfoRes.ok) {
       console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
-      return new NextResponse('Failed to fetch user info', { status: 500 });
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
     let email = profile.email as string | undefined;
@@ -2153,7 +2182,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     }, state);
   } catch (err: any) {
     console.error('[GITHUB CALLBACK]', err?.message || err);
-    return new NextResponse('GitHub OAuth callback failed', { status: 500 });
+    return NextResponse.json({ error: 'GitHub OAuth callback failed' }, { status: 500 });
   }
 }
 
@@ -2165,7 +2194,7 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
     console.info(`[OAUTH:discord] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.DISCORD_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return new NextResponse('Discord OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
     }
     const sp = request.nextUrl.searchParams;
     const redirectTo = sp.get('redirect_to') || sp.get('redirect');
@@ -2186,7 +2215,7 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[DISCORD AUTH]', err?.message || err);
-    return new NextResponse('Failed to initiate Discord auth', { status: 500 });
+    return NextResponse.json({ error: 'Failed to initiate Discord auth' }, { status: 500 });
   }
 }
 
@@ -2195,24 +2224,24 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
     const cfg = await getOauthProviderConfig('discord');
     const clientId = cfg.clientId;
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return new NextResponse('Discord OAuth not configured', { status: 500 });
+      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
     const stateParam = request.nextUrl.searchParams.get('state');
     const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
     const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-      return new NextResponse('Invalid OAuth state', { status: 400 });
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
     }
     if (!code) {
-      return new NextResponse('Missing code', { status: 400 });
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
     const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
@@ -2229,7 +2258,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
      if (!tokenRes.ok) {
        const errBody = await tokenRes.text();
        console.error('[DISCORD TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
-       return new NextResponse('Failed to exchange token', { status: 500 });
+       return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
      }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -2238,7 +2267,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!userInfoRes.ok) {
-      return new NextResponse('Failed to fetch user info', { status: 500 });
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
     const discordId = profile.id as string;
@@ -2256,7 +2285,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     }, state);
   } catch (err: any) {
     console.error('[DISCORD CALLBACK]', err?.message || err);
-    return new NextResponse('Discord OAuth callback failed', { status: 500 });
+    return NextResponse.json({ error: 'Discord OAuth callback failed' }, { status: 500 });
   }
 }
 
@@ -2270,7 +2299,7 @@ export async function profileHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) {
-      return new NextResponse('Unauthenticated', { status: 401 });
+      return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     }
 
     if (request.method === 'GET') {
@@ -2335,7 +2364,7 @@ export async function profileHandler(request: NextRequest) {
           discordId: true,
         },
       });
-      if (!user) return new NextResponse('User not found', { status: 404 });
+      if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
       const { passwordHash, googleId, githubId, discordId, ...safeUser } = user as any;
 
       const backupUser = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
@@ -2353,7 +2382,7 @@ export async function profileHandler(request: NextRequest) {
       return NextResponse.json(result);
     }
 
-    if (request.method === 'PATCH') {
+    if (request.method === 'PATCH' || request.method === 'PUT') {
       const body: any = await request.json();
       const schema = z.object({
         name: z.string().min(1).optional(),
@@ -2381,7 +2410,14 @@ export async function profileHandler(request: NextRequest) {
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
-        return new NextResponse('Invalid payload', { status: 400 });
+        const issues = parsed.error.issues;
+        const msg = issues.map((i) => {
+          const field = i.path.join('.') || 'body';
+          if (i.code === 'too_small' && i.minimum === 1) return `${field} is required`;
+          if (i.code === 'invalid_format') return `${field} format is invalid`;
+          return `${field}: ${i.message}`;
+        }).join('; ');
+        return NextResponse.json({ error: msg || 'Invalid profile data' }, { status: 400 });
       }
       const data: any = { ...parsed.data };
       if (data.birthday !== undefined && data.birthday !== null) {
@@ -2427,7 +2463,7 @@ export async function profileHandler(request: NextRequest) {
               ? adapterFields
               : [];
         if (err?.code === 'P2002' && targets.includes('username')) {
-          return new NextResponse('That username is already taken. Please choose another one.', { status: 409 });
+          return NextResponse.json({ error: 'That username is already taken. Please choose another one.' }, { status: 409 });
         }
         throw err;
       }
@@ -2447,11 +2483,11 @@ export async function profileHandler(request: NextRequest) {
       return NextResponse.json(updated);
     }
 
-    return new NextResponse('Method not allowed', { status: 405 });
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
   } catch (err: any) {
     const detail = err?.message || (err?.meta ? JSON.stringify(err.meta) : '') || String(err);
     console.error('[PROFILE]', detail);
-    return new NextResponse('Failed to fetch or update profile', { status: 500 });
+    return NextResponse.json({ error: 'Failed to fetch or update profile' }, { status: 500 });
   }
 }
 
@@ -2470,18 +2506,18 @@ export async function isAdminUser(email: string): Promise<boolean> {
 export async function requestPasswordResetOtpHandler(request: NextRequest) {  try {
     const { email, adminOnly } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     if (adminOnly) {
       const ok = await isAdminUser(email);
       if (!ok) {
-        return new NextResponse('This email is not registered with admin access. Please reset your password from your account dashboard.', { status: 403 });
+        return NextResponse.json({ error: 'This email is not registered with admin access. Please reset your password from your account dashboard.' }, { status: 403 });
       }
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     const result = await requestPasswordResetOtp(email);
     // Always return success to prevent email enumeration.
@@ -2489,7 +2525,7 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {  tr
     return NextResponse.json({ message: 'If an account exists, a verification code has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET OTP REQUEST]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -2498,19 +2534,19 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     const result = await requestPasswordResetMagicLink(email);
     // Always return success to prevent email enumeration.
     return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET MAGIC LINK REQUEST]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -2519,12 +2555,12 @@ export async function requestPasswordResetHandler(request: NextRequest) {
   try {
     const { email, method, adminOnly } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     if (adminOnly) {
       const ok = await isAdminUser(email);
       if (!ok) {
-        return new NextResponse('This email is not registered with admin access. Please reset your password from your account dashboard.', { status: 403 });
+        return NextResponse.json({ error: 'This email is not registered with admin access. Please reset your password from your account dashboard.' }, { status: 403 });
       }
     }
     const resetMethod: 'otp' | 'magic_link' | 'recovery' = method === 'magic_link' ? 'magic_link' : method === 'recovery' ? 'recovery' : 'otp';
@@ -2543,7 +2579,7 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     return NextResponse.json({ message: 'If an account exists, a reset link has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET REQUEST]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -2552,24 +2588,24 @@ export async function verifyPasswordResetHandler(request: NextRequest) {
   try {
     const { email, code, token } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     if (!code && !token) {
-      return new NextResponse('Code or token required', { status: 400 });
+      return NextResponse.json({ error: 'Code or token required' }, { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
     const result = await verifyPasswordReset(email, { code, token });
     if (!result.success) {
-      return new NextResponse(result.error || 'Verification failed', { status: 400 });
+      return NextResponse.json({ error: result.error || 'Verification failed' }, { status: 400 });
     }
     return NextResponse.json({ resetToken: result.resetToken });
   } catch (err: any) {
     console.error('[PASSWORD RESET VERIFY]', err?.message || err);
-    return new NextResponse('Failed to verify', { status: 500 });
+    return NextResponse.json({ error: 'Failed to verify' }, { status: 500 });
   }
 }
 
@@ -2580,24 +2616,24 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
     const resetToken = body.resetToken || body.token;
     const newPassword = body.newPassword || body.password;
     if (!resetToken || !newPassword) {
-      return new NextResponse('Reset token and new password required', { status: 400 });
+      return NextResponse.json({ error: 'Reset token and new password required' }, { status: 400 });
     }
     if (typeof newPassword !== 'string' || newPassword.length < 8) {
-      return new NextResponse('Password must be at least 8 characters', { status: 400 });
+      return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
     const result = await confirmPasswordReset(resetToken, newPassword);
     if (!result.success) {
-      return new NextResponse(result.error || 'Failed to reset password', { status: 400 });
+      return NextResponse.json({ error: result.error || 'Failed to reset password' }, { status: 400 });
     }
     return NextResponse.json({ message: 'Password updated successfully' });
   } catch (err: any) {
     console.error('[PASSWORD RESET CONFIRM]', err?.message || err);
-    return new NextResponse('Failed to reset password', { status: 500 });
+    return NextResponse.json({ error: 'Failed to reset password' }, { status: 500 });
   }
 }
 
@@ -2607,16 +2643,16 @@ export async function requestMagicLinkHandler(request: NextRequest) {
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`magic-link:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`magic-link:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, name: true } });
@@ -2647,7 +2683,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
     console.error('[MAGIC LINK REQUEST]', err?.message || err, err?.stack);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -2655,17 +2691,28 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
   try {
     const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
-      return new NextResponse('Token required', { status: 400 });
+      return NextResponse.json({ error: 'Token required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`magic-link-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return new NextResponse('Too many attempts. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
     const decoded = await verifyMagicLinkToken(token);
     if (!decoded) {
-      return new NextResponse('Invalid or expired magic link', { status: 401 });
+      return NextResponse.json({ error: 'Invalid or expired magic link' }, { status: 401 });
+    }
+
+    // If user is already logged in, prompt to logout first so they can
+    // switch to the magic-link account instead of silently overwriting.
+    const existingSession = await getSession(request);
+    if (existingSession) {
+      const currentUser = await prisma.user.findUnique({ where: { id: existingSession.userId }, select: { id: true, email: true } });
+      const magicUser = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { id: true, email: true } });
+      if (currentUser && magicUser && currentUser.id !== magicUser.id) {
+        return NextResponse.json({ requiresLogout: true, currentEmail: currentUser.email, magicEmail: magicUser.email, magicUserId: decoded.userId }, { status: 200 });
+      }
     }
 
     // Enforce one-time use: atomically claim the token's jti in Redis so a
@@ -2693,13 +2740,13 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     const userId = decoded.userId;
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true } });
     if (!user) {
-      return new NextResponse('User not found', { status: 404 });
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
     if (user.isBanned || user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
     if (!user.emailVerified) {
-      return new NextResponse('Please verify your email before signing in', { status: 403 });
+      return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
     }
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -2728,7 +2775,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[MAGIC LINK VERIFY]', err?.message || err);
-    return new NextResponse('Magic link verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Magic link verification failed' }, { status: 500 });
   }
 }
 
@@ -2742,7 +2789,7 @@ export async function accountRecoveryHandler(request: NextRequest) {
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
@@ -2764,7 +2811,7 @@ export async function accountRecoveryHandler(request: NextRequest) {
     return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
   } catch (err: any) {
     console.error('[ACCOUNT RECOVERY]', err?.message || err);
-    return new NextResponse('Failed to process request', { status: 500 });
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
@@ -2784,16 +2831,16 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
   try {
     const { email } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
-      return new NextResponse('Email is required', { status: 400 });
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`recovery-login:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
     if (!checkWindowLimit(`recovery-login:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
-      return new NextResponse('Too many requests. Please try again later.', { status: 429 });
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
 
     const cooldown = enforceResendCooldown(`recovery-login:${email.toLowerCase()}`);
@@ -2809,10 +2856,10 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
       select: { id: true, email: true, secondaryEmail: true, isBanned: true, isSuspended: true },
     });
     if (!user || !user.secondaryEmail) {
-      return new NextResponse('No verified recovery email is set for this account', { status: 400 });
+      return NextResponse.json({ error: 'No verified recovery email is set for this account' }, { status: 400 });
     }
     if (user.isBanned || user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
 
     const code = generateOtpCode();
@@ -2821,17 +2868,17 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
       const result = await sendSignupOtpEmail(user.secondaryEmail, code, 'login_otp');
       if (!result.success) {
         console.error('[RECOVERY LOGIN] Email send returned failure');
-        return new NextResponse('Could not send a code to your recovery email. Try again later.', { status: 502 });
+        return NextResponse.json({ error: 'Could not send a code to your recovery email. Try again later.' }, { status: 502 });
       }
     } catch (err: any) {
       console.error('[RECOVERY LOGIN] Email send error:', err?.message || err);
-      return new NextResponse('Could not send a code to your recovery email. Try again later.', { status: 502 });
+      return NextResponse.json({ error: 'Could not send a code to your recovery email. Try again later.' }, { status: 502 });
     }
 
     return NextResponse.json({ ok: true, masked: maskEmail(user.secondaryEmail) });
   } catch (err: any) {
     console.error('[RECOVERY LOGIN REQUEST]', err?.message || err);
-    return new NextResponse('Failed to send recovery code', { status: 500 });
+    return NextResponse.json({ error: 'Failed to send recovery code' }, { status: 500 });
   }
 }
 
@@ -2839,20 +2886,20 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
   try {
     const { email, code } = (await request.json()) as any;
     if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
-      return new NextResponse('Email and code are required', { status: 400 });
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
     }
 
     const user = await prisma.user.findUnique({
       where: { email: email.toLowerCase() },
       select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true },
     });
-    if (!user) return new NextResponse('Invalid email or code', { status: 401 });
-    if (user.isBanned || user.isSuspended) return new NextResponse('Account suspended', { status: 403 });
-    if (!user.emailVerified) return new NextResponse('Please verify your email before signing in', { status: 403 });
+    if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
+    if (user.isBanned || user.isSuspended) return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
+    if (!user.emailVerified) return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
 
     const ok = await verifyOtpCode(user.id, 'email', code);
     if (!ok) {
-      return new NextResponse('Invalid or expired verification code', { status: 400 });
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
 
     if (user.is2FAEnabled) {
@@ -2879,7 +2926,7 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[RECOVERY LOGIN VERIFY]', err?.message || err);
-    return new NextResponse('Verification failed', { status: 500 });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -2889,12 +2936,12 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
   try {
     const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
-      return new NextResponse('Invalid token', { status: 400 });
+      return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
     }
 
     const userId = await verifySuspiciousLoginToken(token);
     if (!userId) {
-      return new NextResponse('Invalid or expired token', { status: 401 });
+      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
     }
 
     const user = await prisma.user.findUnique({
@@ -2902,10 +2949,10 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
       select: { id: true, email: true, isBanned: true, isSuspended: true },
     });
     if (!user) {
-      return new NextResponse('User not found', { status: 404 });
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
     if (user.isBanned || user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -2914,7 +2961,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
     setSessionCookie(res, sessionToken, refreshToken, request);
     return res;
   } catch {
-    return new NextResponse('Failed to confirm suspicious login', { status: 400 });
+    return NextResponse.json({ error: 'Failed to confirm suspicious login' }, { status: 400 });
   }
 }
 
@@ -2922,7 +2969,7 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
   try {
     const { token } = (await request.json()) as any;
     if (!token || typeof token !== 'string') {
-      return new NextResponse('Invalid token', { status: 400 });
+      return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
     }
 
     // Log the denied attempt
@@ -2939,7 +2986,7 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
 
     return NextResponse.json({ ok: true });
   } catch {
-    return new NextResponse('Failed to deny suspicious login', { status: 400 });
+    return NextResponse.json({ error: 'Failed to deny suspicious login' }, { status: 400 });
   }
 }
 
@@ -2952,12 +2999,12 @@ export async function verifyHandler(request: NextRequest) {
     const { getSessionFromToken } = await import('./auth/session');
     const authHeader = request.headers.get('authorization') || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (!token) return new NextResponse(JSON.stringify({ error: 'Missing token' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+    if (!token) return NextResponse.json({ error: 'Missing token' }, { status: 401 });
     const session = await getSessionFromToken(token);
-    if (!session) return new NextResponse(JSON.stringify({ error: 'Invalid token' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-    return new NextResponse(JSON.stringify({ userId: session.userId, email: session.email, adminRole: (session as any).adminRole || null }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (!session) return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
+    return NextResponse.json({ userId: session.userId, email: session.email, adminRole: (session as any).adminRole || null });
   } catch {
-    return new NextResponse(JSON.stringify({ error: 'Verification failed' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
   }
 }
 
@@ -3050,16 +3097,16 @@ export async function cliTokenHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) {
-      return new NextResponse('Not authenticated', { status: 401 });
+      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       select: { id: true, email: true, name: true, isBanned: true, isSuspended: true },
     });
-    if (!user) return new NextResponse('User not found', { status: 404 });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
     if (user.isBanned || user.isSuspended) {
-      return new NextResponse('Account suspended', { status: 403 });
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
 
     const secret = new TextEncoder().encode(process.env.JWT_SECRET!);
@@ -3083,7 +3130,7 @@ export async function cliTokenHandler(request: NextRequest) {
     });
   } catch (err: any) {
     console.error('[CLI-TOKEN]', err?.message || err);
-    return new NextResponse('Failed to generate CLI token', { status: 500 });
+    return NextResponse.json({ error: 'Failed to generate CLI token' }, { status: 500 });
   }
 }
 

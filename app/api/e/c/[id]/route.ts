@@ -24,6 +24,6 @@ export async function GET(
     }
   } catch { /* tracking is best-effort */ }
 
-  if (!target) return new NextResponse('Invalid link', { status: 400 });
+  if (!target) return NextResponse.json({ error: 'Invalid link' }, { status: 400 });
   return NextResponse.redirect(target, 302);
 }

@@ -89,8 +89,9 @@ const securityHeaders = {
 function addCorsHeaders(response: NextResponse, origin: string) {
   response.headers.set('Access-Control-Allow-Origin', origin);
   response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, x-turnstile-token');
+  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, X-CSRF-Nonce, x-turnstile-token, x-csrf-token');
   response.headers.set('Access-Control-Allow-Credentials', 'true');
+  response.headers.set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset');
   response.headers.set('Access-Control-Max-Age', '86400');
 }
 
@@ -391,7 +392,8 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         }, 403);
       } else if (su?.scheduledDeletionAt) {
         const isRead = request.method === 'GET' || request.method === 'HEAD';
-        const safePaths = ['delete-account', 'auth/logout', 'auth/refresh', 'users/me', 'users/me/profile', 'users/me/preferences', 'notifications', 'users/me/security', 'export-data', 'email-config'];
+        // While deletion is scheduled, user is read-only: only GET + cancel deletion + logout/refresh allowed
+        const safePaths = ['delete-account', 'auth/logout', 'auth/refresh'];
         const isAllowed = isRead || safePaths.some(p => pathname.includes(p));
         if (!isAllowed) {
           statusResponse = jsonResponse(allowedOrigin, {

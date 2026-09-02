@@ -12,9 +12,9 @@ const POOL_CONFIG = {
   // Maximum number of clients in the pool.
   // Local dev: higher pool to handle concurrent requests from dashboard/forms/admin.
   // Vercel prod: keep conservative for Supabase's connection limit.
-  max: process.env.NODE_ENV === 'production' ? 5 : 10,
+  max: process.env.NODE_ENV === 'production' ? 8 : 12,
   // Minimum idle clients kept alive to avoid cold-start latency.
-  min: process.env.NODE_ENV === 'production' ? 2 : 4,
+  min: process.env.NODE_ENV === 'production' ? 3 : 4,
   // Milliseconds a client can sit idle before being destroyed.
   // Supabase's pooler has its own idle timeout; ours should be shorter.
   idleTimeoutMillis: 30_000,
@@ -24,7 +24,7 @@ const POOL_CONFIG = {
   // Allow idle clients to be reaped faster in development
   // where instances are short-lived.
   ...(process.env.NODE_ENV !== 'production'
-    ? { max: 10, min: 4, idleTimeoutMillis: 45_000, connectionTimeoutMillis: 45_000 }
+    ? { max: 12, min: 4, idleTimeoutMillis: 45_000, connectionTimeoutMillis: 45_000 }
     : {}),
 };
 
@@ -149,7 +149,7 @@ export async function reWarmAfterColdStart(): Promise<void> {
     const pool = globalForPrisma.pgPool;
     if (!pool) return;
     
-    console.log(`[DB-POOL] 🔄  Re-warming pool after cold start (avg wake time: ${coldStartState.coldStartWakeTimeMs}ms)...`);
+    console.log(`[DB-POOL] Re-warming pool after cold start (avg wake time: ${coldStartState.coldStartWakeTimeMs}ms)...`);
     
     // Re-warm with cold-start awareness
     await warmPool(pool, true);
@@ -270,7 +270,7 @@ function recordColdStart() {
     coldStartState.isColdStart = true;
     coldStartState.lastColdStartDetected = Date.now();
     coldStartState.coldStartCount++;
-    console.warn(`[DB-COLD] ❄️  Cold start detected (#${coldStartState.coldStartCount}) — warming up connections...`);
+    console.warn(`[DB-COLD] Cold start detected (#${coldStartState.coldStartCount}) — warming up connections...`);
   }
 }
 
@@ -281,7 +281,7 @@ function recordActivity() {
     coldStartState.coldStartWakeTimeMs = 
       coldStartState.coldStartWakeTimeMs === 0 ? wakeTime :
       Math.round((coldStartState.coldStartWakeTimeMs + wakeTime) / 2);
-    console.log(`[DB-COLD] ✅  Database warmed up in ${wakeTime}ms (avg: ${coldStartState.coldStartWakeTimeMs}ms)`);
+    console.log(`[DB-COLD] Database warmed up in ${wakeTime}ms (avg: ${coldStartState.coldStartWakeTimeMs}ms)`);
     coldStartState.isColdStart = false;
   }
   coldStartState.lastActivity = Date.now();
@@ -431,14 +431,14 @@ function monitorPool() {
     if (waitDuration >= POOL_WARN_MS && (!poolAlertState.lastWarningAt || Date.now() - poolAlertState.lastWarningAt > 60_000)) {
       poolAlertState.lastWarningAt = Date.now();
       poolAlertState.alertCount++;
-      console.warn(`[DB-POOL-ALERT] ⚠️  WARNING: Pool exhaustion for ${Math.round(waitDuration / 1000)}s — waiting: ${waiting}, total: ${total}/${max}, idle: ${idle}`);
+      console.warn(`[DB-POOL-ALERT] WARNING: Pool exhaustion for ${Math.round(waitDuration / 1000)}s — waiting: ${waiting}, total: ${total}/${max}, idle: ${idle}`);
     }
 
     // Critical threshold
     if (waitDuration >= POOL_CRIT_MS && (!poolAlertState.lastCriticalAt || Date.now() - poolAlertState.lastCriticalAt > 60_000)) {
       poolAlertState.lastCriticalAt = Date.now();
       poolAlertState.alertCount++;
-      console.error(`[DB-POOL-ALERT] 🔴 CRITICAL: Pool exhaustion for ${Math.round(waitDuration / 1000)}s — waiting: ${waiting}, total: ${total}/${max}, idle: ${idle}`);
+      console.error(`[DB-POOL-ALERT] CRITICAL: Pool exhaustion for ${Math.round(waitDuration / 1000)}s — waiting: ${waiting}, total: ${total}/${max}, idle: ${idle}`);
     }
 
     poolAlertState.lastAlertAt = Date.now();
@@ -446,7 +446,7 @@ function monitorPool() {
     // No waiting clients — reset if we were in exhaustion
     if (poolAlertState.waitingSince) {
       const duration = Date.now() - poolAlertState.waitingSince;
-      console.log(`[DB-POOL-ALERT] ✅ Pool exhaustion resolved after ${Math.round(duration / 1000)}s`);
+      console.log(`[DB-POOL-ALERT] Pool exhaustion resolved after ${Math.round(duration / 1000)}s`);
       poolAlertState.waitingSince = null;
     }
   }
@@ -670,10 +670,20 @@ if (!g6.__tirbeoDbHealthCache) {
 }
 const dbHealthCache: DbHealthCache = g6.__tirbeoDbHealthCache;
 
-const DB_HEALTH_CHECK_INTERVAL = 10_000; // check every 10s
-const DB_HEALTH_FAIL_THRESHOLD = 3; // consider DB down after 3 consecutive failures
+const DB_HEALTH_CHECK_INTERVAL = 15_000; // check every 15s (was 10s — reduce health-check load)
+const DB_HEALTH_FAIL_THRESHOLD = 5; // consider DB down after 5 consecutive failures (was 3 — DNS blips cause false positives)
 
-/** Fast cached DB health check — returns immediately if recently checked */
+/**
+ * Fast cached DB health check — returns immediately if recently checked.
+ * 
+ * Design notes:
+ *  - Uses a direct pg pool query (bypasses Prisma) for the health check to
+ *    avoid occupying a Prisma adapter slot during the probe.
+ *  - Only marks DB as DOWN after 5 consecutive failures to avoid false
+ *    positives from transient DNS blips (EAI_AGAIN) or Supabase cold starts.
+ *  - Returns `true` (optimistic) while DB status is uncertain rather than
+ *    blocking every request with a 503.
+ */
 export async function isDbHealthy(): Promise<boolean> {
   const now = Date.now();
   if (now - dbHealthCache.lastCheck < DB_HEALTH_CHECK_INTERVAL) {
@@ -681,7 +691,18 @@ export async function isDbHealthy(): Promise<boolean> {
   }
 
   try {
-    await withRetry(() => prisma.$queryRaw`SELECT 1`, 1, 100);
+    // Use the raw pg pool instead of Prisma to avoid adapter-slot contention
+    const pool = globalForPrisma.pgPool;
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        await client.query('SELECT 1');
+      } finally {
+        client.release();
+      }
+    } else {
+      await withRetry(() => prisma.$queryRaw`SELECT 1`, 1, 100);
+    }
     dbHealthCache.ok = true;
     dbHealthCache.consecutiveFailures = 0;
     dbHealthCache.lastError = '';
@@ -695,7 +716,6 @@ export async function isDbHealthy(): Promise<boolean> {
     // Detect cold start scenario
     if (isColdStartError(err) && isIdleLongEnough()) {
       recordColdStart();
-      // Trigger proactive reconnection in background
       reWarmAfterColdStart().catch(() => {});
     }
     
@@ -704,7 +724,9 @@ export async function isDbHealthy(): Promise<boolean> {
       dbHealthCache.ok = false;
       console.error(`[DB-HEALTH] Database marked as DOWN after ${dbHealthCache.consecutiveFailures} consecutive failures: ${dbHealthCache.lastError}`);
     }
-    return false;
+    // Return true optimistically for the first few failures — let the actual
+    // query handle the error rather than blocking everything with 503.
+    return true;
   }
 }
 

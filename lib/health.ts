@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, getPoolAlertState } from './db/prisma';
 import { getSession } from './session';
 import { jsonUnauthorized, jsonForbidden } from './response';
-import { getCachedRedisClient, checkRedisHealth, getAllRedisStates } from './db/redis';
+import { getCachedRedisClient, checkRedisHealth, getAllRedisStates, getRedisHealthSummary, pingAllRedisClients } from './db/redis';
 
 
 function isAdmin(user: any): boolean {
@@ -45,29 +45,51 @@ export async function publicHealthHandler() {
     return NextResponse.json(healthCache.data);
   }
 
-  const checks: Record<string, string> = {};
+  const checks: Record<string, any> = {};
   let healthy = true;
 
+  // ─── Database ───
   try {
+    const dbStart = Date.now();
     await prisma.$queryRaw`SELECT 1`;
-    checks.database = 'ok';
+    checks.database = { status: 'ok', latencyMs: Date.now() - dbStart };
   } catch {
-    checks.database = 'error';
+    checks.database = { status: 'error' };
     healthy = false;
   }
 
+  // ─── Redis ───
   const r = getHealthRedis();
   if (r) {
     const redisHealth = await checkRedisHealth(r);
-    checks.redis = redisHealth.ok ? 'ok' : 'error';
-    if (!redisHealth.ok) {
-      healthy = false;
-    }
+    checks.redis = {
+      status: redisHealth.ok ? 'ok' : 'error',
+      latencyMs: redisHealth.latencyMs,
+      error: redisHealth.error || undefined,
+    };
+    if (!redisHealth.ok) healthy = false;
   } else {
-    checks.redis = process.env.REDIS_URL ? 'error' : 'not-configured';
-    if (!process.env.REDIS_URL) healthy = false;
+    checks.redis = {
+      status: process.env.REDIS_URL ? 'error' : 'not-configured',
+      error: process.env.REDIS_URL ? 'Redis client failed to initialize' : undefined,
+    };
   }
 
+  // ─── Redis Connection Health ───
+  const redisSummary = getRedisHealthSummary();
+  checks.redisConnections = {
+    configured: redisSummary.configured,
+    total: redisSummary.totalClients,
+    connected: redisSummary.connectedClients,
+    reconnects: redisSummary.totalReconnects,
+    failedRequests: redisSummary.totalFailedRequests,
+    healthy: redisSummary.totalClients === 0 || redisSummary.connectedClients > 0,
+  };
+  if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
+    healthy = false;
+  }
+
+  // ─── Pool ───
   const poolStatus = getPoolStatus();
   const result = {
     status: healthy ? 'healthy' : 'degraded',
@@ -97,25 +119,39 @@ export async function detailedHealthHandler(req: NextRequest) {
     healthy = false;
   }
 
+  // ─── Redis health (PING) ───
   const r = getHealthRedis();
   if (r) {
     const redisHealth = await checkRedisHealth(r);
     checks.redis = {
       status: redisHealth.ok ? 'ok' : 'error',
       latencyMs: redisHealth.latencyMs,
-      error: redisHealth.error,
+      error: redisHealth.error || undefined,
     };
-    if (!redisHealth.ok) {
-      healthy = false;
-    }
+    if (!redisHealth.ok) healthy = false;
   } else {
-    checks.redis = { status: 'not-configured' };
+    checks.redis = { status: process.env.REDIS_URL ? 'error' : 'not-configured' };
   }
 
-  // Add Redis connection states for diagnostics
-  const redisStates = getAllRedisStates();
-  if (Object.keys(redisStates).length > 0) {
-    checks.redisConnections = redisStates;
+  // ─── Per-client Redis PING latencies ───
+  const pingResults = await pingAllRedisClients();
+  if (Object.keys(pingResults).length > 0) {
+    checks.redisPing = pingResults;
+  }
+
+  // ─── Redis connection states ───
+  const redisSummary = getRedisHealthSummary();
+  checks.redisConnections = {
+    configured: redisSummary.configured,
+    total: redisSummary.totalClients,
+    connected: redisSummary.connectedClients,
+    reconnects: redisSummary.totalReconnects,
+    failedRequests: redisSummary.totalFailedRequests,
+    allHealthy: redisSummary.totalClients === 0 || redisSummary.connectedClients === redisSummary.totalClients,
+    clients: redisSummary.clients,
+  };
+  if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
+    healthy = false;
   }
 
   try {
