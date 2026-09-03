@@ -42,6 +42,7 @@ import {
   requestPasswordResetHandler,
   verifyPasswordResetHandler,
   confirmPasswordResetHandler,
+  quickLoginWithOtpHandler,
   accountRecoveryHandler,
   suspiciousLoginConfirmHandler,
   suspiciousLoginDenyHandler,
@@ -200,7 +201,7 @@ const INTERNAL_ROUTES = [
   'auth/discord', 'auth/discord/callback',
   'auth/verify-2fa', 'auth/recovery-2fa',
   'auth/recovery-login/request', 'auth/recovery-login/verify',
-  'auth/password-reset/request', 'auth/password-reset/verify', 'auth/password-reset/confirm',
+  'auth/password-reset/request', 'auth/password-reset/verify', 'auth/password-reset/confirm', 'auth/password-reset/quick-login',
    'auth/account-recovery',
    'auth/suspicious-login/confirm', 'auth/suspicious-login/deny',
    'auth/session',
@@ -253,15 +254,9 @@ const INTERNAL_ROUTES = [
 
 ];
 
-let routeCache: { data: any[]; ts: number } | null = null;
 let blockCache: { data: any[]; ts: number } | null = null;
 const CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
 const STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
-
-async function loadRoutes() {
-  // Route model removed - all routes handled by INTERNAL_ROUTES and dynamic route matching
-  return [];
-}
 
 async function loadBlocked() {
   if (blockCache && Date.now() - blockCache.ts < CACHE_TTL) return blockCache.data;
@@ -277,15 +272,8 @@ async function loadBlocked() {
   }
 }
 
-function matchRoute(slug: string[], method: string, routes: any[]) {
+function matchRoute(slug: string[], method: string) {
   const pathPart = slug.join('/');
-  // Internal/fixed routes take precedence over stale DB route rows: DB rows can
-  // carry restricted allowed_roles or proxy targets that would shadow the
-  // hard-coded auth handlers (e.g. a seeded 'auth/login' row → 403 for guests).
-  const dbRoute = !INTERNAL_ROUTES.includes(pathPart)
-    ? routes.find((r) => r.path === pathPart && r.method.toUpperCase() === method.toUpperCase())
-    : undefined;
-  if (dbRoute) return dbRoute;
 
   // Handle email/templates/{name} dynamic route
   // Handle admin/emails/{id} dynamic route
@@ -386,6 +374,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/login': ['POST'],
       'auth/signup': ['POST'],
       'auth/email-exists': ['POST'],
+      'auth/username-exists': ['POST'],
       'profile/check-username': ['GET'],
       'auth/verify-email': ['POST'],
       'auth/verify': ['GET'],
@@ -409,7 +398,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/login-otp/request': ['POST'],
       'auth/login-otp/verify': ['POST'],
       'auth/magic-link/request': ['POST'],
-      'auth/magic-link/verify': ['POST'],
+      'auth/magic-link/verify': ['GET', 'POST'],
       'auth/google': ['GET'],
       'auth/google/callback': ['GET'],
       'auth/github': ['GET'],
@@ -423,6 +412,7 @@ function matchRoute(slug: string[], method: string, routes: any[]) {
       'auth/password-reset/request': ['POST'],
       'auth/password-reset/verify': ['POST'],
       'auth/password-reset/confirm': ['POST'],
+      'auth/password-reset/quick-login': ['POST'],
        'auth/account-recovery': ['POST'],
        'auth/suspicious-login/confirm': ['POST'],
        'auth/suspicious-login/deny': ['POST'],
@@ -594,9 +584,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   let routes: any[] = [];
   let blocked: any[] = [];
   try {
-    [routes, blocked] = await Promise.all([loadRoutes(), loadBlocked()]);
+    blocked = await loadBlocked();
   } catch (e: any) {
-    console.error('[HANDLER] loadRoutes/loadBlocked failed:', e?.message);
+    console.error('[HANDLER] loadBlocked failed:', e?.message);
     return NextResponse.json({ error: 'Database connection error' }, { status: 500 });
   }
 
@@ -628,7 +618,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     }
   }
 
-  const route = matchRoute(slug, method, routes);
+  const route = matchRoute(slug, method);
   if (!route) {
     console.warn(`[ROUTE] Not found — path: ${pathStr}, method: ${method}`);
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 404 });
@@ -696,18 +686,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/logout':
         resp = await logoutHandler(request);
         break;
-      case 'captcha/challenge':
-        resp = await captchaChallengeHandler(request);
-        break;
-      case 'captcha/verify':
-        resp = await captchaVerifyHandler(request);
-        break;
-      case 'captcha/status':
-        resp = await captchaStatusHandler(request);
-        break;
-      case 'captcha/image/[id]':
-        resp = await captchaImageHandler(request, (route as any).meta.imageId);
-        break;
       case 'users/me':
         resp = await profileHandler(request);
         break;
@@ -753,9 +731,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/magic-link/request':
         resp = await requestMagicLinkHandler(request);
-        break;
-      case 'auth/magic-link/verify':
-        resp = await verifyMagicLinkHandler(request);
         break;
       case 'auth/google':
         resp = await googleAuthRedirectHandler(request);
@@ -822,6 +797,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/password-reset/confirm':
         resp = await confirmPasswordResetHandler(request);
+        break;
+      case 'auth/password-reset/quick-login':
+        resp = await quickLoginWithOtpHandler(request);
         break;
       case 'profile':
         resp = await extendedProfileHandler(request);
@@ -901,9 +879,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'notifications':
         resp = await notificationsHandler(request);
         break;
-      case 'notifications/prefs':
-        resp = await notificationPrefsHandler(request);
-        break;
+      // notifications/prefs handled by standalone route at app/api/notifications/prefs/
       case 'notifications/prefs/channels':
         resp = await notificationChannelsHandler(request);
         break;
@@ -932,9 +908,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'consent-history':
         resp = await consentHistoryHandler(request);
         break;
-      case 'admin/heartbeat':
-        resp = await heartbeatHandler(request);
-        break;
+      // admin/heartbeat handled by standalone route at app/api/admin/heartbeat/
       case 'email/config':
         resp = await emailConfigHandler(request);
         break;
@@ -1155,23 +1129,24 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'admin/oauth/clients':
       case 'admin/oauth/clients/[id]':
       case 'admin/oauth/clients/[id]/secret':
-        resp = NextResponse.json({ error: 'OAuth2 server removed' }, { status: 410 });
-        break;
-
       case 'admin/help-articles':
       case 'admin/help-articles/[id]':
-        resp = NextResponse.json({ error: 'Help articles removed' }, { status: 410 });
-        break;
-
-      case 'admin/groups':
-        resp = NextResponse.json({ groups: [] });
-        break;
-
       case 'admin/integrations':
+      case 'admin/settings':
+      case 'auth/oauth/authorize':
+      case 'auth/oauth/token':
+      case 'auth/oauth/revoke':
+      case 'oidc/userinfo':
+      case 'content/settings':
+      case 'content/settings/update':
+      case 'content/feature-flags':
+      case 'content/feature-flags/update':
+      case 'content/jobs':
+      case 'content/jobs/create':
+      case 'content/retry-job/[id]':
+      case 'support/queues':
+      case 'support/queues/create':
         resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
-        break;
-      case 'admin/security/score':
-        resp = NextResponse.json({ error: 'Handled by standalone route' }, { status: 200 });
         break;
 
       case 'admin/analytics/overview':
@@ -1180,14 +1155,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'admin/analytics/consented-users':
         resp = await adminAnalyticsConsentedUsersHandler(request);
         break;
-      case 'admin/settings':
-        resp = NextResponse.json({ error: 'Settings are code-owned defaults now' }, { status: 410 });
-        break;
 
-      case 'admin/maintenance':
-        resp = await adminMaintenanceHandler(request);
-        break;
-
+      // admin/maintenance handled by standalone route at app/api/admin/maintenance/
       case 'passkey/register/options':
         resp = await passkeyRegisterOptionsHandler(request);
         break;

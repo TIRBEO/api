@@ -261,3 +261,23 @@ export async function verifyPendingSignupToken(
     return null;
   }
 }
+
+// ── OAuth consent token (5 min, purpose: 'oauth-consent') ──
+// Used when SameSite=Lax cookies aren't sent on cross-origin POST from dashboard to API.
+export async function signConsentToken(userId: string): Promise<string> {
+  return new SignJWT({ sub: userId, purpose: 'oauth-consent' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('5m')
+    .sign(getSecret());
+}
+
+export async function verifyConsentToken(token: string): Promise<string | null> {
+  try {
+    const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
+    if (payload.sub && payload.purpose === 'oauth-consent') return payload.sub as string;
+    return null;
+  } catch {
+    return null;
+  }
+}

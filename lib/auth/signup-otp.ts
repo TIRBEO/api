@@ -81,11 +81,7 @@ export async function sendSignupOtpEmail(email: string, code: string, templateNa
   const result = await sendTemplateEmail(email, templateName, { otp: code });
   if (!result.success) {
     console.error(`[SIGNUP OTP] Email send failed for ${email}: ${result.error}`);
-    console.log(`[SIGNUP OTP] FALLBACK CODE for ${email}: ${code}`);
-  }
-  // Always log in dev for testing
-  if (process.env.NODE_ENV === 'development') {
-    console.log(`[SIGNUP OTP] CODE for ${email}: ${code}`);
+    // Note: OTP codes are NEVER logged for security.
   }
   return result;
 }

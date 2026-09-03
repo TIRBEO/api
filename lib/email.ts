@@ -220,32 +220,46 @@ export async function sendEmail(
 }
 
 async function sendViaResend(apiKey: string, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string): Promise<EmailResult> {
-  try {
-    const body: Record<string, any> = {
-      from: fromName ? `${fromName} <${fromEmail}>` : fromEmail,
-      to: [to],
-      subject,
-      html,
-      tracking: { click: { enable: false }, open: { enable: true } },
-    };
-    if (replyTo) body.replyTo = replyTo;
-    const res = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      return { success: false, error: `Resend error ${res.status}: ${err}` };
+  const body: Record<string, any> = {
+    from: fromName ? `${fromName} <${fromEmail}>` : fromEmail,
+    to: [to],
+    subject,
+    html,
+    tracking: { click: { enable: false }, open: { enable: true } },
+  };
+  if (replyTo) body.replyTo = replyTo;
+
+  // Retry up to 2 times on transient network errors
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        // Don't retry client errors (4xx) — only server errors (5xx)
+        if (res.status < 500) return { success: false, error: `Resend error ${res.status}: ${err}` };
+        if (attempt < 2) { await new Promise(r => setTimeout(r, 500 * attempt)); continue; }
+        return { success: false, error: `Resend error ${res.status}: ${err}` };
+      }
+      const data: any = await res.json();
+      return { success: true, messageId: data.id };
+    } catch (err: unknown) {
+      const msg = String(err);
+      // Retry on network errors (fetch failed, ECONNRESET, etc.)
+      if (attempt < 2 && (msg.includes('fetch failed') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT'))) {
+        await new Promise(r => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      return { success: false, error: msg };
     }
-    const data: any = await res.json();
-    return { success: true, messageId: data.id };
-  } catch (err: unknown) {
-    return { success: false, error: String(err) };
   }
+  return { success: false, error: 'Email delivery failed after retries' };
 }
 
 async function sendViaSmtp(

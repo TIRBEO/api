@@ -6,7 +6,7 @@ import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendS
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from './auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from './auth/session';
 import { getSession, requireAdmin } from './session';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken } from './auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken } from './auth/jwt';
 
 import { verifyTotp } from './auth/totp';
 import { sendTemplateEmail } from './email';
@@ -314,7 +314,7 @@ const OAUTH_STATE_COOKIE = '__oauth_state';
 // Post-login target for an EXISTING account. Legacy accounts may still be
 // missing the recorded policy consent — send them to the in-dashboard
 // confirmation screen (session cookie is already set on this response).
-function oauthPostLoginTarget(user: any, redirectTo: string | undefined): string {
+function oauthPostLoginTarget(user: any, redirectTo: string | undefined, consentToken?: string): string {
   const dashboardBase = getDashboardBase();
   const target = redirectTo || dashboardBase;
   const needsConsent = !((user as any)?.consents as any)?.signupConsent?.policyAccepted;
@@ -322,6 +322,7 @@ function oauthPostLoginTarget(user: any, redirectTo: string | undefined): string
   const url = new URL(`${dashboardBase}/oauth-complete`);
   url.searchParams.set('finish', '1');
   if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
+  if (consentToken) url.searchParams.set('consent', consentToken);
   return url.toString();
 }
 
@@ -514,7 +515,7 @@ async function finishProviderSignIn(
   // Record login history
   const { recordLoginHistory } = await import('./security');
   recordLoginHistory({ request, userId: account.id, email: account.email, success: true, method: provider }).catch(() => {});
-  const target = oauthPostLoginTarget(account, redirectTo);
+  const target = oauthPostLoginTarget(account, redirectTo, await signConsentToken(account.id));
   const res = NextResponse.redirect(target);
   setSessionCookie(res, token, refreshToken, request);
   clearOauthStateCookie(res, request);
@@ -1320,7 +1321,7 @@ export async function signupHandler(request: NextRequest) {
       type: 'system',
       title: 'Welcome to Tirbeo',
       body: `Your account (${user.email}) was created on ${fmtNow()}. Start by exploring the dashboard and completing your profile.`,
-      link: '/overview',
+      link: '/home',
     }).catch(() => {});
 
     // Send verification OTP — unless the user already verified via signup-otp
@@ -1412,16 +1413,23 @@ export async function signupOtpVerifyHandler(request: NextRequest) {
 // user can be routed to the dashboard afterwards.
 export async function oauthConsentHandler(request: NextRequest) {
   try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
     const body: any = await request.json();
-    const { policyAccepted, adminDataAccess, signatureName } = body;
+    const { policyAccepted, adminDataAccess, signatureName, consentToken } = body;
     if (!policyAccepted) {
       return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, consents: true } });
+    // Auth: try session cookie first, then fallback to signed consent token
+    let userId: string | null = null;
+    const session = await getSession(request);
+    if (session) {
+      userId = session.userId;
+    } else if (consentToken) {
+      userId = await verifyConsentToken(consentToken);
+    }
+    if (!userId) return jsonUnauthorized();
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, consents: true } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const consentRecord: any = (user.consents as any) || {};
@@ -1512,6 +1520,10 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       if (body.password.length < 8) {
         return NextResponse.json({ error: 'Password must be at least 8 characters.' }, { status: 400 });
       }
+      const pwBreach = await checkPasswordBreach(body.password);
+      if (pwBreach.breached) {
+        return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
+      }
       passwordHash = await hashPassword(body.password);
     }
 
@@ -1584,7 +1596,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       type: 'system',
       title: 'Welcome to Tirbeo!',
       body: 'Your account is ready. Explore your dashboard to get started.',
-      link: '/overview',
+      link: '/home',
       icon: 'welcome',
     })).catch(() => {});
 
@@ -2621,6 +2633,10 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
     if (typeof newPassword !== 'string' || newPassword.length < 8) {
       return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
     }
+    // Password strength check
+    if (!/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      return NextResponse.json({ error: 'Password must include uppercase, lowercase, and a number.' }, { status: 400 });
+    }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
@@ -2634,6 +2650,38 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[PASSWORD RESET CONFIRM]', err?.message || err);
     return NextResponse.json({ error: 'Failed to reset password' }, { status: 500 });
+  }
+}
+
+// ─── Quick Login via OTP (no password change) ───
+export async function quickLoginWithOtpHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || !code) {
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
+    }
+    if (typeof code !== 'string' || code.length !== 6 || !/^\d{6}$/.test(code)) {
+      return NextResponse.json({ error: 'Invalid code format' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!checkWindowLimit(`quick-login:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const { quickLoginWithOtp } = await import('./auth/password-reset');
+    const result = await quickLoginWithOtp(email, code);
+    if (!result.success) {
+      return NextResponse.json({ error: result.error || 'Invalid or expired code' }, { status: 400 });
+    }
+
+    // Set session + refresh cookies (same pattern as login)
+    const resp = NextResponse.json({ message: 'Logged in successfully', userId: result.userId });
+    setSessionCookie(resp, result.sessionToken!, result.refreshToken, request);
+    return resp;
+  } catch (err: any) {
+    console.error('[QUICK LOGIN OTP]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to login' }, { status: 500 });
   }
 }
 
@@ -2654,6 +2702,13 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     if (!checkWindowLimit(`magic-link:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
       return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
+    const mlCooldown = enforceResendCooldown(`magic-link:${email.toLowerCase()}`);
+    if (!mlCooldown.allowed) {
+      return NextResponse.json(
+        { message: `Please wait ${Math.ceil(mlCooldown.remainingMs / 1000)}s before requesting again.`, retryAfterMs: mlCooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(mlCooldown.remainingMs / 1000)) } }
+      );
+    }
 
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, name: true } });
     // Always return success to prevent email enumeration
@@ -2663,7 +2718,11 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
 
     const token = await signMagicLinkToken(user.id);
-    const callbackUrl = `${getAccountsBaseUrl()}/callback?magic_token=${token}`;
+    // Point to the accounts app callback, which verifies the token via POST
+    // and redirects to the dashboard. This avoids the catch-all route matching
+    // issues that occur when hitting the API GET endpoint directly.
+    const accountsBase = getAccountsBaseUrl();
+    const callbackUrl = `${accountsBase}/callback?magic_token=${token}`;
 
     let emailSent = false;
     try {
@@ -2689,8 +2748,20 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
 export async function verifyMagicLinkHandler(request: NextRequest) {
   try {
-    const { token } = (await request.json()) as any;
+    // Support both GET (from email link) and POST (from accounts app)
+    let token = '';
+    if (request.method === 'GET') {
+      token = request.nextUrl.searchParams.get('token') || '';
+    } else {
+      const body = (await request.json()) as any;
+      token = body?.token || '';
+    }
     if (!token || typeof token !== 'string') {
+      if (request.method === 'GET') {
+        // GET with no token — redirect to accounts login
+        const accountsUrl = getAccountsBaseUrl();
+        return NextResponse.redirect(`${accountsUrl}/login?error=magic_link_invalid`);
+      }
       return NextResponse.json({ error: 'Token required' }, { status: 400 });
     }
 
@@ -2751,6 +2822,34 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+
+    // GET request (from email link): create session + redirect to dashboard
+    if (request.method === 'GET') {
+      const dashboardBase = getDashboardBase();
+      const res = NextResponse.redirect(dashboardBase);
+      setSessionCookie(res, sessionToken, refreshToken, request);
+
+      await createAuditEvent({
+        actorId: user.id,
+        action: 'user.login',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: { method: 'magic_link', ip },
+      });
+      createNotification({
+        userId: user.id,
+        type: 'login',
+        title: 'Signed in with magic link',
+        body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}) on ${fmtNow()}.`,
+        link: '/account/security',
+        metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) },
+      }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+      const { recordLoginHistory: rlh3 } = await import('./security');
+      rlh3({ request, userId: user.id, email: user.email, success: true, method: 'magic_link' }).catch(() => {});
+      return res;
+    }
+
+    // POST request (from accounts app): return JSON
     const res = NextResponse.json({ email: user.email, token: sessionToken });
     setSessionCookie(res, sessionToken, refreshToken, request);
 

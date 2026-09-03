@@ -116,33 +116,6 @@ function validateCsrf(request: NextRequest): boolean {
   return diff === 0;
 }
 
-// Enhanced CSRF validation with nonce support
-function validateCsrfWithNonce(request: NextRequest): boolean {
-  const headerToken = request.headers.get('x-csrf-token');
-  const cookieToken = request.cookies.get(CSRF_COOKIE_NAME)?.value;
-  const nonceHeader = request.headers.get('x-csrf-nonce');
-  
-  // Standard CSRF validation
-  if (headerToken && cookieToken) {
-    return validateCsrf(request);
-  }
-  
-  // Nonce-based validation for state-changing requests
-  if (nonceHeader && cookieToken) {
-    // Nonce should be a timestamp-based token
-    try {
-      const nonceTime = parseInt(nonceHeader.split(':')[0] || '0', 10);
-      const now = Date.now();
-      // Nonce is valid for 5 minutes
-      if (Math.abs(now - nonceTime) < 5 * 60 * 1000) {
-        return true;
-      }
-    } catch {}
-  }
-  
-  return false;
-}
-
 // State-changing methods that require CSRF validation for cookie-authed requests
 const STATE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -155,7 +128,7 @@ const CSRF_EXEMPT_PATHS = [
   '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
   '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
   '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
-  '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
+  '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm', '/api/auth/password-reset/quick-login',
   '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
   '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
   '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
@@ -328,7 +301,7 @@ export async function proxy(request: NextRequest) {
     '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback', '/api/auth/discord', '/api/auth/discord/callback',
     '/api/auth/oauth/merge', // login-merge: authorized by signed short-lived token in body, no session involved
     '/api/auth/oauth/pending', '/api/auth/oauth/complete', '/api/auth/oauth-consent', '/api/auth/oauth/consent',
-    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm',
+    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm', '/api/auth/password-reset/quick-login',
     '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
     '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
     '/api/auth/refresh',

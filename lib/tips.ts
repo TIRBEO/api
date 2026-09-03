@@ -170,7 +170,7 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
       id: 'welcome-back',
       title: 'Welcome back — pick up where you left off',
       body: `You haven’t been active for ${daysSinceActive} days. Check your inbox and recent activity.`,
-      actionUrl: `${D}/overview`,
+      actionUrl: `${D}/home`,
       actionLabel: 'Go to overview',
     });
   } else if (daysSinceActive > 7) {
@@ -216,7 +216,7 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
       id: 'explore-overview',
       title: 'Explore your dashboard',
       body: 'Your overview shows recent activity, tickets, and quick actions — a good place to start.',
-      actionUrl: `${D}/overview`,
+      actionUrl: `${D}/home`,
       actionLabel: 'Open overview',
     });
   }

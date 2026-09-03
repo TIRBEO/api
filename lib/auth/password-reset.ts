@@ -30,14 +30,8 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
     .then((result) => {
       if (!result.success) {
         console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
-        }
       }
-      // Always log in dev for testing
-      if (process.env.NODE_ENV === 'development') {
-        console.log(`[PASSWORD RESET OTP] CODE for ${email}: ${code}`);
-      }
+      // Note: OTP codes are NEVER logged for security.
     })
     .catch((err) => console.error('[PASSWORD RESET OTP] Email send threw:', err?.message));
 
@@ -69,9 +63,6 @@ export async function requestPasswordResetMagicLink(email: string): Promise<{ su
     .then((result) => {
       if (!result.success) {
         console.error(`[PASSWORD RESET MAGIC LINK] Email send failed for ${email}: ${result.error}`);
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
-        }
       }
     })
     .catch((err) => console.error('[PASSWORD RESET MAGIC LINK] Email send threw:', err?.message));
@@ -115,9 +106,6 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
     .then((r) => {
       if (!r.success) {
         console.error(`[PASSWORD RESET RECOVERY] Email send failed for ${user.secondaryEmail}: ${r.error}`);
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`[PASSWORD RESET RECOVERY] FALLBACK CODE for ${user.secondaryEmail}: ${code}`);
-        }
       }
     })
     .catch((err) => console.error('[PASSWORD RESET RECOVERY] Email send threw:', err?.message));
@@ -156,9 +144,6 @@ export async function requestPasswordReset(
       .then((result) => {
         if (!result.success) {
           console.error(`[PASSWORD RESET] Email send failed for ${email}: ${result.error}`);
-          if (process.env.NODE_ENV !== 'production') {
-            console.log(`[PASSWORD RESET] FALLBACK URL for ${email}: ${resetUrl}`);
-          }
         }
       })
       .catch((err) => console.error('[PASSWORD RESET] Email send threw:', err?.message));
@@ -190,9 +175,6 @@ export async function requestPasswordReset(
       .then((result) => {
         if (!result.success) {
           console.error(`[PASSWORD RESET OTP] Email send failed for ${email}: ${result.error}`);
-          if (process.env.NODE_ENV !== 'production') {
-            console.log(`[PASSWORD RESET OTP] FALLBACK CODE for ${email}: ${code}`);
-          }
         }
       })
       .catch((err) => console.error('[PASSWORD RESET OTP] Email send threw:', err?.message));
@@ -253,16 +235,50 @@ export async function verifyPasswordReset(
   return { success: true, resetToken: confirmToken };
 }
 
+// Password strength check
+function checkPasswordStrength(pw: string): { ok: boolean; error?: string } {
+  if (pw.length < 8) return { ok: false, error: 'Password must be at least 8 characters.' };
+  if (pw.length > 128) return { ok: false, error: 'Password must be at most 128 characters.' };
+  if (!/[a-z]/.test(pw)) return { ok: false, error: 'Password must contain at least one lowercase letter.' };
+  if (!/[A-Z]/.test(pw)) return { ok: false, error: 'Password must contain at least one uppercase letter.' };
+  if (!/[0-9]/.test(pw)) return { ok: false, error: 'Password must contain at least one number.' };
+  // Check for common weak passwords
+  const weak = ['password', 'password1', 'qwerty', '12345678', 'abc12345', 'letmein', 'admin', 'welcome', 'monkey', 'dragon'];
+  if (weak.includes(pw.toLowerCase())) return { ok: false, error: 'This password is too common. Please choose a stronger one.' };
+  return { ok: true };
+}
+
 // Actually set the new password — doesn't need email, token encodes userId
 export async function confirmPasswordReset(
   resetToken: string,
   newPassword: string
 ): Promise<{ success: boolean; error?: string }> {
+  const strength = checkPasswordStrength(newPassword);
+  if (!strength.ok) return { success: false, error: strength.error };
+
+  // Check HIBP breach database
+  try {
+    const { checkPasswordBreach } = await import('./breach');
+    const breach = await checkPasswordBreach(newPassword);
+    if (breach.breached) {
+      return { success: false, error: `This password has appeared in ${breach.count.toLocaleString()} data breaches. Please choose a different one.` };
+    }
+  } catch {
+    // Non-blocking: if HIBP check fails, allow the reset
+  }
+
   const userId = await verifyPasswordResetToken(resetToken);
   if (!userId) return { success: false, error: 'Invalid or expired reset token' };
 
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) return { success: false, error: 'User not found' };
+
+  // Don't allow the same password
+  if (user.passwordHash) {
+    const { verifyPassword } = await import('./password');
+    const same = await verifyPassword(user.passwordHash, newPassword);
+    if (same) return { success: false, error: 'New password must be different from your current password.' };
+  }
 
   const { hashPassword } = await import('./password');
   const hash = await hashPassword(newPassword);
@@ -278,4 +294,39 @@ export async function confirmPasswordReset(
   await prisma.session.deleteMany({ where: { userId: user.id } });
 
   return { success: true };
+}
+
+// Quick login via OTP — verify code and create session directly (no password change)
+// Used for "one-time code" and "forgot password" flows where user just enters the OTP
+// and gets logged in with a short-lived session.
+export async function quickLoginWithOtp(
+  email: string,
+  code: string
+): Promise<{ success: boolean; error?: string; sessionToken?: string; refreshToken?: string; userId?: string }> {
+  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  if (!user) return { success: false, error: 'Invalid or expired code' };
+
+  // Find the latest OTP for this user
+  const otp = await prisma.otp.findFirst({
+    where: { userId: user.id, type: 'email' },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (!otp || otp.expiresAt < new Date()) {
+    return { success: false, error: 'Invalid or expired code' };
+  }
+
+  const ok = await verifyOtpCode(otp.otpHash, code);
+  if (!ok) {
+    return { success: false, error: 'Invalid or expired code' };
+  }
+
+  // Delete all OTPs for this user
+  await prisma.otp.deleteMany({ where: { userId: user.id, type: 'email' } });
+
+  // Create a session for the user
+  const { createSession } = await import('./session');
+  const session = await createSession(user.id);
+
+  return { success: true, sessionToken: session.token, refreshToken: session.refreshToken, userId: user.id };
 }

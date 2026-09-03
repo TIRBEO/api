@@ -23,10 +23,10 @@
     "DISCORD_REDIRECT_URI": "https://api.tirbeo.app/api/auth/discord/callback",
     "PORT": "3000",
     "WS_PORT": "3001",
-    "RT_API_TOKEN": "REPLACE_WITH_YOUR_RT_API_TOKEN",
+    "RT_API_TOKEN": "",
     "RT_PUBLISH_URL": "https://ws.tirbeo.app/api/publish",
     "VAPID_PUBLIC_KEY": "BAl33vholmLbvhBML9Xt5RerNEGKqkvpN9Po2RYUtYhAi7-kNr-fcXUcZkPplBWf8aOr3AuzL6ZeyqKuJrS_YM0",
-    "VAPID_PRIVATE_KEY": "REPLACE_WITH_YOUR_VAPID_PRIVATE_KEY",
+    "VAPID_PRIVATE_KEY": "",
     "VAPID_SUBJECT": "mailto:support@tirbeo.app"
   }
 }
