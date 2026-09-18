@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual } from 'crypto';
-import { logSecurityEvent, getClientIp, getRayId } from '../../../../lib/security';
-import { checkRateLimit } from '../../../../lib/auth/rate-limit';
+import { logSecurityEvent, getClientIp, getRayId } from '@/features/security/security';
+import { checkRateLimit } from '@/features/auth/rate-limit';
 
 export const runtime = 'nodejs';
 

@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { verifyTempPasswordChangeToken } from '@/lib/auth/jwt';
-import { hashPassword, verifyPassword } from '@/lib/auth/password';
-import { prisma } from '@/lib/db/prisma';
-import { createSession, setSessionCookie } from '@/lib/session';
+import { verifyTempPasswordChangeToken } from '@/features/auth/jwt';
+import { hashPassword, verifyPassword } from '@/features/auth/password';
+import { prisma } from '@/infrastructure/db/prisma';
+import { createSession, setSessionCookie } from '@/features/auth/http-guards';
 
 export async function POST(request: NextRequest) {
   try {
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
-    const { checkPasswordBreach } = await import('@/lib/auth/breach');
+    const { checkPasswordBreach } = await import('@/features/auth/breach');
     const breach = await checkPasswordBreach(newPassword);
     if (breach.breached) {
       return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
@@ -49,7 +49,7 @@ export async function POST(request: NextRequest) {
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);
 
-    const { logSecurityEvent } = await import('@/lib/security');
+    const { logSecurityEvent } = await import('@/features/security/security');
     logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_password_initial_set', details: { reason: 'first_login' } }).catch(() => {});
 
     return res;

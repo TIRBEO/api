@@ -1,4 +1,4 @@
-import { prisma } from '../lib/db/prisma';
+import { prisma } from '@/infrastructure/db/prisma';
 
 async function main() {
   console.log('[SEED] Nothing to seed — all defaults are code-owned now.');

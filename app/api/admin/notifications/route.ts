@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/session';
-import { listNotifications, getUnreadCount, markAsRead, createNotification } from '../../../../lib/notifications';
+import { requireAdmin } from '@/features/auth/http-guards';
+import { listNotifications, getUnreadCount, markAsRead, createNotification } from '@/features/notifications/notifications';
 
 export async function GET(request: NextRequest) {
   const session = await requireAdmin(request);
@@ -46,11 +46,11 @@ export async function POST(request: NextRequest) {
   }
 
   // Broadcast to every user (paginated).
-  const { prisma } = await import('../../../../lib/db/prisma');
+  const { prisma } = await import('@/infrastructure/db/prisma');
   const BATCH = 200;
   let cursor: string | undefined = undefined;
   let sent = 0;
-  // eslint-disable-next-line no-constant-condition
+   
   while (true) {
     const batch: { id: string }[] = await prisma.user.findMany({
       where: { ...(cursor ? { id: { gt: cursor } } : {}) },

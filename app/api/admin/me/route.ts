@@ -1,11 +1,11 @@
-import { NextResponse } from 'next/server';
-import { getSessionFromRequest } from '@/lib/auth/session';
-import { prisma } from '../../../../lib/db/prisma';
-import { cachedJson } from '../../../../lib/response';
-import { getEffectivePermissions } from '../../../../lib/roles';
+import { NextRequest, NextResponse } from 'next/server';
+import { getSession } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
+import { cachedJson } from '@/shared/response';
+import { getEffectivePermissions } from '@/features/auth/roles';
 
-export async function GET(request: Request) {
-  const session = await getSessionFromRequest(request as any);
+export async function GET(request: NextRequest) {
+  const session = await getSession(request);
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   const user = await prisma.user.findUnique({

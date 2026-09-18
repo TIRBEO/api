@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { getBranding } from '../../../../lib/branding';
-import { createTtlCache } from '../../../../lib/cache';
+import { getBranding } from '@/features/branding/branding';
+import { createTtlCache } from '@/infrastructure/cache';
 
 export const runtime = 'nodejs';
 

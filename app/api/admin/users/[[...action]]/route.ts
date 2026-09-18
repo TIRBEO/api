@@ -1,9 +1,11 @@
 import { NextRequest } from 'next/server';
-import { listUsers, getUserDetail, createUser, updateUser, deleteUser, banUser, unbanUser, suspendUser, unsuspendUser } from '../../../../../lib/adminHandlers';
+import { listUsers, getUserDetail, createUser, updateUser, deleteUser, banUser, unbanUser, suspendUser, unsuspendUser, resolveUserByRefCode, exportUsersCsv } from '@/features/admin/adminHandlers';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
   const { action } = await params;
   const [userId] = action || [];
+  if (userId === 'resolve') return resolveUserByRefCode(request);
+  if (userId === 'export') return exportUsersCsv(request);
   if (userId) return getUserDetail(request, userId);
   return listUsers(request);
 }

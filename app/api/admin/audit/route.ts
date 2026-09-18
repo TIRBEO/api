@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { withAdmin } from '@/lib/role-guard';
-import { listAuditEvents, createAuditEvent } from '../../../../lib/audit';
+import { withAdmin } from '@/features/auth/role-guard';
+import { listAuditEvents, createAuditEvent } from '@/features/security/audit';
 
 export const GET = withAdmin(async (request, session) => {
 

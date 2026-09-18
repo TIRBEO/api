@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../../lib/db/prisma';
-import { requireRole } from '../../../../../lib/session';
-import { trackQuery } from '../../../../../lib/queryMonitor';
+import { prisma } from '@/infrastructure/db/prisma';
+import { requireRole } from '@/features/auth/http-guards';
+import { trackQuery } from '@/infrastructure/observability/queryMonitor';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'admin');
@@ -100,10 +100,20 @@ export async function GET(request: NextRequest) {
       eventTypes,
     ] = await Promise.all([
       trackQuery('security_events_by_severity_created', () => prisma.securityEvent.findMany({
-        where: { severity: 'critical' },
+        where: {
+          severity: 'critical',
+          createdAt: { gte: thirtyDaysAgo },
+        },
         orderBy: { createdAt: 'desc' },
         take: 5,
-        include: { user: { select: { email: true, name: true } } },
+        select: {
+          id: true,
+          severity: true,
+          eventType: true,
+          createdAt: true,
+          ipAddress: true,
+          user: { select: { email: true, name: true } },
+        },
       })),
       trackQuery('security_events_group_by_ip', () => prisma.securityEvent.groupBy({
         by: ['ipAddress'],

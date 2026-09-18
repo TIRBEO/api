@@ -1,18 +1,21 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { checkRateLimitWithInfo } from './lib/auth/rate-limit';
-import { isSuspicious } from './lib/auth/suspicious-activity';
-import { verifyTurnstile, getTurnstileSiteKey, isTurnstileConfigured } from './lib/auth/turnstile';
-import { detectXss } from './lib/auth/xss-scan';
-import { getMaintenanceState } from './lib/ws/server';
+import { checkRateLimitWithInfo } from '@/features/auth/rate-limit';
+import { isSuspicious } from '@/features/auth/suspicious-activity';
+import { verifyTurnstile, getTurnstileSiteKey, isTurnstileConfigured } from '@/features/auth/turnstile';
+import { detectXss } from '@/features/auth/xss-scan';
+import { getMaintenanceState } from '@/shared/maintenance-state';
+import { eventIdFor, generateEventId } from '@/features/users/refcode';
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
   try {
     const u = new URL(origin);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (u.username || u.password) return false;
     if (['localhost', '127.0.0.1'].includes(u.hostname)) return true;
     if (u.hostname === 'api.tirbeo.app') return true;
     if (u.hostname.endsWith('.tirbeo.app')) return true;
-    if (u.hostname === 'api-tirbeo.vercel.app') return true;
+    // vercel.app preview domains are NOT allowed — only tirbeo.app + localhost
     return false;
   } catch {
     return false;
@@ -83,7 +86,7 @@ const securityHeaders = {
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=(), payment=(), usb=(), serial=(), midi=(), sync-xhr=(), autoplay=(), display-capture=(), fullscreen=(), picture-in-picture=(), screen-wake-lock=(), clipboard-read=(), clipboard-write=()',
-  'Content-Security-Policy': `default-src 'self'; script-src 'self' 'unsafe-inline' ${isDev ? "'unsafe-eval'" : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-ancestors 'none';`,
+  'Content-Security-Policy': `default-src 'self'; script-src 'self' 'unsafe-inline' ${isDev ? "'unsafe-eval'" : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: https://lh3.googleusercontent.com https://avatars.githubusercontent.com https://cdn.discordapp.com https://*.googleusercontent.com; font-src 'self' data:; connect-src 'self' https: wss: ${isDev ? "http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*" : ""}; frame-ancestors 'none';`,
 };
 
 function addCorsHeaders(response: NextResponse, origin: string) {
@@ -93,6 +96,7 @@ function addCorsHeaders(response: NextResponse, origin: string) {
   response.headers.set('Access-Control-Allow-Credentials', 'true');
   response.headers.set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset');
   response.headers.set('Access-Control-Max-Age', '86400');
+  response.headers.set('Vary', 'Origin');
 }
 
 function jsonResponse(origin: string, body: any, status: number) {
@@ -123,6 +127,7 @@ const STATE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const CSRF_EXEMPT_PATHS = [
   '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
   '/api/auth/refresh',
+  '/api/support/appeal',
   '/api/auth/email-exists', '/api/auth/username-exists',
   '/api/auth/signup-otp/request', '/api/auth/signup-otp/verify',
   '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
@@ -132,10 +137,11 @@ const CSRF_EXEMPT_PATHS = [
   '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
   '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
   '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
+  '/api/admin/passkey/options', '/api/admin/passkey/verify',
+  '/api/auth/passkey/auth-options', '/api/auth/passkey/verify',
   '/api/public/', '/api/newsletter/',
   '/api/waitlist',
-  '/api/feedback',    '/api/passkey/register/options', '/api/passkey/register/verify', '/api/passkey/list',
-  '/api/passkey/auth/options', '/api/passkey/auth/verify',
+  '/api/feedback',
   '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
   '/auth/discord', '/auth/discord/callback',
   '/api/auth/oauth/merge',
@@ -177,13 +183,13 @@ export async function proxy(request: NextRequest) {
   
   // Quick admin check for rate limit bypass — cache the payload so we
   // avoid re-verifying the JWT 2-3 more times below.
-  let adminUserId: string | undefined;
-  let adminRole: string | undefined;
-  let cachedPayload: { sub: string; sid: string; adminRole?: string } | null = null;
-  if (preHasCookie) {
+let adminUserId: string | undefined;
+let adminRole: string | undefined;
+let cachedPayload: { sub: string; sid: string; adminRole?: string } | null = null;
+if (preHasCookie) {
     try {
-      const { verifyToken } = await import('./lib/auth/jwt');
-      const payload = await verifyToken(preCookie!);
+      const jwtModule = await import('@/features/auth/jwt');
+      const payload = await jwtModule.verifyToken(preCookie!);
       if (payload) {
         cachedPayload = payload as any;
         if (payload.adminRole) {
@@ -197,12 +203,16 @@ export async function proxy(request: NextRequest) {
     }
   }
   
-  // Admin API key check — requires a valid ADMIN_KEY env var to match against
+  // Admin API key check — requires a valid ADMIN_KEY env var to match against.
+  // Constant-time comparison: header values are attacker-controlled and a
+  // plain === would leak the key length/prefix via timing.
   if (!isAdminUser) {
     const adminKey = request.headers.get('x-admin-key');
     const expectedKey = process.env.ADMIN_KEY || process.env.ADMIN_API_KEY;
-    if (adminKey && expectedKey && adminKey === expectedKey) {
-      isAdminUser = true;
+    if (adminKey && expectedKey && adminKey.length === expectedKey.length) {
+      let diff = 0;
+      for (let i = 0; i < expectedKey.length; i++) diff |= adminKey.charCodeAt(i) ^ expectedKey.charCodeAt(i);
+      if (diff === 0) isAdminUser = true;
     }
   }
   
@@ -265,10 +275,13 @@ export async function proxy(request: NextRequest) {
   const isAuth = pathname.startsWith('/api/auth/login') || pathname.startsWith('/api/auth/signup') || pathname.startsWith('/api/auth/verify-2fa') || pathname.startsWith('/api/auth/recovery-2fa') || pathname.startsWith('/api/auth/login-otp') || pathname.startsWith('/api/auth/password-reset') || pathname.startsWith('/api/auth/signup-otp') || pathname.startsWith('/api/auth/magic-link');
   const rateResult = await checkRateLimitWithInfo(`${ip}:${pathname}`, isAuth, undefined, isAdminUser, adminUserId, adminRole);
   if (!rateResult.allowed) {
-    const resp = jsonResponse(allowedOrigin, { error: 'Too many requests. Please try again later.' }, 429);
+    // Typed event ID ("RL" family) so the user can reference this exact block.
+    const rlEventId = generateEventId('ratelimit');
+    const resp = jsonResponse(allowedOrigin, { error: 'Too many requests. Please try again later.', eventId: rlEventId }, 429);
     resp.headers.set('X-RateLimit-Limit', String(rateResult.limit));
     resp.headers.set('X-RateLimit-Remaining', '0');
     resp.headers.set('X-RateLimit-Reset', String(rateResult.reset));
+    resp.headers.set('X-Event-Id', rlEventId);
     return resp;
   }
 
@@ -308,15 +321,18 @@ export async function proxy(request: NextRequest) {
     '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
     '/api/auth/verify',
     '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
+  '/api/admin/passkey/options', '/api/admin/passkey/verify',
+  '/api/auth/passkey/auth-options', '/api/auth/passkey/verify',
     '/api/public/', '/api/newsletter/',
     '/api/waitlist',
     '/api/feedback',
     '/api/forms/public/',
-    '/api/passkey/auth/options', '/api/passkey/auth/verify',
     '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
     '/auth/discord', '/auth/discord/callback',
      '/api/captcha/challenge', '/api/captcha/status', '/api/captcha/verify', '/api/captcha/image/',
      '/api/image/',
+     '/api/cdn/share/',
+     '/api/cdn/u/',
      '/api/health',
      '/api/security/log',
      '/api/debug/',
@@ -343,19 +359,45 @@ if (!hasCookie && !hasAuthHeader) {
 // Runs once per authenticated request. Banned users get 403 ACCOUNT_BANNED;
 // suspended users get 403 ACCOUNT_SUSPENDED with reason + until; expired
 // suspensions are lifted automatically on first hit.
-const statusExempt = ['/api/auth/', '/api/health', '/api/users/me/status'];
+// /api/support/appeal is exempt: it authenticates with account credentials
+// precisely so blocked users can file an appeal without a session.
+const statusExempt = ['/api/auth/', '/api/health', '/api/users/me/status', '/api/support/appeal'];
 let statusResponse: NextResponse | null = null;
 if (!statusExempt.some(p => pathname.startsWith(p))) {
   try {
-    const { verifyToken } = await import('./lib/auth/jwt');
-    const tokenForStatus: string | null = (preCookie || cookie || (hasAuthHeader ? request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') : '')) || null;
-    const tokenPayload = tokenForStatus ? await verifyToken(tokenForStatus) : null;
+    // Reuse the cached JWT payload from the early admin check to avoid
+    // a second verifyToken call (saves ~2-5s per request).
+    const tokenPayload = cachedPayload?.sub
+      ? cachedPayload
+      : null;
     if (tokenPayload?.sub) {
-      const { prisma } = await import('./lib/db/prisma');
-      const su = await prisma.user.findUnique({
-        where: { id: String(tokenPayload.sub) },
-        select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true, scheduledDeletionAt: true, deletedAt: true, deletionReason: true },
-      });
+      const _statusCache: Map<string, { data: any; expiry: number }> = (globalThis as any).__statusCache || ((globalThis as any).__statusCache = new Map());
+      const STATUS_CACHE_TTL = 60000;
+      const cachedStatus = _statusCache.get(tokenPayload.sub);
+      let su: any = null;
+      const { prisma } = await import('@/infrastructure/db/prisma');
+      if (cachedStatus && cachedStatus.expiry > Date.now()) {
+        su = cachedStatus.data;
+      } else {
+        su = await prisma.user.findUnique({
+          where: { id: String(tokenPayload.sub) },
+          select: { isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true, scheduledDeletionAt: true, deletedAt: true, deletionReason: true, banRefCode: true, suspendRefCode: true },
+        });
+        _statusCache.set(tokenPayload.sub, { data: su, expiry: Date.now() + STATUS_CACHE_TTL });
+        // Seed the ban-check cache from the same query so state-changing POSTs
+        // don't issue a second user lookup for the same token.
+        const _seedBanCache: Map<string, { banned: boolean; suspended: boolean; deleted: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
+        _seedBanCache.set(tokenPayload.sub, {
+          banned: !!su?.isBanned,
+          suspended: !!su?.isSuspended,
+          deleted: !!su?.deletedAt,
+          ts: Date.now(),
+        });
+        if (_statusCache.size > 2000) {
+          const now = Date.now();
+          for (const [k, v] of _statusCache) { if (now - v.expiry > STATUS_CACHE_TTL) _statusCache.delete(k); }
+        }
+      }
       if (su?.deletedAt) {
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_DELETED', deleted: true,
@@ -380,6 +422,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         await prisma.session.deleteMany({ where: { userId: tokenPayload.sub } }).catch(() => {});
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_BANNED', banned: true,
+          eventId: su.banRefCode || eventIdFor(String(tokenPayload.sub), 'ban'),
           message: 'Your account has been permanently banned.',
         }, 403);
       } else if (su?.isSuspended) {
@@ -391,6 +434,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         } else {
           statusResponse = jsonResponse(allowedOrigin, {
             error: 'ACCOUNT_SUSPENDED', suspended: true,
+            eventId: su.suspendRefCode || eventIdFor(String(tokenPayload.sub), 'suspend'),
             reason: su.suspendReason || 'No reason provided',
             until: su.suspendedUntil?.toISOString() || null,
             message: `Your account is suspended${su.suspendedUntil ? ` until ${new Date(su.suspendedUntil).toUTCString()}` : ''}.`,
@@ -424,9 +468,10 @@ if (hasAuthHeader) {
 
   // ── Block check + banned/suspended check (single cached JWT verify) ──
   // Use cachedPayload from the early admin check to avoid re-verifying.
-  if (hasCookie && STATE_METHODS.has(request.method) && cachedPayload?.sub) {
+  if (hasCookie && STATE_METHODS.has(request.method) && cachedPayload?.sub && !pathname.startsWith('/api/support/appeal')) {
     try {
-      const { isBlocked } = await import('./lib/captcha/service');
+      const captchaService = await import('@/features/captcha/service');
+      const isBlocked = captchaService.isBlocked;
       const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
       const blockStatus = await isBlocked(cachedPayload.sub, cachedPayload.sid, clientIp);
       if (blockStatus.blocked) {
@@ -442,8 +487,8 @@ if (hasAuthHeader) {
       const _banCache: Map<string, { banned: boolean; suspended: boolean; deleted: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
       const _bcKey = cachedPayload.sub;
       const _bcHit = _banCache.get(_bcKey);
-      if (!_bcHit || Date.now() - _bcHit.ts > 30_000) {
-        const { prisma } = await import('./lib/db/prisma');
+      if (!_bcHit || Date.now() - _bcHit.ts > 60_000) {
+        const { prisma } = await import('@/infrastructure/db/prisma');
         const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { isBanned: true, isSuspended: true, deletedAt: true } });
         const banned = !!user?.isBanned;
         const suspended = !!user?.isSuspended;
@@ -451,7 +496,7 @@ if (hasAuthHeader) {
         _banCache.set(_bcKey, { banned, suspended, deleted, ts: Date.now() });
         if (_banCache.size > 2000) {
           const now = Date.now();
-          for (const [k, v] of _banCache) { if (now - v.ts > 30_000) _banCache.delete(k); }
+          for (const [k, v] of _banCache) { if (now - v.ts > 60_000) _banCache.delete(k); }
         }
         if (deleted) return jsonResponse(allowedOrigin, { error: 'Account has been deleted' }, 403);
         if (banned) return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
@@ -468,14 +513,16 @@ if (hasAuthHeader) {
     }
   }
 
-  // ── Check banned/suspended for API key-authed state changes ──
+  // ── Check banned/suspended/deletion for API key-authed state changes ──
   if (hasAuthHeader && STATE_METHODS.has(request.method)) {
     try {
-      const { authenticateApiKey } = await import('./lib/auth/api-key');
-      const apiKeyResult = await authenticateApiKey(request);
+        const apiKeyModule = await import('@/features/auth/api-key');
+        const apiKeyResult = await apiKeyModule.authenticateApiKey(request);
       if (apiKeyResult?.userId) {
-        const { prisma } = await import('./lib/db/prisma');
-        const user = await prisma.user.findUnique({ where: { id: apiKeyResult.userId }, select: { isBanned: true, isSuspended: true } });
+        const { prisma } = await import('@/infrastructure/db/prisma');
+        const user = await prisma.user.findUnique({ where: { id: apiKeyResult.userId }, select: { isBanned: true, isSuspended: true, deletedAt: true, scheduledDeletionAt: true } });
+        if (user?.deletedAt) return jsonResponse(allowedOrigin, { error: 'ACCOUNT_DELETED', deleted: true, message: 'Your account has been deleted.' }, 403);
+        if (user?.scheduledDeletionAt && !request.url.includes('/api/user/delete-account')) return jsonResponse(allowedOrigin, { error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, message: 'Your account is scheduled for deletion.' }, 403);
         if (user?.isBanned) return jsonResponse(allowedOrigin, { error: 'Account has been banned' }, 403);
         if (user?.isSuspended) return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
       }

@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { resetUserPassword } from '../../../../../../lib/adminHandlers';
+import { resetUserPassword } from '@/features/admin/adminHandlers';
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

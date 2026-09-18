@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getBranding, type Branding } from '../../../../lib/branding';
-import { cachedJson } from '../../../../lib/response';
+import { getBranding, type Branding } from '@/features/branding/branding';
+import { cachedJson } from '@/shared/response';
 
 export const dynamic = 'force-dynamic';
 

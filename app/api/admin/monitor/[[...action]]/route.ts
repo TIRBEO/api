@@ -1,6 +1,6 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { prisma } from '../../../../../lib/db/prisma';
-import { requireRole } from '../../../../../lib/session';
+import { prisma } from '@/infrastructure/db/prisma';
+import { requireRole } from '@/features/auth/http-guards';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
   const session = await requireRole(request, 'editor');

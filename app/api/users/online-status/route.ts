@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getLastSeenMap } from '../../../../lib/ws/server';
+import { getLastSeenMap } from '@/infrastructure/realtime/ws/server';
 
 export async function GET(request: NextRequest) {
   try {

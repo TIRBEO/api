@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
-import { getSessionFromToken } from '../../../../lib/auth/session';
-import { COOKIE_NAME } from '../../../../lib/auth/jwt';
+import { prisma } from '@/infrastructure/db/prisma';
+import { getSessionFromToken } from '@/features/auth/session';
+import { COOKIE_NAME } from '@/features/auth/jwt';
 
 export async function GET(request: NextRequest) {
   const cookieToken = request.cookies.get(COOKIE_NAME)?.value;

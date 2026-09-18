@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
-import { getSession } from '../../../../lib/session';
-import { createAuditEvent } from '../../../../lib/audit';
-import { jsonUnauthorized } from '../../../../lib/response';
-import { generateRecoveryCodes } from '../../../../lib/auth/totp';
-import { hashRecoveryCode } from '../../../../lib/auth/password';
+import { prisma } from '@/infrastructure/db/prisma';
+import { getSession } from '@/features/auth/http-guards';
+import { createAuditEvent } from '@/features/security/audit';
+import { jsonUnauthorized } from '@/shared/response';
+import { generateRecoveryCodes } from '@/features/auth/totp';
+import { hashRecoveryCode } from '@/features/auth/password';
 
 // Backup codes live on users.backup_codes: [{ code: <hash>, used: boolean }]
 // Codes are stored hashed; plaintext is shown exactly once at generation time.

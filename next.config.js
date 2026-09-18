@@ -3,7 +3,24 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-  serverExternalPackages: ['ioredis', 'argon2'],
+  // @tirbeo/* packages ship TypeScript source (no prebuilt dist) — Next must
+  // compile them, same as the other file:- workspace packages.
+  transpilePackages: ['@tirbeo/pusher', '@tirbeo/types'],
+  serverExternalPackages: ['ioredis', 'argon2', '@prisma/client', '@prisma/adapter-pg', 'pg'],
+  async rewrites() {
+    return {
+      beforeFiles: [
+        // Clean public URL for redeemed one-time share content — same
+        // handler, same access window; the browser only sees this path.
+        { source: '/share-file/:token', destination: '/api/cdn/share/:token/content' },
+      ],
+      afterFiles: [
+        // Public file URLs: cdn.tirbeo.app/u/<userId>/<folders>/<file>
+        // (also covers the API origin itself in dev)
+        { source: '/u/:path*', destination: '/api/cdn/u/:path*' },
+      ],
+    };
+  },
   async headers() {
     return [
       {

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '../../../../../lib/session';
-import { listSecurityEvents, getSecurityStats } from '../../../../../lib/security';
+import { requireRole } from '@/features/auth/http-guards';
+import { listSecurityEvents, getSecurityStats } from '@/features/security/security';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'manager');
@@ -29,7 +29,7 @@ export async function DELETE(request: NextRequest) {
   const session = await requireRole(request, 'admin');
   if (session instanceof NextResponse) return session;
 
-  const { prisma } = await import('../../../../../lib/db/prisma');
+  const { prisma } = await import('@/infrastructure/db/prisma');
   const url = request.nextUrl;
   const olderThanDays = Number(url.searchParams.get('olderThanDays')) || 30;
   const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);

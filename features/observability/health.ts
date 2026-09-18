@@ -1,0 +1,229 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, getPoolAlertState } from '@/infrastructure/db/prisma';
+import { getSession } from '@/features/auth/http-guards';
+import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
+import { getCachedRedisClient, checkRedisHealth, getAllRedisStates, getRedisHealthSummary, pingAllRedisClients } from '@/infrastructure/db/redis';
+
+
+function isAdmin(user: any): boolean {
+  return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
+}
+
+function isAdminUser(user: any): boolean {
+  return isAdmin(user);
+}
+
+// Cache health check results for 15s to avoid hammering DB/Redis on every request
+let healthCache: { data: any; ts: number } | null = null;
+const HEALTH_CACHE_TTL = 15_000;
+
+// Shared Redis connection for health checks (avoids creating/destroying a connection every 15s)
+let healthRedis: any = null;
+let healthRedisFailed = false;
+
+function getHealthRedis(): any {
+  if (healthRedisFailed) return null;
+  if (healthRedis) return healthRedis;
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) return null;
+  try {
+    healthRedis = getCachedRedisClient('health', {
+      url: redisUrl,
+      enableKeepAlive: true,
+      keepAliveInterval: 25_000,
+    });
+    return healthRedis;
+  } catch {
+    healthRedisFailed = true;
+    return null;
+  }
+}
+
+export async function publicHealthHandler() {
+  // Return cached result if fresh enough
+  if (healthCache && Date.now() - healthCache.ts < HEALTH_CACHE_TTL) {
+    return NextResponse.json(healthCache.data);
+  }
+
+  const checks: Record<string, any> = {};
+  let healthy = true;
+
+  // ─── Database ───
+  try {
+    const dbStart = Date.now();
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = { status: 'ok', latencyMs: Date.now() - dbStart };
+  } catch {
+    checks.database = { status: 'error' };
+    healthy = false;
+  }
+
+  // ─── Redis ───
+  const r = getHealthRedis();
+  if (r) {
+    const redisHealth = await checkRedisHealth(r);
+    checks.redis = {
+      status: redisHealth.ok ? 'ok' : 'error',
+      latencyMs: redisHealth.latencyMs,
+      error: redisHealth.error || undefined,
+    };
+    if (!redisHealth.ok) healthy = false;
+  } else {
+    checks.redis = {
+      status: process.env.REDIS_URL ? 'error' : 'not-configured',
+      error: process.env.REDIS_URL ? 'Redis client failed to initialize' : undefined,
+    };
+  }
+
+  // ─── Redis Connection Health ───
+  const redisSummary = getRedisHealthSummary();
+  checks.redisConnections = {
+    configured: redisSummary.configured,
+    total: redisSummary.totalClients,
+    connected: redisSummary.connectedClients,
+    reconnects: redisSummary.totalReconnects,
+    failedRequests: redisSummary.totalFailedRequests,
+    healthy: redisSummary.totalClients === 0 || redisSummary.connectedClients > 0,
+  };
+  if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
+    healthy = false;
+  }
+
+  // ─── Pool ───
+  const poolStatus = getPoolStatus();
+  const result = {
+    status: healthy ? 'healthy' : 'degraded',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    checks,
+    pool: poolStatus || undefined,
+  };
+  healthCache = { data: result, ts: Date.now() };
+  return NextResponse.json(result);
+}
+
+export async function detailedHealthHandler(req: NextRequest) {
+  const user = await getSession(req);
+  if (!user) return jsonUnauthorized();
+  if (!isAdmin(user)) return jsonForbidden();
+
+  const checks: Record<string, any> = {};
+  let healthy = true;
+
+  try {
+    const dbStart = Date.now();
+    await prisma.$queryRaw`SELECT 1`;
+    checks.database = { status: 'ok', latencyMs: Date.now() - dbStart };
+  } catch (e: any) {
+    checks.database = { status: 'error', error: e?.message };
+    healthy = false;
+  }
+
+  // ─── Redis health (PING) ───
+  const r = getHealthRedis();
+  if (r) {
+    const redisHealth = await checkRedisHealth(r);
+    checks.redis = {
+      status: redisHealth.ok ? 'ok' : 'error',
+      latencyMs: redisHealth.latencyMs,
+      error: redisHealth.error || undefined,
+    };
+    if (!redisHealth.ok) healthy = false;
+  } else {
+    checks.redis = { status: process.env.REDIS_URL ? 'error' : 'not-configured' };
+  }
+
+  // ─── Per-client Redis PING latencies ───
+  const pingResults = await pingAllRedisClients();
+  if (Object.keys(pingResults).length > 0) {
+    checks.redisPing = pingResults;
+  }
+
+  // ─── Redis connection states ───
+  const redisSummary = getRedisHealthSummary();
+  checks.redisConnections = {
+    configured: redisSummary.configured,
+    total: redisSummary.totalClients,
+    connected: redisSummary.connectedClients,
+    reconnects: redisSummary.totalReconnects,
+    failedRequests: redisSummary.totalFailedRequests,
+    allHealthy: redisSummary.totalClients === 0 || redisSummary.connectedClients === redisSummary.totalClients,
+    clients: redisSummary.clients,
+  };
+  if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
+    healthy = false;
+  }
+
+  try {
+    const recentCriticalEvents = await prisma.incident_events.findMany({
+      where: { severity: 'critical', createdAt: { gte: new Date(Date.now() - 24 * 3600_000) } },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      select: { id: true, type: true, message: true, createdAt: true },
+    });
+    checks.recentCriticalEvents = recentCriticalEvents;
+  } catch (e: any) {
+    checks.recentCriticalEvents = { status: 'error', error: e?.message };
+  }
+
+  const poolStatus = getPoolStatus();
+  return NextResponse.json({
+    status: healthy ? 'healthy' : 'degraded',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+    environment: process.env.NODE_ENV || 'development',
+    version: process.env.npm_package_version || '0.0.1',
+    checks,
+    pool: poolStatus || undefined,
+  });
+}
+
+// ─── GET /api/health/pool ───
+// Detailed connection pool metrics for monitoring dashboards.
+// Returns real-time pool state, utilization, health indicators, and memory usage.
+export async function poolHealthHandler(req: NextRequest) {
+  // Optional: require admin auth for detailed pool metrics
+  const authHeader = req.headers.get('authorization');
+  const adminKey = req.headers.get('x-admin-key');
+  const session = await getSession(req).catch(() => null);
+  const isAdmin = (session?.userId && isAdminUser(session)) || !!adminKey;
+
+  // Allow unauthenticated access for basic metrics, but require admin for full details
+  const detailed = getDetailedPoolStatus();
+  if (!detailed) {
+    return NextResponse.json({ error: 'Pool not initialized' }, { status: 503 });
+  }
+
+  // Quick DB latency check
+  const dbCheck = await checkDatabaseConnection();
+
+  const alertState = getPoolAlertState();
+
+  const response: any = {
+    timestamp: new Date().toISOString(),
+    database: {
+      connected: dbCheck.ok,
+      latencyMs: dbCheck.latencyMs,
+    },
+    pool: detailed,
+    alerts: {
+      isExhausted: alertState.isExhausted,
+      waitingDurationMs: alertState.waitingDurationMs,
+      waitingDurationFormatted: alertState.waitingDurationMs > 0
+        ? `${Math.round(alertState.waitingDurationMs / 1000)}s`
+        : '0s',
+      totalAlerts: alertState.alertCount,
+      lastWarningAt: alertState.lastWarningAt ? new Date(alertState.lastWarningAt).toISOString() : null,
+      lastCriticalAt: alertState.lastCriticalAt ? new Date(alertState.lastCriticalAt).toISOString() : null,
+      thresholds: alertState.thresholds,
+    },
+  };
+
+  // Admin-only: include memory and full config
+  if (!isAdmin) {
+    delete response.pool.memory;
+    delete response.pool.config;
+  }
+
+  return NextResponse.json(response);
+}

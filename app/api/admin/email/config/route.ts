@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../../lib/db/prisma';
-import { withAdmin } from '@/lib/role-guard';
+import { prisma } from '@/infrastructure/db/prisma';
+import { withAdmin } from '@/features/auth/role-guard';
 
 export const GET = withAdmin(async (request, session) => {
 

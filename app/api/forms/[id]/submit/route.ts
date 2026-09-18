@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db/prisma';
-import { sendEmail, sendTemplateEmail, renderTemplate, escapeHtml } from '@/lib/email';
+import { prisma } from '@/infrastructure/db/prisma';
+import { sendEmail, sendTemplateEmail, renderTemplate, escapeHtml } from '@/features/email/email';
+import { createNotification } from '@/features/notifications/notifications';
+import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
 
 // POST /api/forms/:id/submit — Public form submission
 export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -114,6 +116,40 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       update: { submissions: { increment: 1 } },
     }).catch(() => {});
 
+    // ── Real-time: notify form owner + send live stats ──
+    const formOwnerId = form.userId;
+    if (formOwnerId) {
+      // 1. In-app notification (DB + WS bell badge)
+      createNotification({
+        userId: formOwnerId,
+        type: 'forms',
+        title: `New submission: ${form.name}`,
+        body: `A new response was submitted to "${form.name}".`,
+        link: `/forms/${form.id}`,
+      }).catch(() => {});
+
+      // 2. WS domain event — live submission feed
+      sendToUserWs(formOwnerId, {
+        type: 'form_submission',
+        formId: form.id,
+        formName: form.name,
+        submission: { id: submission.id, data: submissionData, createdAt: submission.createdAt },
+      }).catch(() => {});
+
+      // 3. WS live stats event — update counters in real-time
+      prisma.form.findUnique({
+        where: { id: form.id },
+        select: { submissionCount: true },
+      }).then((updated) => {
+        sendToUserWs(formOwnerId, {
+          type: 'form:stats',
+          formId: form.id,
+          views: 0,
+          responses: updated?.submissionCount ?? 0,
+        }).catch(() => {});
+      }).catch(() => {});
+    }
+
     // Send auto-response email to submitter
     if (form.autoReply) {
       try {
@@ -211,7 +247,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
               submissionId: submission.id,
               submittedAt: new Date().toLocaleString(),
               ip: ip || 'Unknown',
-              viewUrl: `${process.env.NEXT_PUBLIC_DASHBOARD_URL || 'http://localhost:3004'}/forms/${form.id}`,
+              viewUrl: `${process.env.NEXT_PUBLIC_DASHBOARD_URL || 'http://localhost:3005'}/forms/${form.id}`,
             }, {
               rawVars: ['fieldRows'],
               replyTo: form.replyToEmail || undefined,
@@ -248,6 +284,20 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
       where: { formId_date: { formId: form.id, date: today } },
       create: { formId: form.id, date: today, views: 1, starts: 1 },
       update: { views: { increment: 1 }, starts: { increment: 1 } },
+    }).then(() => {
+      // Send live stats to form owner
+      if (form.userId) {
+        prisma.formAnalytic.findUnique({
+          where: { formId_date: { formId: form.id, date: today } },
+        }).then((analytics) => {
+          sendToUserWs(form.userId!, {
+            type: 'form:stats',
+            formId: form.id,
+            views: analytics?.views ?? 0,
+            responses: analytics?.submissions ?? 0,
+          }).catch(() => {});
+        }).catch(() => {});
+      }
     }).catch(() => {});
 
     return NextResponse.json({

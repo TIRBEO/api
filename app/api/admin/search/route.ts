@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/session';
-import { prisma } from '../../../../lib/db/prisma';
+import { requireAdmin } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
 
 const SEARCHABLE_PAGES = [
   { label: 'Dashboard', url: '/', category: 'Page' },

@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
-import { requireAdmin } from '../../../../lib/session';
-import { getRateLimitMetrics, getBlockRateAlerts } from '../../../../lib/auth/rate-limit';
-import { getQueryPerformanceStats } from '../../../../lib/queryMonitor';
-import { publicHealthHandler } from '../../../../lib/health';
-import { getRedisHealthSummary } from '../../../../lib/db/redis';
+import { prisma } from '@/infrastructure/db/prisma';
+import { requireAdmin } from '@/features/auth/http-guards';
+import { getRateLimitMetrics, getBlockRateAlerts } from '@/features/auth/rate-limit';
+import { getQueryPerformanceStats } from '@/infrastructure/observability/queryMonitor';
+import { publicHealthHandler } from '@/features/observability/health';
+import { getRedisHealthSummary } from '@/infrastructure/db/redis';
 
 function safe<T>(p: Promise<T>): Promise<T> {
   return p.catch(() => 0 as any);

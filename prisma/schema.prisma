@@ -47,6 +47,8 @@ model User {
   isSuspended             Boolean?        @default(false) @map("is_suspended")
   suspendReason           String?         @map("suspend_reason")
   suspendedUntil          DateTime?       @map("suspended_until") @db.Timestamptz(6)
+  banRefCode              String?         @map("ban_ref_code")
+  suspendRefCode          String?         @map("suspend_ref_code")
   mustChangePassword      Boolean?        @default(false) @map("must_change_password")
   lastActiveAt            DateTime?       @map("last_active_at") @db.Timestamptz(6)
   lastLoginAt       DateTime? @map("last_login_at") @db.Timestamptz(6)
@@ -72,11 +74,14 @@ model User {
   passkeys                Passkey[]
   securityEvents          SecurityEvent[]
   sessions                Session[]
+  magicLinkUses           MagicLinkUse[]
+  magicLinks             MagicLink[]
   ticketMessages          TicketMessage[] @relation("TicketMessageAuthor")
   assignedTickets         Ticket[]        @relation("TicketAssignee")
   customerTickets         Ticket[]        @relation("TicketCustomer")
   tipLogs                 UserTipLog[]
   pushSubscriptions       PushSubscription[]
+  cdnFiles                CdnFile[]
 
   @@index([adminRole], map: "idx_users_admin_role")
   @@index([createdAt], map: "idx_users_created")
@@ -733,6 +738,278 @@ model ticket_attachments {
   @@map("ticket_attachments")
 }
 
+model CdnFile {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  path            String   @unique
+  filename        String
+  /// Folder rows are synthetic (path ends with '/'); mirrored from live DB.
+  folder          Boolean  @default(false)
+  mimeType        String   @map("mime_type")
+  /// BYTES — always an integer byte count, never a formatted string.
+  size            Int
+  /// Owning bucket slug, e.g. "production".
+  bucketId        String?  @map("bucket_id")
+  /// Object-store key, e.g. "production/images/hero.webp".
+  storageKey      String?  @map("storage_key")
+  /// public | private. Private files require signed URLs.
+  visibility      String?  @default("public")
+  etag            String?
+  width           Int?
+  height          Int?
+  /// milliseconds of audio/video, if known.
+  durationMs      Int?     @map("duration_ms")
+  /// SHA-256 hex for duplicate detection / integrity.
+  checksum        String?
+  cacheControl    String?  @map("cache_control")
+  contentDisposition String? @map("content_disposition")
+  /// Controlled custom metadata JSON (size/type limited by API).
+  metadata        Json?    @default("{}")
+  /// Soft delete (PRD §111) — CDN visibility removed immediately.
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+  projectId       String?  @map("project_id")
+  commitSha       String?  @map("commit_sha")
+  githubCommitSha String?  @map("github_commit_sha")
+  uploadedBy      String?  @map("uploaded_by")
+  status          String   @default("published")
+  tags            String[] @default([])
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user            User?    @relation(fields: [uploadedBy], references: [id], onDelete: SetNull)
+
+  @@index([uploadedBy], map: "idx_cdn_files_uploader")
+  @@index([status], map: "idx_cdn_files_status")
+  @@index([mimeType], map: "idx_cdn_files_mime")
+  @@index([createdAt(sort: Desc)], map: "idx_cdn_files_created")
+  @@index([filename], map: "idx_cdn_files_filename")
+  @@index([bucketId], map: "idx_cdn_files_bucket")
+  @@map("cdn_files")
+}
+
+/// Top-level CDN container (INTERNAL ONLY — never exposed publicly).
+/// The public model is Project → path. Buckets are a storage detail.
+model CdnBucket {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId       String   @default("default") @map("project_id")
+  name            String
+  /// URL-safe slug, unique per project.
+  slug            String
+  /// public | private
+  visibility      String   @default("public")
+  storageProvider String   @default("tirbeo") @map("storage_provider")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([projectId, slug], map: "uq_cdn_buckets_project_slug")
+  @@index([projectId], map: "idx_cdn_buckets_project")
+  @@map("cdn_buckets")
+}
+
+/// A CDN project: the public top-level container. Files live at
+/// canonical paths inside a project (`avatars/u/profile.webp`).
+model CdnProject {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  ownerId   String?  @map("owner_id")
+  name      String
+  /// URL-safe slug, unique per owner scope.
+  slug      String
+  settings  Json?    @default("{}")
+  /// Quotas in BYTES / counts: { storageBytes, bandwidthBytes, maxFiles, maxFileBytes }.
+  quotas    Json?    @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([ownerId, slug], map: "uq_cdn_projects_owner_slug")
+  @@index([ownerId], map: "idx_cdn_projects_owner")
+  @@map("cdn_projects")
+}
+
+/// Custom domains: CDN, API, or static-hosting hostnames.
+/// Types: cdn | api | hosting. States: pending|verifying|verified|ssl_pending|active|failed|disabled.
+model CdnDomain {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId   String   @default("default") @map("project_id")
+  domain      String   @unique
+  /// cdn | api | hosting
+  type        String   @default("cdn")
+  /// Optional path prefix the domain maps to (custom CDN).
+  pathPrefix  String?  @map("path_prefix")
+  /// pending | verifying | verified | ssl_pending | active | failed | disabled
+  status      String   @default("pending")
+  /// TXT ownership token (`_tirbeo.<domain>`).
+  txtToken    String?  @map("txt_token")
+  /// active | pending | failed
+  sslStatus   String?  @default("pending") @map("ssl_status")
+  sslExpiresAt DateTime? @map("ssl_expires_at") @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([projectId], map: "idx_cdn_domains_project")
+  @@index([status], map: "idx_cdn_domains_status")
+  @@index([type], map: "idx_cdn_domains_type")
+  @@map("cdn_domains")
+}
+
+/// Static website hosting configs: a domain serving a path root.
+model CdnHostingConfig {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId   String   @default("default") @map("project_id")
+  name        String
+  /// Path root served, e.g. `websites/marketing`.
+  rootPath    String   @map("root_path")
+  index       String   @default("index.html")
+  notFound    String?  @map("not_found")
+  spaFallback Boolean  @default(false) @map("spa_fallback")
+  domainId    String?  @map("domain_id")
+  /// [{ from, to, status }]
+  redirects   Json?    @default("[]")
+  /// { "pathGlob": { header: value } }
+  headers     Json?    @default("{}")
+  status      String   @default("active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([projectId], map: "idx_cdn_hosting_project")
+  @@map("cdn_hosting_configs")
+}
+
+/// Webhook endpoints: HMAC-signed event deliveries with retry state.
+model CdnWebhook {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId String   @default("default") @map("project_id")
+  name      String?
+  url       String
+  events    String[] @default([])
+  secret    String?
+  /// active | disabled | failing
+  status    String   @default("active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([projectId], map: "idx_cdn_webhooks_project")
+  @@map("cdn_webhooks")
+}
+
+model CdnWebhookDelivery {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  webhookId  String   @map("webhook_id")
+  event      String
+  /// success | retrying | failed
+  status     String   @default("retrying")
+  attempts   Int      @default(0)
+  lastStatus Int?     @map("last_status")
+  nextRetry  DateTime? @map("next_retry") @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([webhookId], map: "idx_cdn_webhook_deliveries_hook")
+  @@index([status], map: "idx_cdn_webhook_deliveries_status")
+  @@map("cdn_webhook_deliveries")
+}
+
+/// Cache purge log (purge itself is executed by the CDN provider layer).
+model CdnCachePurge {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  projectId String   @default("default") @map("project_id")
+  paths     String[] @default([])
+  /// queued | completed | failed
+  status    String   @default("queued")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([projectId], map: "idx_cdn_cache_purges_project")
+  @@map("cdn_cache_purges")
+}
+
+model CdnActivity {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  type        String
+  fileId      String?  @map("file_id")
+  path        String?
+  result      String   @default("ok")
+  actor       String?
+  actorLabel  String?  @map("actor_label")
+  metadata    Json?    @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([type], map: "idx_cdn_activity_type")
+  @@index([fileId], map: "idx_cdn_activity_file")
+  @@index([actor], map: "idx_cdn_activity_actor")
+  @@index([createdAt(sort: Desc)], map: "idx_cdn_activity_created")
+  @@map("cdn_activity")
+}
+
+model CdnSettings {
+  id                String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key               String   @unique
+  value             Json
+  description       String?
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("cdn_settings")
+}
+
+model CdnCategory {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key             String   @unique
+  label           String
+  pathPrefix      String   @map("path_prefix")
+  suggestedNames  String[] @default([]) @map("suggested_names")
+  order           Int      @default(0)
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([key], map: "idx_cdn_categories_key")
+  @@index([order], map: "idx_cdn_categories_order")
+  @@map("cdn_categories")
+}
+
+model AuthLog {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  type      String
+  data      Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([type])
+  @@index([createdAt])
+  @@map("auth_logs")
+}
+
+model VerificationLimit {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  method    String   @unique
+  max       Int
+  windowMs  Int      @map("window_ms")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("verification_limits")
+}
+
+model Cooldown {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key       String   @unique @map("key")
+  lastSent  DateTime @map("last_sent") @db.Timestamptz(6)
+  count     Int    @default(1)
+  windowStart DateTime @map("window_start") @db.Timestamptz(6)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([expiresAt], map: "idx_cooldowns_expires")
+  @@map("cooldowns")
+}
+
+model MagicLink {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  jti       String   @unique @map("jti")
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_magic_links_user")
+  @@map("magic_links")
+}
+
 enum session_status {
   active
   expired
@@ -744,4 +1021,254 @@ enum severity_level {
   warning
   error
   critical
+}
+
+model MagicLinkUse {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  jti       String   @unique @map("jti")
+  userId    String   @map("user_id")
+  usedAt    DateTime @default(now()) @map("used_at") @db.Timestamptz(6)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_magic_link_uses_user")
+  @@index([expiresAt], map: "idx_magic_link_uses_expires")
+  @@map("magic_link_uses")
+}
+
+model LandingPage {
+  id               String                    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  slug             String                    @unique @default("home")
+  draft            Json                      @default("{}")
+  publishedConfig  Json?                     @map("published_config")
+  draftVersion     Int                       @default(1) @map("draft_version")
+  publishedVersion Int?                      @map("published_version")
+  publishedAt      DateTime?                 @map("published_at") @db.Timestamptz(6)
+  editedBy         String?                   @map("edited_by")
+  createdAt        DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime                  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  publications     LandingPagePublication[]
+
+  @@index([publishedAt(sort: Desc)], map: "idx_landing_pages_published_at")
+  @@map("landing_pages")
+}
+
+model LandingPagePublication {
+  id          String      @id @default(dbgenerated("(gen_random_uuid())::text"))
+  landingPageId String    @map("landing_page_id")
+  version     Int
+  config      Json
+  publishedBy String?     @map("published_by")
+  publishedAt DateTime    @default(now()) @map("published_at") @db.Timestamptz(6)
+  landingPage LandingPage @relation(fields: [landingPageId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([landingPageId, version], map: "idx_landing_page_publications_page_version")
+  @@index([landingPageId, publishedAt(sort: Desc)], map: "idx_landing_page_publications_page_published")
+  @@map("landing_page_publications")
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Email Brain — event registry, versioned content, queue, digests, AI ledger
+// Docs: docs/email-brain/01-architecture.md
+// ══════════════════════════════════════════════════════════════════════
+
+model email_events {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  eventKey        String   @unique @map("event_key")
+  category        String // security | transactional | activity | product | marketing
+  delivery        String   @default("immediate") // immediate | digest | manual
+  mandatory       Boolean  @default(false) // user preferences cannot suppress
+  description     String?
+  defaultVars     Json?    @map("default_vars")
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  definitions email_definitions[]
+
+  @@index([category])
+  @@map("email_events")
+}
+
+model email_definitions {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  eventKey        String   @map("event_key")
+  name            String
+  status          String   @default("draft") // draft | approved | active | archived
+  activeVersionId String?  @map("active_version_id")
+  createdBy       String?  @map("created_by")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  event    email_events     @relation(fields: [eventKey], references: [eventKey], onDelete: Cascade)
+  versions email_versions[]
+
+  @@unique([eventKey, name], map: "idx_email_definitions_event_name")
+  @@index([status])
+  @@map("email_definitions")
+}
+
+model email_versions {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  definitionId String   @map("definition_id")
+  version      Int
+  subject      String
+  blocks       Json
+  language     String   @default("en")
+  origin       String   @default("ai") // ai | manual | translated
+  status       String   @default("draft") // draft | approved | active | archived
+  createdBy    String?  @map("created_by")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  definition email_definitions @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, language, version], map: "idx_email_versions_def_lang_ver")
+  @@index([definitionId, status], map: "idx_email_versions_def_status")
+  @@map("email_versions")
+}
+
+model email_jobs {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  dedupeKey   String?  @map("dedupe_key")
+  eventKey    String   @map("event_key")
+  userId      String?  @map("user_id")
+  toEmail     String   @map("to_email")
+  category    String
+  priority    String   @default("normal") // security events → high
+  status      String   @default("queued") // queued | processing | sent | failed | dead | suppressed | digest_queued
+  payload     Json     @default("{}") // variable keys + non-sensitive values
+  contentVersionId String? @map("content_version_id")
+  definitionId String? @map("definition_id")
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(3) @map("max_attempts")
+  lastError   String?  @map("last_error")
+  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([dedupeKey], map: "idx_email_jobs_dedupe")
+  @@index([status, availableAt], map: "idx_email_jobs_poll")
+  @@index([eventKey, createdAt], map: "idx_email_jobs_event_time")
+  @@index([toEmail, createdAt], map: "idx_email_jobs_recipient_time")
+  @@map("email_jobs")
+}
+
+model email_deliveries {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  jobId      String   @map("job_id")
+  userId     String?  @map("user_id")
+  toEmail    String   @map("to_email")
+  eventKey   String   @map("event_key")
+  category   String
+  subject    String
+  status     String   @default("sent") // sent | failed | bounced | complained | opened | clicked
+  provider   String?
+  messageId  String?  @map("message_id")
+  contentVersionId String? @map("content_version_id")
+  openedAt   DateTime? @map("opened_at") @db.Timestamptz(6)
+  clickedAt  DateTime? @map("clicked_at") @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([eventKey, createdAt], map: "idx_email_deliveries_event_time")
+  @@index([userId, createdAt], map: "idx_email_deliveries_user_time")
+  @@index([messageId], map: "idx_email_deliveries_message")
+  @@map("email_deliveries")
+}
+
+model email_preferences {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String   @map("user_id")
+  eventKey   String   @map("event_key")
+  frequency  String   @default("default") // immediate | daily | weekly | monthly | never | default
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([userId, eventKey], map: "idx_email_prefs_user_event")
+  @@map("email_preferences")
+}
+
+model email_digest_items {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String   @map("user_id")
+  category   String // activity | product | transactional
+  entityGroup String  @map("entity_group") // e.g. project:abc, form:xyz
+  title      String
+  body       String?
+  importance Int      @default(0)
+  dedupeKey  String?  @map("dedupe_key")
+  payload    Json     @default("{}")
+  consumed   Boolean  @default(false)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([userId, dedupeKey], map: "idx_email_digest_items_dedupe")
+  @@index([userId, consumed, createdAt], map: "idx_email_digest_items_poll")
+  @@map("email_digest_items")
+}
+
+model email_digests {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String   @map("user_id")
+  cadence     String // daily | weekly | monthly
+  itemCount   Int      @default(0) @map("item_count")
+  rangeStart  DateTime @map("range_start") @db.Timestamptz(6)
+  rangeEnd    DateTime @map("range_end") @db.Timestamptz(6)
+  aiEnhanced  Boolean  @default(false) @map("ai_enhanced")
+  contentVersionId String? @map("content_version_id")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, cadence, createdAt], map: "idx_email_digests_user")
+  @@map("email_digests")
+}
+
+model email_suppressions {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String?  @map("user_id")
+  toEmail    String   @map("to_email")
+  eventKey   String   @map("event_key")
+  reason     String // preference | quiet_hours | rate_limit | duplicate | global_unsub | disabled
+  dedupeKey  String?  @map("dedupe_key")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([eventKey, createdAt], map: "idx_email_suppressions_event")
+  @@map("email_suppressions")
+}
+
+model email_provider_events {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  provider   String
+  eventType  String   @map("event_type") // delivered | bounced | complained | opened | clicked
+  messageId  String?  @map("message_id")
+  toEmail    String   @map("to_email")
+  payload    Json     @default("{}")
+  processed  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([messageId], map: "idx_email_provider_events_message")
+  @@index([processed], map: "idx_email_provider_events_processed")
+  @@map("email_provider_events")
+}
+
+model ai_generations {
+  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  task          String // generate | rewrite | translate | subject | digest_summary
+  fingerprint   String?  // sha256 of request — cache lookup
+  eventKey      String?  @map("event_key")
+  model         String
+  tone          String?
+  instruction   String?
+  targetLang    String?  @map("target_lang")
+  inputTokens   Int?     @map("input_tokens")
+  outputTokens  Int?     @map("output_tokens")
+  costEstimate  Float?   @map("cost_estimate")
+  status        String   @default("succeeded") // succeeded | failed
+  error         String?
+  cached        Boolean  @default(false)
+  usedCount     Int      @default(0) @map("used_count")
+  requestedBy   String?  @map("requested_by")
+  resultSubject String?  @map("result_subject")
+  resultBlocks  Json?    @map("result_blocks")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([fingerprint], map: "idx_ai_generations_fingerprint")
+  @@index([task, createdAt], map: "idx_ai_generations_task_time")
+  @@map("ai_generations")
 }

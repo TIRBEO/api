@@ -1,0 +1,3689 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
+import { prisma } from '@/infrastructure/db/prisma';
+import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp, sendPhoneOtp } from '@/features/auth/otp';
+import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from '@/features/auth/signup-otp';
+import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/features/auth/password';
+import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from '@/features/auth/session';
+import { getSession, requireAdmin, requireRole } from '@/features/auth/http-guards';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken } from '@/features/auth/jwt';
+
+import { verifyTotp } from '@/features/auth/totp';
+import { sendTemplateEmail } from '@/features/email/email';
+import { sanitizeInput, logSecurityEvent } from '@/features/security/security';
+import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from '@/features/auth/password-reset';
+import { createAuditEvent } from '@/features/security/audit';
+import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
+import { checkPasswordBreach } from '@/features/auth/breach';
+import { jsonUnauthorized } from '@/shared/response';
+import { createNotification, describeDevice } from '@/features/notifications/notifications';
+import { createTtlCache } from '@/infrastructure/cache';
+import { logPerformance } from '@/infrastructure/observability/perf';
+import { SignJWT } from 'jose';
+import { checkWindowLimit, checkWindowLimitDB, computeRiskScore, recordDeviceSeen } from '@/features/captcha/risk';
+import { logAuthJson } from '@/features/auth/auth-log';
+import { getCachedRedisClient } from '@/infrastructure/db/redis';
+import { getUserWarningCount, getRequiredDifficulty, assertCaptchaSatisfied, hasRecentLoginSuccess, getCaptchaSettings } from '@/features/captcha/service';
+import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
+import { getAccountsBaseUrl, getAdminBaseUrl } from '@/config/app-urls';
+import { eventIdFor } from '@/features/users/refcode';
+import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
+
+// Cache email existence lookups (login/signup fire these on every debounced
+// keystroke). Results are almost never changed mid-session, so a 30s TTL is
+// safe and removes a DB round-trip per keystroke.
+const emailExistsCache = createTtlCache<{ exists: boolean; hasPassword: boolean; photoUrl: string | null; name: string | null; hasRecoveryEmail: boolean; recoveryEmail: string | null }>(30_000, 5000, 'emailExists');
+
+// Cache for GET /api/users/me — dashboard polls this frequently.
+// 10s TTL: stale data is acceptable for profile display, and bust on PATCH.
+const profileCache = createTtlCache<any>(10_000, 2000, 'profile');
+export function bustProfileCache(userId: string) { profileCache.delete(userId); }
+
+export async function sessionHandler(request: NextRequest) {
+  const startTime = performance.now();
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    
+    // Check cache first — dashboard polls this frequently
+    const cached = profileCache.get(session.userId);
+    if (cached) {
+      logPerformance('auth/session/cache', startTime);
+      return NextResponse.json({ user: cached });
+    }
+    
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: {
+        id: true, email: true, name: true, photoUrl: true,
+        is2FAEnabled: true, adminRole: true, emailVerified: true, consents: true,
+        // Dashboard needs these to render the "Add password" banner,
+        // scheduled-deletion countdown, etc.
+        mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true, loginCount: true,
+      },
+    });
+    if (!user) return jsonUnauthorized();
+    const adminRole = user.adminRole || undefined;
+    const userData = {
+      id: user.id, email: user.email, name: user.name, photoUrl: user.photoUrl,
+      is2FAEnabled: user.is2FAEnabled, adminRole, emailVerified: user.emailVerified,
+      consents: user.consents ?? {},
+      mustChangePassword: user.mustChangePassword,
+      scheduledDeletionAt: user.scheduledDeletionAt,
+      deletionReason: user.deletionReason,
+      loginCount: user.loginCount,
+    };
+    profileCache.set(session.userId, userData);
+    logPerformance('auth/session', startTime);
+    return NextResponse.json({ user: userData });
+  } catch (err: any) {
+    console.error('[SESSION]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to fetch session' }, { status: 500 });
+  }
+}
+
+export async function refreshHandler(request: NextRequest) {
+  const startTime = performance.now();
+  const ip = getIp(request);
+  const userAgent = request.headers.get('user-agent') || undefined;
+  
+  try {
+    const refreshToken = request.cookies.get(REFRESH_COOKIE_NAME)?.value;
+    if (!refreshToken) {
+      const res = NextResponse.json({ error: 'Refresh token missing' }, { status: 401 });
+      clearSessionCookie(res, request);
+      return res;
+    }
+
+    // Attempt token rotation with retry for transient failures.
+    // Hard deadline per attempt: a dead network used to hang this endpoint
+    // for 10-18 minutes, dragging every polling client with it.
+    let result: Awaited<ReturnType<typeof rotateRefreshToken>> = null;
+    let lastError: any = null;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        result = await withTimeout(
+          rotateRefreshToken(refreshToken, ip, userAgent),
+          REFRESH_ATTEMPT_TIMEOUT_MS,
+          'refresh rotation',
+        );
+        // null = definitive invalid token (revoked/expired) — no retry
+        break;
+      } catch (err: any) {
+        lastError = err;
+        console.error(`[REFRESH] Attempt ${attempt} failed:`, err?.message);
+        // Only retry on transient errors (network, DNS) — and never retry a
+        // deadline miss; if the network is dead, retrying doubles the wait.
+        if (attempt < 2 && isTransientError(err) && !isDeadlineError(err)) {
+          await new Promise(r => setTimeout(r, 150));
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!result) {
+      if (lastError && isTransientError(lastError)) {
+        // Network/infra problem — NOT an auth failure. Keep the client's
+        // session cookies so it can retry; a 401 here would log users out
+        // during brief outages.
+        console.warn('[REFRESH] Transient failure, returning 503 (session preserved)');
+        const res = NextResponse.json(
+          { error: 'Service temporarily unavailable, please try again' },
+          { status: 503 },
+        );
+        res.headers.set('Retry-After', '2');
+        return res;
+      }
+      console.log('[REFRESH] Token rotation failed, clearing session');
+      const res = new NextResponse(
+        lastError?.message || 'Session expired',
+        { status: 401 }
+      );
+      clearSessionCookie(res, request);
+      return res;
+    }
+
+    // Create response with new tokens. `userId` lets clients detect an
+    // account switch (cookie session changed identity) and drop any stale
+    // localStorage bearer token minted for a DIFFERENT user.
+    let refreshedUserId = '';
+    try {
+      const sess = await prisma.session.findUnique({ where: { id: result.sessionId }, select: { userId: true } });
+      refreshedUserId = sess?.userId || '';
+    } catch { /* non-fatal */ }
+    const res = NextResponse.json({ 
+      token: result.token, 
+      sessionId: result.sessionId,
+      ...(refreshedUserId ? { userId: refreshedUserId } : {}),
+    });
+    
+    // Always set cookies, even if there was a previous error
+    setSessionCookie(res, result.token, result.refreshToken, request);
+    
+    logPerformance('auth/refresh', startTime);
+    return res;
+    
+  } catch (err: any) {
+    console.error('[REFRESH] Unhandled error:', err?.message || err);
+    if (isTransientError(err)) {
+      const res = NextResponse.json(
+        { error: 'Service temporarily unavailable, please try again' },
+        { status: 503 },
+      );
+      res.headers.set('Retry-After', '2');
+      return res;
+    }
+    const res = NextResponse.json({ error: 'Refresh failed' }, { status: 500 });
+    // Only clear cookies when we're sure the session is invalid —
+    // transient infra errors must not log users out.
+    clearSessionCookie(res, request);
+    return res;
+  }
+}
+
+/** Max time for one refresh-token rotation attempt before failing fast. */
+const REFRESH_ATTEMPT_TIMEOUT_MS = 10_000;
+
+/** Reject if the promise doesn't settle within `ms`. Bounds how long a
+ *  request can hang when the DB/network is dead (previously saw 18-minute
+ *  hangs during a DNS outage). */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
+function isDeadlineError(err: any): boolean {
+  return !!err && String(err.message || '').includes('timed out after');
+}
+
+/** Check if an error is transient (worth retrying / not an auth failure) */
+function isTransientError(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err.message || err.code || err).toLowerCase();
+  // Network errors, DNS failures, timeouts, rate limits are transient
+  return msg.includes('timeout') ||
+         msg.includes('timed out') ||
+         msg.includes('network') ||
+         msg.includes('econnreset') ||
+         msg.includes('econnrefused') ||
+         msg.includes('etimedout') ||
+         msg.includes('eai_again') ||
+         msg.includes('enotfound') ||
+         msg.includes('dns') ||
+         msg.includes('abort') ||
+         msg.includes('rate limit') ||
+         msg.includes('too many');
+}
+
+function getIp(request: NextRequest): string | undefined {
+  const xff = request.headers.get('x-forwarded-for');
+  if (xff) return xff.split(',')[0].trim();
+  return request.headers.get('x-real-ip') || undefined;
+}
+
+
+function isAllowedRedirect(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.username || u.password) return false;
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    // http only allowed for localhost dev
+    if (u.protocol === 'http:' && !(u.hostname === 'localhost' || u.hostname === '127.0.0.1')) return false;
+    const host = u.hostname;
+    if (host.endsWith('.tirbeo.app')) return true;
+    if (process.env.NODE_ENV !== 'production' && (host === 'localhost' || host === '127.0.0.1')) return true;
+    // vercel.app is NOT allowed — strict tirbeo.app + localhost only
+    return false;
+  } catch { return false; }
+}
+
+/**
+ * Canonical OAuth redirect URI for a provider callback path.
+ *
+ * Resolution order:
+ *   1. {PROVIDER}_REDIRECT_URI env (explicit, wins over everything here)
+ *   2. Derived from the canonical API domain (API_DOMAIN / APP_DOMAIN env)
+ *      → https://<api-domain>/api/auth/<provider>/callback
+ *   3. Request host — ONLY for local dev (localhost/127.0.0.1).
+ *
+ * The incoming Host/x-forwarded-proto headers are never trusted on public
+ * deployments: behind Vercel the Host is the deployment hostname (e.g.
+ * tirbeo-api.vercel.app or a preview URL), which is not registered with the
+ * provider and causes Error 400: redirect_uri_mismatch.
+ */
+function getDynamicRedirectUri(request: NextRequest, path: string): string {
+  const provider = path.split('/')[2];
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // 1. Explicit env var (non-localhost) — highest priority
+  const envMap: Record<string, string | undefined> = {
+    google: process.env.GOOGLE_REDIRECT_URI,
+    github: process.env.GITHUB_REDIRECT_URI,
+    discord: process.env.DISCORD_REDIRECT_URI,
+  };
+  const envUri = envMap[provider || ''];
+
+  // ── Local development: ALWAYS callback to localhost over http ──
+  // Never derive production URIs from *_DOMAIN env vars while developing.
+  if (!isProd) {
+    if (envUri && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(envUri)) return envUri;
+    const host = request.headers.get('host') || '';
+    if (/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) return `http://${host}/api${path}`;
+    console.warn(`[OAUTH:${provider}] Non-local host "${host}" in dev — forcing http://localhost:3000/api${path}`);
+    return `http://localhost:3000/api${path}`;
+  }
+
+  if (envUri && !envUri.includes('localhost') && !envUri.includes('127.0.0.1')) return envUri;
+
+  // 2. In production, if env var is localhost, override with the production domain
+  //    (env var may be stale from .env.local; production MUST use the real domain)
+  if (isProd && envUri && (envUri.includes('localhost') || envUri.includes('127.0.0.1'))) {
+    const rawDomain = process.env.API_DOMAIN || process.env.APP_DOMAIN || '';
+    const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (cleanDomain && !cleanDomain.includes('localhost')) {
+      const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
+      console.warn(`[OAUTH:${provider}] Env var ${provider.toUpperCase()}_REDIRECT_URI is localhost but NODE_ENV=production. Using https://${apiHost}/api${path}`);
+      return `https://${apiHost}/api${path}`;
+    }
+  }
+
+  // 3. Derived from APP_DOMAIN / API_DOMAIN env vars
+  const rawDomain =
+    process.env.API_DOMAIN ||
+    process.env.APP_DOMAIN ||
+    process.env.NEXT_PUBLIC_APP_DOMAIN ||
+    '';
+  const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (cleanDomain && !cleanDomain.includes('localhost') && !cleanDomain.includes('127.0.0.1')) {
+    const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
+    return `https://${apiHost}/api${path}`;
+  }
+
+  // 4. Local development fallback — only for localhost
+  const host = request.headers.get('host') || 'localhost:3000';
+  if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) {
+    console.warn(
+      `[OAUTH:${provider}] Host "${host}" is not trusted for redirect URIs. ` +
+      `Set ${provider.toUpperCase()}_REDIRECT_URI or APP_DOMAIN to pin the callback URL.`,
+    );
+  }
+  const protoHeader = (request.headers.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const protocol = protoHeader || 'https';
+  return `${protocol}://${host}/api${path}`;
+}
+
+interface OauthProviderConfig {
+  enabled: boolean;
+  clientId?: string;
+  clientSecret?: string;
+  redirectUri?: string;
+}
+
+/** Structured UA breakdown stored on every login_history row. */
+function parseLoginMetadata(ua?: string | null): Record<string, string> {
+  const d = describeDevice(ua);
+  const [browser, ...osParts] = d.split(' on ');
+  return {
+    os: osParts.join(' on ') || 'Unknown',
+    browser: browser || 'Unknown',
+    deviceType: /mobile|android|iphone|ipad/i.test(ua || '') ? 'mobile'
+      : /tablet|ipad/i.test(ua || '') ? 'tablet' : 'desktop',
+  };
+}
+
+const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }> = {
+  google: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', uri: 'GOOGLE_REDIRECT_URI' },
+  github: { id: 'GITHUB_CLIENT_ID', secret: 'GITHUB_CLIENT_SECRET', uri: 'GITHUB_REDIRECT_URI' },
+  discord: { id: 'DISCORD_CLIENT_ID', secret: 'DISCORD_CLIENT_SECRET', uri: 'DISCORD_REDIRECT_URI' },
+};
+
+async function getOauthProviderConfig(provider: string): Promise<OauthProviderConfig> {
+  // OAuth providers are configured purely via environment variables.
+  const keys = OAUTH_ENV_KEYS[provider];
+  const rawUri = process.env[keys?.uri];
+  // In development, only allow localhost redirect URIs — getDynamicRedirectUri
+  // derives one otherwise so the OAuth state cookie domain matches.
+  if (process.env.NODE_ENV !== 'production') {
+    const redirectUri = rawUri && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(rawUri) ? rawUri : undefined;
+    return {
+      enabled: !!process.env[keys?.id],
+      clientId: process.env[keys?.id],
+      clientSecret: process.env[keys?.secret],
+      redirectUri,
+    };
+  }
+  // Ignore localhost redirect URIs in production — let getDynamicRedirectUri handle it
+  const redirectUri = rawUri && !rawUri.includes('localhost') && !rawUri.includes('127.0.0.1') ? rawUri : undefined;
+  return {
+    enabled: !!process.env[keys?.id],
+    clientId: process.env[keys?.id],
+    clientSecret: process.env[keys?.secret],
+    redirectUri,
+  };
+}
+
+function getOauthCookieDomain(request: NextRequest): string | undefined {
+  const host = request.headers.get('host') || '';
+  if (host.endsWith('.vercel.app')) return host;
+  if (process.env.NODE_ENV !== 'development') return COOKIE_DOMAIN;
+  return undefined;
+}
+
+const OAUTH_STATE_COOKIE = '__oauth_state';
+
+// Post-login target for an EXISTING account. Legacy accounts may still be
+// missing the recorded policy consent — send them to the in-dashboard
+// confirmation screen (session cookie is already set on this response).
+function oauthPostLoginTarget(user: any, redirectTo: string | undefined, consentToken?: string): string {
+  const dashboardBase = getDashboardBase();
+  const target = redirectTo || dashboardBase;
+  const needsConsent = !((user as any)?.consents as any)?.signupConsent?.policyAccepted;
+  if (!needsConsent) return target;
+  const url = new URL(`${dashboardBase}/oauth-complete`);
+  url.searchParams.set('finish', '1');
+  if (redirectTo) url.searchParams.set('redirect_to', redirectTo);
+  if (consentToken) url.searchParams.set('consent', consentToken);
+  return url.toString();
+}
+
+// ═══ SHARED OAUTH CALLBACK COMPLETION ═══
+// One implementation for Google/GitHub/Discord: account lookup → link-or-create
+// → integration upsert (parallel with session creation) → redirect. The three
+// handlers only differ in how they exchange the code for a provider profile.
+
+interface ProviderProfile {
+  providerId: string;
+  email?: string;
+  name?: string;
+  photoUrl?: string;
+}
+
+const PROVIDER_ID_FIELD: Record<string, string> = {
+  google: 'googleId',
+  github: 'githubId',
+  discord: 'discordId',
+};
+
+function getDashboardBase(): string {
+  return process.env.NEXT_PUBLIC_DASHBOARD_URL || `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}`;
+}
+
+/** URL of the accounts-app merge confirmation screen. */
+function accountsMergeUrl(provider: string, mode: 'login' | 'transfer', token: string): string {
+  const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+  const base = (process.env.ACCOUNTS_URL || `https://accounts.${appDomain}`).replace(/\/$/, '');
+  const url = new URL(`${base}/callback`);
+  url.searchParams.set('oauth', 'merge');
+  url.searchParams.set('mode', mode);
+  url.searchParams.set('provider', provider);
+  url.searchParams.set('token', token);
+  return url.toString();
+}
+
+/**
+ * Locate the account for this provider identity WITHOUT writing anything.
+ * matchedBy: 'provider' → identity already linked; 'email' → same-email
+ * account exists but identity never connected (needs explicit merge).
+ */
+async function findProviderUser(provider: string, profile: ProviderProfile) {
+  const idField = PROVIDER_ID_FIELD[provider];
+  const byProvider = await prisma.user.findUnique({ where: { [idField]: profile.providerId } as any });
+  if (byProvider) return { user: byProvider, matchedBy: 'provider' as const };
+  if (profile.email) {
+    const byEmail = await prisma.user.findUnique({ where: { email: profile.email } });
+    if (byEmail) return { user: byEmail, matchedBy: 'email' as const };
+  }
+  return { user: null, matchedBy: null };
+}
+
+/**
+ * Finish any provider callback: issue the session (and record the integration
+ * in parallel), handle link-mode, then redirect.
+ *
+ * Sign-in matrix:
+ *  - identity already linked → direct sign-in
+ *  - same-email account, identity never connected → merge confirmation screen
+ *    (merging is only ever offered for matching emails)
+ *  - dashboard "Connect" while logged in: fresh identity attaches silently;
+ *    an identity owned by ANOTHER account goes to a transfer-merge screen
+ */
+async function finishProviderSignIn(
+  request: NextRequest,
+  provider: string,
+  profile: ProviderProfile,
+  state: { nonce: string; redirect: string; link: boolean },
+): Promise<NextResponse> {
+  const idField = PROVIDER_ID_FIELD[provider];
+  const dashboardBase = getDashboardBase();
+
+  // ── Link mode: initiated from dashboard Connected Apps while logged in ──
+  if (state.link) {
+    const existingSession = await getSession(request);
+    if (existingSession) {
+      let owner = await prisma.user.findUnique({ where: { [idField]: profile.providerId } as any });
+      if (!owner && profile.email) {
+        owner = await prisma.user.findUnique({ where: { email: profile.email } });
+      }
+      // Identity belongs to a DIFFERENT account → signed transfer decision.
+      if (owner && owner.id !== existingSession.userId) {
+        const mergeToken = await signMergeToken({
+          provider,
+          providerId: profile.providerId,
+          email: profile.email || owner.email,
+          name: profile.name || profile.email || 'account',
+          photoUrl: profile.photoUrl,
+          existingUserId: owner.id,
+        });
+        const res = NextResponse.redirect(accountsMergeUrl(provider, 'transfer', mergeToken));
+        clearOauthStateCookie(res, request);
+        return res;
+      }
+      // Fresh identity, or already ours → make sure the sign-in link is on
+      // the logged-in account (email-matched owner may still lack the ID).
+      if (!owner || (owner as any)[idField] !== profile.providerId) {
+        await prisma.user.update({
+          where: { id: existingSession.userId },
+          data: { [idField]: profile.providerId } as any,
+        }).catch(() => {});
+      }
+      const metadata = { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) };
+      await prisma.auditEvent.create({
+        data: { actorId: existingSession.userId, action: `oauth.${provider}.connected`, targetType: 'user', targetId: existingSession.userId, metadata, severity: 'info' },
+      }).catch(() => {});
+      // Notify the user that a new sign-in method was connected
+      createNotification({
+        userId: existingSession.userId,
+        type: 'security',
+        title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} connected`,
+        body: `Your ${provider.charAt(0).toUpperCase() + provider.slice(1)} account was linked to Tirbeo. You can now sign in with it.`,
+        link: '/account/connected-apps',
+      }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+      const res = NextResponse.redirect(`${dashboardBase}/account/connected-apps?connected=${provider}`);
+      clearOauthStateCookie(res, request);
+      return res;
+    }
+    // Not logged in — fall through to normal login below.
+  }
+
+  // ── Plain sign-in ──
+  const { user, matchedBy } = await findProviderUser(provider, profile);
+
+  if (user && matchedBy === 'email') {
+    // Same-email account exists but this provider was never connected —
+    // never auto-link silently; ask via the merge screen. Only same-email
+    // merges reach this point by construction.
+    const mergeToken = await signMergeToken({
+      provider,
+      providerId: profile.providerId,
+      email: profile.email!,
+      name: profile.name || profile.email || 'account',
+      photoUrl: profile.photoUrl,
+      existingUserId: user.id,
+    });
+    const res = NextResponse.redirect(accountsMergeUrl(provider, 'login', mergeToken));
+    clearOauthStateCookie(res, request);
+    return res;
+  }
+
+  const account = user;
+  if (!account) {
+    // ── Brand-new user: DO NOT create the account here. ──
+    // Hand the provider profile to the in-dashboard confirmation screen via a
+    // short-lived signed token; the account (and consent record) is only
+    // created when the user explicitly clicks "Create account".
+    if (!profile.email) {
+      return NextResponse.json({ error: `${provider[0].toUpperCase()}${provider.slice(1)} email not available` }, { status: 400 });
+    }
+    const signupToken = await signPendingSignupToken({
+      provider,
+      providerId: profile.providerId,
+      email: profile.email,
+      name: profile.name || undefined,
+      photoUrl: profile.photoUrl || undefined,
+      redirect: state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined,
+    });
+    const url = new URL(`${dashboardBase}/oauth-complete`);
+    url.searchParams.set('signup', signupToken);
+    if (state.redirect && isAllowedRedirect(state.redirect)) url.searchParams.set('redirect_to', state.redirect);
+    const res = NextResponse.redirect(url.toString());
+    clearOauthStateCookie(res, request);
+    return res;
+  } else if (!account.photoUrl && profile.photoUrl) {
+    // Backfill avatar only — the identity link already exists in this branch.
+    await prisma.user.update({ where: { id: account.id }, data: { photoUrl: profile.photoUrl } as any }).catch(() => {});
+    bustProfileCache(account.id);
+  }
+
+  const redirectTo = state.redirect && isAllowedRedirect(state.redirect) ? state.redirect : undefined;
+  const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  // Session + integration bookkeeping run concurrently — neither depends on
+  // the other and the round-trips were previously serial.
+  const [, { token, refreshToken }] = await Promise.all([
+    prisma.auditEvent.create({
+      data: { actorId: account.id, action: `oauth.${provider}.login`, targetType: 'user', targetId: account.id, metadata: { [`${provider}Id`]: profile.providerId, ...(profile.email ? { email: profile.email } : {}) }, severity: 'info' },
+    }).catch(() => null),
+    createSession(account.id, request.headers.get('user-agent') || undefined, ip),
+  ]);
+  // Notify user of new sign-in from connected app
+  createNotification({
+    userId: account.id,
+    type: 'login',
+    title: `Signed in with ${provider.charAt(0).toUpperCase() + provider.slice(1)}`,
+    body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
+    link: '/account/security',
+    metadata: { provider, ip, device: describeDevice(request.headers.get('user-agent')) },
+  }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+  // Record login history
+  const { recordLoginHistory } = await import('@/features/security/security');
+  recordLoginHistory({ request, userId: account.id, email: account.email, success: true, method: provider }).catch(() => {});
+  const target = oauthPostLoginTarget(account, redirectTo, await signConsentToken(account.id));
+  const res = NextResponse.redirect(target);
+  setSessionCookie(res, token, refreshToken, request);
+  clearOauthStateCookie(res, request);
+  return res;
+}
+
+/**
+ * POST /api/auth/oauth/merge — GUEST login-merge (no session required).
+ *
+ * Body: { token: string }
+ * The signed merge token (10 min) is the authorization: it is only ever
+ * issued for a same-email match. Links the provider identity to the token's
+ * account, issues the session, and returns { redirect_to }.
+ *
+ * NOTE: transfer-merge (identity owned by ANOTHER account while logged in)
+ * goes through POST /api/integrations/merge with the session instead.
+ */
+export async function oauthMergeCompleteHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json().catch(() => ({}));
+    if (body.transfer === true) {
+      return NextResponse.json({ error: 'Transfer requires an active session — use /api/integrations/merge.' }, { status: 400 });
+    }
+    const data = typeof body.token === 'string' ? await verifyMergeToken(body.token) : null;
+    if (!data) {
+      return NextResponse.json({ error: 'This merge request expired. Please sign in again.' }, { status: 400 });
+    }
+    const idField = PROVIDER_ID_FIELD[data.provider];
+    if (!idField) return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
+
+    const target = await prisma.user.findUnique({ where: { id: data.existingUserId } });
+    if (!target) {
+      return NextResponse.json({ error: 'The account to merge with no longer exists.' }, { status: 404 });
+    }
+    // The identity must not have been bound to a different account meanwhile.
+    const holder = await prisma.user.findUnique({ where: { [idField]: data.providerId } as any });
+    if (holder && holder.id !== target.id) {
+      return NextResponse.json({ error: `This ${data.provider} account is already linked to a different Tirbeo account.` }, { status: 409 });
+    }
+
+    const metadata = { [`${data.provider}Id`]: data.providerId, email: data.email };
+
+    // Link + sign in to the matched account in one step.
+    const [, { token, refreshToken }] = await Promise.all([
+      prisma.user.update({ where: { id: target.id }, data: { [idField]: data.providerId, ...(target.photoUrl ? {} : { photoUrl: data.photoUrl || undefined }) } as any }),
+      createSession(target.id, request.headers.get('user-agent') || undefined, (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()),
+    ]);
+    bustProfileCache(target.id);
+    prisma.auditEvent.create({
+      data: { actorId: target.id, action: 'account.merge.login', targetType: 'user', targetId: target.id, metadata: { provider: data.provider, providerId: data.providerId } },
+    }).catch(() => {});
+
+    const res = NextResponse.json({ ok: true, redirect_to: oauthPostLoginTarget(target, undefined) });
+    setSessionCookie(res, token, refreshToken, request);
+    return res;
+  } catch (err: any) {
+    console.error('[OAUTH MERGE]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to complete the merge. Please try signing in again.' }, { status: 500 });
+  }
+}
+
+function setOauthStateCookie(res: NextResponse, nonce: string, request: NextRequest) {
+  res.cookies.set(OAUTH_STATE_COOKIE, nonce, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 600,
+    domain: getOauthCookieDomain(request),
+  });
+}
+
+function clearOauthStateCookie(res: NextResponse, request: NextRequest) {
+  res.cookies.set(OAUTH_STATE_COOKIE, '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0,
+    domain: getOauthCookieDomain(request),
+  });
+}
+
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+  turnstileToken: z.string().optional(),
+  captchaRayId: z.string().optional(),
+  emailVerified: z.boolean().optional(),
+  fingerprint: z.string().optional(),
+});
+
+export async function loginHandler(request: NextRequest) {
+  const loginStartTime = performance.now();
+  try {
+    const parsed = loginSchema.safeParse(await request.json());
+    if (!parsed.success) {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
+    }
+    const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
+
+    const fingerprint = bodyFingerprint
+      || request.cookies.get('__dfp')?.value
+      || request.headers.get('x-device-fingerprint')
+      || '';
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const userAgent = request.headers.get('user-agent') || '';
+    const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
+    const sessionId = captchaSession;
+
+    // Independent counters — checked concurrently to halve the DB wait.
+    const [loginEmailOk, loginIpOk] = await Promise.all([
+      checkWindowLimitDB(`login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, ip, email),
+      checkWindowLimitDB(`login:ip:${ip}`, 20, 15 * 60 * 1000, ip, email),
+    ]);
+    if (!loginEmailOk || !loginIpOk) {
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, deletedAt: true, adminRole: true, suspendReason: true, suspendedUntil: true, banRefCode: true, suspendRefCode: true } });
+    if (!user) {
+      logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+    if (user.deletedAt) {
+      return NextResponse.json({ error: 'Account has been deleted' }, { status: 403 });
+    }
+    if (user.isBanned) {
+return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: user.banRefCode || eventIdFor(user.id, 'ban'), message: 'Your account has been permanently banned.' }, { status: 403 });
+    }
+    if (user.isSuspended) {
+      if (user.suspendedUntil && new Date(user.suspendedUntil) < new Date()) {
+        await prisma.user.update({ where: { id: user.id }, data: { isSuspended: false, suspendReason: null, suspendedUntil: null } });
+        logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: user.suspendedUntil?.toISOString() || null } }).catch(() => {});
+      } else {
+        return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: user.suspendRefCode || eventIdFor(user.id, 'suspend'), reason: user.suspendReason || 'No reason provided', until: user.suspendedUntil?.toISOString() || null, message: `Your account is suspended${user.suspendedUntil ? ` until ${new Date(user.suspendedUntil).toUTCString()}` : ''}.` }, { status: 403 });
+      }
+    }
+    if (!user.passwordHash) {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+
+    // Progressive friction: if this account/IP has prior failed-attempt history,
+    // require a CAPTCHA before revealing password validity — so automated
+    // password-spraying is challenged before the lockout threshold is reached.
+    // A recent successful login from this IP clears the friction (risk resets
+    // when traffic normalizes).
+
+    // Parallelize DB queries for speed
+    const [warnings, provenIdentity, passwordValid] = await Promise.all([
+      getUserWarningCount(user.id, ip),
+      hasRecentLoginSuccess(ip),
+      verifyPassword(user.passwordHash, password),
+    ]);
+    
+    const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
+    if (forceCaptcha) {
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
+      const check = await assertCaptchaSatisfied({
+        rayId: captchaRayId,
+        sessionId,
+        ipAddress: ip,
+        userAgent,
+        fingerprint,
+        requiredDifficulty,
+      });
+      if (!check.ok) {
+        return NextResponse.json({ error: check.error }, { status: 403 });
+      }
+    }
+
+    if (!passwordValid) {
+      recordRateLimitHit(ip);
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'wrong_password' } }).catch(() => {});
+      // Record failed login attempt
+      prisma.login_history.create({
+        data: {
+          userId: user.id,
+          email: user.email,
+          ipAddress: ip,
+          userAgent: userAgent || null,
+          success: false,
+          method: 'password',
+          metadata: parseLoginMetadata(userAgent),
+        },
+      }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+
+    const settings = await getCaptchaSettings();
+
+    if (settings.enabled) {
+      const risk = settings.riskEnabled
+        ? await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true })
+        : null;
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, risk);
+
+      const required = risk?.requireCaptcha || requiredDifficulty !== 'easy';
+      if (required) {
+        const check = await assertCaptchaSatisfied({
+          rayId: captchaRayId,
+          sessionId,
+          ipAddress: ip,
+          userAgent,
+          fingerprint,
+          requiredDifficulty,
+        });
+        if (!check.ok) {
+          return NextResponse.json({ error: check.error }, { status: 403 });
+        }
+      }
+    }
+
+    if (user.is2FAEnabled) {
+      // Suspicious sign-in from a new IP / device: challenge with an email OTP
+      // first, then the authenticator 2FA code (OTP → 2FA). With no suspicious
+      // activity, only the authenticator 2FA code is required.
+      const lastSession2fa = await prisma.session.findFirst({
+        where: { userId: user.id, status: { not: 'revoked' } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, ipAddress: true },
+      });
+      const isNewIp2fa = !lastSession2fa || lastSession2fa.ipAddress !== ip;
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({
+        needs2FA: true,
+        tempToken,
+        ...(isNewIp2fa ? { needsOtp: true } : {}),
+      });
+    }
+
+    // Suspicious sign-in from a new IP / location (no 2FA configured): challenge
+    // with an email OTP before issuing a session instead of logging in directly.
+    const lastSession = await prisma.session.findFirst({
+      where: { userId: user.id, status: { not: 'revoked' } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, ipAddress: true },
+    });
+    const isNewIp = !lastSession || lastSession.ipAddress !== ip;
+    if (isNewIp) {
+      return NextResponse.json({ needsOtp: true });
+    }
+
+    const adminRole = user.adminRole || undefined;
+    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    // Fire-and-forget: clear rate limits, log security event, create notification, record device
+    // These should NOT block the login response
+    Promise.allSettled([
+      Promise.resolve(clearRateLimitHits(ip)),
+      Promise.resolve(logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_success', details: { reason: 'password' } })),
+      createAuditEvent({ actorId: user.id, action: 'user.login', targetType: 'user', targetId: user.id, metadata: { method: 'password', ip, device: describeDevice(userAgent) } }).catch(() => {}),
+      Promise.resolve(createNotification({
+        userId: user.id,
+        type: 'security',
+        title: 'New sign-in to your account',
+        body: `Signed in with your password from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}). If this wasn't you, review your sessions immediately.`,
+        link: '/account/sessions',
+        metadata: { ip, device: describeDevice(userAgent), method: 'Password' },
+        skipEmail: true,
+      })),
+      Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
+      // Record login history for the Login History section
+      prisma.login_history.create({
+        data: {
+          userId: user.id,
+          email: user.email,
+          ipAddress: ip,
+          userAgent: userAgent || null,
+          success: true,
+          method: 'password',
+          metadata: parseLoginMetadata(userAgent),
+        },
+      }).catch(() => {}),
+      ...(isNewIp ? [sendTemplateEmail(user.email, 'login_alert', {
+        name: user.email.split('@')[0],
+        location: 'Unknown',
+        device: userAgent || 'Unknown device',
+        loginTime: new Date().toLocaleString(),
+        revokeUrl: `https://dashboard.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}/settings/sessions`,
+      })] : []),
+    ]).catch(() => {});
+
+    logPerformance('auth/login', loginStartTime, { userId: user.id, isNewIp });
+    return res;
+  } catch (err: any) {
+    console.error('[LOGIN]', err?.message || err);
+    return NextResponse.json({ error: 'Login failed' }, { status: 500 });
+  }
+}
+
+export async function adminLoginHandler(request: NextRequest, preParsed?: z.infer<typeof loginSchema>) {
+  try {
+    const parsed = preParsed ? { success: true as const, data: preParsed } : loginSchema.safeParse(await request.json());
+    if (!parsed.success) {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
+    }
+    const { email, password, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
+
+    // The CaptchaWidget stores the device fingerprint in the __dfp cookie — fall
+    // back to it (and the x-device-fingerprint header) so the risk score and
+    // required difficulty match the challenge the user actually solved.
+    const fingerprint = bodyFingerprint
+      || request.cookies.get('__dfp')?.value
+      || request.headers.get('x-device-fingerprint')
+      || '';
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const userAgent = request.headers.get('user-agent') || '';
+    const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
+    const sessionId = captchaSession;
+
+    // Independent counters — checked concurrently to halve the DB wait.
+    const [adminEmailOk, adminIpOk] = await Promise.all([
+      checkWindowLimitDB(`admin:login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, ip, email),
+      checkWindowLimitDB(`admin:login:ip:${ip}`, 20, 15 * 60 * 1000, ip, email),
+    ]);
+    if (!adminEmailOk || !adminIpOk) {
+      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      select: { id: true, email: true, passwordHash: true, is2FAEnabled: true, isBanned: true, isSuspended: true, adminRole: true, mustChangePassword: true, suspendReason: true },
+    });
+    if (!user) {
+      logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+    if (user.isBanned) {
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, message: 'Admin accounts cannot be banned users. Contact support.' }, { status: 403 });
+    }
+    if (user.isSuspended) {
+      return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: user.suspendReason || 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
+    }
+    if (!user.passwordHash) {
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+
+    // Progressive friction: if this account/IP has prior failed-attempt history,
+    // require a CAPTCHA before revealing password validity — so automated
+    // password-spraying is challenged before the lockout threshold is reached.
+    // A recent successful login from this IP clears the friction.
+
+    const warnings = await getUserWarningCount(user.id, ip);
+    const provenIdentity = await hasRecentLoginSuccess(ip);
+    const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
+    if (forceCaptcha) {
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, null);
+      const check = await assertCaptchaSatisfied({
+        rayId: captchaRayId,
+        sessionId,
+        ipAddress: ip,
+        userAgent,
+        fingerprint,
+        requiredDifficulty,
+      });
+      if (!check.ok) {
+        return NextResponse.json({ error: check.error }, { status: 403 });
+      }
+    }
+
+    if (!(await verifyPassword(user.passwordHash, password))) {
+      recordRateLimitHit(ip);
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'wrong_password' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+
+    if (!user.adminRole) {
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'not_admin' } }).catch(() => {});
+      sendTemplateEmail(user.email, 'admin_alert', {
+        subject: 'Unauthorized Admin Access Attempt',
+        message: 'A user without admin privileges attempted to access the admin panel.',
+        details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
+        dashboardUrl: getAdminBaseUrl(),
+      }).catch(() => {});
+      return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
+    }
+
+    const settings = await getCaptchaSettings();
+
+    if (settings.enabled) {
+      const risk = settings.riskEnabled
+        ? await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true })
+        : null;
+      const requiredDifficulty = await getRequiredDifficulty(user.id, sessionId, ip, risk);
+
+      const required = risk?.requireCaptcha || requiredDifficulty !== 'easy';
+      if (required) {
+        const check = await assertCaptchaSatisfied({
+          rayId: captchaRayId,
+          sessionId,
+          ipAddress: ip,
+          userAgent,
+          fingerprint,
+          requiredDifficulty,
+        });
+        if (!check.ok) {
+          return NextResponse.json({ error: check.error }, { status: 403 });
+        }
+      }
+    }
+
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ needs2FA: true, tempToken });
+    }
+
+    // First-time admins (created with a temporary password) must set their own
+    // password before any admin session is issued.
+    if (user.mustChangePassword) {
+      const tempToken = await signTempPasswordChangeToken(user.id);
+      return NextResponse.json({ needsPasswordChange: true, tempToken });
+    }
+
+    const adminRole = user.adminRole || undefined;
+    const { token, refreshToken, sessionId: newSessionId } = await createSession(user.id, userAgent || undefined, ip, adminRole);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    clearRateLimitHits(ip);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_success', details: { reason: 'password' } }).catch(() => {});
+    const { recordLoginHistory: rlh4 } = await import('@/features/security/security');
+    rlh4({ request, userId: user.id, email: user.email, success: true, method: 'admin_password' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in to admin panel',
+      body: `Signed in from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'admin_password', ip, device: describeDevice(userAgent) },
+      skipEmail: true,
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+
+    recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId }).catch(() => {});
+
+    const lastSession = await prisma.session.findFirst({
+      where: { userId: user.id, id: { not: newSessionId }, status: { not: 'revoked' } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, ipAddress: true },
+    });
+
+    const isNewIp = !lastSession || lastSession.ipAddress !== ip;
+    if (isNewIp) {
+      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+      sendTemplateEmail(user.email, 'login_alert', {
+        name: user.email.split('@')[0],
+        location: 'Admin Panel',
+        device: userAgent || 'Unknown device',
+        loginTime: new Date().toLocaleString(),
+        revokeUrl: `https://dashboard.${appDomain}/settings/sessions`,
+      }).catch(() => {});
+    }
+
+    return res;
+  } catch (err: any) {
+    console.error('[ADMIN LOGIN]', err?.message || err);
+    return NextResponse.json({ error: 'Login failed' }, { status: 400 });
+  }
+}
+
+export async function verify2faLoginHandler(request: NextRequest) {
+  try {
+    const { tempToken, token: totpToken, code } = (await request.json()) as any;
+    const totpCode = (typeof totpToken === 'string' && totpToken) || (typeof code === 'string' && code) || '';
+    if (typeof tempToken !== 'string' || totpCode.length === 0) {
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`2fa:ip:${clientIp}`, 15, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const userId = await verifyTemp2faToken(tempToken);
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired temp token' }, { status: 401 });
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, totpSecret: true, is2FAEnabled: true } });
+    if (!user || !user.totpSecret || !user.is2FAEnabled) {
+      return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
+    }
+
+    if (!(await checkWindowLimitDB(`2fa:user:${userId}`, 5, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    if (!await verifyTotp(totpCode, user.totpSecret)) {
+      logSecurityEvent({ request, userId, eventType: 'auth.2fa_failed', details: { reason: 'invalid_code' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 });
+    }
+
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    clearRateLimitHits(clientIp);
+    logSecurityEvent({ request, userId, eventType: 'auth.login_2fa_success', details: { reason: 'totp' } }).catch(() => {});
+    const { recordLoginHistory: rlh5 } = await import('@/features/security/security');
+    rlh5({ request, userId, email: user.email, success: true, method: 'totp' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with authenticator',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'totp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    return res;
+  } catch {
+    return NextResponse.json({ error: '2FA verification failed' }, { status: 500 });
+  }
+}
+
+export async function recovery2faLoginHandler(request: NextRequest) {
+  try {
+    const { tempToken, recoveryCode } = (await request.json()) as any;
+    if (typeof tempToken !== 'string' || typeof recoveryCode !== 'string') {
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`2fa-recovery:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const userId = await verifyTemp2faToken(tempToken);
+    if (!userId) return NextResponse.json({ error: 'Invalid or expired temp token' }, { status: 401 });
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, is2FAEnabled: true } });
+    if (!user || !user.is2FAEnabled) {
+      return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
+    }
+
+    const fullUser = await prisma.user.findUnique({ where: { id: userId }, select: { backupCodes: true } });
+    const backupCodes = Array.isArray((fullUser as any)?.backupCodes) ? (fullUser as any).backupCodes as any[] : [];
+    const inputHash = hashRecoveryCode(recoveryCode);
+    const idx = backupCodes.findIndex((c: any) => c.code === inputHash && !c.used);
+    if (idx === -1) return NextResponse.json({ error: 'Invalid recovery code' }, { status: 401 });
+
+    backupCodes[idx].used = true;
+    await prisma.user.update({
+      where: { id: userId },
+      data: { backupCodes },
+    });
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_2fa_success', details: { method: 'backup_code' } }).catch(() => {});
+    const { recordLoginHistory: rlh7 } = await import('@/features/security/security');
+    rlh7({ request, userId: user.id, email: user.email, success: true, method: 'backup_code' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with backup code',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'backup_code', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    return res;
+  } catch {
+    return NextResponse.json({ error: 'Recovery code verification failed' }, { status: 400 });
+  }
+}
+
+const signupSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  firstName: z.string().min(1),
+  lastName: z.string().min(1),
+  username: z.string().min(3).max(30),
+  dob: z.string().optional(),
+  gender: z.string().optional(),
+  photoUrl: z.string().url().optional().or(z.literal('')),
+  occupation: z.string().optional(),
+  companyName: z.string().optional().or(z.literal('')),
+  role: z.string().max(100).optional(),
+  recoveryEmail: z.string().email().optional().or(z.literal('')),
+  // Client-generated TOTP secret + flag when the user set up 2FA during signup.
+  totpSecret: z.string().optional(),
+  is2FAEnabled: z.boolean().optional(),
+  policyAccepted: z.boolean(),
+  adminDataAccess: z.boolean().optional(),
+  turnstileToken: z.string().optional(),
+  captchaRayId: z.string().optional(),
+  fingerprint: z.string().optional(),
+  // Optional pre-verified signup OTP (requested via auth/signup-otp/request,
+  // verified without consuming via auth/signup-otp/verify). When valid, the
+  // account is created with emailVerified=true and no verify email is sent.
+  otpCode: z.string().optional(),
+});
+
+export async function emailExistsHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    const email = (body?.email || '').toString().toLowerCase().trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return NextResponse.json({ exists: false, hasPassword: false }, { status: 200 });
+    }
+    const cached = emailExistsCache.get(email);
+    if (cached) return NextResponse.json(cached, { status: 200 });
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+      select: { id: true, passwordHash: true, photoUrl: true, name: true, secondaryEmail: true },
+    });
+    if (!user) {
+      const result = { exists: false, hasPassword: false, photoUrl: null, name: null, hasRecoveryEmail: false, recoveryEmail: null };
+      emailExistsCache.set(email, result);
+      return NextResponse.json(result, { status: 200 });
+    }
+    const result = {
+      exists: true,
+      hasPassword: !!user.passwordHash,
+      photoUrl: user.photoUrl || null,
+      name: user.name || null,
+      hasRecoveryEmail: !!user.secondaryEmail,
+      recoveryEmail: user.secondaryEmail ? maskEmail(user.secondaryEmail) : null,
+    };
+    emailExistsCache.set(email, result);
+    return NextResponse.json(result, { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL-EXISTS]', err?.message || err);
+    return NextResponse.json({ error: 'Could not check email' }, { status: 500 });
+  }
+}
+
+export async function usernameExistsHandler(request: NextRequest) {
+  try {
+    // Support both GET (query params from dashboard) and POST (body from signup)
+    let username = '';
+    if (request.method === 'GET') {
+      username = request.nextUrl.searchParams.get('username') || '';
+    } else {
+      const body: any = await request.json().catch(() => ({}));
+      username = (body?.username || '').toString();
+    }
+    username = username.toString().toLowerCase().trim();
+
+    // Validate username format: lowercase alphanumeric with hyphens, 3-30 chars
+    if (!username || username.length < 3 || username.length > 30) {
+      return NextResponse.json({ available: false, taken: false, reserved: false, valid: false }, { status: 200 });
+    }
+    if (!/^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/.test(username)) {
+      return NextResponse.json({ available: false, taken: false, reserved: false, valid: false }, { status: 200 });
+    }
+
+    // Check for reserved words
+    const reserved = ['admin', 'api', 'www', 'mail', 'support', 'help', 'info', 'blog', 'docs', 'status', 'app', 'web', 'dev', 'test', 'null', 'undefined', 'true', 'false', 'root', 'system', 'settings', 'config', 'auth', 'login', 'signup', 'dashboard'];
+    if (reserved.includes(username)) {
+      return NextResponse.json({ available: false, taken: false, reserved: true, valid: true }, { status: 200 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { username },
+      select: { id: true },
+    });
+    return NextResponse.json({
+      available: !user,
+      taken: !!user,
+      exists: !!user,
+      reserved: false,
+      valid: true,
+    }, { status: 200 });
+  } catch (err: any) {
+    console.error('[USERNAME-EXISTS]', err?.message || err);
+    return NextResponse.json({ error: 'Could not check username' }, { status: 500 });
+  }
+}
+
+export async function signupHandler(request: NextRequest) {
+  try {
+    const parsed = signupSchema.safeParse(await request.json());
+    if (!parsed.success) {
+      console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
+      return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
+    }
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, occupation, companyName, role, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, captchaRayId, fingerprint, otpCode } = parsed.data;
+    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedUsername = username.toString().trim().toLowerCase();
+    const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
+    const normalizedCompanyName = companyName ? companyName.toString().trim() : undefined;
+    const normalizedOccupation = occupation ? sanitizeInput(occupation, 120).trim() : undefined;
+    const normalizedRole = role ? sanitizeInput(role, 100).trim() : undefined;
+    const normalizedRecoveryEmail = recoveryEmail ? recoveryEmail.toString().trim().toLowerCase() : undefined;
+    const normalizedTotpSecret = totpSecret ? totpSecret.toString().trim() : undefined;
+    
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const userAgent = request.headers.get('user-agent') || '';
+    const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
+
+    if (!policyAccepted) {
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
+    }
+
+    // Relaxed rate limits for signup - 20 per hour per IP, 10 per hour per email
+    if (!(await checkWindowLimitDB(`signup:ip:${ip}`, 20, 60 * 60 * 1000, ip, email))) {
+      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`signup:email:${email.toLowerCase()}`, 10, 60 * 60 * 1000, ip, email))) {
+      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    if (existing) {
+      return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+    }
+
+    if (normalizedUsername) {
+      const existingUsername = await prisma.user.findUnique({ where: { username: normalizedUsername } });
+      if (existingUsername) {
+        return NextResponse.json({ error: 'Username already taken' }, { status: 409 });
+      }
+    }
+
+    const settings = await getCaptchaSettings();
+    if (settings.enabled) {
+      const risk = settings.riskEnabled
+        ? await computeRiskScore({ ip, ua: userAgent, sessionId: captchaSession, fingerprint, authPath: true })
+        : null;
+      const requiredDifficulty = await getRequiredDifficulty(undefined, captchaSession, ip, risk);
+      const required = risk?.requireCaptcha || requiredDifficulty !== 'easy';
+      if (required) {
+        const check = await assertCaptchaSatisfied({
+          rayId: captchaRayId,
+          sessionId: captchaSession,
+          ipAddress: ip,
+          userAgent,
+          fingerprint,
+          requiredDifficulty,
+        });
+        if (!check.ok) {
+          return NextResponse.json({ error: check.error }, { status: 403 });
+        }
+      }
+    }
+
+    // If the user pre-verified their email via signup-otp, validate the code
+    // (this consumes it) and create the account already email-verified.
+    let preVerifiedEmail = false;
+    if (otpCode) {
+      preVerifiedEmail = await verifySignupOtp(normalizedEmail, otpCode);
+      if (!preVerifiedEmail) {
+        return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+      }
+    }
+
+    const breach = await checkPasswordBreach(password);
+    if (breach.breached) {
+      return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
+    }
+
+    const passwordHash = await hashPassword(password);
+    const name = sanitizeInput(`${firstName} ${lastName}`.trim(), 200);
+    const birthday = dob ? new Date(dob) : undefined;
+    const user = await prisma.user.create({
+      data: {
+        email: normalizedEmail,
+        passwordHash,
+        name,
+        username: normalizedUsername,
+        photoUrl: normalizedPhotoUrl || undefined,
+        occupation: normalizedOccupation,
+        companyName: normalizedCompanyName ? sanitizeInput(normalizedCompanyName, 120) : undefined,
+        companyRole: normalizedRole || undefined,
+        secondaryEmail: normalizedRecoveryEmail || undefined,
+        totpSecret: normalizedTotpSecret || undefined,
+        is2FAEnabled: !!(is2FAEnabled && normalizedTotpSecret),
+        gender: gender ? sanitizeInput(gender, 100) : undefined,
+        birthday,
+        // Email can ONLY be marked verified through the signup OTP flow — a
+        // client-supplied flag is never trusted (would allow claiming a
+        // verified account without proving email ownership).
+        emailVerified: preVerifiedEmail,
+        consents: {
+          signupConsent: {
+            acceptedAt: new Date().toISOString(),
+            policyAccepted: true,
+            adminDataAccess: !!adminDataAccess,
+          },
+          allowCrashReports: true,
+        },
+        notificationPreferences: {
+          email: true, push: true,
+          security: true, forms: false, product: false, support: true,
+          formsEmail: false, formsPush: false,
+          productEmail: false, productPush: false,
+          supportEmail: false, supportPush: true,
+          digestEnabled: false, digestFrequency: 'daily',
+        },
+      },
+    });
+
+    const { token, refreshToken } = await createSession(user.id, userAgent || undefined, ip);
+    const res = NextResponse.json({ id: user.id, email: user.email, token }, { status: 201 });
+    setSessionCookie(res, token, refreshToken, request);
+
+    recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId: captchaSession }).catch(() => {});
+
+    // Send welcome email (non-blocking)
+    sendTemplateEmail(email, 'welcome', { name: name || email.split('@')[0] }, {
+      fromEmail: 'noreply@send.tirbeo.app',
+      fromName: 'Tirbeo',
+    }).catch(err => console.error('[SIGNUP] Welcome email failed:', err?.message));
+
+    // Create welcome notification — STRICTLY per-user, no broadcast, no CC.
+    // This notification must ONLY be visible to the newly created account
+    // (user.id). It is never sent to any other user, admin, or channel.
+    createNotification({
+      userId: user.id,
+      type: 'system',
+      title: 'Welcome to Tirbeo',
+      body: `Your account (${user.email}) was created. Start by exploring the dashboard and completing your profile.`,
+      link: '/home',
+      // Explicitly disable the product digest email path — welcome email is
+      // already sent above via the 'welcome' template (single recipient).
+      skipEmail: true,
+      skipPush: false,
+    }).catch((e) => console.error('[SIGNUP] welcome notification failed for', user.id, e?.message));
+
+    // Send verification OTP — unless the user already verified via signup-otp
+    if (!preVerifiedEmail) {
+      const verifyCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
+      const otpHash = hashOtpCode(verifyCode);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await prisma.otp.create({
+        data: { userId: user.id, type: 'email', otpHash, expiresAt },
+      });
+      sendTemplateEmail(email, 'verify_email', { otp: verifyCode, name: name || email.split('@')[0] }, {
+        fromEmail: 'noreply@send.tirbeo.app',
+        fromName: 'Tirbeo',
+      }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
+    }
+
+    return res;
+  } catch (err: any) {
+    console.error('[SIGNUP]', err?.message || err, err?.stack);
+    return NextResponse.json({ error: 'Signup failed' }, { status: 400 });
+  }
+}
+
+export async function requestSignupOtpHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+
+    const cooldown = await enforceResendCooldown(`signup-otp:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+
+    const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (existing) {
+      return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+    }
+
+    const code = genSignupOtp();
+    await storeSignupOtp(email, code);
+    logAuthJson('signup_otp', { email: email.toLowerCase(), ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
+    let emailSent = false;
+    try {
+      const result = await sendSignupOtpEmail(email, code);
+      emailSent = result.success;
+    } catch (emailErr) {
+      console.error('[SIGNUP OTP] Email send error:', emailErr);
+    }
+    return NextResponse.json({ message: 'Verification code sent to email' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[SIGNUP OTP REQUEST]', err?.message || err, err?.stack);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+// Verify a pre-signup OTP without consuming it (final consumption happens at auth/signup)
+export async function signupOtpVerifyHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
+    }
+
+    const ok = await checkSignupOtp(email, code);
+    if (!ok) {
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    }
+    return NextResponse.json({ verified: true });
+  } catch (err: any) {
+    console.error('[SIGNUP OTP VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+export async function limitsHandler(request: NextRequest) {
+  try {
+    if (request.method === 'PUT') {
+      const body: any = await request.json().catch(()=> ({}));
+      const { method, max, windowMs } = body;
+      if (!method || typeof max !== 'number') return NextResponse.json({ error: 'method and max required' }, { status: 400 });
+      // Admin only for PUT
+      const session = await requireRole(request as any, 'admin');
+      if (session instanceof Response) return session as any;
+      const row = await (prisma as any).verificationLimit.upsert({
+        where: { method },
+        update: { max, windowMs: windowMs || 15*60*1000 },
+        create: { method, max, windowMs: windowMs || 15*60*1000 },
+      });
+      return NextResponse.json({ ok: true, limit: row });
+    }
+    const limits: Record<string, number> = {
+      'login-otp': 5,
+      'magic-link': 3,
+      'otp': 5,
+      'recovery': 5,
+      'signup-otp': 5,
+      'global-email': 5,
+      'global-ip': 20,
+    };
+    try {
+      const dbLimits = await (prisma as any).verificationLimit.findMany().catch(()=>[]);
+      for (const row of dbLimits as any[]) {
+        if (row.method && typeof row.max === 'number') limits[row.method] = row.max;
+      }
+    } catch {}
+    return NextResponse.json({ limits });
+  } catch (e:any) { return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 }); }
+}
+
+export async function remainingHandler(request: NextRequest) {
+  try {
+    const email = (request.nextUrl.searchParams.get('email') || '').toLowerCase().trim();
+    const method = request.nextUrl.searchParams.get('method') || '';
+    if (!email) return NextResponse.json({ error: 'email required' }, { status: 400 });
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    // ── Fast status: Redis counters + in-memory mirror (no DB scans) ──
+    // Maxes come from the VerificationLimit table (30s cache).
+    const maxes = await getAllVerifyMaxes();
+    const out: Record<string, { used: number; remaining: number; max: number; resetAt: number; exceeded: boolean }> = {};
+    const methods = method ? [method] : Object.keys(maxes);
+    const globalIp = await peekGenericWindow(`global:ip:${ip}`, maxes['global-ip'] ?? 20, VERIFY_WINDOW_MS);
+    const globalEmailStatus = await getGlobalEmailStatus(email);
+
+    for (const m of methods) {
+      if (m === 'global-email') {
+        out[m] = {
+          used: globalEmailStatus.used,
+          remaining: globalEmailStatus.remaining,
+          max: globalEmailStatus.max,
+          resetAt: globalEmailStatus.resetAt,
+          exceeded: !globalEmailStatus.ok,
+        };
+        continue;
+      }
+      if (m === 'global-ip') {
+        out[m] = { used: globalIp.used, remaining: globalIp.remaining, max: globalIp.max, resetAt: globalIp.resetAt, exceeded: !globalIp.ok };
+        continue;
+      }
+      const st = await getVerifyStatus(m, email);
+      // Effective remaining also capped by the shared global-email and global-ip
+      // counters — mirrors what the send endpoints will actually enforce.
+      const effectiveRemaining = Math.max(0, Math.min(st.remaining, globalEmailStatus.remaining, globalIp.remaining));
+      out[m] = {
+        used: st.used,
+        remaining: effectiveRemaining,
+        max: st.max,
+        resetAt: Math.min(st.resetAt, globalEmailStatus.resetAt, globalIp.resetAt),
+        exceeded: !st.ok || !globalEmailStatus.ok || !globalIp.ok || effectiveRemaining === 0,
+      };
+    }
+    return NextResponse.json({
+      email,
+      windowMs: VERIFY_WINDOW_MS,
+      windowResetAt: windowResetAt(VERIFY_WINDOW_MS),
+      remaining: out,
+      globalEmailUsed: globalEmailStatus.used,
+    });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 });
+  }
+}
+
+export async function initLimitsHandler() {
+  try {
+    const defaults: Record<string, { max: number; windowMs: number }> = {
+      'login-otp': { max: 5, windowMs: 900000 },
+      'magic-link': { max: 3, windowMs: 900000 },
+      'otp': { max: 5, windowMs: 900000 },
+      'recovery': { max: 5, windowMs: 900000 },
+      'signup-otp': { max: 5, windowMs: 900000 },
+      'global-email': { max: 5, windowMs: 900000 },
+      'global-ip': { max: 20, windowMs: 900000 },
+    };
+    for (const [method, { max, windowMs }] of Object.entries(defaults)) {
+      await (prisma as any).verificationLimit.upsert({
+        where: { method },
+        update: { max, windowMs },
+        create: { method, max, windowMs },
+      }).catch(()=>{});
+    }
+    return NextResponse.json({ ok: true, message: 'Verification limits initialized' });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 });
+  }
+}
+
+// Record policy consent for an OAuth-created account (no password yet) so the
+// user can be routed to the dashboard afterwards.
+export async function oauthConsentHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    const { policyAccepted, adminDataAccess, signatureName, consentToken } = body;
+    if (!policyAccepted) {
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
+    }
+
+    // Auth: try session cookie first, then fallback to signed consent token
+    let userId: string | null = null;
+    const session = await getSession(request);
+    if (session) {
+      userId = session.userId;
+    } else if (consentToken) {
+      userId = await verifyConsentToken(consentToken);
+    }
+    if (!userId) return jsonUnauthorized();
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, consents: true } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    const consentRecord: any = (user.consents as any) || {};
+    consentRecord.signupConsent = {
+      acceptedAt: new Date().toISOString(),
+      policyAccepted: true,
+      adminDataAccess: !!adminDataAccess,
+      signatureName: signatureName ? sanitizeInput(signatureName, 200).trim() : (user.email ? user.email.split('@')[0] : ''),
+      oauth: true,
+    };
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { consents: consentRecord, emailVerified: true },
+    });
+
+    return NextResponse.json({ ok: true, message: 'Consent recorded' });
+  } catch (err: any) {
+    console.error('[OAUTH CONSENT]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to record consent' }, { status: 500 });
+  }
+}
+
+// GET /api/auth/oauth/pending?token=… — preview the provider profile carried by
+// a pending-signup token, for the in-dashboard account-creation screen.
+export async function oauthPendingHandler(request: NextRequest) {
+  try {
+    const token = request.nextUrl.searchParams.get('token') || '';
+    const data = await verifyPendingSignupToken(token);
+    if (!data) {
+      return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
+    }
+    return NextResponse.json({
+      provider: data.provider,
+      email: data.email,
+      name: data.name || '',
+      photoUrl: data.photoUrl || null,
+    });
+  } catch (err: any) {
+    console.error('[OAUTH PENDING]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to load signup info' }, { status: 500 });
+  }
+}
+
+// POST /api/auth/oauth/complete — create the Tirbeo account from a
+// pending-signup token. The signed token is the authorization; the explicit
+// policyAccepted flag means the account (and its consent record) only ever
+// exists after the user clicked "Create account".
+export async function oauthSignupCompleteHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    if (!body?.policyAccepted) {
+      return NextResponse.json({ error: 'Policy acceptance is required' }, { status: 400 });
+    }
+    const data = typeof body.token === 'string' ? await verifyPendingSignupToken(body.token) : null;
+    if (!data) {
+      return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
+    }
+    const idField = PROVIDER_ID_FIELD[data.provider];
+    if (!idField) return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
+
+    // Accept name from request body (user may have edited it on the signup
+    // screen) — fall back to whatever the OAuth provider supplied in the token.
+    const displayName = (typeof body.name === 'string' && body.name.trim()) || data.name || undefined;
+
+    // Accept username from request body — validate and save (required).
+    if (typeof body.username !== 'string' || !body.username.trim()) {
+      return NextResponse.json({ error: 'Username is required.' }, { status: 400 });
+    }
+    const uname = body.username.trim().toLowerCase();
+    if (uname.length < 3 || uname.length > 30 || !/^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/.test(uname)) {
+      return NextResponse.json({ error: 'Username must be 3-30 characters, lowercase letters, numbers, hyphens, or underscores.' }, { status: 400 });
+    }
+    const reserved = ['admin','api','www','mail','support','help','info','blog','docs','status','app','web','dev','test','null','undefined','true','false','root','system','settings','config','auth','login','signup','dashboard'];
+    if (reserved.includes(uname)) {
+      return NextResponse.json({ error: 'This username is reserved.' }, { status: 400 });
+    }
+    const existingUname = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } });
+    if (existingUname) {
+      return NextResponse.json({ error: 'This username is already taken.' }, { status: 400 });
+    }
+    const username: string = uname;
+
+    // Optional password chosen on the confirmation screen.
+    let passwordHash: string | undefined;
+    if (typeof body.password === 'string' && body.password.length > 0) {
+      if (body.password.length < 8) {
+        return NextResponse.json({ error: 'Password must be at least 8 characters.' }, { status: 400 });
+      }
+      const pwBreach = await checkPasswordBreach(body.password);
+      if (pwBreach.breached) {
+        return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
+      }
+      passwordHash = await hashPassword(body.password);
+    }
+
+    // The provider identity may have been claimed meanwhile — never hijack.
+    const holder = await prisma.user.findUnique({ where: { [idField]: data.providerId } as any });
+    if (holder) {
+      return NextResponse.json({ error: `This ${data.provider} account is already linked.` }, { status: 409 });
+    }
+
+    const email = data.email.toLowerCase().trim();
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      // Account was created for this email between callback and confirm —
+      // attach the identity instead of failing.
+      const updateData: any = { [idField]: data.providerId };
+      if (!existing.name && displayName) updateData.name = sanitizeInput(displayName, 120);
+      if (!existing.photoUrl && data.photoUrl) updateData.photoUrl = data.photoUrl;
+      await prisma.user.update({ where: { id: existing.id }, data: updateData }).catch(() => {});
+
+      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+      const { token: sessionToken, refreshToken } = await createSession(existing.id, request.headers.get('user-agent') || undefined, ip);
+      const res = NextResponse.json({
+        ok: true,
+        redirect_to: data.redirect && isAllowedRedirect(data.redirect) ? data.redirect : (process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase()),
+      });
+      setSessionCookie(res, sessionToken, refreshToken, request);
+      return res;
+    }
+
+    const user = await prisma.user.create({
+      select: { id: true },
+      data: {
+        email,
+        name: displayName ? sanitizeInput(displayName, 120) : undefined,
+        username: username || undefined,
+        photoUrl: data.photoUrl || undefined,
+        [idField]: data.providerId,
+        passwordHash,
+        mustChangePassword: !passwordHash,
+        // The OAuth provider already verified this email — skip the
+        // verification gate so social signups aren't blocked.
+        emailVerified: true,
+        consents: {
+          signupConsent: {
+            acceptedAt: new Date().toISOString(),
+            policyAccepted: true,
+            adminDataAccess: false,
+            oauth: true,
+          },
+          allowCrashReports: true,
+        },
+        notificationPreferences: {
+          email: true, push: true,
+          security: true, forms: false, product: false, support: true,
+          formsEmail: false, formsPush: false,
+          productEmail: false, productPush: false,
+          supportEmail: false, supportPush: true,
+          digestEnabled: false, digestFrequency: 'daily',
+        },
+      } as any,
+    });
+
+    prisma.auditEvent.create({
+      data: { actorId: user.id, action: 'user.created', targetType: 'user', targetId: user.id, metadata: { provider: data.provider, email, via: 'oauth_complete' } },
+    }).catch(() => {});
+
+    // Welcome notification (best-effort). Email already sent above via the
+    // 'welcome' template (single recipient) — skip the notification digest path.
+    Promise.resolve(createNotification({
+      userId: user.id,
+      type: 'system',
+      title: 'Welcome to Tirbeo!',
+      body: 'Your account is ready. Explore your dashboard to get started.',
+      link: '/home',
+      icon: 'welcome',
+      skipEmail: true,
+      skipPush: false,
+    })).catch(() => {});
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.json({
+      ok: true,
+      redirect_to: data.redirect && isAllowedRedirect(data.redirect) ? data.redirect : (process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase()),
+    });
+    setSessionCookie(res, sessionToken, refreshToken, request);
+
+    sendTemplateEmail(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
+      fromEmail: 'noreply@send.tirbeo.app',
+      fromName: 'Tirbeo',
+    }).catch(err => console.error('[OAUTH COMPLETE] Welcome email failed:', err?.message));
+
+    return res;
+  } catch (err: any) {
+    console.error('[OAUTH COMPLETE]', err?.message || err);
+    return NextResponse.json({ error: 'Could not create your account. Please try again.' }, { status: 500 });
+  }
+}
+
+/**
+ * 403 response for banned/suspended accounts carrying the structured block
+ * payload (kind, eventId, reason, until, message) so the accounts app can
+ * redirect to the signed blocked screen on the dashboard.
+ */
+function blockedAccountResponse(user: { id: string; isBanned: boolean; isSuspended: boolean } & Record<string, any>): NextResponse {
+  if (user.isBanned) {
+    return NextResponse.json({
+      error: 'ACCOUNT_BANNED',
+      banned: true,
+      eventId: user.banRefCode || eventIdFor(user.id, 'ban'),
+      message: 'Your account has been permanently banned.',
+    }, { status: 403 });
+  }
+  return NextResponse.json({
+    error: 'ACCOUNT_SUSPENDED',
+    suspended: true,
+    eventId: user.suspendRefCode || eventIdFor(user.id, 'suspend'),
+    reason: user.suspendReason || null,
+    until: user.suspendedUntil || null,
+    message: 'Your account is temporarily suspended.',
+  }, { status: 403 });
+}
+
+export async function requestLoginOtpHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    // Relaxed login OTP rate limits - 10 per hour per IP, 5 per hour per email
+    // ── Fast limits (Redis + in-memory mirror; DB-configured maxes) ──
+    const [otp, globalEmail, otpIpWin, ipWin] = await Promise.all([
+      consumeVerifyAttempt('login-otp', email.toLowerCase(), clientIp),
+      getVerifyStatus('global-email', email.toLowerCase()),
+      checkWindowLimitDB(`login-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email),
+      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email),
+    ]);
+
+    const remainingInfo = {
+      'login-otp': { used: otp.used, remaining: otp.remaining, max: otp.max, resetAt: otp.resetAt },
+      'global-email': { used: globalEmail.used, remaining: globalEmail.remaining, max: globalEmail.max, resetAt: globalEmail.resetAt },
+    };
+
+    if (!otp.ok || !globalEmail.ok) {
+      const exceeded = !otp.ok ? otp : globalEmail;
+      return NextResponse.json(
+        {
+          error: `Limit reached for code sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+          message: `Limit reached — try again after ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+          retryAfterMs: Math.max(0, exceeded.resetAt - Date.now()),
+          exceeded: !otp.ok ? 'login-otp' : 'global-email',
+          remaining: remainingInfo,
+        },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, exceeded.resetAt - Date.now()) / 1000)) } },
+      );
+    }
+    if (!otpIpWin || !ipWin) {
+      const resetAt = windowResetAt(15 * 60 * 1000);
+      return NextResponse.json(
+        {
+          error: 'Too many requests from this device. Please try again later.',
+          retryAfterMs: Math.max(0, resetAt - Date.now()),
+          exceeded: 'global-ip',
+          remaining: remainingInfo,
+        },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, resetAt - Date.now()) / 1000)) } },
+      );
+    }
+
+    const cooldown = await enforceResendCooldown(`login-otp:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs, remaining: remainingInfo },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (!user) {
+      return NextResponse.json({ message: 'If an account exists, a code has been sent.' });
+    }
+
+    if (user.deletedAt) return NextResponse.json({ error: 'ACCOUNT_DELETED', deleted: true, message: 'Your account has been deleted.' }, { status: 403 });
+    if (user.scheduledDeletionAt) return NextResponse.json({ error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, scheduledAt: user.scheduledDeletionAt, message: 'Your account is scheduled for deletion.' }, { status: 403 });
+    if (user.isBanned) return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: user.banRefCode || eventIdFor(user.id, 'ban'), message: 'Your account has been permanently banned.' }, { status: 403 });
+    if (user.isSuspended) return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: user.suspendRefCode || eventIdFor(user.id, 'suspend'), reason: user.suspendReason, until: user.suspendedUntil, message: 'Your account is temporarily suspended.' }, { status: 403 });
+
+    const code = genSignupOtp();
+    await storeSignupOtp(email, code);
+    logAuthJson('signup_otp', { email: email.toLowerCase(), ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
+    // fire-and-forget: return in <30ms, don't block on 7s email provider
+    sendSignupOtpEmail(email, code, 'login_otp').catch((e) => console.error('[LOGIN OTP] async send error:', e?.message));
+    return NextResponse.json({ message: 'Verification code sent to your email', remaining: remainingInfo }, { status: 200 });
+  } catch (err: any) {
+    console.error('[LOGIN OTP REQUEST]', err?.message || err, err?.stack);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+export async function verifyLoginOtpHandler(request: NextRequest) {
+  try {
+    const { email, otpCode } = (await request.json()) as any;
+    if (!email || typeof email !== 'string' || !otpCode || typeof otpCode !== 'string') {
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true } });
+    if (!user) {
+      return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
+    }
+    if (user.isBanned || user.isSuspended) {
+      return blockedAccountResponse(user);
+    }
+    if (!user.emailVerified) {
+      return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const otpOk = await verifySignupOtp(email, otpCode);
+    if (!otpOk) {
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'invalid_otp' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    }
+
+    // If 2FA is enabled, always require the authenticator code before issuing
+    // a session — even after a successful email OTP (suspicious login).
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ requiresMfa: true, tempToken });
+    }
+
+    // Login OTP creates a SHORT-TERM session (3 days) — expires after logout or 3 days
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, clientIp, undefined, true);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    clearRateLimitHits(clientIp);
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_otp_success', details: { reason: 'suspicious_login_otp' } }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with email code',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'otp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    const { recordLoginHistory } = await import('@/features/security/security');
+    recordLoginHistory({ request, userId: user.id, email: user.email, success: true, method: 'otp' }).catch(() => {});
+    return res;
+  } catch (err) {
+    console.error('[LOGIN OTP VERIFY]', err);
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+export async function logoutHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (session && session.sessionId !== 'cli') {
+      await revokeSession(session.sessionId);
+    }
+    const res = NextResponse.json({ ok: true }, { status: 200 });
+    // Pass `request` so cookies are cleared for the SAME domain they were set
+    // on (prod: .tirbeo.app). Without it the clear-cookie is host-only and the
+    // session cookie survives on other subdomains → half-logged-out state.
+    clearSessionCookie(res, request);
+    return res;
+  } catch {
+    const res = NextResponse.json({ error: 'Logout failed' }, { status: 400 });
+    clearSessionCookie(res, request);
+    return res;
+  }
+}
+
+/**
+ * GET /api/auth/token — exchange the httpOnly session cookie for a fresh
+ * short-lived access token. Used by every frontend app (dashboard/forms/admin/
+ * cdn) on boot and whenever a tab regains focus, so the WebSocket/realtime
+ * bearer token ALWAYS belongs to the user who owns the current cookie session
+ * (never a stale token from a previously logged-in account).
+ */
+export async function tokenHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const { issueAccessAndRefreshTokens } = await import('@/features/auth/session');
+    const issued = session.sessionId !== 'cli' ? await issueAccessAndRefreshTokens(session.sessionId) : null;
+    const token = issued?.token;
+    if (!token) return NextResponse.json({ error: 'Failed to issue token' }, { status: 500 });
+    return NextResponse.json({ token, userId: session.userId, sessionId: session.sessionId });
+  } catch (err: any) {
+    console.error('[AUTH/TOKEN]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to issue token' }, { status: 500 });
+  }
+}
+
+export async function sessionRevokeByTokenHandler(request: NextRequest) {
+  try {
+    const { token } = (await request.json()) as any;
+    if (!token || typeof token !== 'string') return NextResponse.json({ error: 'Token required' }, { status: 400 });
+    const sessionId = await verifySessionRevokeToken(token);
+    if (!sessionId) return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
+    await revokeSession(sessionId);
+    return NextResponse.json({ error: 'Session revoked' }, { status: 200 });
+  } catch {
+    return NextResponse.json({ error: 'Failed to revoke session' }, { status: 400 });
+  }
+}
+
+// Email OTP - request
+export async function requestEmailOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true } });
+    if (!user || !user.email) return NextResponse.json({ error: 'User email missing' }, { status: 400 });
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`global:email:${user.email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, user.email))) {
+      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, user.email))) {
+      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+    }
+    const cooldown = await enforceResendCooldown(`email-otp:${user.id}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'email', code);
+    await sendEmailOtp(user.email, code);
+    return NextResponse.json({ error: 'OTP sent to email' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL OTP REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to send OTP' }, { status: 500 });
+  }
+}
+
+// Email OTP - verify
+export async function verifyEmailOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const { code, email } = (await request.json()) as any;
+    if (typeof code !== 'string') return NextResponse.json({ error: 'Invalid OTP payload' }, { status: 400 });
+    const ok = await verifyOtpCode(session.userId, 'email', code);
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired OTP' }, { status: 400 });
+    if (email && typeof email === 'string') {
+      await prisma.user.update({
+        where: { id: session.userId },
+        data: { secondaryEmail: email },
+      });
+    }
+    return NextResponse.json({ error: 'Email OTP verified' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[EMAIL OTP VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'OTP verification failed' }, { status: 500 });
+  }
+}
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Email change / verification - send code to the target email
+export async function changeEmailRequestHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const body: any = await request.json();
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return NextResponse.json({ error: 'Enter a valid email address' }, { status: 400 });
+    }
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    const isCurrent = user.email?.toLowerCase() === email;
+    if (isCurrent && user.emailVerified) {
+      return NextResponse.json({ error: 'Your email is already verified' }, { status: 400 });
+    }
+    if (!isCurrent) {
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing) return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
+    }
+
+    const clientIp2 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp2, email))) {
+      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+    }
+    const cooldown = await enforceResendCooldown(`change-email:${user.id}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+    const code = generateOtpCode();
+    await storeOtp(user.id, 'email_verify', code);
+    await sendEmailOtp(email, code);
+    return NextResponse.json({ error: 'Verification code sent' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[CHANGE EMAIL REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to send verification code' }, { status: 500 });
+  }
+}
+
+// Email change / verification - verify code and update the primary email
+export async function changeEmailVerifyHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const body: any = await request.json();
+    const code = typeof body?.code === 'string' ? body.code.trim() : '';
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
+    if (!code) return NextResponse.json({ error: 'Enter the verification code' }, { status: 400 });
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return NextResponse.json({ error: 'Enter a valid email address' }, { status: 400 });
+    }
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, email: true, emailVerified: true } });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+    const ok = await verifyOtpCode(user.id, 'email_verify', code);
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+
+    const currentEmail = user.email?.toLowerCase();
+    if (currentEmail !== email) {
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing && existing.id !== user.id) {
+        return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
+      }
+      await prisma.user.update({ where: { id: user.id }, data: { email, emailVerified: true } });
+    } else if (!user.emailVerified) {
+      await prisma.user.update({ where: { id: user.id }, data: { emailVerified: true } });
+    }
+
+    createNotification({
+      userId: user.id,
+      type: 'security',
+      title: 'Email updated',
+      body: currentEmail === email
+        ? `Your email (${email}) was verified.`
+        : `Your email was changed to ${email}. If this wasn't you, contact support immediately.`,
+      link: '/account/profile',
+    }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
+
+    return NextResponse.json({ error: 'Email verified' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[CHANGE EMAIL VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+// Signup email verification (no session required)
+export async function verifySignupEmailHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+    if (code && typeof code !== 'string') {
+      return NextResponse.json({ error: 'Invalid verification code' }, { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 400 });
+
+    // Resend request — generate a new OTP and email it again
+    if (!code) {
+      const clientIp3 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+      if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp3, email))) {
+        return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      }
+      const cooldown = await enforceResendCooldown(`verify-email:${email.toLowerCase()}`);
+      if (!cooldown.allowed) {
+        return NextResponse.json(
+          { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+          { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+        );
+      }
+      const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
+      const otpHash = hashOtpCode(otpCode);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await prisma.otp.create({
+        data: { userId: user.id, type: 'email', otpHash, expiresAt },
+      });
+      sendTemplateEmail(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] }, {
+        fromEmail: 'noreply@send.tirbeo.app',
+        fromName: 'Tirbeo',
+      }).catch(err => console.error('[SIGNUP] Resend verification email failed:', err?.message));
+      return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
+    }
+
+    const ok = await verifyOtpCode(user.id, 'email', code);
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { emailVerified: true },
+    });
+
+    return NextResponse.json({ error: 'Email verified successfully' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[SIGNUP EMAIL VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+// Phone OTP - request
+export async function requestPhoneOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true, phoneNumber: true } });
+    if (!user || !user.phoneNumber) return NextResponse.json({ error: 'User phone missing' }, { status: 400 });
+    const code = generateOtpCode();
+    await storeOtp(session.userId, 'phone', code);
+    await sendPhoneOtp(user.phoneNumber, code);
+    return NextResponse.json({ error: 'OTP sent to phone' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[PHONE OTP REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to send OTP' }, { status: 500 });
+  }
+}
+
+// Phone OTP - verify
+export async function verifyPhoneOtpHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    const { code } = (await request.json()) as any;
+    if (typeof code !== 'string') return NextResponse.json({ error: 'Invalid OTP payload' }, { status: 400 });
+    const ok = await verifyOtpCode(session.userId, 'phone', code);
+    if (!ok) return NextResponse.json({ error: 'Invalid or expired OTP' }, { status: 400 });
+    return NextResponse.json({ error: 'Phone OTP verified' }, { status: 200 });
+  } catch (err: any) {
+    console.error('[PHONE OTP VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'OTP verification failed' }, { status: 500 });
+  }
+}
+
+// Google OAuth - start flow
+export async function googleAuthRedirectHandler(request: NextRequest) {
+  try {
+    const cfg = await getOauthProviderConfig('google');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
+    console.info(`[OAUTH:google] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GOOGLE_REDIRECT_URI ? 'env' : 'derived from request'}]`);
+    if (!cfg.enabled || !clientId || !redirectUri) {
+      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
+    }
+    const sp = request.nextUrl.searchParams;
+    const redirectTo = sp.get('redirect_to') || sp.get('redirect');
+    const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
+    const nonce = crypto.randomUUID();
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'openid email profile',
+      // No prompt=consent / access_type=offline: we don't need Google refresh
+      // tokens and forcing re-approval every sign-in slows returning users to
+      // a crawl. Returning users now sail through with one click.
+      state: stateToken,
+    });
+    const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+    const res = NextResponse.redirect(googleAuthUrl);
+    setOauthStateCookie(res, nonce, request);
+    return res;
+  } catch (err: any) {
+    console.error('[GOOGLE AUTH]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to initiate Google auth' }, { status: 500 });
+  }
+}
+
+// Google OAuth callback handler
+export async function googleAuthCallbackHandler(request: NextRequest) {
+  try {
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+    const cfg = await getOauthProviderConfig('google');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
+      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
+    }
+    const code = request.nextUrl.searchParams.get('code');
+    const stateParam = request.nextUrl.searchParams.get('state');
+    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    }
+    if (!code) {
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }).toString(),
+    });
+    if (!tokenRes.ok) {
+      const errBody = await tokenRes.text();
+      console.error('[GOOGLE TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri, 'client_id:', clientId?.slice(0, 20));
+      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+    }
+    const tokenData: any = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+
+    const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!userInfoRes.ok) {
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+    }
+    const profile: any = await userInfoRes.json();
+
+    return finishProviderSignIn(request, 'google', {
+      providerId: profile.id as string,
+      email: profile.email as string,
+      name: profile.name as string,
+      photoUrl: profile.picture as string | undefined,
+    }, state);
+  } catch (err: any) {
+    console.error('[GOOGLE CALLBACK]', err?.message || err);
+    return NextResponse.json({ error: 'Google OAuth callback failed' }, { status: 500 });
+  }
+}
+
+// GitHub OAuth - start flow
+export async function githubAuthRedirectHandler(request: NextRequest) {
+  try {
+    const cfg = await getOauthProviderConfig('github');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
+    console.info(`[OAUTH:github] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GITHUB_REDIRECT_URI ? 'env' : 'derived from request'}]`);
+    if (!cfg.enabled || !clientId || !redirectUri) {
+      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
+    }
+    const sp = request.nextUrl.searchParams;
+    const redirectTo = sp.get('redirect_to') || sp.get('redirect');
+    const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
+    const nonce = crypto.randomUUID();
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      scope: 'read:user user:email',
+      state: stateToken,
+    });
+    const githubAuthUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
+    const res = NextResponse.redirect(githubAuthUrl);
+    setOauthStateCookie(res, nonce, request);
+    return res;
+  } catch (err: any) {
+    console.error('[GITHUB AUTH]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to initiate GitHub auth' }, { status: 500 });
+  }
+}
+
+// GitHub OAuth callback handler
+export async function githubAuthCallbackHandler(request: NextRequest) {
+  try {
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+    const cfg = await getOauthProviderConfig('github');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
+      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
+    }
+    const code = request.nextUrl.searchParams.get('code');
+    const stateParam = request.nextUrl.searchParams.get('state');
+    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      console.warn('[OAUTH:github] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce });
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    }
+    if (!code) {
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+    }
+
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
+    });
+    if (!tokenRes.ok) {
+      const errBody = await tokenRes.text();
+      console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
+      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+    }
+    const tokenData: any = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+
+    const GITHUB_HEADERS = { Authorization: `Bearer ${accessToken}`, 'User-Agent': 'Tirbeo-App', Accept: 'application/vnd.github+json' };
+
+    const userInfoRes = await fetch('https://api.github.com/user', {
+      headers: GITHUB_HEADERS,
+    });
+    if (!userInfoRes.ok) {
+      console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+    }
+    const profile: any = await userInfoRes.json();
+    let email = profile.email as string | undefined;
+
+    // GitHub keeps the account email private by default — fetch it explicitly.
+    if (!email) {
+      let emailsRes = await fetch('https://api.github.com/user/emails', {
+        headers: GITHUB_HEADERS,
+      });
+      if (!emailsRes.ok) {
+        await new Promise((r) => setTimeout(r, 400));
+        emailsRes = await fetch('https://api.github.com/user/emails', {
+          headers: GITHUB_HEADERS,
+        });
+      }
+      if (emailsRes.ok) {
+        const emails: any[] = await emailsRes.json();
+        const primary = emails.find((e: any) => e.primary && e.verified);
+        if (primary) {
+          email = primary.email;
+        } else {
+          const verified = emails.find((e: any) => e.verified);
+          if (verified) {
+            email = verified.email;
+          } else {
+            const noreply = emails.find((e: any) => e.email && e.email.includes('noreply'));
+            if (noreply) email = noreply.email;
+          }
+        }
+      } else {
+        console.error('[GITHUB EMAILS] Fetch failed after retry:', emailsRes.status);
+      }
+    }
+    // Last resort: construct GitHub's noreply address from the username
+    if (!email && profile.login) {
+      email = `${profile.login}@users.noreply.github.com`;
+      console.info(`[OAUTH:github] Using noreply fallback: ${email}`);
+    }
+
+    return finishProviderSignIn(request, 'github', {
+      providerId: String(profile.id),
+      ...(email ? { email } : {}),
+      name: (profile.name as string) || (profile.login as string),
+      photoUrl: profile.avatar_url as string | undefined,
+    }, state);
+  } catch (err: any) {
+    console.error('[GITHUB CALLBACK]', err?.message || err);
+    return NextResponse.json({ error: 'GitHub OAuth callback failed' }, { status: 500 });
+  }
+}
+
+// Discord OAuth - start flow
+export async function discordAuthRedirectHandler(request: NextRequest) {
+  try {
+    const cfg = await getOauthProviderConfig('discord');
+    const clientId = cfg.clientId;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
+    console.info(`[OAUTH:discord] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.DISCORD_REDIRECT_URI ? 'env' : 'derived from request'}]`);
+    if (!cfg.enabled || !clientId || !redirectUri) {
+      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
+    }
+    const sp = request.nextUrl.searchParams;
+    const redirectTo = sp.get('redirect_to') || sp.get('redirect');
+    const safeRedirect = redirectTo && isAllowedRedirect(redirectTo) ? redirectTo : undefined;
+    const isLink = sp.get('link') === '1';
+    const nonce = crypto.randomUUID();
+    const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'identify email',
+      state: stateToken,
+    });
+    const discordAuthUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
+    const res = NextResponse.redirect(discordAuthUrl);
+    setOauthStateCookie(res, nonce, request);
+    return res;
+  } catch (err: any) {
+    console.error('[DISCORD AUTH]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to initiate Discord auth' }, { status: 500 });
+  }
+}
+
+// Discord OAuth callback handler
+export async function discordAuthCallbackHandler(request: NextRequest) {
+  try {
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+    const cfg = await getOauthProviderConfig('discord');
+    const clientId = cfg.clientId;
+    const clientSecret = cfg.clientSecret;
+    const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
+    if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
+      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
+    }
+    const code = request.nextUrl.searchParams.get('code');
+    const stateParam = request.nextUrl.searchParams.get('state');
+    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    }
+    if (!code) {
+      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+    }
+
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+       }).toString(),
+     });
+     if (!tokenRes.ok) {
+       const errBody = await tokenRes.text();
+       console.error('[DISCORD TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
+       return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+     }
+    const tokenData: any = await tokenRes.json();
+    const accessToken = tokenData.access_token;
+
+    const userInfoRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!userInfoRes.ok) {
+      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+    }
+    const profile: any = await userInfoRes.json();
+    const discordId = profile.id as string;
+    if (!profile.email) {
+      console.warn('[OAUTH:discord] No email on profile — user must have a VERIFIED email on their Discord account');
+    }
+
+    return finishProviderSignIn(request, 'discord', {
+      providerId: discordId,
+      ...(profile.verified && profile.email ? { email: profile.email as string } : {}),
+      name: (profile.global_name as string) || (profile.username as string),
+      photoUrl: profile.avatar
+        ? `https://cdn.discordapp.com/avatars/${discordId}/${profile.avatar}.png`
+        : undefined,
+    }, state);
+  } catch (err: any) {
+    console.error('[DISCORD CALLBACK]', err?.message || err);
+    return NextResponse.json({ error: 'Discord OAuth callback failed' }, { status: 500 });
+  }
+}
+
+// Activity feed
+
+// Workspace list
+
+// Workspace create
+
+export async function profileHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) {
+      return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+    }
+
+    if (request.method === 'GET') {
+      // Update lastActiveAt so user shows as "online" (fire-and-forget)
+      prisma.user.update({ where: { id: session.userId }, data: { lastActiveAt: new Date() } }).catch(() => {});
+
+      // Check in-memory cache first (avoids DB round-trip on dashboard poll)
+      const cached = profileCache.get(session.userId);
+      if (cached) return NextResponse.json(cached);
+
+      const user = await prisma.user.findUnique({
+        where: { id: session.userId },
+        select: {
+          id: true,
+          email: true,
+          username: true,
+          name: true,
+          photoUrl: true,
+          secondaryEmail: true,
+          secondaryEmailVerified: true,
+          phoneNumber: true,
+          occupation: true,
+          gender: true,
+          birthday: true,
+          bio: true,
+          country: true,
+          language: true,
+          timezone: true,
+          website: true,
+          linkedin: true,
+          githubUsername: true,
+          twitter: true,
+          companyName: true,
+          companyRole: true,
+          industry: true,
+          companySize: true,
+          adminRole: true,
+          is2FAEnabled: true,
+
+          lastLoginAt: true,
+          lastLoginIp: true,
+          loginCount: true,
+          createdAt: true,
+          updatedAt: true,
+          lastActiveAt: true,
+          emailVerified: true,
+          phoneVerified: true,
+          consents: true,
+          passwordHash: true,
+          theme: true,
+          dateFormat: true,
+          timeFormat: true,
+          isBanned: true,
+          isSuspended: true,
+          suspendReason: true,
+          suspendedUntil: true,
+          mustChangePassword: true,
+          scheduledDeletionAt: true,
+          deletionReason: true,
+          googleId: true,
+          githubId: true,
+          discordId: true,
+        },
+      });
+      if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+      const { passwordHash, googleId, githubId, discordId, ...safeUser } = user as any;
+
+      const backupUser = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
+      const backupCodes = Array.isArray((backupUser as any)?.backupCodes) ? (backupUser as any).backupCodes : [];
+      const backupCodeCount = backupCodes.length;
+      const result = {
+        ...safeUser,
+        hasPassword: !!passwordHash,
+        hasBackupCodes: backupCodeCount > 0,
+        hasGoogle: !!googleId,
+        hasGithub: !!githubId,
+        hasDiscord: !!discordId,
+      };
+      profileCache.set(session.userId, result);
+      return NextResponse.json(result);
+    }
+
+    if (request.method === 'PATCH' || request.method === 'PUT') {
+      const body: any = await request.json();
+      const schema = z.object({
+        name: z.string().min(1).optional(),
+        username: z.string().min(3).max(30).regex(/^[a-zA-Z0-9_.-]+$/, 'Username may only contain letters, numbers, dots, dashes and underscores.').optional().nullable(),
+        photoUrl: z.string().optional().nullable(),
+        secondaryEmail: z.string().email().optional(),
+        phoneNumber: z.string().optional().nullable(),
+        occupation: z.string().optional().nullable(),
+        gender: z.string().optional().nullable(),
+        birthday: z.string().optional().nullable(),
+        bio: z.string().optional().nullable(),
+        country: z.string().optional().nullable(),
+        language: z.string().optional().nullable(),
+        timezone: z.string().optional().nullable(),
+        theme: z.enum(['light', 'dark', 'system']).optional().nullable(),
+        dateFormat: z.string().optional().nullable(),
+        timeFormat: z.string().optional().nullable(),
+        website: z.string().optional().nullable(),
+        linkedIn: z.string().optional().nullable(),
+        linkedin: z.string().optional().nullable(),
+        github: z.string().optional().nullable(),
+        githubUsername: z.string().optional().nullable(),
+        twitter: z.string().optional().nullable(),
+        companyName: z.string().optional().nullable(),
+        companyRole: z.string().optional().nullable(),
+        industry: z.string().optional().nullable(),
+        companySize: z.string().optional().nullable(),
+      });
+      const parsed = schema.safeParse(body);
+      if (!parsed.success) {
+        const issues = parsed.error.issues;
+        const msg = issues.map((i) => {
+          const field = i.path.join('.') || 'body';
+          if (i.code === 'too_small' && i.minimum === 1) return `${field} is required`;
+          if (i.code === 'invalid_format') return `${field} format is invalid`;
+          return `${field}: ${i.message}`;
+        }).join('; ');
+        return NextResponse.json({ error: msg || 'Invalid profile data' }, { status: 400 });
+      }
+      const data: any = { ...parsed.data };
+      if (data.birthday !== undefined && data.birthday !== null) {
+        if (data.birthday === '') {
+          data.birthday = null;
+        } else if (typeof data.birthday === 'string') {
+          const d = new Date(data.birthday);
+          data.birthday = isNaN(d.getTime()) ? null : d;
+        }
+      }
+      // Map camelCase to Prisma field names
+      if ('linkedIn' in data) { data.linkedin = data.linkedIn; delete data.linkedIn; }
+      if ('linkedin' in data) { data.linkedin = data.linkedin ?? null; }
+      if ('github' in data) { data.githubUsername = data.github; delete data.github; }
+      if (data.githubUsername === undefined) delete data.githubUsername;
+      if (data.githubUsername !== undefined && typeof data.githubUsername === 'string') {
+        const gh = data.githubUsername.trim().replace(/^@/, '').replace(/^https?:\/\/(www\.)?github\.com\//i, '').replace(/\/+$/, '');
+        data.githubUsername = gh || null;
+      }
+      let updated;
+      try {
+        updated = await prisma.user.update({
+          where: { id: session.userId },
+          data,
+          select: {
+            id: true, email: true, username: true, name: true, photoUrl: true,
+            phoneNumber: true, occupation: true, bio: true,
+            website: true, linkedin: true, githubUsername: true, twitter: true,
+            country: true, timezone: true, language: true,
+            theme: true, dateFormat: true, timeFormat: true,
+            companyName: true, companyRole: true, industry: true, companySize: true,
+            gender: true, birthday: true, secondaryEmail: true,
+            emailVerified: true, createdAt: true, updatedAt: true,
+          },
+        });
+      } catch (err: any) {
+        const meta = err?.meta || {};
+        const adapterFields = meta?.driverAdapterError?.cause?.constraint?.fields;
+        const targets: string[] = Array.isArray(meta?.target)
+          ? meta.target
+          : typeof meta?.target === 'string'
+            ? [meta.target]
+            : Array.isArray(adapterFields)
+              ? adapterFields
+              : [];
+        if (err?.code === 'P2002' && targets.includes('username')) {
+          return NextResponse.json({ error: 'That username is already taken. Please choose another one.' }, { status: 409 });
+        }
+        throw err;
+      }
+
+      prisma.auditEvent.create({
+        data: {
+          actorId: session.userId,
+          action: 'profile.updated',
+          targetType: 'user',
+          targetId: session.userId,
+          metadata: { fields: Object.keys(data) } as any,
+          severity: 'info',
+        },
+      }).catch(() => {});
+
+      bustProfileCache(session.userId);
+      return NextResponse.json(updated);
+    }
+
+    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
+  } catch (err: any) {
+    const detail = err?.message || (err?.meta ? JSON.stringify(err.meta) : '') || String(err);
+    console.error('[PROFILE]', detail);
+    return NextResponse.json({ error: 'Failed to fetch or update profile' }, { status: 500 });
+  }
+}
+
+// Password reset — request OTP only
+// Only users with actual admin panel access (adminRole set — the same field the
+// admin proxy /authorize gate checks) may use the admin reset flow. Custom
+// end-user roles do NOT grant admin panel access, so they are rejected here.
+export async function isAdminUser(email: string): Promise<boolean> {
+  const user = await prisma.user.findUnique({
+    where: { email: email.toLowerCase() },
+    select: { adminRole: true },
+  });
+  return !!user && !!user.adminRole;
+}
+
+export async function requestPasswordResetOtpHandler(request: NextRequest) {  try {
+    const { email, adminOnly } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+    if (adminOnly) {
+      const ok = await isAdminUser(email);
+      if (!ok) {
+        return NextResponse.json({ error: 'This email is not registered with admin access. Please reset your password from your account dashboard.' }, { status: 403 });
+      }
+    }
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+    }
+
+    if (!(await checkWindowLimitDB(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+    const result = await requestPasswordResetOtp(email);
+    // Always return success to prevent email enumeration.
+    // If email fails, the code is logged to console as fallback.
+    return NextResponse.json({ message: 'If an account exists, a verification code has been sent.' });
+  } catch (err: any) {
+    console.error('[PASSWORD RESET OTP REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+// Password reset — request magic link only
+export async function requestPasswordResetMagicLinkHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+    }
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+    }
+
+    if (!(await checkWindowLimitDB(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+    const result = await requestPasswordResetMagicLink(email);
+    // Always return success to prevent email enumeration.
+    return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
+  } catch (err: any) {
+    console.error('[PASSWORD RESET MAGIC LINK REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+// Password reset — request (legacy — sends both OTP and link for backward compatibility)
+export async function requestPasswordResetHandler(request: NextRequest) {
+  try {
+    const { email, method, adminOnly } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+    if (adminOnly) {
+      const ok = await isAdminUser(email);
+      if (!ok) {
+        return NextResponse.json({ error: 'This email is not registered with admin access. Please reset your password from your account dashboard.' }, { status: 403 });
+      }
+    }
+    const resetMethod: 'otp' | 'magic_link' | 'recovery' = method === 'magic_link' ? 'magic_link' : method === 'recovery' ? 'recovery' : 'otp';
+    const result =
+      resetMethod === 'recovery'
+        ? await requestPasswordResetRecovery(email)
+        : await requestPasswordReset(email, resetMethod);
+    if (!result.success && result.retryAfterMs) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(result.retryAfterMs / 1000)) } },
+      );
+    }
+    // Always return success to prevent email enumeration.
+    // If email fails, the resetUrl + code are logged to console as fallback.
+    return NextResponse.json({ message: 'If an account exists, a reset link has been sent.' });
+  } catch (err: any) {
+    console.error('[PASSWORD RESET REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+// Password reset — verify (code or token)
+export async function verifyPasswordResetHandler(request: NextRequest) {
+  try {
+    const { email, code, token } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+    if (!code && !token) {
+      return NextResponse.json({ error: 'Code or token required' }, { status: 400 });
+    }
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    if (!checkWindowLimit(`pw-reset-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+    const result = await verifyPasswordReset(email, { code, token });
+    if (!result.success) {
+      return NextResponse.json({ error: result.error || 'Verification failed' }, { status: 400 });
+    }
+    return NextResponse.json({ resetToken: result.resetToken });
+  } catch (err: any) {
+    console.error('[PASSWORD RESET VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to verify' }, { status: 500 });
+  }
+}
+
+// Password reset — confirm (set new password)
+export async function confirmPasswordResetHandler(request: NextRequest) {
+  try {
+    const body: any = await request.json();
+    const resetToken = body.resetToken || body.token;
+    const newPassword = body.newPassword || body.password;
+    if (!resetToken || !newPassword) {
+      return NextResponse.json({ error: 'Reset token and new password required' }, { status: 400 });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
+      return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
+    }
+    // Password strength check
+    if (!/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+      return NextResponse.json({ error: 'Password must include uppercase, lowercase, and a number.' }, { status: 400 });
+    }
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+    const result = await confirmPasswordReset(resetToken, newPassword);
+    if (!result.success) {
+      return NextResponse.json({ error: result.error || 'Failed to reset password' }, { status: 400 });
+    }
+    return NextResponse.json({ message: 'Password updated successfully' });
+  } catch (err: any) {
+    console.error('[PASSWORD RESET CONFIRM]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to reset password' }, { status: 500 });
+  }
+}
+
+// ─── Quick Login via OTP (no password change) ───
+export async function quickLoginWithOtpHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || !code) {
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
+    }
+    if (typeof code !== 'string' || code.length !== 6 || !/^\d{6}$/.test(code)) {
+      return NextResponse.json({ error: 'Invalid code format' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!checkWindowLimit(`quick-login:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const { quickLoginWithOtp } = await import('@/features/auth/password-reset');
+    const result = await quickLoginWithOtp(email, code);
+    if (!result.success) {
+      // Blocked accounts (banned/suspended) return 403 with the structured
+      // block payload so the accounts app can redirect to the blocked screen.
+      const anyResult = result as any;
+      if (anyResult.block) {
+        return NextResponse.json(
+          { error: anyResult.error, [anyResult.block.kind === 'banned' ? 'banned' : 'suspended']: true, ...anyResult.block },
+          { status: 403 },
+        );
+      }
+      return NextResponse.json({ error: result.error || 'Invalid or expired code' }, { status: 400 });
+    }
+
+    // Set session + refresh cookies (same pattern as login)
+    const resp = NextResponse.json({ message: 'Logged in successfully', userId: result.userId });
+    setSessionCookie(resp, result.sessionToken!, result.refreshToken, request);
+    return resp;
+  } catch (err: any) {
+    console.error('[QUICK LOGIN OTP]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to login' }, { status: 500 });
+  }
+}
+
+// ─── Magic Link (one-time login link via email) ───
+
+export async function requestMagicLinkHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    // ── Fast limits (Redis + in-memory mirror; DB-configured maxes) ──
+    // Per-email method counter + global-email counter are consumed atomically.
+    // The IP-scoped counter and the blocklist check run alongside (Redis
+    // counter, 15s-cached blocklist) — no awaited DB round-trips left here.
+    const [ml, globalEmail, ipWin, ipBlocked] = await Promise.all([
+      consumeVerifyAttempt('magic-link', email.toLowerCase(), clientIp),
+      getVerifyStatus('global-email', email.toLowerCase()),
+      checkWindowLimitDB(`magic-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email),
+      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email),
+    ]);
+
+    const remainingInfo = {
+      'magic-link': { used: ml.used, remaining: ml.remaining, max: ml.max, resetAt: ml.resetAt },
+      'global-email': { used: globalEmail.used, remaining: globalEmail.remaining, max: globalEmail.max, resetAt: globalEmail.resetAt },
+    };
+
+    if (!ml.ok || !globalEmail.ok) {
+      const exceeded = !ml.ok ? ml : globalEmail;
+      return NextResponse.json(
+        {
+          error: `Limit reached for magic link sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+          message: `Limit reached — try again after ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+          retryAfterMs: Math.max(0, exceeded.resetAt - Date.now()),
+          exceeded: !ml.ok ? 'magic-link' : 'global-email',
+          remaining: remainingInfo,
+        },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, exceeded.resetAt - Date.now()) / 1000)) } },
+      );
+    }
+    if (!ipBlocked || !ipWin) {
+      const resetAt = windowResetAt(15 * 60 * 1000);
+      return NextResponse.json(
+        {
+          error: 'Too many requests from this device. Please try again later.',
+          retryAfterMs: Math.max(0, resetAt - Date.now()),
+          exceeded: 'global-ip',
+          remaining: remainingInfo,
+        },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, resetAt - Date.now()) / 1000)) } },
+      );
+    }
+
+    const mlCooldown = await enforceResendCooldown(`magic-link:${email.toLowerCase()}`);
+    if (!mlCooldown.allowed) {
+      return NextResponse.json(
+        { message: `Please wait ${Math.ceil(mlCooldown.remainingMs / 1000)}s before requesting again.`, retryAfterMs: mlCooldown.remainingMs, remaining: remainingInfo },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(mlCooldown.remainingMs / 1000)) } }
+      );
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() }, select: { id: true, name: true } });
+    // Always return success to prevent email enumeration
+    if (!user) {
+      return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
+    }
+
+    // Invalidate all previous active magic links for this user
+    await prisma.magicLink.deleteMany({
+      where: { userId: user.id, expiresAt: { gt: new Date() } },
+    }).catch(() => {});
+
+    const token = await signMagicLinkToken(user.id);
+    let tokenJti = '';
+    try {
+      const decoded = await verifyMagicLinkToken(token);
+      tokenJti = decoded?.jti || '';
+    } catch {}
+
+    if (tokenJti) {
+      await prisma.magicLink.create({
+        data: { jti: tokenJti, userId: user.id, expiresAt: new Date(Date.now() + 15 * 60 * 1000) },
+      }).catch(() => {});
+    }
+
+    logAuthJson('magic_link', { email: email.toLowerCase(), ip: clientIp, jti: tokenJti?.slice?.(0,8) || '?', method: 'magic-link' }).catch(() => {});
+    // Point to the accounts app callback, which verifies the token via POST
+    // and redirects to the dashboard. This avoids the catch-all route matching
+    // issues that occur when hitting the API GET endpoint directly.
+    const accountsBase = getAccountsBaseUrl();
+    const callbackUrl = `${accountsBase}/callback?magic_token=${token}`;
+
+    // fire-and-forget: 7s provider should not block response
+    sendTemplateEmail(email, 'magic_link', {
+      magicLink: callbackUrl,
+      name: user.name || 'there',
+    }).catch((e) => console.error('[MAGIC LINK] async send error:', e?.message));
+
+    const resp: any = { message: 'If an account exists, a magic link has been sent.', remaining: remainingInfo };
+    return NextResponse.json(resp, { status: 200 });
+  } catch (err: any) {
+    console.error('[MAGIC LINK REQUEST]', err?.message || err, err?.stack);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+export async function verifyMagicLinkHandler(request: NextRequest) {
+  try {
+    // Support both GET (from email link) and POST (from accounts app)
+    let token = '';
+    if (request.method === 'GET') {
+      token = request.nextUrl.searchParams.get('token') || '';
+    } else {
+      const body = (await request.json()) as any;
+      token = body?.token || '';
+    }
+    if (!token || typeof token !== 'string') {
+      if (request.method === 'GET') {
+        // GET with no token — redirect to accounts login
+        const accountsUrl = getAccountsBaseUrl();
+        return NextResponse.redirect(`${accountsUrl}/login?error=magic_link_invalid`);
+      }
+      return NextResponse.json({ error: 'Token required' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    if (!(await checkWindowLimitDB(`magic-link-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
+      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+    }
+
+    const decoded = await verifyMagicLinkToken(token);
+    if (!decoded) {
+      return NextResponse.json({ error: 'Invalid or expired magic link' }, { status: 401 });
+    }
+
+    // If user is already logged in, prompt to logout first so they can
+    // switch to the magic-link account instead of silently overwriting.
+    const existingSession = await getSession(request);
+    if (existingSession) {
+      const currentUser = await prisma.user.findUnique({ where: { id: existingSession.userId }, select: { id: true, email: true } });
+      const magicUser = await prisma.user.findUnique({ where: { id: decoded.userId }, select: { id: true, email: true } });
+      if (currentUser && magicUser && currentUser.id !== magicUser.id) {
+        return NextResponse.json({ requiresLogout: true, currentEmail: currentUser.email, magicEmail: magicUser.email, magicUserId: decoded.userId }, { status: 200 });
+      }
+    }
+
+// If user is already logged in, prompt to logout first so they can
+    // switch to the magic-link account instead of silently overwriting.
+
+    const userId = decoded.userId;
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true } });
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+    if (user.isBanned || user.isSuspended) {
+      return blockedAccountResponse(user);
+    }
+    if (!user.emailVerified) {
+      return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
+    }
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    // Magic link creates a SHORT-TERM session (3 days) — expires after logout or 3 days
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, undefined, true);
+
+    // GET request (from email link): create session + redirect to dashboard
+    if (request.method === 'GET') {
+      const dashboardBase = getDashboardBase();
+      const res = NextResponse.redirect(dashboardBase);
+      setSessionCookie(res, sessionToken, refreshToken, request);
+
+      await createAuditEvent({
+        actorId: user.id,
+        action: 'user.login',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: { method: 'magic_link', ip },
+      });
+      createNotification({
+        userId: user.id,
+        type: 'login',
+        title: 'Signed in with magic link',
+body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
+        link: '/account/security',
+        metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) },
+      }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+      const { recordLoginHistory: rlh3 } = await import('@/features/security/security');
+      rlh3({ request, userId: user.id, email: user.email, success: true, method: 'magic_link' }).catch(() => {});
+      return res;
+    }
+
+    // POST request (from accounts app): return JSON
+    const res = NextResponse.json({ email: user.email, token: sessionToken });
+    setSessionCookie(res, sessionToken, refreshToken, request);
+
+    await createAuditEvent({
+      actorId: user.id,
+      action: 'user.login',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: { method: 'magic_link', ip },
+    });
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with magic link',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    const { recordLoginHistory: rlh3 } = await import('@/features/security/security');
+    rlh3({ request, userId: user.id, email: user.email, success: true, method: 'magic_link' }).catch(() => {});
+
+    return res;
+  } catch (err: any) {
+    console.error('[MAGIC LINK VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Magic link verification failed' }, { status: 500 });
+  }
+}
+
+// ─── Workspace Delete (user-facing) ───
+
+
+
+// ─── Account Recovery ───────────────────────────────────────
+
+export async function accountRecoveryHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+    // Always return success to prevent email enumeration
+    if (!user) {
+      return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
+    }
+
+    const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+    // The standalone /recovery page was removed (accounts app is auth-only now);
+    // point users at /forgot-password which has the full OTP/magic-link reset flow.
+    const recoveryUrl = `https://accounts.${appDomain}/forgot-password`;
+
+    await sendTemplateEmail(email, 'account_recovery', {
+      recoveryUrl,
+      name: user.name || 'there',
+    }).catch(err => console.error('[ACCOUNT RECOVERY] Email send error:', err));
+
+    return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
+  } catch (err: any) {
+    console.error('[ACCOUNT RECOVERY]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+  }
+}
+
+// ─── Recovery Email Login ───────────────────────────────────
+// Sign in using a verified recovery (secondary) email. A code is sent to the
+// recovery email and, once verified, the user is logged into their primary
+// account (chained through 2FA when enabled).
+
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!domain) return email;
+  const keep = Math.min(local.length, 2);
+  return `${local.slice(0, keep)}${'*'.repeat(Math.max(local.length - keep, 1))}@${domain}`;
+}
+
+export async function recoveryLoginRequestHandler(request: NextRequest) {
+  try {
+    const { email } = (await request.json()) as any;
+    if (!email || typeof email !== 'string') {
+      return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+    }
+
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    if (!checkWindowLimit(`recovery-login:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+    if (!checkWindowLimit(`recovery-login:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
+
+    const cooldown = await enforceResendCooldown(`recovery-login:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return NextResponse.json(
+        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
+      );
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      select: { id: true, email: true, secondaryEmail: true, isBanned: true, isSuspended: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true },
+    });
+    if (!user || !user.secondaryEmail) {
+      return NextResponse.json({ error: 'No verified recovery email is set for this account' }, { status: 400 });
+    }
+    if (user.isBanned || user.isSuspended) {
+      return blockedAccountResponse(user);
+    }
+
+    const code = generateOtpCode();
+    await storeOtp(user.id, 'email', code);
+    try {
+      const result = await sendSignupOtpEmail(user.secondaryEmail, code, 'login_otp');
+      if (!result.success) {
+        console.error('[RECOVERY LOGIN] Email send returned failure');
+        return NextResponse.json({ error: 'Could not send a code to your recovery email. Try again later.' }, { status: 502 });
+      }
+    } catch (err: any) {
+      console.error('[RECOVERY LOGIN] Email send error:', err?.message || err);
+      return NextResponse.json({ error: 'Could not send a code to your recovery email. Try again later.' }, { status: 502 });
+    }
+
+    return NextResponse.json({ ok: true, masked: maskEmail(user.secondaryEmail) });
+  } catch (err: any) {
+    console.error('[RECOVERY LOGIN REQUEST]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to send recovery code' }, { status: 500 });
+  }
+}
+
+export async function recoveryLoginVerifyHandler(request: NextRequest) {
+  try {
+    const { email, code } = (await request.json()) as any;
+    if (!email || typeof email !== 'string' || !code || typeof code !== 'string') {
+      return NextResponse.json({ error: 'Email and code are required' }, { status: 400 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      select: { id: true, email: true, isBanned: true, isSuspended: true, emailVerified: true, is2FAEnabled: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true },
+    });
+    if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
+    if (user.isBanned || user.isSuspended) return blockedAccountResponse(user);
+    if (!user.emailVerified) return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
+
+    const ok = await verifyOtpCode(user.id, 'email', code);
+    if (!ok) {
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    }
+
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ requiresMfa: true, tempToken });
+    }
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    // Recovery-email code login = SHORT-TERM session (3 days), same as login OTP / magic link.
+    const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, undefined, true);
+    const res = NextResponse.json({ id: user.id, email: user.email, token });
+    setSessionCookie(res, token, refreshToken, request);
+
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_email_success' }).catch(() => {});
+    const { recordLoginHistory: rlh6 } = await import('@/features/security/security');
+    rlh6({ request, userId: user.id, email: user.email, success: true, method: 'recovery_email' }).catch(() => {});
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in with recovery email',
+      body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
+      link: '/account/security',
+      metadata: { method: 'recovery_email', ip, device: describeDevice(request.headers.get('user-agent')) },
+    }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+    return res;
+  } catch (err: any) {
+    console.error('[RECOVERY LOGIN VERIFY]', err?.message || err);
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+// ─── Suspicious Login ───────────────────────────────────────
+
+export async function suspiciousLoginConfirmHandler(request: NextRequest) {
+  try {
+    const { token } = (await request.json()) as any;
+    if (!token || typeof token !== 'string') {
+      return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+    }
+
+    const userId = await verifySuspiciousLoginToken(token);
+    if (!userId) {
+      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, isBanned: true, isSuspended: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true },
+    });
+    if (!user) {
+      return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    }
+    if (user.isBanned || user.isSuspended) {
+      return blockedAccountResponse(user);
+    }
+
+    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    const res = NextResponse.json({ id: user.id, email: user.email, token: sessionToken });
+    setSessionCookie(res, sessionToken, refreshToken, request);
+    return res;
+  } catch {
+    return NextResponse.json({ error: 'Failed to confirm suspicious login' }, { status: 400 });
+  }
+}
+
+export async function suspiciousLoginDenyHandler(request: NextRequest) {
+  try {
+    const { token } = (await request.json()) as any;
+    if (!token || typeof token !== 'string') {
+      return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
+    }
+
+    // Log the denied attempt
+    const userId = await verifySuspiciousLoginToken(token);
+    if (userId) {
+      await createAuditEvent({
+        actorId: userId,
+        action: 'suspicious_login.denied',
+        targetType: 'user',
+        targetId: userId,
+        severity: 'warning',
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch {
+    return NextResponse.json({ error: 'Failed to deny suspicious login' }, { status: 400 });
+  }
+}
+
+// ─── Verify (legacy email OTP verification) ──────────────────
+
+export async function verifyHandler(request: NextRequest) {
+  // Lightweight token verification used by the Cloudflare WebSocket Worker.
+  // Returns { userId, email, adminRole } on success.
+  try {
+    const { getSessionFromToken } = await import('@/features/auth/session');
+    const authHeader = request.headers.get('authorization') || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) return NextResponse.json({ error: 'Missing token' }, { status: 401 });
+    const session = await getSessionFromToken(token);
+    if (!session) return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
+    return NextResponse.json({ userId: session.userId, email: session.email, adminRole: (session as any).adminRole || null });
+  } catch {
+    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+  }
+}
+
+// ─── Public Help Config ───
+
+const DEFAULT_HELP_ARTICLES = [
+  { id: "1", title: "Getting Started with Tirbeo", content: "Welcome to Tirbeo! This guide will help you set up your account, configure your profile, and explore the platform.", category: "Getting Started", icon: "zap" },
+  { id: "2", title: "How to Change Your Password", content: "Go to Security → Change Password. Enter your current password, then your new password (minimum 8 characters).", category: "Security", icon: "shield" },
+  { id: "3", title: "Setting Up Two-Factor Authentication", content: "Navigate to Security → Two-Factor Authentication. You can use an authenticator app or SMS verification.", category: "Security", icon: "shield" },
+  { id: "4", title: "Managing Your Notifications", content: "Go to Preferences → Notifications to configure what alerts you receive.", category: "Account", icon: "bell" },
+  { id: "5", title: "Customizing Your Dashboard", content: "Open Preferences to personalize your experience. Change themes, adjust fonts, modify colors.", category: "Account", icon: "settings" },
+  { id: "6", title: "Connecting Third-Party Accounts", content: "Visit Integrations to connect Google, GitHub, and other services.", category: "Account", icon: "link" },
+  { id: "7", title: "Understanding Your Activity Log", content: "The Activity page shows a complete history of everything that happened on your account.", category: "Account", icon: "activity" },
+  { id: "8", title: "Managing Active Sessions", content: "In Security → Active Sessions, you can see all devices currently signed into your account.", category: "Security", icon: "shield" },
+  { id: "9", title: "Recovery Options", content: "Set up recovery email and phone in Security → Recovery Options.", category: "Security", icon: "shield" },
+  { id: "10", title: "Backup Codes", content: "In Security → Backup Codes, you can generate one-time codes for emergency access.", category: "Security", icon: "shield" },
+  { id: "11", title: "Reporting a Bug", content: "Found a bug? Report it through our GitHub issues page or contact support directly.", category: "Support", icon: "bug" },
+  { id: "12", title: "Privacy & Data", content: "Your privacy matters. You can export all your data from Preferences → Data & Privacy.", category: "Account", icon: "globe" },
+  { id: "13", title: "How to Create a Form", content: "Navigate to Forms → Create Form. Choose a template or start from scratch, add fields, and publish.", category: "Forms", icon: "book" },
+  { id: "14", title: "Form Field Types", content: "Tirbeo supports text, email, number, dropdown, radio, checkbox, file upload, rating, and more.", category: "Forms", icon: "book" },
+  { id: "15", title: "Sharing Your Form", content: "Use the Share button to get a link, embed code, or QR code. You can also set visibility to public or private.", category: "Forms", icon: "link" },
+  { id: "16", title: "Viewing Form Responses", content: "Go to Forms → Responses to see all submissions. You can filter by date, export to CSV, or view individual responses.", category: "Forms", icon: "activity" },
+  { id: "17", title: "Form Analytics", content: "The Analytics tab shows completion rates, drop-off points, device breakdown, and geographic data.", category: "Forms", icon: "activity" },
+  { id: "18", title: "Form Security Settings", content: "Enable CAPTCHA, set response limits, require login, or add expiration dates in Form Settings → Security.", category: "Forms", icon: "shield" },
+  { id: "19", title: "Collaborating on Forms", content: "Invite team members via Settings → Collaborators. They can edit or view based on permissions.", category: "Forms", icon: "link" },
+  { id: "20", title: "Form Templates", content: "Browse pre-built templates in the Templates gallery. Customize any template to match your brand.", category: "Forms", icon: "book" },
+  { id: "21", title: "Managing Your Subscription", content: "View your plan, usage, and billing history in Settings → Billing. Upgrade or downgrade anytime.", category: "Billing", icon: "settings" },
+  { id: "22", title: "Payment Methods", content: "Add or update payment cards in Settings → Billing → Payment Methods. We accept Visa, Mastercard, and Amex.", category: "Billing", icon: "globe" },
+  { id: "23", title: "Invoice & Receipts", content: "Download invoices from Settings → Billing → Invoices. They are also emailed after each payment.", category: "Billing", icon: "book" },
+  { id: "24", title: "Cancel Subscription", content: "Go to Settings → Billing → Cancel Plan. Your access continues until the end of the billing period.", category: "Billing", icon: "settings" },
+  { id: "25", title: "API Keys", content: "Generate API keys in Settings → API. Keys are shown once; store them securely. Rotate keys regularly.", category: "Integrations", icon: "link" },
+  { id: "26", title: "Webhooks", content: "Configure webhooks in Settings → Integrations to receive real-time events for forms, tickets, and users.", category: "Integrations", icon: "link" },
+  { id: "27", title: "SSO & SAML", content: "Enterprise plans support SAML 2.0 SSO. Configure in Settings → Security → Single Sign-On.", category: "Integrations", icon: "shield" },
+  { id: "28", title: "Zapier Integration", content: "Connect Tirbeo to 5,000+ apps via Zapier. Find Tirbeo in the Zapier app directory.", category: "Integrations", icon: "link" },
+  { id: "29", title: "Custom Domains", content: "Add a custom domain in Settings → Domains. Update your DNS CNAME to point to Tirbeo.", category: "Account", icon: "globe" },
+  { id: "30", title: "Team Roles & Permissions", content: "Manage roles in Settings → Roles. Assign admin, editor, or viewer access to team members.", category: "Account", icon: "shield" },
+  { id: "31", title: "Organization Settings", content: "Configure workspace name, logo, and default settings in Settings → Organization.", category: "Account", icon: "settings" },
+  { id: "32", title: "Data Export", content: "Export all your data as JSON or CSV from Settings → Data & Privacy → Export.", category: "Account", icon: "activity" },
+  { id: "33", title: "Account Deletion", content: "Permanently delete your account in Settings → Account → Delete Account. This action cannot be undone.", category: "Account", icon: "shield" },
+  { id: "34", title: "Email Configuration", content: "Set up custom email providers, DKIM, and sending domains in Settings → Email.", category: "Account", icon: "bell" },
+  { id: "35", title: "Rate Limits", content: "Free plans have API rate limits. View current usage in Settings → API → Rate Limits.", category: "Account", icon: "activity" },
+  { id: "36", title: "Troubleshooting Login Issues", content: "Clear cookies, disable VPN, or use incognito mode. If issues persist, contact support.", category: "Troubleshooting", icon: "bug" },
+  { id: "37", title: "Form Not Publishing", content: "Check that all required fields are filled and your plan allows form publishing.", category: "Troubleshooting", icon: "bug" },
+  { id: "38", title: "Emails Not Sending", content: "Verify your email configuration in Settings → Email. Check spam folders and sender reputation.", category: "Troubleshooting", icon: "bug" },
+  { id: "39", title: "Slow Dashboard Performance", content: "Try disabling browser extensions, clearing cache, or switching to a supported browser.", category: "Troubleshooting", icon: "bug" },
+  { id: "40", title: "Mobile App Support", content: "Tirbeo is fully responsive on mobile browsers, so you can create forms and review responses on any device.", category: "Troubleshooting", icon: "bug" },
+  { id: "41", title: "Browser Compatibility", content: "We support Chrome, Firefox, Safari, and Edge (latest 2 versions). IE is not supported.", category: "Troubleshooting", icon: "bug" },
+  { id: "42", title: "Contacting Support", content: "Email support@tirbeo.app or use the Contact Us page. Premium users get priority support.", category: "Support", icon: "lifebuoy" },
+  { id: "43", title: "Support Response Times", content: "Free: 48 hours, Pro: 24 hours, Enterprise: 4 hours. Check status at support.tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "44", title: "Feature Requests", content: "Submit feature requests via the Feedback button in-app or email ideas@tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "45", title: "Service Status", content: "Check real-time status at status.tirbeo.app. Subscribe to updates for incident notifications.", category: "Support", icon: "lifebuoy" },
+  { id: "46", title: "Community Forum", content: "Join discussions, share tips, and connect with other users at community.tirbeo.app.", category: "Support", icon: "lifebuoy" },
+  { id: "47", title: "Video Tutorials", content: "Watch step-by-step guides on our YouTube channel at youtube.com/@tirbeo.", category: "Getting Started", icon: "zap" },
+  { id: "48", title: "Onboarding Walkthrough", content: "New users see an interactive tour on first login. Replay it from Settings → Help → Tour.", category: "Getting Started", icon: "zap" },
+  { id: "49", title: "Keyboard Shortcuts", content: "Press Cmd/Ctrl + K for command palette. See all shortcuts in Help → Keyboard Shortcuts.", category: "Getting Started", icon: "zap" },
+  { id: "50", title: "Dark Mode", content: "Toggle dark mode from the user menu or Settings → Theme. Your preference syncs across devices.", category: "Account", icon: "settings" },
+  { id: "51", title: "Language & Region", content: "Change language in Settings → Preferences. We support English, Spanish, French, and German.", category: "Account", icon: "globe" },
+  { id: "52", title: "Accessibility", content: "Tirbeo follows WCAG 2.1 AA standards. Report accessibility issues to a11y@tirbeo.app.", category: "Account", icon: "globe" },
+  { id: "53", title: "GDPR Compliance", content: "We are GDPR compliant. Request data deletion or export from Settings → Privacy.", category: "Security", icon: "shield" },
+  { id: "54", title: "SOC 2 Certification", content: "Tirbeo is SOC 2 Type II certified. View our security whitepaper at tirbeo.app/security.", category: "Security", icon: "shield" },
+  { id: "55", title: "Data Residency", content: "Choose your data region in Settings → Privacy → Data Residency. Available: US, EU, APAC.", category: "Security", icon: "globe" },
+  { id: "56", title: "OAuth Apps", content: "Manage connected OAuth apps in Settings → Security → Connected Apps. Revoke access anytime.", category: "Security", icon: "shield" },
+  { id: "57", title: "Passkeys", content: "Set up passkeys for passwordless login in Settings → Security → Passkeys.", category: "Security", icon: "shield" },
+  { id: "58", title: "Audit Logs", content: "View detailed audit logs in Admin → Security → Audit. Enterprise plans retain logs for 1 year.", category: "Security", icon: "activity" },
+  { id: "59", title: "IP Allowlisting", content: "Restrict access to specific IPs in Settings → Security → IP Allowlist.", category: "Security", icon: "shield" },
+  { id: "60", title: "Custom SMTP", content: "Configure custom SMTP in Settings → Email → SMTP. Supports SendGrid, Mailgun, AWS SES.", category: "Integrations", icon: "link" },
+];
+
+export async function helpConfigHandler(request: NextRequest) {
+  return NextResponse.json({
+    articles: DEFAULT_HELP_ARTICLES,
+    contactEmail: "support@tirbeo.app",
+    faqEnabled: true,
+  });
+}
+
+export async function faqHandler(request: NextRequest) {
+  const category = request.nextUrl.searchParams.get('category') || '';
+  const search = request.nextUrl.searchParams.get('search') || '';
+  const help = await helpConfigHandler(request);
+  const articles: any[] = (await help.json() as any).articles;
+  let filtered = articles;
+  if (category) filtered = filtered.filter((a: any) => a.category === category);
+  if (search) filtered = filtered.filter((a: any) => a.title.toLowerCase().includes(search.toLowerCase()) || a.content.toLowerCase().includes(search.toLowerCase()));
+  const categories = Array.from(new Set(articles.map((a: any) => a.category)));
+  return NextResponse.json({ articles: filtered, categories });
+}
+
+export async function cliTokenHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) {
+      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { id: true, email: true, name: true, isBanned: true, isSuspended: true, banRefCode: true, suspendRefCode: true, suspendReason: true, suspendedUntil: true },
+    });
+    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    if (user.isBanned || user.isSuspended) {
+      return blockedAccountResponse(user);
+    }
+
+    const secret = new TextEncoder().encode(process.env.JWT_SECRET!);
+    const cliToken = await new SignJWT({ sub: user.id, purpose: 'cli' })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuedAt()
+      .setExpirationTime('30d')
+      .sign(secret);
+
+    await createAuditEvent({
+      actorId: user.id,
+      action: 'CLI_LOGIN',
+      targetType: 'session',
+      targetId: cliToken.slice(0, 16),
+      metadata: { userAgent: request.headers.get('user-agent') },
+    });
+
+    return NextResponse.json({
+      token: cliToken,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+  } catch (err: any) {
+    console.error('[CLI-TOKEN]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to generate CLI token' }, { status: 500 });
+  }
+}
+
+// ─── Waitlist ───────────────────────────────────────────────
+
+
+// ─── Feedback ───────────────────────────────────────────────
+
+
+// ─── Admin: Subscribers ─────────────────────────────────────
+
+
+// ─── Admin: Feedback ────────────────────────────────────────
+
+
+// ─── Chat (OpenRouter LLM proxy for landing demo) ────────────
+
+const ALLOWED_CHAT_MODELS = new Set([
+  'tencent/hy3:free',
+  'google/gemini-2.0-flash-exp:free',
+  'meta-llama/llama-4-maverick:free',
+  'mistralai/mistral-small-3.1-24b-instruct:free',
+]);
+
+const chatRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+function checkChatRateLimit(ip: string, maxRequests = 20, windowMs = 60000): boolean {
+  const now = Date.now();
+  const entry = chatRateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    chatRateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= maxRequests) return false;
+  entry.count++;
+  return true;
+}
+
+export async function chatHandler(request: NextRequest) {
+  try {
+    const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+    if (!checkChatRateLimit(clientIp)) {
+      return NextResponse.json({ error: 'Rate limit exceeded. Please try again later.' }, { status: 429 });
+    }
+
+    const key = process.env.OPENROUTER_API_KEY;
+    if (!key) {
+      return NextResponse.json({ error: 'OPENROUTER_API_KEY not set' }, { status: 500 });
+    }
+
+    const body: any = await request.json().catch(() => ({}));
+    const model = body.model || 'tencent/hy3:free';
+    if (!ALLOWED_CHAT_MODELS.has(model)) {
+      return NextResponse.json(
+        { error: `Model "${model}" is not allowed. Allowed models: ${[...ALLOWED_CHAT_MODELS].join(', ')}` },
+        { status: 400 }
+      );
+    }
+
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    if (messages.length > 50) {
+      return NextResponse.json({ error: 'Maximum 50 messages allowed per request' }, { status: 400 });
+    }
+    const sanitizedMessages = messages.map((m: any) => {
+      if (!m || typeof m.content !== 'string') return null;
+      return {
+        role: ['user', 'assistant', 'system'].includes(m.role) ? m.role : 'user',
+        content: m.content.slice(0, 10000),
+      };
+    }).filter(Boolean);
+    if (sanitizedMessages.length === 0) {
+      return NextResponse.json({ error: 'No valid messages provided' }, { status: 400 });
+    }
+
+    const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://tirbeo.app',
+        'X-Title': 'Tirbeo',
+      },
+      body: JSON.stringify({
+        model,
+        messages: sanitizedMessages,
+        temperature: 0.7,
+        max_tokens: 2048,
+      }),
+    });
+    const data = await upstream.text();
+    return new NextResponse(data, {
+      status: upstream.status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err: any) {
+    console.error('[CHAT]', err?.message || err);
+    return NextResponse.json({ error: err?.message || 'proxy error' }, { status: 500 });
+  }
+}

@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
-import { createAuditEvent } from '@/lib/audit';
-import { sendTemplateEmail } from '@/lib/email';
+import { requireRole } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
+import { createAuditEvent } from '@/features/security/audit';
+import { sendTemplateEmail } from '@/features/email/email';
+import { createNotification } from '@/features/notifications/notifications';
+import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
+import { getSupportBaseUrl } from '@/config/app-urls';
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireRole(request, 'manager');
@@ -28,16 +31,34 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   await createAuditEvent({ actorId: session.userId, action: isInternal ? 'ADMIN_TICKET_NOTE' : 'ADMIN_TICKET_REPLY', targetType: 'ticket', targetId: id });
 
   if (!isInternal) {
-    const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true } });
+    // 1. Email to customer
+    const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true, name: true } });
     if (customer?.email) {
       sendTemplateEmail(customer.email, 'ticket_updated', {
         ticketId: ticket.id,
         ticketSubject: ticket.subject,
         ticketStatus: ticket.status.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-        ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
+        ticketUrl: `${getSupportBaseUrl()}/tickets/${ticket.id}`,
         updateMessage: 'Support team has replied to your ticket.',
       }).catch(() => {});
     }
+
+    // 2. In-app notification to customer (skipEmail — dedicated template already sent above)
+    createNotification({
+      userId: ticket.customerId,
+      type: 'support',
+      title: `New reply: ${ticket.subject}`,
+      body: content.trim().slice(0, 200),
+      link: `/support/tickets/${ticket.id}`,
+      skipEmail: true,
+    }).catch(() => {});
+
+    // 3. WS domain event — live chat feed
+    sendToUserWs(ticket.customerId, {
+      type: 'ticket_message',
+      ticketId: ticket.id,
+      message: { id: message.id, content: message.content, authorId: session.userId, isInternal: false, createdAt: message.createdAt.toISOString() },
+    }).catch(() => {});
   }
 
   return NextResponse.json(message, { status: 201 });

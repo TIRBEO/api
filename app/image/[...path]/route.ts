@@ -1,7 +1,7 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import { readFile } from 'fs/promises';
 import path from 'path';
-import { validateImageFile } from '@/lib/imageSecurity';
+import { validateImageFile } from '@/features/media/imageSecurity';
 
 export const runtime = 'nodejs';
 

@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { verifyMagicLinkHandler } from '../../../../../lib/authHandlers';
+import { verifyMagicLinkHandler } from '@/features/auth/authHandlers';
 
 export async function GET(request: NextRequest) {
   return verifyMagicLinkHandler(request);

@@ -1,9 +1,10 @@
 import { NextResponse, NextRequest } from 'next/server';
-import { prisma, isDbHealthy, dbErrorResponse } from '../../../lib/db/prisma';
-import { getSession, requireSession, isAdmin } from '@/lib/session';
-import { logRequest } from '../../../lib/logger';
-import { jsonError, jsonForbidden, jsonUnauthorized } from '../../../lib/response';
-import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '../../../lib/auth/rate-limit';
+import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
+import { getSession, requireSession, isAdmin } from '@/features/auth/http-guards';
+import { logRequest } from '@/infrastructure/observability/logger';
+import { jsonError, jsonForbidden, jsonUnauthorized } from '@/shared/response';
+import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
+import { generateEventId } from '@/features/users/refcode';
 
 import {
   loginHandler,
@@ -51,15 +52,16 @@ import {
    cliTokenHandler,
    sessionHandler,
    refreshHandler,
+   tokenHandler,
    sessionRevokeByTokenHandler,
- } from '../../../lib/authHandlers';
+ } from '@/features/auth/authHandlers';
 
 import {
   captchaChallengeHandler,
   captchaVerifyHandler,
   captchaStatusHandler,
   captchaImageHandler,
-} from '../../../lib/captcha/captcha-dispatch';
+} from '@/features/captcha/captcha-dispatch';
 
 // oauthHandlers removed — OAuth2 server models deleted
 
@@ -72,6 +74,8 @@ import {
   integrationsHandler,
   mergeAccountsHandler,
   userActivityHandler,
+  userAppsHandler,
+  userOverviewHandler,
   preferencesHandler,
   consentHistoryHandler,
   setPasswordHandler,
@@ -87,7 +91,7 @@ import {
   exportDataHandler,
   deleteAccountRequestHandler,
   publicProfileHandler,
-} from '../../../lib/userHandlers';
+} from '@/features/users/userHandlers';
 
 import {
   emailConfigHandler,
@@ -97,7 +101,24 @@ import {
   adminEmailsHandler,
   adminEmailReplyHandler,
   adminEmailDetailHandler,
-} from '../../../lib/emailAdminHandlers';
+} from '@/features/email/emailAdminHandlers';
+
+import {
+  emailBrainOverviewHandler,
+  emailBrainEventsHandler,
+  emailBrainDigestsHandler,
+  emailBrainSuppressionsHandler,
+  emailBrainAiUsageHandler,
+} from '@/features/email-brain/adminHandlers';
+import {
+  emailBrainDefinitionsHandler,
+  emailBrainDefinitionActionHandler,
+  emailBrainVersionsHandler,
+  emailBrainAiHandler,
+  emailBrainPreviewHandler,
+  emailBrainTestHandler,
+} from '@/features/email-brain/contentAdmin';
+import { emailPreferencesHandler } from '@/features/email-brain/userPrefs';
 
 // helpHandlers removed — HelpArticle model deleted
 
@@ -120,16 +141,16 @@ import {
   passwordCheckHandler,
   sessionsRevokeAllHandler,
   sessionRevokeHandler,
-} from '../../../lib/securityHandlers';
+} from '@/features/security/securityHandlers';
 
 import {
   apiKeysHandler,
   apiKeyDeleteHandler,
-} from '../../../lib/developerHandlers';
+} from '@/features/admin/developerHandlers';
 
 import {
   chatHandler,
-} from '../../../lib/authHandlers';
+} from '@/features/auth/authHandlers';
 
 // oauthAdminHandlers removed — OAuth2 server models deleted
 
@@ -137,27 +158,17 @@ import {
   knownAccountsHandler,
   switchAccountHandler,
   removeKnownAccountHandler,
-} from '../../../lib/accountSwitchHandlers';
+} from '@/features/auth/accountSwitchHandlers';
 
 // connectedAccountsHandler removed (LinkedAccount model removed)
 
 import {
-  passkeyRegisterOptionsHandler,
-  passkeyRegisterVerifyHandler,
-  passkeyAuthOptionsHandler,
-  passkeyAuthVerifyHandler,
-  passkeyListHandler,
-  passkeyDeleteHandler,
-  passkeyUpdateHandler,
-} from '../../../lib/passkeyHandlers';
-
-import {
   incidentEventsListHandler, incidentEventsCreateHandler,
-} from '../../../lib/contentHandlers';
+} from '@/features/content/contentHandlers';
 
-import { adminAnalyticsOverviewHandler } from '../../../lib/adminAnalytics';
-import { adminAnalyticsConsentedUsersHandler } from '../../../lib/adminAnalyticsHandlers';
-import { adminMaintenanceHandler } from '../../../lib/adminHandlers';
+import { adminAnalyticsOverviewHandler } from '@/features/admin/adminAnalytics';
+import { adminAnalyticsConsentedUsersHandler } from '@/features/admin/adminAnalyticsHandlers';
+import { adminMaintenanceHandler } from '@/features/admin/adminHandlers';
 
 import {
   ticketListHandler, ticketCreateHandler, ticketDetailHandler, ticketUpdateHandler,
@@ -166,27 +177,42 @@ import {
   ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
   ticketAttachmentDownloadHandler,
   ticketMarkReadHandler,
-} from '../../../lib/supportHandlers';
+  supportAppealCreateHandler,
+} from '@/features/support/supportHandlers';
 
 import {
   loginHistoryHandler,
-} from '../../../lib/securityHandlers';
+} from '@/features/security/securityHandlers';
 
 
 
 import {
   publicHealthHandler, detailedHealthHandler, poolHealthHandler,
-} from '../../../lib/health';
+} from '@/features/observability/health';
 import {
   cacheDebugHandler, cacheResetDebugHandler,
   queryPerfDebugHandler, queryPerfResetDebugHandler,
   queryPerfConfigDebugHandler, queryPerfConfigUpdateDebugHandler,
-} from '../../../lib/debugHandlers';
+} from '@/features/admin/debugHandlers';
 
 // jobs module removed
 
-const appUrl = (subdomain: string, path: string) =>
-  `https://${subdomain}.${process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app'}${path}`;
+import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl } from '@/config/app-urls';
+
+const appUrl = (subdomain: string, path: string) => {
+  const base = (() => {
+    switch (subdomain) {
+      case 'dashboard': return getDashboardBaseUrl();
+      case 'admin': return getAdminBaseUrl();
+      case 'forms': return getFormsBaseUrl();
+      case 'support': return getSupportBaseUrl();
+      case 'cdn': return getCdnBaseUrl();
+      case 'accounts': return getAccountsBaseUrl();
+      default: return getAccountsBaseUrl();
+    }
+  })();
+  return `${base}${path}`;
+};
 
 const INTERNAL_ROUTES = [
   'auth/login', 'auth/signup', 'auth/email-exists', 'auth/username-exists', 'auth/logout',
@@ -206,6 +232,7 @@ const INTERNAL_ROUTES = [
    'auth/suspicious-login/confirm', 'auth/suspicious-login/deny',
    'auth/session',
    'auth/refresh',
+   'auth/token',
    'auth/accounts', 'auth/switch-account', 'auth/accounts/remove',
    'security/session-revoke',
    'auth/verify-email', 'auth/verify',
@@ -219,18 +246,14 @@ const INTERNAL_ROUTES = [
   'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/digest', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
-  'emails', 'emails/unsubscribe', 'pushes',
+  'emails', 'emails/unsubscribe', 'emails/preferences', 'pushes',
   'districts',
   'developer/api-keys',
-  'user/mailbox', 'user/mailbox/check', 'user/mailbox/dns',
-  'user/apps',
+  'user/activity', 'user/apps', 'user/overview',
   'admin/reserved-addresses',
   'admin/groups',
   'admin/ous', 'admin/security/score',
   'admin/settings', 'admin/analytics/overview', 'admin/analytics/consented-users', 'admin/maintenance',
-  'passkey/register/options', 'passkey/register/verify',
-  'passkey/auth/options', 'passkey/auth/verify',
-  'passkey/list',
   // connected-accounts removed — OAuth IDs stored on users table directly
   'user/export-data', 'user/delete-account', 'profile/public',
   'content/incident-events', 'content/health', 'content/jobs', 'content/jobs/create', 'content/retry-job',
@@ -249,7 +272,7 @@ const INTERNAL_ROUTES = [
     'debug/query-perf/config',
     'debug/rate-limits/reset',
   // Support
-  'support/tickets', 'support/tickets/create',  'support/tickets/appeals',
+  'support/tickets', 'support/tickets/create',  'support/tickets/appeals', 'support/appeal',
 
 
 ];
@@ -272,7 +295,17 @@ async function loadBlocked() {
   }
 }
 
-function matchRoute(slug: string[], method: string) {
+interface RouteMatch {
+  path: string;
+  method: string;
+  internal: boolean;
+  allowedRoles: string[];
+  meta?: Record<string, string | undefined>;
+  /** Optional absolute proxy target; derived from path when absent. */
+  target?: string;
+}
+
+function matchRoute(slug: string[], method: string): RouteMatch | undefined {
   const pathPart = slug.join('/');
 
   // Handle email/templates/{name} dynamic route
@@ -309,20 +342,6 @@ function matchRoute(slug: string[], method: string) {
   }
 
 // connected-accounts routes removed (LinkedAccount model removed)
-
-  // Handle passkey/{id} dynamic route (only DELETE/PATCH on non-static subpaths)
-  if (slug.length === 2 && slug[0] === 'passkey') {
-    const passkeyId = slug[1];
-    const PASSKEY_STATIC = ['register', 'auth', 'list'];
-    if (!PASSKEY_STATIC.includes(passkeyId)) {
-      if (method.toUpperCase() === 'DELETE') {
-        return { path: 'passkey/[id]', method: 'DELETE', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
-      }
-      if (method.toUpperCase() === 'PATCH') {
-        return { path: 'passkey/[id]', method: 'PATCH', internal: true, allowedRoles: ['guest'], meta: { passkeyId } };
-      }
-    }
-  }
 
   // Handle content/retry-job/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'retry-job') {
@@ -418,6 +437,7 @@ function matchRoute(slug: string[], method: string) {
        'auth/suspicious-login/deny': ['POST'],
        'auth/session': ['GET'],
        'auth/refresh': ['POST'],
+       'auth/token': ['GET'],
        'auth/accounts': ['GET'],
        'auth/switch-account': ['POST'],
        'auth/accounts/remove': ['POST'],
@@ -466,14 +486,13 @@ function matchRoute(slug: string[], method: string) {
       'admin/emails/reply': ['POST'],
       'admin/email-preview': ['GET'],
       'emails': ['GET'],
+      'emails/preferences': ['GET', 'POST'],
       'emails/unsubscribe': ['GET', 'POST'],
       'pushes': ['GET'],
       'districts': ['GET'],
       'developer/api-keys': ['GET', 'POST'],
-      'user/mailbox': ['GET', 'POST', 'PUT', 'DELETE'],
-      'user/mailbox/check': ['GET'],
-      'user/mailbox/dns': ['GET'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
+      'user/overview': ['GET'],
       'admin/reserved-addresses': ['GET', 'POST'],
       'admin/groups': ['GET', 'POST'],
       'admin/ous': ['GET', 'POST'],
@@ -482,11 +501,6 @@ function matchRoute(slug: string[], method: string) {
       'admin/maintenance': ['GET', 'POST'],
       'admin/analytics/overview': ['GET'],
       'admin/analytics/consented-users': ['GET'],
-      'passkey/register/options': ['POST'],
-      'passkey/register/verify': ['POST'],
-      'passkey/auth/options': ['POST'],
-      'passkey/auth/verify': ['POST'],
-      'passkey/list': ['GET'],
       // connected-accounts removed — OAuth IDs stored on users table directly
       'user/export-data': ['GET', 'POST'],
       'user/delete-account': ['POST', 'DELETE'],
@@ -514,6 +528,7 @@ function matchRoute(slug: string[], method: string) {
       // Support
       'support/tickets': ['GET', 'POST'],
       'support/tickets/create': ['POST'],
+      'support/appeal': ['POST'],
       'support/tickets/[id]/read': ['POST'],
       'support/tickets/[id]/attachments': ['GET', 'POST'],
       'support/tickets/[id]/attachments/[attachmentId]': ['GET'],
@@ -575,13 +590,27 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         authMethod = 'cookie';
       }
     } else if (authHeader) {
-      console.warn(`[AUTH] API key auth FAILED — header present but no valid key found, path: ${pathStr}, method: ${method}`);
+      // Only actual API keys (tb_…) can resolve via the API-key path. A Bearer
+      // JWT (eyJ…) is handled by cookie/session auth above — do NOT log it as an
+      // API-key failure, or every dashboard request spams 401-noise even on 200s.
+      const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim();
+      if (bearerToken.startsWith('tb_')) {
+        console.warn(`[AUTH] API key auth FAILED — header present but no valid key found, path: ${pathStr}, method: ${method}`);
+      }
     }
   } catch (e: any) {
     console.error('[HANDLER] getSession failed:', e?.message);
   }
 
-  let routes: any[] = [];
+  // ── Vercel serverless: trigger due background jobs on first request ──
+  // Fire-and-forget — does not block the response.
+  if (process.env.VERCEL && pathStr !== 'cron') {
+    import('@/jobs/job-gate').then(({ runDueJobs }) => {
+      runDueJobs().catch(() => {});
+    }).catch(() => {});
+  }
+
+  const routes: any[] = [];
   let blocked: any[] = [];
   try {
     blocked = await loadBlocked();
@@ -756,6 +785,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'auth/refresh':
         resp = await refreshHandler(request);
         break;
+      case 'auth/token':
+        resp = await tokenHandler(request);
+        break;
       case 'auth/accounts':
         resp = await knownAccountsHandler(request);
         break;
@@ -925,7 +957,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           resp = NextResponse.json({ error: 'Missing token' }, { status: 400 });
           break;
         }
-        const { verifyUnsubscribeToken, processUnsubscribe } = await import('../../../lib/emailPrefs');
+        const { verifyUnsubscribeToken, processUnsubscribe } = await import('@/features/email/emailPrefs');
         const decoded = verifyUnsubscribeToken(token);
         if (!decoded) {
           resp = NextResponse.json({ error: 'Invalid or expired token' }, { status: 400 });
@@ -939,47 +971,92 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'admin/emails':
         resp = await adminEmailsHandler(request);
         break;
+
+      // ── Email Brain ──
+      case 'admin/email-brain/overview':
+        resp = await emailBrainOverviewHandler(request);
+        break;
+      case 'admin/email-brain/events':
+        resp = await emailBrainEventsHandler(request);
+        break;
+      case 'admin/email-brain/ai-usage':
+        resp = await emailBrainAiUsageHandler(request);
+        break;
+      case 'admin/email-brain/digests':
+        resp = await emailBrainDigestsHandler(request);
+        break;
+      case 'admin/email-brain/suppressions':
+        resp = await emailBrainSuppressionsHandler(request);
+        break;
+      case 'admin/email-brain/ai':
+        resp = await emailBrainAiHandler(request);
+        break;
+      case 'admin/email-brain/preview':
+        resp = await emailBrainPreviewHandler(request);
+        break;
+      case 'admin/email-brain/test':
+        resp = await emailBrainTestHandler(request);
+        break;
+      case 'admin/email-brain/definitions':
+        resp = await emailBrainDefinitionsHandler(request);
+        break;
+      case 'admin/email-brain/definitions/action': {
+        // POST /admin/email-brain/definitions/action {definitionId, ...} — the
+        // catch-all router matches flat paths; id comes in the body.
+        const body = await request.json().catch(() => ({} as any));
+        resp = await emailBrainDefinitionActionHandler(request, (body as any)?.definitionId || '');
+        break;
+      }
+      case 'admin/email-brain/versions': {
+        const body = await request.json().catch(() => ({} as any));
+        resp = await emailBrainVersionsHandler(request, (body as any)?.definitionId || '');
+        break;
+      }
+
+      case 'emails/preferences':
+        resp = await emailPreferencesHandler(request);
+        break;
       case 'admin/emails/reply':
         resp = await adminEmailReplyHandler(request);
         break;
       case 'admin/email-preview': {
         const adminSess = await requireSession(request);
         if (adminSess instanceof NextResponse) { resp = adminSess; break; }
-        const { isAdmin: checkAdmin } = await import('@/lib/session');
+        const { isAdmin: checkAdmin } = await import('@/features/auth/http-guards');
         const admUser = await prisma.user.findUnique({ where: { id: adminSess.userId }, select: { adminRole: true } });
         if (!admUser?.adminRole) { resp = jsonForbidden('Admin only'); break; }
         const epUrl = new URL(request.url);
         const epTemplate = epUrl.searchParams.get('template') || 'welcome';
-        const { getFallbackTemplates } = await import('@/lib/email');
+        const { getFallbackTemplates } = await import('@/features/email/email');
         const templates = await getFallbackTemplates();
         const tmpl = templates[epTemplate];
         if (tmpl) {
-          const { renderTemplate } = await import('@/lib/email');
+          const { renderTemplate } = await import('@/features/email/email');
           const sampleVars: Record<string, string> = {
             name: 'John Doe', email: 'john@example.com', otp: '123456',
-            dashboardUrl: 'https://tirbeo.app', adminUrl: 'https://admin.tirbeo.app',
-            loginUrl: 'https://accounts.tirbeo.app/login', resetUrl: 'https://accounts.tirbeo.app/reset',
-            magicLink: 'https://accounts.tirbeo.app/auth/magic/abc',
-            recoveryUrl: 'https://accounts.tirbeo.app/recover/abc',
-            formTitle: 'Contact Form', formUrl: 'https://forms.tirbeo.app/form/abc',
+            dashboardUrl: getDashboardBaseUrl(), adminUrl: getAdminBaseUrl(),
+            loginUrl: getAccountsBaseUrl() + '/login', resetUrl: getAccountsBaseUrl() + '/reset',
+            magicLink: getAccountsBaseUrl() + '/auth/magic/abc',
+            recoveryUrl: getAccountsBaseUrl() + '/recover/abc',
+            formTitle: 'Contact Form', formUrl: getFormsBaseUrl() + '/form/abc',
             respondentName: 'Jane Doe', submittedAt: 'Aug 25, 2026, 2:05 PM UTC',
             ticketId: 'TKT-001', ticketSubject: 'Login issue', ticketStatus: 'open',
-            ticketUrl: 'https://tirbeo.app/support/tickets/abc',
+            ticketUrl: getSupportBaseUrl() + '/support/tickets/abc',
             subject: 'Test Alert', message: 'This is a test alert.', details: '<p>Details here</p>',
             service: 'PostgreSQL', alertTime: 'Aug 25, 2026, 2:05 PM UTC',
             location: 'New York, US', device: 'Chrome on macOS', loginTime: 'Aug 25, 2026, 2:05 PM UTC',
-            ipAddress: '192.168.1.1', revokeUrl: 'https://tirbeo.app/account/sessions',
+            ipAddress: '192.168.1.1', revokeUrl: getDashboardBaseUrl() + '/account/sessions',
             changedAt: 'Aug 25, 2026, 2:05 PM UTC',
             company: 'Acme Inc', companyName: 'Acme Inc',
             adminRole: 'admin', temporaryPassword: 'Temp123!',
             title: 'New Feature: Real-time Notifications',
-            ctaUrl: 'https://tirbeo.app/overview', ctaLabel: 'Try it now',
+            ctaUrl: getDashboardBaseUrl() + '/overview', ctaLabel: 'Try it now',
             count: '5', digestItems: '<div style="padding:12px;background:#f8f9fa;border-radius:8px;"><strong>New submission</strong></div>',
             periodLabel: 'Aug 19 – Aug 25, 2026',
             statRows: '<div style="padding:12px 0;"><strong>Logins:</strong> 12<br/><strong>Submissions:</strong> 47</div>',
             suspiciousSection: '',
             tipTitle: 'Enable Two-Factor Authentication', tipBody: 'Secure your account.',
-            actionUrl: 'https://tirbeo.app/account/security',
+            actionUrl: getDashboardBaseUrl() + '/account/security',
             statusType: 'suspended', reason: 'Violation of terms', untilLabel: 'Until further notice.',
             dateLabel: 'Sep 25, 2026',
             updateMessage: "We're looking into your issue.",
@@ -993,7 +1070,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
             connectionName: 'Google OAuth', expiresAt: 'Sep 25, 2026', affectedFlows: 'My Flow',
             connectionsUrl: 'https://flows.tirbeo.app/connections',
             plan: 'Pro', amount: '$29/mo', date: 'Aug 25, 2026',
-            exportedAt: 'Aug 25, 2026', downloadUrl: 'https://tirbeo.app/download',
+            exportedAt: 'Aug 25, 2026', downloadUrl: getDashboardBaseUrl() + '/download',
             milestone: '100',
             responseCount: '23', totalResponses: '156',
             webhookUrl: 'https://example.com/webhook', httpStatus: '500',
@@ -1012,7 +1089,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'emails': {
         const emSession = await requireSession(request);
         if (emSession instanceof NextResponse) { resp = emSession; break; }
-        const { prisma: emPrisma } = await import('@/lib/db/prisma');
+        const { prisma: emPrisma } = await import('@/infrastructure/db/prisma');
         const emUrl = new URL(request.url);
         const emLimit = Math.min(parseInt(emUrl.searchParams.get('limit') || '50', 10), 200);
         const emOffset = parseInt(emUrl.searchParams.get('offset') || '0', 10);
@@ -1096,7 +1173,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'pushes': {
         const psSession = await requireSession(request);
         if (psSession instanceof NextResponse) { resp = psSession; break; }
-        const { prisma: psPrisma } = await import('@/lib/db/prisma');
+        const { prisma: psPrisma } = await import('@/infrastructure/db/prisma');
         const psUser = await psPrisma.user.findUnique({ where: { id: psSession.userId }, select: { notificationPreferences: true } });
         const psPrefs: any = (psUser as any)?.notificationPreferences || {};
         const psSubs = psPrefs.pushSubscriptions || [];
@@ -1157,26 +1234,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
 
       // admin/maintenance handled by standalone route at app/api/admin/maintenance/
-      case 'passkey/register/options':
-        resp = await passkeyRegisterOptionsHandler(request);
-        break;
-      case 'passkey/register/verify':
-        resp = await passkeyRegisterVerifyHandler(request);
-        break;
-      case 'passkey/auth/options':
-        resp = await passkeyAuthOptionsHandler(request);
-        break;
-      case 'passkey/auth/verify':
-        resp = await passkeyAuthVerifyHandler(request);
-        break;
-      case 'passkey/list':
-        resp = await passkeyListHandler(request);
-        break;
-      case 'passkey/[id]':
-        if (method === 'DELETE') resp = await passkeyDeleteHandler(request, (route as any).meta.passkeyId);
-        else if (method === 'PATCH') resp = await passkeyUpdateHandler(request, (route as any).meta.passkeyId);
-        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-        break;
+
 // connected-accounts routes removed (LinkedAccount model removed)
       case 'user/export-data':
         resp = await exportDataHandler(request);
@@ -1207,50 +1265,26 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'admin/subscribers':
         resp = NextResponse.json({ subscribers: [] });
         break;
-      case 'user/mailbox':
-        resp = NextResponse.json({ mailbox: [] });
-        break;
-      case 'user/mailbox/check':
-        resp = NextResponse.json({ checked: true });
-        break;
-      case 'user/mailbox/dns':
-        resp = NextResponse.json({ records: [] });
-        break;
       case 'user/apps':
-        resp = NextResponse.json({ apps: [] });
+        resp = await userAppsHandler(request);
+        break;
+      case 'user/overview':
+        resp = await userOverviewHandler(request);
         break;
       case 'auth/verify':
         resp = await verifyHandler(request);
         break;
 
-      case 'auth/oauth/authorize':
-      case 'auth/oauth/token':
-      case 'auth/oauth/revoke':
-      case 'oidc/userinfo':
-        resp = NextResponse.json({ error: 'OAuth2/OIDC server removed' }, { status: 410 });
-        break;
       case 'email/templates/[name]':
         resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
         break;
       case 'admin/emails/[id]':
         resp = await adminEmailDetailHandler(request, (route as any).meta.emailId);
         break;
-      // Content routes
-      case 'content/settings':
-      case 'content/settings/update':
-      case 'content/feature-flags':
-      case 'content/feature-flags/update':
-        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
-        break;
       case 'content/incident-events':
         if (method === 'GET') resp = await incidentEventsListHandler(request);
         else if (method === 'POST') resp = await incidentEventsCreateHandler(request);
         else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-        break;
-      case 'content/jobs':
-      case 'content/jobs/create':
-      case 'content/retry-job/[id]':
-        resp = NextResponse.json({ error: 'Job system removed' }, { status: 410 });
         break;
       // Support routes
       case 'support/tickets':
@@ -1259,6 +1293,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/tickets/create':
         resp = await ticketCreateHandler(request);
+        break;
+      case 'support/appeal':
+        resp = await supportAppealCreateHandler(request);
         break;
       case 'support/tickets/appeals':
         resp = await ticketAppealsHandler(request);
@@ -1297,10 +1334,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'support/tickets/[id]/attachments/[attachmentId]':
         resp = await ticketAttachmentDownloadHandler(request, (route as any).meta.ticketId, (route as any).meta.attachmentId);
         break;
-      case 'support/queues':
-      case 'support/queues/create':
-        resp = NextResponse.json({ error: 'Queue system removed' }, { status: 410 });
-        break;
       case 'health':
         resp = await publicHealthHandler();
         break;
@@ -1325,7 +1358,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           : await queryPerfConfigDebugHandler(request);
         break;
       case 'debug/rate-limits/reset': {
-        const { clearRateLimits } = await import('../../../lib/captcha/risk');
+        const { clearRateLimits } = await import('@/features/captcha/risk');
         clearRateLimits();
         resp = NextResponse.json({ success: true, message: 'Rate limits cleared' });
         break;
@@ -1340,7 +1373,14 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     }
     } catch (err: any) {
       console.error(`[HANDLER] Internal route ${route.path} error:`, err?.message || err, err?.stack);
-      resp = NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+      // Typed event ID ("SY" — system fault) so users can reference this
+      // exact 500 and staff can correlate it with server logs.
+      const syEventId = generateEventId('system');
+      console.error(`[HANDLER] System event ID for ${method} ${pathStr}: ${syEventId}`);
+      resp = NextResponse.json(
+        { error: 'Internal server error', eventId: syEventId },
+        { status: 500, headers: { 'X-Event-Id': syEventId } },
+      );
     }
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: resp.status });
     return addRateLimitHeaders(resp);

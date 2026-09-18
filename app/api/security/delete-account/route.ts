@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
-import { getSession } from '../../../../lib/session';
-import { verifyPassword } from '../../../../lib/auth/password';
-import { revokeSession } from '../../../../lib/auth/session';
-import { createAuditEvent } from '../../../../lib/audit';
-import { logSecurityEvent } from '../../../../lib/security';
+import { prisma } from '@/infrastructure/db/prisma';
+import { getSession } from '@/features/auth/http-guards';
+import { requireReauth } from '@/features/auth/reauth';
+import { revokeSessionFamilyByUser } from '@/features/auth/session';
+import { createAuditEvent } from '@/features/security/audit';
+import { logSecurityEvent } from '@/features/security/security';
 
 export const runtime = 'nodejs';
 
@@ -23,10 +23,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 });
     }
 
-    const { password, reason } = (await request.json()) as any;
-    if (!password || typeof password !== 'string') {
-      return NextResponse.json({ error: 'Password is required' }, { status: 400 });
-    }
+    const { reason } = (await request.json().catch(() => ({}))) as any;
+
+    // Sensitive action — identity proof via the shared reauth guard
+    // (passkey assertion, account password, or TOTP). Replaces the old
+    // password-only check, which passwordless accounts could never pass.
+    const proof = await requireReauth(request, session.userId);
+    if ('response' in proof) return proof.response;
 
     // Check if already soft-deleted
     const existingUser = await prisma.user.findUnique({
@@ -42,16 +45,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Account is already scheduled for deletion' }, { status: 400 });
     }
 
-    // Verify password
-    if (!existingUser.passwordHash) {
-      return NextResponse.json({ error: 'Account has no password set' }, { status: 400 });
-    }
-
-    const isValid = await verifyPassword(existingUser.passwordHash, password);
-    if (!isValid) {
-      return NextResponse.json({ error: 'Invalid password' }, { status: 401 });
-    }
-
     // ─── Step 1: Revoke all sessions immediately ───
     await prisma.session.updateMany({
       where: { userId: session.userId, status: 'active' },
@@ -60,7 +53,7 @@ export async function POST(request: NextRequest) {
 
     // ─── Step 2: Soft-delete — hide all user data ───
     // The user row stays but is marked deleted. All queries exclude deletedAt != null.
-    logSecurityEvent({ request, userId: session.userId, eventType: 'security.deletion_scheduled', severity: 'warning', details: { reason: reason || 'user_requested' } }).catch(() => {});
+    logSecurityEvent({ request, userId: session.userId, eventType: 'security.deletion_scheduled', severity: 'warning', details: { reason: reason || 'user_requested', reauthMethod: proof.method } }).catch(() => {});
     const scheduledDeletionAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
 
     await prisma.user.update({
@@ -124,19 +117,28 @@ export async function POST(request: NextRequest) {
     }).catch(() => {});
 
     // ─── Step 5: Clear session cookie ───
+    // Revoke ALL sessions for the user (every device, every app) and clear the
+    // cookies for the SAME domain they were set on. Previously only __session
+    // was cleared host-only, so __refresh/__csrf survived on .tirbeo.app and
+    // the user stayed signed in on other subdomains after scheduling deletion.
+    await revokeSessionFamilyByUser(session.userId).catch(() => {});
     const response = NextResponse.json({
       success: true,
       message: 'Account scheduled for permanent deletion in 30 days. Contact support@tirbeo.app to cancel.',
       scheduledDeletionAt: scheduledDeletionAt.toISOString(),
     });
 
-    response.cookies.set('__session', '', {
+    const clearedCookieOptions = {
       httpOnly: true,
       secure: process.env.NODE_ENV !== 'development',
-      sameSite: 'lax',
+      sameSite: 'lax' as const,
       path: '/',
       maxAge: 0,
-    });
+      domain: process.env.NEXT_PUBLIC_COOKIE_DOMAIN || undefined,
+    };
+    response.cookies.set('__session', '', clearedCookieOptions);
+    response.cookies.set('__refresh', '', clearedCookieOptions);
+    response.cookies.set('__csrf', '', { ...clearedCookieOptions, httpOnly: false });
 
     return response;
   } catch (err: any) {

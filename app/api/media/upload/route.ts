@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireSession } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
+import { requireSession } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
 import { v4 as uuidv4 } from 'uuid';
-import { storeMediaFile } from '@/lib/mediaStorage';
+import { storeMediaFile } from '@/features/media/mediaStorage';
 
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const EXT_MAP: Record<string, string> = {

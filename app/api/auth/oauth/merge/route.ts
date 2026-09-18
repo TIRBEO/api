@@ -1,3 +1,3 @@
-import { oauthMergeCompleteHandler } from '../../../../../lib/authHandlers';
+import { oauthMergeCompleteHandler } from '@/features/auth/authHandlers';
 
 export { oauthMergeCompleteHandler as POST };

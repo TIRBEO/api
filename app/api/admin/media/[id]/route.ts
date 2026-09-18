@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { getMediaHandler, updateMediaHandler, deleteMediaHandler } from '../../../../../lib/adminMediaHandlers';
+import { getMediaHandler, updateMediaHandler, deleteMediaHandler } from '@/features/admin/adminMediaHandlers';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;

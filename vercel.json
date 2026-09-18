@@ -3,30 +3,47 @@
   "buildCommand": "npm run build",
   "crons": [
     {
-      "path": "/api/cron/digest",
-      "schedule": "0 1 * * *"
-    },
-    {
-      "path": "/api/cron/push-prune",
-      "schedule": "0 2 * * *"
+      "path": "/api/cron",
+      "schedule": "0 3 * * *"
     }
   ],
   "env": {
     "NEXT_PUBLIC_API_URL": "https://api.tirbeo.app",
     "NEXT_PUBLIC_APP_DOMAIN": "tirbeo.app",
     "NEXT_PUBLIC_COOKIE_DOMAIN": "tirbeo.app",
-    "NEXT_PUBLIC_TURNSTILE_SITE_KEY": "",
     "APP_DOMAIN": "tirbeo.app",
     "API_DOMAIN": "api.tirbeo.app",
-    "GOOGLE_REDIRECT_URI": "https://api.tirbeo.app/api/auth/google/callback",
-    "GITHUB_REDIRECT_URI": "https://api.tirbeo.app/api/auth/github/callback",
-    "DISCORD_REDIRECT_URI": "https://api.tirbeo.app/api/auth/discord/callback",
     "PORT": "3000",
-    "WS_PORT": "3001",
     "RT_API_TOKEN": "",
     "RT_PUBLISH_URL": "https://ws.tirbeo.app/api/publish",
-    "VAPID_PUBLIC_KEY": "BAl33vholmLbvhBML9Xt5RerNEGKqkvpN9Po2RYUtYhAi7-kNr-fcXUcZkPplBWf8aOr3AuzL6ZeyqKuJrS_YM0",
+    "VAPID_PUBLIC_KEY": "",
     "VAPID_PRIVATE_KEY": "",
-    "VAPID_SUBJECT": "mailto:support@tirbeo.app"
+    "VAPID_SUBJECT": "mailto:support@tirbeo.app",
+    "PUSHER_APP_ID_PRIMARY": "2194260",
+    "PUSHER_KEY_PRIMARY": "95ec31012edaf673af92",
+    "PUSHER_CLUSTER_PRIMARY": "mt1",
+    "PUSHER_APP_ID_SECONDARY": "2194261",
+    "PUSHER_KEY_SECONDARY": "c6716f35ee695ef14918",
+    "PUSHER_CLUSTER_SECONDARY": "mt1",
+    "PUSHER_APP_ID_TERTIARY": "2194265",
+    "PUSHER_KEY_TERTIARY": "439f77585f04cd6a3025",
+    "PUSHER_CLUSTER_TERTIARY": "mt1",
+    "PUSHER_APP_ID_AP2": "2194266",
+    "PUSHER_KEY_AP2": "0dc7b602fa2883797f86",
+    "PUSHER_CLUSTER_AP2": "ap2",
+    "PUSHER_APP_ID_AP4": "2194271",
+    "PUSHER_KEY_AP4": "30d7c6e7fe9433069371",
+    "PUSHER_CLUSTER_AP4": "ap4",
+    "BEAMS_INSTANCE_ID": "869b3b95-386f-4984-ae8c-9b9735966bc8"
+  },
+  "build": {
+    "env": {
+      "PUSHER_SECRET_PRIMARY": "@pusher_secret_primary",
+      "PUSHER_SECRET_SECONDARY": "@pusher_secret_secondary",
+      "PUSHER_SECRET_TERTIARY": "@pusher_secret_tertiary",
+      "PUSHER_SECRET_AP2": "@pusher_secret_ap2",
+      "PUSHER_SECRET_AP4": "@pusher_secret_ap4",
+      "BEAMS_PRIMARY_KEY": "@beams_primary_key"
+    }
   }
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/lib/session';
-import { unblockTarget } from '@/lib/security';
-import { createAuditEvent } from '@/lib/audit';
+import { requireRole } from '@/features/auth/http-guards';
+import { unblockTarget } from '@/features/security/security';
+import { createAuditEvent } from '@/features/security/audit';
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ targetType: string; targetId: string }> }) {
   const session = await requireRole(request, 'manager');

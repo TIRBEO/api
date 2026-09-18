@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../../lib/db/prisma';
-import { withAdmin } from '@/lib/role-guard';
+import { prisma } from '@/infrastructure/db/prisma';
+import { withAdmin } from '@/features/auth/role-guard';
+import { createNotification } from '@/features/notifications/notifications';
+import { sendBroadcastWs } from '@/infrastructure/realtime/ws-deliver';
 
 /** Recipient count for the composer preview. */
 export const GET = withAdmin(async () => {
@@ -45,8 +47,8 @@ export const POST = withAdmin(async (request: NextRequest) => {
     return NextResponse.json({ sent: 0, failed: 0, message: 'No opted-in recipients' });
   }
 
-  const { sendTemplateEmail } = await import('../../../../../lib/email');
-  const { getDashboardBaseUrl } = await import('../../../../../lib/app-urls');
+  const { sendTemplateEmail } = await import('@/features/email/email');
+  const { getDashboardBaseUrl } = await import('@/config/app-urls');
   const dashboardUrl = getDashboardBaseUrl();
 
   let sent = 0;
@@ -69,5 +71,31 @@ export const POST = withAdmin(async (request: NextRequest) => {
   }
 
   console.log(`[BROADCAST] Product update "${title}" — ${sent} sent, ${failed} failed`);
+
+  // Also create in-app notifications for all opted-in users (not just email recipients)
+  const allProductUsers = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "users"
+    WHERE "deleted_at" IS NULL AND "is_banned" = false
+      AND COALESCE(("notification_preferences"->>'product')::boolean, true) = true`;
+  
+  for (const u of allProductUsers) {
+    createNotification({
+      userId: u.id,
+      type: 'product',
+      title,
+      body: message.slice(0, 200),
+      link: ctaUrl.startsWith('http') ? ctaUrl : `/home`,
+    }).catch(() => {});
+  }
+
+  // Broadcast WS event to all connected users
+  sendBroadcastWs({
+    type: 'product_update',
+    title,
+    body: message.slice(0, 200),
+    ctaUrl,
+    ctaLabel,
+  }).catch(() => {});
+
   return NextResponse.json({ sent, failed, total: recipients.length });
 });

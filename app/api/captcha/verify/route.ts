@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSession } from '@/lib/session';
-import { verifyChallenge, getCaptchaSettings } from '@/lib/captcha/service';
+import { getSession } from '@/features/auth/http-guards';
+import { verifyChallenge, getCaptchaSettings } from '@/features/captcha/service';
 
 export const runtime = 'nodejs';
 

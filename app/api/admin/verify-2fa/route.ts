@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { prisma } from '../../../../lib/db/prisma';
-import { createSession, setSessionCookie } from '@/lib/session';
-import { verifyTemp2faToken } from '../../../../lib/auth/jwt';
-import { verifyTotp } from '../../../../lib/auth/totp';
-import { sendTemplateEmail } from '../../../../lib/email';
+import { prisma } from '@/infrastructure/db/prisma';
+import { createSession, setSessionCookie } from '@/features/auth/http-guards';
+import { verifyTemp2faToken } from '@/features/auth/jwt';
+import { verifyTotp } from '@/features/auth/totp';
+import { sendTemplateEmail } from '@/features/email/email';
+import { createNotification } from '@/features/notifications/notifications';
 
 const verifySchema = z.object({
   tempToken: z.string().min(1),
@@ -42,7 +43,7 @@ export async function POST(request: NextRequest) {
         subject: 'Unauthorized Admin Access Attempt',
         message: 'A user without admin privileges attempted to access the admin panel.',
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
-        dashboardUrl: 'https://admin.tirbeo.app',
+        dashboardUrl: (await import('@/config/app-urls')).getAdminBaseUrl(),
       }, { rawVars: ['details'] }).catch(() => {});
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
@@ -51,6 +52,16 @@ export async function POST(request: NextRequest) {
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);
+
+    // Notify admin of 2FA login
+    createNotification({
+      userId: user.id,
+      type: 'login',
+      title: 'Signed in to admin panel with 2FA',
+      body: `Admin login from IP: ${ip || 'unknown'}`,
+      link: '/account/security',
+    }).catch(() => {});
+
     return res;
   } catch (err: any) {
     console.error('[ADMIN LOGIN] 2FA error:', err?.message || err);

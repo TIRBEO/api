@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireSession } from '@/lib/session';
-import { getUserPushSubscriptions, sendPushNotification, isPushConfigured } from '@/lib/push-notifications';
+import { requireSession } from '@/features/auth/http-guards';
+import { getUserPushSubscriptions, sendPushNotification, isPushConfigured } from '@/infrastructure/push/push-notifications';
 
 export const runtime = 'nodejs';
 

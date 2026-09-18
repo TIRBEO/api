@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireSession } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
-import { checkRateLimit } from '@/lib/notifications';
+import { requireSession } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
+import { checkRateLimit, DEFAULT_PREFS } from '@/features/notifications/notifications';
 
 export const runtime = 'nodejs';
 
@@ -18,16 +18,9 @@ const ALLOWED_FIELDS = [
   'supportEmail', 'supportPush',
   // Digest
   'digestEnabled', 'digestFrequency',
+  // Weekly activity summary (separate opt-in email, its own cadence)
+  'weeklySummary', 'weeklySummaryFrequency',
 ] as const;
-
-const DEFAULT_PREFS: Record<string, unknown> = {
-  email: true, push: true,
-  forms: true, product: false, support: true,
-  formsEmail: true, formsPush: true,
-  productEmail: false, productPush: true,
-  supportEmail: true, supportPush: true,
-  digestEnabled: false, digestFrequency: 'daily',
-};
 
 const DIGEST_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);
 
@@ -83,6 +76,9 @@ export async function PUT(request: NextRequest) {
 
     if (data.digestFrequency !== undefined && !DIGEST_FREQUENCIES.has(data.digestFrequency)) {
       return NextResponse.json({ error: 'Invalid digestFrequency' }, { status: 400 });
+    }
+    if (data.weeklySummaryFrequency !== undefined && !DIGEST_FREQUENCIES.has(data.weeklySummaryFrequency)) {
+      return NextResponse.json({ error: 'Invalid weeklySummaryFrequency' }, { status: 400 });
     }
 
     const prefs = await loadPrefs(session.userId);

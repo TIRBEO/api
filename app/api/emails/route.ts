@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireSession } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
+import { requireSession } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
 
 export const runtime = 'nodejs';
 

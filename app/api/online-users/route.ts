@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getOnlineUserIds } from '../../../lib/ws/server';
+import { getOnlineUserIds } from '@/infrastructure/realtime/ws/server';
 
 export async function GET() {
   try {

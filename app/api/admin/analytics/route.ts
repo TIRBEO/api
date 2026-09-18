@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { analyticsHandler } from '../../../../lib/adminAnalyticsHandlers';
+import { analyticsHandler } from '@/features/admin/adminAnalyticsHandlers';
 
 export async function GET(request: NextRequest) {
   return analyticsHandler(request);

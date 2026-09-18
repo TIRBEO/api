@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db/prisma';
-import { getSession } from '@/lib/session';
+import { prisma } from '@/infrastructure/db/prisma';
+import { getSession } from '@/features/auth/http-guards';
 import {
   generateChallenge,
   getRequiredDifficulty,
@@ -8,8 +8,8 @@ import {
   getCaptchaSettings,
   issueChallengeToken,
   logCaptchaEvent,
-} from '@/lib/captcha/service';
-import { computeRiskScore, computeDeviceFingerprint } from '@/lib/captcha/risk';
+} from '@/features/captcha/service';
+import { computeRiskScore, computeDeviceFingerprint } from '@/features/captcha/risk';
 
 export const runtime = 'nodejs';
 

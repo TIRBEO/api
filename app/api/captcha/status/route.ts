@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSession } from '@/lib/session';
+import { getSession } from '@/features/auth/http-guards';
 import {
   isBlocked,
   getRequiredDifficulty,
   getCaptchaSettings,
   getUserWarningCount,
   getSessionWarningCount,
-} from '@/lib/captcha/service';
-import { computeRiskScore } from '@/lib/captcha/risk';
-import { createTtlCache } from '@/lib/cache';
+} from '@/features/captcha/service';
+import { computeRiskScore } from '@/features/captcha/risk';
+import { createTtlCache } from '@/infrastructure/cache';
 
 export const runtime = 'nodejs';
 

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/db/prisma';
-import { requireAdmin } from '@/lib/session';
+import { prisma } from '@/infrastructure/db/prisma';
+import { requireAdmin } from '@/features/auth/http-guards';
 
 export async function GET(request: NextRequest) {
   try {

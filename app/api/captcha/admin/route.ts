@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db/prisma';
-import { requireRole } from '@/lib/session';
-import { getCaptchaSettings, updateCaptchaSettings } from '@/lib/captcha/service';
+import { prisma } from '@/infrastructure/db/prisma';
+import { requireRole } from '@/features/auth/http-guards';
+import { getCaptchaSettings, updateCaptchaSettings } from '@/features/captcha/service';
 
 export const runtime = 'nodejs';
 

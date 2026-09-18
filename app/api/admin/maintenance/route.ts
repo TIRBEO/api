@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '../../../../lib/session';
-import { setMaintenanceMode, getMaintenanceState } from '../../../../lib/ws/server';
-import { sendMaintenanceNotification, sendMaintenanceCompleteNotification } from '../../../../lib/maintenance-notifications';
-import { createAuditEvent } from '../../../../lib/audit';
+import { requireRole } from '@/features/auth/http-guards';
+import { setMaintenanceMode, getMaintenanceState } from '@/infrastructure/realtime/ws/server';
+import { sendMaintenanceNotification, sendMaintenanceCompleteNotification } from '@/jobs/maintenance-notifications';
+import { createAuditEvent } from '@/features/security/audit';
 
 // GET /api/admin/maintenance - Get current maintenance status
 export async function GET(request: NextRequest) {

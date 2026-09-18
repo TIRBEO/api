@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
-import { createAuditEvent } from '@/lib/audit';
-import { sendTemplateEmail } from '@/lib/email';
+import { requireRole } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
+import { createAuditEvent } from '@/features/security/audit';
+import { sendTemplateEmail } from '@/features/email/email';
+import { createNotification } from '@/features/notifications/notifications';
+import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
+import { getSupportBaseUrl } from '@/config/app-urls';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireRole(request, 'manager');
@@ -49,7 +52,7 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
   await createAuditEvent({ actorId: session.userId, action: 'ADMIN_TICKET_UPDATED', targetType: 'ticket', targetId: id, metadata: { prevStatus, newStatus: body.status } });
 
-  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true } });
+  const customer = await prisma.user.findUnique({ where: { id: ticket.customerId }, select: { email: true, name: true } });
   if (customer?.email) {
     const statusLabel = (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
     const isSolved = body.status === 'closed' || body.status === 'resolved';
@@ -57,20 +60,48 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       ticketId: ticket.id,
       ticketSubject: updated.subject,
       ticketStatus: statusLabel,
-      ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
+      ticketUrl: `${getSupportBaseUrl()}/tickets/${ticket.id}`,
       updateMessage: isSolved ? 'Your ticket has been marked as solved. If the issue persists, feel free to reopen it.' : 'Your ticket status has been updated by our support team.',
+    }).catch(() => {});
+
+    // In-app notification to customer (skipEmail — dedicated template already sent above)
+    createNotification({
+      userId: ticket.customerId,
+      type: 'support',
+      title: `Ticket ${isSolved ? 'resolved' : 'updated'}: ${updated.subject}`,
+      body: isSolved ? 'Your ticket has been marked as resolved.' : `Status changed to ${statusLabel}.`,
+      link: `/support/tickets/${ticket.id}`,
+      skipEmail: true,
+    }).catch(() => {});
+
+    // WS domain event — live status update
+    sendToUserWs(ticket.customerId, {
+      type: 'ticket_updated',
+      ticketId: ticket.id,
+      status: body.status,
+      subject: updated.subject,
     }).catch(() => {});
   }
 
   if (body.assignedId && body.assignedId !== ticket.assignedId) {
-    const agent = await prisma.user.findUnique({ where: { id: body.assignedId }, select: { email: true } });
+    const agent = await prisma.user.findUnique({ where: { id: body.assignedId }, select: { email: true, name: true } });
     if (agent?.email) {
       sendTemplateEmail(agent.email, 'ticket_updated', {
         ticketId: ticket.id,
         ticketSubject: updated.subject,
         ticketStatus: (body.status || '').replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
-        ticketUrl: `https://support.tirbeo.app/tickets/${ticket.id}`,
+        ticketUrl: `${getSupportBaseUrl()}/tickets/${ticket.id}`,
         updateMessage: `You have been assigned ticket #${ticket.id}. Please review and take action.`,
+      }).catch(() => {});
+
+      // In-app notification to assigned agent (skipEmail — dedicated template already sent above)
+      createNotification({
+        userId: body.assignedId,
+        type: 'support',
+        title: `Ticket assigned: ${updated.subject}`,
+        body: `You have been assigned ticket #${ticket.id}.`,
+        link: `/support/tickets/${ticket.id}`,
+        skipEmail: true,
       }).catch(() => {});
     }
   }

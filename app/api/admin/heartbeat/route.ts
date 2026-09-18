@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { requireAdmin } from '@/lib/session';
+import { requireAdmin } from '@/features/auth/http-guards';
 
 export async function POST(request: Request) {
   const session = await requireAdmin(request as any);

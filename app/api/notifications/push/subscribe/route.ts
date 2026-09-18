@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireSession } from '@/lib/session';
-import { subscribeToPush, isPushConfigured, getVapidPublicKey } from '@/lib/push-notifications';
-import { hasConsent } from '@/lib/consent';
+import { requireSession } from '@/features/auth/http-guards';
+import { subscribeToPush, isPushConfigured, getVapidPublicKey } from '@/infrastructure/push/push-notifications';
+import { hasConsent } from '@/features/users/consent';
 
 export const runtime = 'nodejs';
 
@@ -68,7 +68,7 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Missing endpoint' }, { status: 400 });
     }
 
-    const { unsubscribeFromPush } = await import('@/lib/push-notifications');
+    const { unsubscribeFromPush } = await import('@/infrastructure/push/push-notifications');
     await unsubscribeFromPush(session.userId, endpoint);
 
     return NextResponse.json({ ok: true });

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '../../../../../lib/session';
-import { getOrCreatePrefs, updatePrefs } from '../../../../../lib/notifications';
+import { requireAdmin } from '@/features/auth/http-guards';
+import { getOrCreatePrefs, updatePrefs } from '@/features/notifications/notifications';
 
 export async function GET(request: NextRequest) {
   const session = await requireAdmin(request);

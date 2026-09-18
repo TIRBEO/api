@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '../../../../../lib/session';
-import { listBlocks, blockTarget, getSecurityStats } from '../../../../../lib/security';
-import { createAuditEvent } from '../../../../../lib/audit';
+import { requireRole } from '@/features/auth/http-guards';
+import { listBlocks, blockTarget, getSecurityStats } from '@/features/security/security';
+import { createAuditEvent } from '@/features/security/audit';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'manager');

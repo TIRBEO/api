@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db/prisma';
-import { verifyImageToken, renderCaptchaSvg } from '@/lib/captcha/service';
+import { prisma } from '@/infrastructure/db/prisma';
+import { verifyImageToken, renderCaptchaSvg } from '@/features/captcha/service';
 
 export const runtime = 'nodejs';
 

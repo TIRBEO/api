@@ -5,7 +5,7 @@ import {
   disable2faHandler,
   status2faHandler,
   regenerateRecoveryCodesHandler,
-} from '../../../../lib/admin2faHandlers';
+} from '@/features/admin/admin2faHandlers';
 
 export async function GET(request: NextRequest) {
   return status2faHandler(request);

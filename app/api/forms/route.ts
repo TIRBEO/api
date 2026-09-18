@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db/prisma';
-import { getSessionFromRequest } from '@/lib/auth/session';
+import { prisma } from '@/infrastructure/db/prisma';
+import { getSessionFromRequest } from '@/features/auth/session';
 function generateSlug(name: string): string {
   return name
     .toLowerCase()
@@ -79,7 +79,10 @@ export async function POST(req: NextRequest) {
     if (!session?.userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
     const body: any = await req.json();
-    const { name, description, fields, settings } = body;
+    const { name, description, fields } = body;
+    // NOTE: the Form model has no `settings` column — clients may send one but
+    // persisting it would throw (P2022). Extended per-form options belong in
+    // dedicated columns, added via migration.
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return NextResponse.json({ error: 'Form name is required' }, { status: 400 });
@@ -96,7 +99,6 @@ export async function POST(req: NextRequest) {
         accessKey,
         userId: session.userId,
         status: 'draft',
-        settings: settings || {},
         fields: {
           create: (fields || []).map((f: any, i: number) => ({
             label: f.label || `Field ${i + 1}`,

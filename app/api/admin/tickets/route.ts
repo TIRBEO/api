@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/lib/session';
-import { prisma } from '@/lib/db/prisma';
-import { createAuditEvent } from '@/lib/audit';
-import { sendTemplateEmail } from '@/lib/email';
-import { trackQuery } from '@/lib/queryMonitor';
+import { requireRole } from '@/features/auth/http-guards';
+import { prisma } from '@/infrastructure/db/prisma';
+import { createAuditEvent } from '@/features/security/audit';
+import { sendTemplateEmail } from '@/features/email/email';
+import { trackQuery } from '@/infrastructure/observability/queryMonitor';
 
 export async function GET(request: NextRequest) {
   const session = await requireRole(request, 'manager');

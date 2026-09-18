@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { listMediaHandler, uploadMediaHandler } from '../../../../lib/adminMediaHandlers';
+import { listMediaHandler, uploadMediaHandler } from '@/features/admin/adminMediaHandlers';
 
 export async function GET(request: NextRequest) {
   return listMediaHandler(request);

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/lib/session';
-import { getCaptchaAnalytics, getBlockedUsers, getCaptchaSettings, updateCaptchaSettings } from '@/lib/captcha/service';
+import { requireRole } from '@/features/auth/http-guards';
+import { getCaptchaAnalytics, getBlockedUsers, getCaptchaSettings, updateCaptchaSettings } from '@/features/captcha/service';
 
 export const runtime = 'nodejs';
 
