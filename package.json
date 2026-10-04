@@ -23,7 +23,6 @@
     "@react-email/render": "^2.1.0",
     "@simplewebauthn/server": "^13.3.2",
     "@supabase/supabase-js": "^2.112.0",
-    "@tirbeo/pusher": "file:../../packages/pusher",
     "@tirbeo/types": "file:../../packages/types",
     "@tirbeo/ui": "^1.0.5",
     "argon2": "0.45.1",

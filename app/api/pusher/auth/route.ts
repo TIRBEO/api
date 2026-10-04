@@ -14,7 +14,7 @@
 // pusher-js issues for its XHR auth transport).
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/features/auth/http-guards';
-import { pusherAuthorizeChannel, getPusherApps } from '@tirbeo/pusher';
+import { pusherAuthorizeChannel, getPusherApps } from '@/shared/pusher';
 
 export const runtime = 'nodejs';
 

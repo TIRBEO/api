@@ -16,7 +16,7 @@ import {
   isBeamsConfigured,
   getPusherApps,
   REGION_SUFFIXES,
-} from '@tirbeo/pusher';
+} from '@/shared/pusher';
 import { getDashboardBaseUrl } from '@/config/app-urls';
 
 export function pusherStatus(): { realtime: boolean; push: boolean } {
