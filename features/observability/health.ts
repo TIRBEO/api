@@ -4,6 +4,7 @@ import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, 
 import { getSession } from '@/features/auth/http-guards';
 import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
 import { getCachedRedisClient, checkRedisHealth, getRedisHealthSummary, pingAllRedisClients } from '@/infrastructure/db/redis';
+import { deliveryDiagnostics } from '@/infrastructure/realtime/pusher-deliver';
 
 
 function isAdmin(user: any): boolean {
@@ -86,6 +87,12 @@ export async function publicHealthHandler() {
     healthy = false;
   }
 
+  // ─── Realtime + web push delivery (Pusher Channels / Beams) ───
+  // Reported but NOT counted against overall health: a missing Pusher secret
+  // silently disables realtime and push, which would otherwise be invisible.
+  // Treat a degraded `delivery` as a deployment misconfiguration to fix.
+  checks.delivery = deliveryDiagnostics();
+
   // ─── Pool ───
   const poolStatus = getPoolStatus();
   const result = {
@@ -147,6 +154,13 @@ export async function detailedHealthHandler(req: NextRequest) {
   if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
     healthy = false;
   }
+
+  // ─── Realtime + web push delivery (Pusher Channels / Beams) ───
+  // The admin view DOES count a degraded delivery layer against overall
+  // health, so an operator tailing this endpoint is told loudly.
+  const delivery = deliveryDiagnostics();
+  checks.delivery = delivery;
+  if (delivery.status !== 'ok') healthy = false;
 
   try {
     const recentCriticalEvents = await prisma.activityEvent.findMany({
