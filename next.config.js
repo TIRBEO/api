@@ -13,10 +13,24 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-  // @tirbeo/* packages ship TypeScript source (no prebuilt dist) — Next must
-  // compile them, same as the other file:- workspace packages.
-  transpilePackages: ['@tirbeo/pusher', '@tirbeo/types'],
+  // @tirbeo/types ships TypeScript source (no prebuilt dist) — Next must
+  // compile it like the other workspace packages.
   serverExternalPackages: ['ioredis', 'argon2', '@prisma/client', '@prisma/adapter-pg', 'pg'],
+  // Turbopack externalizes serverExternalPackages and resolves them at runtime
+  // from node_modules — but Vercel's per-function file tracer misses the hashed
+  // externals, so the lambda ships without @prisma/client / ioredis and every
+  // DB or Redis route dies with an empty 500. Force those directories into
+  // every API function's traced files.
+  outputFileTracingIncludes: {
+    '/api/**': [
+      './node_modules/@prisma/**',
+      './node_modules/.prisma/**',
+      './node_modules/prisma/**',
+      './node_modules/ioredis/**',
+      './node_modules/pg/**',
+      './node_modules/argon2/**',
+    ],
+  },
   async rewrites() {
     return {
       beforeFiles: [
