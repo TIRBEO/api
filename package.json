@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "NODE_ENV=development NODE_OPTIONS='--no-deprecation --dns-result-order=ipv4first' npx tsx --env-file=.env.local server.ts",
-    "build": "npm run check:emails && prisma generate && next build",
+    "build": "npm run check:emails && prisma generate && next build --webpack",
     "check:emails": "tsx scripts/check-email-templates.ts",
     "start": "node server.js",
     "lint": "eslint .",
