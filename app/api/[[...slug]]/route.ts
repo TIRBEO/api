@@ -151,7 +151,7 @@ import {
 
 // jobs module removed
 
-import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl,  } from '@/config/app-urls';
+import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl, getApiBaseUrl } from '@/config/app-urls';
 import { accountChecksHandler } from '@/features/status/accountChecks';
 import { appealFileHandler, appealsListHandler } from '@/features/support/appeals';
 
@@ -965,7 +965,7 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
           break;
         }
         await processUnsubscribe(decoded.userId, decoded.category);
-        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+        const apiBase = getApiBaseUrl();
         resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
         break;
       }
@@ -1112,7 +1112,7 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
                   const { processUnsubscribe } = await import('@/features/email/emailPrefs');
                   await processUnsubscribe(decoded.userId, decoded.category);
                   console.log(`[EMAIL/UNSUBSCRIBE] ${euAddr} unsubscribed (signed token)`);
-                  const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+                  const apiBase = getApiBaseUrl();
                   resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
                 }
               }

@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { prisma } from '@/infrastructure/db/prisma';
-import { getDashboardBaseUrl } from '@/config/app-urls';
+import { getDashboardBaseUrl, getApiBaseUrl } from '@/config/app-urls';
 import { getGlobalEmailSwitches, SWITCH_BY_CATEGORY } from '@/features/email/emailSwitches';
 
 /** Check if current time is within user's quiet hours window. Shared with notifications.ts. */
@@ -182,7 +182,7 @@ export async function buildUnsubscribeUrl(to: string): Promise<string | null> {
     });
     if (!emailRow) return null;
     const token = generateUnsubscribeToken(emailRow.userId, 'all');
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+    const apiBase = getApiBaseUrl();
     return `${apiBase}/api/emails/unsubscribe?token=${encodeURIComponent(token)}&email=${encodeURIComponent(to.toLowerCase())}`;
   } catch {
     return null;

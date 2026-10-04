@@ -787,7 +787,7 @@ export async function integrationsHandler(request: NextRequest) {
           { status: 503 },
         );
       }
-      const baseUrl = process.env.NEXT_PUBLIC_API_URL || request.nextUrl.origin;
+      const baseUrl = (await import('@/config/app-urls')).getApiBaseUrl();
       const redirectUrl = `${baseUrl}/api/auth/${provider}?link=1`;
       return NextResponse.json({ ok: true, redirectUrl });
     }

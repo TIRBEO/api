@@ -198,7 +198,7 @@ describe('POST /api/auth/reauth/send-code', () => {
 
     const [to, template, vars] = lastEmail();
     expect(to).toBe('alice@gmail.com');
-    expect(template).toBe('login_otp');
+    expect(template).toBe('reauth_otp');
     expect(vars.otp).toBe('424242');
     expect(otpRows()).toHaveLength(1);
   });

@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getBranding } from '@/features/branding/branding';
+import { getApiBaseUrl } from '@/config/app-urls';
 import { createTtlCache } from '@/infrastructure/cache';
 
 interface EmailResult { success: boolean; error?: string; messageId?: string; }
@@ -513,7 +514,7 @@ export async function sendTemplateEmail(
     const { ESSENTIAL_TEMPLATES, isBrainMandatory, buildUnsubscribeUrl } = await import('@/features/email/emailPrefs');
     const isEssential = (ESSENTIAL_TEMPLATES as Set<string>).has(templateName);
     const isBrainSec = templateName.startsWith('brain:') && isBrainMandatory(templateName.slice(6));
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+    const apiBase = getApiBaseUrl();
     if (!isEssential && !isBrainSec) {
       // Signed per-recipient link: the POST that mutes email requires this
       // token (ownership proof), so merely knowing an address can't mute it.
@@ -530,7 +531,7 @@ export async function sendTemplateEmail(
       mergedVars['managePreferencesUrl'] = '';
     }
   } catch {
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+    const apiBase = getApiBaseUrl();
     mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
     mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#6e6e73"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6e6e73;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
     mergedVars['managePreferencesUrl'] = '';

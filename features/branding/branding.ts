@@ -6,11 +6,10 @@ export interface Branding {
   emailFromAddress: string;
 }
 
+import { getApiBaseUrl } from '@/config/app-urls';
+
 export function getApiOrigin(): string {
-  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, '');
-  const { isLocalEnv, getAppDomain } = require('@/config/app-urls');
-  if (isLocalEnv()) return 'http://localhost:3000';
-  return `https://api.${getAppDomain()}`;
+  return getApiBaseUrl();
 }
 
 export function normalizeLogoUrl(raw: string | null | undefined): string {
