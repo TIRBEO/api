@@ -43,9 +43,7 @@ const APP_DOMAIN = (
   .replace(/^https?:\/\//, '')
   .replace(/\/$/, '');
 
-const DASHBOARD_URL =
-  process.env.NEXT_PUBLIC_DASHBOARD_URL ||
-  `https://dashboard.${APP_DOMAIN}`;
+const DASHBOARD_URL = `https://myprofile.${APP_DOMAIN}`;
 
 const SESSIONS_URL = `${DASHBOARD_URL}/account/sessions`;
 

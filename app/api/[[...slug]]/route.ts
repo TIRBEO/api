@@ -619,13 +619,13 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   }
 
   // Redirect user-facing paths to the dashboard instead of returning 404.
-  // The API server only serves /api/* routes; pages live on dashboard.tirbeo.com.
+  // The API server only serves /api/* routes; pages live on myprofile.tirbeo.com.
   // Skip paths that are registered internal API routes (e.g. support/tickets).
   if (!pathStr || pathStr.startsWith('account') || pathStr.startsWith('settings') || pathStr.startsWith('overview') || pathStr.startsWith('support')) {
     const isInternal = INTERNAL_ROUTES.some((r) => pathStr === r || pathStr.startsWith(r + '/'));
     if (!isInternal) {
       const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
-      const dashboardBase = `https://dashboard.${appDomain}`;
+      const dashboardBase = `https://myprofile.${appDomain}`;
       if (!pathStr) {
         return NextResponse.json({
           service: 'Tirbeo API',

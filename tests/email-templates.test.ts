@@ -45,12 +45,12 @@ const VARS: Record<string, string> = {
   resetUrl: 'https://accounts.tirbeo.com/reset?token=abc',
   recoveryUrl: 'https://accounts.tirbeo.com/recover?token=abc',
   accountsUrl: 'https://accounts.tirbeo.com/onboarding',
-  dashboardUrl: 'https://dashboard.tirbeo.com',
+  dashboardUrl: 'https://myprofile.tirbeo.com',
   adminUrl: 'https://tirbeo.com/admin',
-  settingsUrl: 'https://dashboard.tirbeo.com/account/preferences',
-  webhookUrl: 'https://dashboard.tirbeo.com/api/webhooks/hooks_1',
+  settingsUrl: 'https://myprofile.tirbeo.com/account/preferences',
+  webhookUrl: 'https://myprofile.tirbeo.com/api/webhooks/hooks_1',
   formUrl: 'https://tirbeo.com/f/form_1',
-  ticketUrl: 'https://dashboard.tirbeo.com/support/tickets/tk_9f2',
+  ticketUrl: 'https://myprofile.tirbeo.com/support/tickets/tk_9f2',
   ticketId: 'tk_9f2',
   ticketSubject: 'Export stuck at 80%',
   ticketStatus: 'Open',
@@ -94,7 +94,7 @@ const VARS: Record<string, string> = {
   completedAt: '28 Feb 2026, 17:00',
   untilLabel: '3 Mar 2026, 09:00',
   alertTime: '28 Feb 2026, 12:05',
-  twoFactorUrl: 'https://dashboard.tirbeo.com/settings/two-factor',
+  twoFactorUrl: 'https://myprofile.tirbeo.com/settings/two-factor',
   startTime: '1 Mar 2026, 02:00',
   estimatedEnd: '1 Mar 2026, 02:30',
   duration: '30 minutes',
@@ -247,7 +247,7 @@ describe('preview manifest parity', () => {
       Object.keys(
         sampleVars({
           accountsUrl: 'https://accounts.tirbeo.com',
-          dashboardUrl: 'https://dashboard.tirbeo.com',
+          dashboardUrl: 'https://myprofile.tirbeo.com',
           adminUrl: 'https://tirbeo.com/admin',
         }),
       ),
@@ -264,7 +264,7 @@ describe('preview manifest parity', () => {
     const all = await buildTemplates(LOGO);
     const vars = sampleVars({
       accountsUrl: 'https://accounts.tirbeo.com',
-      dashboardUrl: 'https://dashboard.tirbeo.com',
+      dashboardUrl: 'https://myprofile.tirbeo.com',
       adminUrl: 'https://tirbeo.com/admin',
     });
     const dirty = Object.entries(all)

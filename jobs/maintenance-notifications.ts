@@ -1,5 +1,6 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import { sendTemplateEmail } from '@/features/email/email';
+import { getDashboardBaseUrl } from '@/config/app-urls';
 
 interface MaintenanceNotificationOptions {
   title: string;
@@ -117,7 +118,7 @@ export async function sendMaintenanceCompleteNotification(options: MaintenanceCo
     completionMessage,
     completedAt: completedAt.toLocaleString(),
     duration,
-    dashboardUrl: process.env.NEXT_PUBLIC_DASHBOARD_URL || 'https://dashboard.tirbeo.com',
+    dashboardUrl: getDashboardBaseUrl(),
   }, title);
 
   console.log(`[MAINTENANCE] Sent ${result.sent} maintenance complete notifications, ${result.failed} failed`);

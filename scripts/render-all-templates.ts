@@ -11,7 +11,7 @@ import { sampleVars } from '../features/email/sample-vars';
 // private copy, which is how the three drifted apart.
 const SAMPLE = sampleVars({
   accountsUrl: 'https://accounts.tirbeo.com',
-  dashboardUrl: 'https://dashboard.tirbeo.com',
+  dashboardUrl: 'https://myprofile.tirbeo.com',
   adminUrl: 'https://tirbeo.com/admin',
 });
 

@@ -65,7 +65,7 @@ const PLAIN_VALUES: Record<string, string> = {
   reason: 'Possible spam content',
 
   ticketId: 'TKT-001',
-  ticketUrl: 'https://dashboard.tirbeo.com/support/tickets/TKT-001',
+  ticketUrl: 'https://myprofile.tirbeo.com/support/tickets/TKT-001',
   ticketSubject: 'Export stuck at 80%',
   ticketStatus: 'Open',
   updateMessage: "We've moved this to the engineering team.",
@@ -80,7 +80,7 @@ const PLAIN_VALUES: Record<string, string> = {
   ctaLabel: 'See what changed',
   ctaUrl: 'https://tirbeo.com/changelog/42',
   actionLabel: 'View account',
-  actionUrl: 'https://dashboard.tirbeo.com/account/security',
+  actionUrl: 'https://myprofile.tirbeo.com/account/security',
   tipTitle: 'Enable two-factor authentication',
   tipBody: 'Add a second step to sign-in and lock out account takeover.',
   statusType: 'Deactivated',
@@ -104,7 +104,7 @@ const PLAIN_VALUES: Record<string, string> = {
   device: 'Chrome on macOS',
   userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
   loginTime: '28 Feb 2026, 14:02 UTC',
-  twoFactorUrl: 'https://dashboard.tirbeo.com/settings/two-factor',
+  twoFactorUrl: 'https://myprofile.tirbeo.com/settings/two-factor',
 
   service: 'api',
   severity: 'high',

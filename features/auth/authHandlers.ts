@@ -549,10 +549,9 @@ interface ProviderProfile {
 const SUPPORTED_OAUTH_PROVIDERS = ['google', 'github', 'discord'];
 
 function getDashboardBase(): string {
-  // Env override first (preview deployments / custom domains), then the
-  // dev-aware central helper so local dev lands on http://localhost:3005
-  // instead of the production dashboard.
-  if (process.env.NEXT_PUBLIC_DASHBOARD_URL) return process.env.NEXT_PUBLIC_DASHBOARD_URL;
+  // The central dev-aware helper is authoritative (myprofile.tirbeo.com in
+  // prod, localhost:3005 in dev). A stale NEXT_PUBLIC_DASHBOARD_URL pointing at
+  // the retired dashboard domain must not override it.
   return getDashboardBaseUrl();
 }
 
@@ -1136,7 +1135,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
         location: 'Admin Panel',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
-        revokeUrl: `https://dashboard.${appDomain}/settings/sessions` }).catch(() => {});
+        revokeUrl: `https://myprofile.${appDomain}/settings/sessions` }).catch(() => {});
     }
 
     return res;
@@ -1959,7 +1958,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       const { token: sessionToken, refreshToken } = await createSession(existingId, request.headers.get('user-agent') || undefined, ip);
       const res = NextResponse.json({
         ok: true,
-        redirect_to: normalizeOAuthRedirect(data.redirect) || (process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase()) });
+        redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
       setSessionCookie(res, sessionToken, refreshToken, request);
       return res;
     }
@@ -2024,7 +2023,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({
       ok: true,
-      redirect_to: normalizeOAuthRedirect(data.redirect) || (process.env.NEXT_PUBLIC_DASHBOARD_URL || getDashboardBase()) });
+      redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
     setSessionCookie(res, sessionToken, refreshToken, request);
 
     sendTemplateEmail(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {

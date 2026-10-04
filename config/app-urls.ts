@@ -30,11 +30,12 @@ export function getAccountsBaseUrl(): string {
   return `https://accounts.${appDomain}`;
 }
 
-/** Dashboard app base URL (e.g. http://localhost:3005 in dev, https://dashboard.tirbeo.com in prod). */
+/** Profile app base URL — the user-facing dashboard (formerly dashboard.tirbeo.com,
+ *  now myprofile.tirbeo.com; http://localhost:3005 in dev). */
 export function getDashboardBaseUrl(): string {
   const appDomain = getAppDomain();
   if (isLocalEnv()) return 'http://localhost:3005';
-  return `https://dashboard.${appDomain}`;
+  return `https://myprofile.${appDomain}`;
 }
 
 /**
@@ -114,6 +115,8 @@ export function getAllowedOrigins(): string[] {
   return [
     `https://${appDomain}`,
     `https://accounts.${appDomain}`,
+    `https://myprofile.${appDomain}`,
+    // Retiring domain: still valid until dashboard.tirbeo.com stops resolving.
     `https://dashboard.${appDomain}`,
     `https://admin.${appDomain}`,
     `https://forms.${appDomain}`,
