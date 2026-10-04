@@ -12,7 +12,7 @@
  * the same way `sendEmail` will, and complain if one throws, comes back empty,
  * or still carries a placeholder after a render.
  *
- *   npx tsx --env-file=.env.local scripts/check-email-templates.ts
+ *   npx tsx scripts/check-email-templates.ts
  */
 
 import {

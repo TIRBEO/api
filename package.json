@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "NODE_ENV=development NODE_OPTIONS='--no-deprecation --dns-result-order=ipv4first' npx tsx --env-file=.env.local server.ts",
     "build": "npm run check:emails && prisma generate && next build",
-    "check:emails": "tsx --env-file=.env.local scripts/check-email-templates.ts",
+    "check:emails": "tsx scripts/check-email-templates.ts",
     "start": "node server.js",
     "lint": "eslint .",
     "db:push": "prisma db push",
