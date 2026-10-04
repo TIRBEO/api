@@ -141,14 +141,14 @@ export async function getEmailConfig() {
   const config: Record<string, any> = {
     provider: process.env.EMAIL_PROVIDER || 'resend',
     enabled: true,
-    resendDomain: 'send.tirbeo.com',
+    resendDomain: process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com',
     apiKey: process.env.RESEND_API_KEY || '',
-    fromEmail: 'noreply@send.tirbeo.com',
-    fromName: 'Tirbeo',
-    defaultFromEmail: 'noreply@send.tirbeo.com',
-    defaultFromName: 'Tirbeo',
-    alertFromEmail: 'alerts@send.tirbeo.com',
-    alertFromName: 'Tirbeo',
+    fromEmail: process.env.EMAIL_FROM || 'noreply@tirbeo.com',
+    fromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
+    defaultFromEmail: process.env.EMAIL_FROM || 'noreply@tirbeo.com',
+    defaultFromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
+    alertFromEmail: process.env.EMAIL_ALERT_FROM || 'noreply@tirbeo.com',
+    alertFromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
     welcomeFromEmail: null,
     welcomeFromName: null,
     otpFromEmail: null,
@@ -292,7 +292,7 @@ export async function sendEmail(
     console.warn(`[EMAIL] DB config disabled but API key present. Falling through to env var. Sending to ${to}: ${subject}`);
   }
 
-  const fromEmail = options?.fromEmail || config?.fromEmail || 'noreply@send.tirbeo.com';
+  const fromEmail = options?.fromEmail || config?.fromEmail || 'noreply@tirbeo.com';
   const fromName = options?.fromName || config?.fromName || 'Tirbeo';
   const threadId = deriveThreadId(to, subject, options?.threadId);
 
@@ -553,7 +553,7 @@ export async function sendTemplateEmail(
   const adminFrom = process.env.ADMIN_FROM_EMAIL || 'admin@mails.tirbeo.com';
 
   const DOMAIN_FROM = {
-    casual: { email: 'noreply@send.tirbeo.com', name: branding.brandName || 'Tirbeo' },
+    casual: { email: 'noreply@tirbeo.com', name: branding.brandName || 'Tirbeo' },
     security: { email: 'security@mails.tirbeo.com', name: 'Tirbeo Security' },
     admin: { email: adminFrom, name: 'Tirbeo Admin' },
   };

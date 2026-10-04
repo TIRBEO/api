@@ -21,7 +21,7 @@ export async function emailConfigHandler(request: NextRequest) {
 
     if (request.method === 'GET') {
       const config = await readEmailConfig();
-      if (!Object.keys(config).length) return NextResponse.json({ provider: 'resend', enabled: false, fromEmail: 'noreply@send.tirbeo.com', fromName: 'Tirbeo' });
+      if (!Object.keys(config).length) return NextResponse.json({ provider: 'resend', enabled: false, fromEmail: 'noreply@tirbeo.com', fromName: 'Tirbeo' });
       const { apiKey, smtpPass, resendApiKey, ...safeConfig } = config;
       return NextResponse.json({
         ...safeConfig,
@@ -309,10 +309,10 @@ export async function adminEmailReplyHandler(request: NextRequest) {
 
       const { to, subject, html, threadId, replyTo } = parsed.data;
       const result = await sendEmail(to, subject, html, {
-        replyTo: replyTo || 'alerts@send.tirbeo.com',
+        replyTo: replyTo || 'noreply@tirbeo.com',
         threadId,
         templateName: 'admin_reply',
-        fromEmail: 'alerts@send.tirbeo.com',
+        fromEmail: 'noreply@tirbeo.com',
         fromName: 'Tirbeo Support',
       });
 

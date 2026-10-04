@@ -1588,7 +1588,7 @@ export async function signupHandler(request: NextRequest) {
 
     // Send welcome email (non-blocking)
     sendTemplateEmail(accountEmail, 'welcome', { name: name || accountEmail.split('@')[0] }, {
-      fromEmail: 'noreply@send.tirbeo.com',
+      fromEmail: 'noreply@tirbeo.com',
       fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Welcome email failed:', err?.message));
 
     // Create welcome notification — STRICTLY per-user, no broadcast, no CC.
@@ -1614,7 +1614,7 @@ export async function signupHandler(request: NextRequest) {
       await prisma.otp.create({
         data: { userId: user.id, kind: 'email', address: accountEmail, otpHash, expiresAt } });
       sendTemplateEmail(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] }, {
-        fromEmail: 'noreply@send.tirbeo.com',
+        fromEmail: 'noreply@tirbeo.com',
         fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
     }
 
@@ -1998,7 +1998,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     setSessionCookie(res, sessionToken, refreshToken, request);
 
     sendTemplateEmail(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
-      fromEmail: 'noreply@send.tirbeo.com',
+      fromEmail: 'noreply@tirbeo.com',
       fromName: 'Tirbeo' }).catch(err => console.error('[OAUTH COMPLETE] Welcome email failed:', err?.message));
 
     return res;
@@ -2438,7 +2438,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
         create: { userId: user.id, kind: 'email', address: email.toLowerCase(), otpHash, expiresAt },
         update: { userId: user.id, otpHash, expiresAt, attempts: 0 } });
       sendTemplateEmail(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] }, {
-        fromEmail: 'noreply@send.tirbeo.com',
+        fromEmail: 'noreply@tirbeo.com',
         fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Resend verification email failed:', err?.message));
       return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
     }

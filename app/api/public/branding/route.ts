@@ -28,6 +28,6 @@ export async function GET() {
       faviconUrl: '',
       primaryColor: '#3b82f6',
       emailFromName: 'Tirbeo',
-      emailFromAddress: 'noreply@send.tirbeo.com' }, { ttl: 60 });
+      emailFromAddress: 'noreply@tirbeo.com' }, { ttl: 60 });
   }
 }

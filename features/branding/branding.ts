@@ -39,7 +39,7 @@ const DEFAULT_BRANDING: Branding = {
   brandName: 'Tirbeo',
   brandTagline: 'The operating system for business automation.',
   emailFromName: 'Tirbeo',
-  emailFromAddress: 'noreply@send.tirbeo.com',
+  emailFromAddress: 'noreply@tirbeo.com',
 };
 
 export async function getBranding(): Promise<Branding> {
