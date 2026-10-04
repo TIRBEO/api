@@ -1,10 +1,12 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
-import { getSession, requireSession, isAdmin } from '@/features/auth/http-guards';
+import { getSession, requireSession } from '@/features/auth/http-guards';
 import { logRequest } from '@/infrastructure/observability/logger';
-import { jsonError, jsonForbidden, jsonUnauthorized } from '@/shared/response';
+import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
+import { jsonError, jsonForbidden } from '@/shared/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
 import { generateEventId } from '@/features/users/refcode';
+import { isIpBlocked } from '@/features/security/security';
 
 import {
   loginHandler,
@@ -18,8 +20,6 @@ import {
   verifyEmailOtpHandler,
   changeEmailRequestHandler,
   changeEmailVerifyHandler,
-  requestPhoneOtpHandler,
-  verifyPhoneOtpHandler,
   googleAuthRedirectHandler,
   googleAuthCallbackHandler,
   githubAuthRedirectHandler,
@@ -39,7 +39,6 @@ import {
   requestLoginOtpHandler,
   verifyLoginOtpHandler,
   requestMagicLinkHandler,
-  verifyMagicLinkHandler,
   requestPasswordResetHandler,
   verifyPasswordResetHandler,
   confirmPasswordResetHandler,
@@ -53,15 +52,7 @@ import {
    sessionHandler,
    refreshHandler,
    tokenHandler,
-   sessionRevokeByTokenHandler,
- } from '@/features/auth/authHandlers';
-
-import {
-  captchaChallengeHandler,
-  captchaVerifyHandler,
-  captchaStatusHandler,
-  captchaImageHandler,
-} from '@/features/captcha/captcha-dispatch';
+   sessionRevokeByTokenHandler } from '@/features/auth/authHandlers';
 
 // oauthHandlers removed — OAuth2 server models deleted
 
@@ -77,21 +68,24 @@ import {
   userAppsHandler,
   userOverviewHandler,
   preferencesHandler,
+  settingsHandler,
   consentHistoryHandler,
   setPasswordHandler,
   requestProfileEditOtpHandler,
   verifyProfileEditOtpHandler,
   avatarUploadHandler,
-  heartbeatHandler,
-  notificationPrefsHandler,
   notificationChannelsHandler,
   notificationCategoriesHandler,
-  notificationDigestHandler,
+  notificationSummaryHandler,
   notificationTipsHandler,
   exportDataHandler,
   deleteAccountRequestHandler,
-  publicProfileHandler,
-} from '@/features/users/userHandlers';
+  publicProfileHandler } from '@/features/users/userHandlers';
+
+import { internalProfileHandler } from '@/features/users/internalProfileHandlers';
+
+import { accountStatusHandler, adminAccountStatusHandler } from '@/features/status/accountStatus';
+import { dataUsageHandler } from '@/features/preferences/dataUsage';
 
 import {
   emailConfigHandler,
@@ -100,25 +94,8 @@ import {
   emailTestHandler,
   adminEmailsHandler,
   adminEmailReplyHandler,
-  adminEmailDetailHandler,
-} from '@/features/email/emailAdminHandlers';
+  adminEmailDetailHandler } from '@/features/email/emailAdminHandlers';
 
-import {
-  emailBrainOverviewHandler,
-  emailBrainEventsHandler,
-  emailBrainDigestsHandler,
-  emailBrainSuppressionsHandler,
-  emailBrainAiUsageHandler,
-} from '@/features/email-brain/adminHandlers';
-import {
-  emailBrainDefinitionsHandler,
-  emailBrainDefinitionActionHandler,
-  emailBrainVersionsHandler,
-  emailBrainAiHandler,
-  emailBrainPreviewHandler,
-  emailBrainTestHandler,
-} from '@/features/email-brain/contentAdmin';
-import { emailPreferencesHandler } from '@/features/email-brain/userPrefs';
 
 // helpHandlers removed — HelpArticle model deleted
 
@@ -133,71 +110,50 @@ import {
   backupCodesListHandler,
   phonesAddHandler,
   phonesRemoveHandler,
-  phonesSendOtpHandler,
-  phonesVerifyOtpHandler,
   recoveryEmailHandler,
   recoveryEmailSendCodeHandler,
   recoveryEmailVerifyHandler,
   passwordCheckHandler,
+  securityStatusHandler,
   sessionsRevokeAllHandler,
-  sessionRevokeHandler,
-} from '@/features/security/securityHandlers';
+  sessionRevokeHandler } from '@/features/security/securityHandlers';
 
 import {
   apiKeysHandler,
-  apiKeyDeleteHandler,
-} from '@/features/admin/developerHandlers';
+  apiKeyDeleteHandler } from '@/features/admin/developerHandlers';
 
 import {
-  chatHandler,
-} from '@/features/auth/authHandlers';
+  chatHandler } from '@/features/auth/authHandlers';
 
 // oauthAdminHandlers removed — OAuth2 server models deleted
 
 import {
   knownAccountsHandler,
   switchAccountHandler,
-  removeKnownAccountHandler,
-} from '@/features/auth/accountSwitchHandlers';
+  removeKnownAccountHandler } from '@/features/auth/accountSwitchHandlers';
 
 // connectedAccountsHandler removed (LinkedAccount model removed)
 
-import {
-  incidentEventsListHandler, incidentEventsCreateHandler,
-} from '@/features/content/contentHandlers';
-
 import { adminAnalyticsOverviewHandler } from '@/features/admin/adminAnalytics';
 import { adminAnalyticsConsentedUsersHandler } from '@/features/admin/adminAnalyticsHandlers';
-import { adminMaintenanceHandler } from '@/features/admin/adminHandlers';
 
 import {
-  ticketListHandler, ticketCreateHandler, ticketDetailHandler, ticketUpdateHandler,
-  ticketMessageHandler, ticketAssignHandler, ticketCloseHandler, ticketReopenHandler,
-  ticketAppealsHandler, ticketAppealUnblockHandler,
-  ticketAttachmentsListHandler, ticketAttachmentsUploadHandler,
-  ticketAttachmentDownloadHandler,
-  ticketMarkReadHandler,
-  supportAppealCreateHandler,
-} from '@/features/support/supportHandlers';
-
-import {
-  loginHistoryHandler,
-} from '@/features/security/securityHandlers';
+  loginHistoryHandler } from '@/features/security/securityHandlers';
 
 
 
 import {
-  publicHealthHandler, detailedHealthHandler, poolHealthHandler,
-} from '@/features/observability/health';
+  publicHealthHandler, detailedHealthHandler, poolHealthHandler } from '@/features/observability/health';
 import {
   cacheDebugHandler, cacheResetDebugHandler,
   queryPerfDebugHandler, queryPerfResetDebugHandler,
-  queryPerfConfigDebugHandler, queryPerfConfigUpdateDebugHandler,
-} from '@/features/admin/debugHandlers';
+  queryPerfConfigDebugHandler, queryPerfConfigUpdateDebugHandler } from '@/features/admin/debugHandlers';
 
 // jobs module removed
 
-import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl } from '@/config/app-urls';
+import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl,  } from '@/config/app-urls';
+import { accountChecksHandler } from '@/features/status/accountChecks';
+import { appealFileHandler, appealsListHandler } from '@/features/support/appeals';
 
 const appUrl = (subdomain: string, path: string) => {
   const base = (() => {
@@ -214,10 +170,42 @@ const appUrl = (subdomain: string, path: string) => {
   return `${base}${path}`;
 };
 
+/**
+ * Origins this server may proxy to even though they resolve to a private
+ * address.
+ *
+ * The blanket private-address ban further down is the right default — it is what
+ * stops a server that proxies on request from being turned into a reader for the
+ * cloud metadata endpoint. But it bans the platform's own apps too, which in
+ * development are `localhost:3005` and on a LAN are `192.168.*`: precisely the
+ * addresses a service-to-service profile call has to make.
+ *
+ * So the exception is a fixed list built from server configuration and never
+ * from anything in the request, matched on the full origin (scheme + host +
+ * port) rather than a hostname suffix, so a lookalike host cannot inherit the
+ * trust by ending with the same name.
+ */
+function trustedInternalOrigins(): Set<string> {
+  const bases = [
+    getMyprofileBaseUrl(), getAccountsBaseUrl(), getDashboardBaseUrl(),
+    getAdminBaseUrl(), getFormsBaseUrl(), getCdnBaseUrl(), getSupportBaseUrl(),
+  ];
+  const origins = new Set<string>();
+  for (const base of bases) {
+    try {
+      const parsed = new URL(base);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') origins.add(parsed.origin);
+    } catch {
+      /* A malformed configured address narrows the list rather than widening
+         it — the safe direction for a typo. */
+    }
+  }
+  return origins;
+}
+
 const INTERNAL_ROUTES = [
   'auth/login', 'auth/signup', 'auth/email-exists', 'auth/username-exists', 'auth/logout',
   'auth/email-otp/request', 'auth/email-otp/verify',
-  'auth/phone-otp/request', 'auth/phone-otp/verify',
     'auth/signup-otp/request', 'auth/signup-otp/verify',
     'auth/change-email/request', 'auth/change-email/verify',
   'auth/oauth-consent', 'auth/oauth/consent', 'auth/oauth/pending', 'auth/oauth/complete',
@@ -236,22 +224,26 @@ const INTERNAL_ROUTES = [
    'auth/accounts', 'auth/switch-account', 'auth/accounts/remove',
    'security/session-revoke',
    'auth/verify-email', 'auth/verify',
-  'captcha/challenge', 'captcha/verify', 'captcha/status', 'captcha/image/[id]',
   'users/me',
-  'profile', 'security/password', 'security/sessions', 'security/set-password',
+  // 'internal/profile' is the profile service's own path to the account row. It
+  // authenticates with a shared service token instead of a session, so the
+  // per-request session lookup, role check and rate-limit bucket that a browser
+  // call pays for are not paid again for the same profile four times over.
+  'profile', 'internal/profile', 'security/password', 'security/sessions', 'security/set-password',
   'security/events', 'security/totp/setup', 'security/totp/verify', 'security/totp/disable',
-  'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/phones/send-otp', 'security/phones/verify-otp', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
-  'security/password-check', 'security/sessions/revoke-all', 'security/login-history',
+  'security/backup-codes/list', 'security/backup-codes/regenerate', 'security/phones', 'security/recovery-email', 'security/recovery-email/send-code', 'security/recovery-email/verify',
+  'security/password-check', 'security/sessions/revoke-all', 'security/login-history', 'security/status',
   'profile/request-edit-otp', 'profile/verify-edit-otp', 'profile/avatar', 'profile/check-username',
-  'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/digest', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'consent-history',
+  'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/summary', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'preferences/data-usage', 'settings', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
   'emails', 'emails/unsubscribe', 'emails/preferences', 'pushes',
   'districts',
   'developer/api-keys',
-  'user/activity', 'user/apps', 'user/overview',
+  'user/activity', 'user/apps', 'user/overview', 'user/account-status', 'user/account-checks',
   'admin/reserved-addresses',
   'admin/groups',
+  'admin/account-status',
   'admin/ous', 'admin/security/score',
   'admin/settings', 'admin/analytics/overview', 'admin/analytics/consented-users', 'admin/maintenance',
   // connected-accounts removed — OAuth IDs stored on users table directly
@@ -277,21 +269,32 @@ const INTERNAL_ROUTES = [
 
 ];
 
-let blockCache: { data: any[]; ts: number } | null = null;
-const CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
-const STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
+// The blocklist table is gone. IP blocks are Redis-backed now (isIpBlocked in
+// features/security/security.ts — same stale-tolerant contract, never throws),
+// and user blocks are derived from the consolidated account status:
+// suspended | deletion_pending | deleted are the blocking states.
+const USER_BLOCK_CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
+const USER_BLOCK_STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
+const BLOCKED_USER_STATUSES = new Set(['suspended', 'deletion_pending', 'deleted', 'restricted']);
+const userBlockCache = new Map<string, { blocked: boolean; ts: number }>();
 
-async function loadBlocked() {
-  if (blockCache && Date.now() - blockCache.ts < CACHE_TTL) return blockCache.data;
-  try {
-    const data = await prisma.blocklist.findMany();
-    blockCache = { data, ts: Date.now() };
-    return data;
+async function isUserBlocked(userId?: string) {
+  if (!userId) return false;
+  const hit = userBlockCache.get(userId);
+  if (hit && Date.now() - hit.ts < USER_BLOCK_CACHE_TTL) return hit.blocked;    try {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+    const blocked = !!user && BLOCKED_USER_STATUSES.has(user?.status);
+    userBlockCache.set(userId, { blocked, ts: Date.now() });
+    if (userBlockCache.size > 2000) {
+      const now = Date.now();
+      for (const [k, v] of userBlockCache) { if (now - v.ts > USER_BLOCK_CACHE_TTL) userBlockCache.delete(k); }
+    }
+    return blocked;
   } catch (e: any) {
-    console.error('[BLOCKLIST] DB query failed, serving stale cache:', e?.message);
+    console.error('[BLOCKLIST] user status query failed, serving stale cache:', e?.message);
     // Serve stale cache if available instead of failing
-    if (blockCache && Date.now() - blockCache.ts < STALE_TTL) return blockCache.data;
-    return [];
+    if (hit && Date.now() - hit.ts < USER_BLOCK_STALE_TTL) return hit.blocked;
+    return false;
   }
 }
 
@@ -349,7 +352,9 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
   }
 
   // Handle support/tickets/{id} dynamic route (GET/PATCH/PUT/DELETE)
-  if (slug.length === 3 && slug[0] === 'support' && slug[1] === 'tickets') {
+  // 'appeals' is a collection name, not a ticket id — it resolves through the
+  // static methodMap below to the appeals list handler.
+  if (slug.length === 3 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] !== 'appeals') {
     const ticketId = slug[2];
     const allowed = ['GET', 'PATCH', 'PUT', 'DELETE'];
     if (allowed.includes(method.toUpperCase())) {
@@ -370,17 +375,6 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
     }
   }
 
-  // Handle support/tickets/appeals/{rayId}/unblock
-  if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] === 'appeals' && slug[4] === 'unblock') {
-    return { path: 'support/tickets/appeals/[rayId]/unblock', method, internal: true, allowedRoles: ['guest'], meta: { appealRayId: slug[3] } };
-  }
-
-  // Handle captcha/image/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'captcha' && slug[1] === 'image') {
-    const imageId = slug[2];
-    return { path: 'captcha/image/[id]', method, internal: true, allowedRoles: ['guest'], meta: { imageId } };
-  }
-
   // Handle profile/oauth/{provider} dynamic route (unlink OAuth account)
   if (slug.length === 3 && slug[0] === 'profile' && slug[1] === 'oauth') {
     if (method.toUpperCase() === 'DELETE') {
@@ -398,14 +392,8 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'auth/verify-email': ['POST'],
       'auth/verify': ['GET'],
       'auth/logout': ['POST'],
-      'captcha/challenge': ['GET', 'POST'],
-      'captcha/verify': ['POST'],
-      'captcha/status': ['GET'],
-      'captcha/image/[id]': ['GET'],
       'auth/email-otp/request': ['POST'],
       'auth/email-otp/verify': ['POST'],
-      'auth/phone-otp/request': ['POST'],
-      'auth/phone-otp/verify': ['POST'],
        'auth/signup-otp/request': ['POST'],
        'auth/signup-otp/verify': ['POST'],
        'auth/change-email/request': ['POST'],
@@ -444,6 +432,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
         'security/session-revoke': ['POST'],
        'users/me': ['GET', 'PATCH'],
       'profile': ['GET', 'PATCH', 'PUT'],
+      'internal/profile': ['GET', 'PATCH'],
       'security/password': ['POST'],
       'security/sessions': ['GET', 'DELETE'],
       'security/set-password': ['POST'],
@@ -454,13 +443,12 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'security/backup-codes/list': ['GET'],
       'security/backup-codes/regenerate': ['POST'],
       'security/phones': ['POST', 'DELETE'],
-      'security/phones/send-otp': ['POST'],
-      'security/phones/verify-otp': ['POST'],
       'security/recovery-email': ['PUT'],
       'security/recovery-email/send-code': ['POST'],
       'security/recovery-email/verify': ['POST'],
       'security/login-history': ['GET'],
       'security/password-check': ['POST'],
+      'security/status': ['GET'],
       'security/sessions/revoke-all': ['DELETE'],
       'profile/request-edit-otp': ['POST'],
       'profile/verify-edit-otp': ['POST'],
@@ -469,13 +457,15 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'notifications/prefs': ['GET', 'PUT'],
       'notifications/prefs/channels': ['GET', 'PUT'],
       'notifications/prefs/categories': ['GET', 'PUT'],
-      'notifications/prefs/digest': ['GET', 'PUT'],
+      'notifications/prefs/summary': ['GET', 'PUT'],
       'notifications/prefs/tips': ['GET', 'PUT'],
       'integrations': ['GET', 'POST', 'DELETE'],
       'integrations/merge': ['POST'],
 
       'user/activity': ['GET'],
       'preferences': ['GET', 'PATCH'],
+      'preferences/data-usage': ['GET', 'PUT', 'PATCH'],
+      'settings': ['GET', 'PATCH'],
       'consent-history': ['GET'],
       'admin/heartbeat': ['POST'],
       'email/config': ['GET', 'PATCH'],
@@ -493,6 +483,9 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'developer/api-keys': ['GET', 'POST'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'user/overview': ['GET'],
+      'user/account-status': ['GET'],
+      'user/account-checks': ['GET'],
+      'admin/account-status': ['PUT'],
       'admin/reserved-addresses': ['GET', 'POST'],
       'admin/groups': ['GET', 'POST'],
       'admin/ous': ['GET', 'POST'],
@@ -503,7 +496,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'admin/analytics/consented-users': ['GET'],
       // connected-accounts removed — OAuth IDs stored on users table directly
       'user/export-data': ['GET', 'POST'],
-      'user/delete-account': ['POST', 'DELETE'],
+      'user/delete-account': ['GET', 'POST', 'DELETE'],
       'profile/public': ['GET'],       'auth/cli-token': ['POST'],
        'waitlist': ['POST'],
       'feedback': ['POST', 'GET'],
@@ -532,10 +525,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'support/tickets/[id]/read': ['POST'],
       'support/tickets/[id]/attachments': ['GET', 'POST'],
       'support/tickets/[id]/attachments/[attachmentId]': ['GET'],
-      'support/tickets/appeals': ['GET'],
-
-
-    };
+      'support/tickets/appeals': ['GET'] };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
       return { path: pathPart, method, internal: true, allowedRoles: ['guest'] };
@@ -544,41 +534,45 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
   return undefined;
 }
 
-function isBlocked(ip?: string, userId?: string, blocked: any[] = []) {
-  return blocked.some((entry: any) =>
-    (entry.type === 'ip' && entry.value === ip) ||
-    (entry.type === 'user' && entry.value === userId)
-  );
-}
-
-export async function GET(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
-  const { slug } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ slug?: string[] }> }) {
+  const { slug = [] } = await params;
   return handler(request, slug, 'GET');
 }
-export async function POST(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
-  const { slug } = await params;
+export async function POST(request: NextRequest, { params }: { params: Promise<{ slug?: string[] }> }) {
+  const { slug = [] } = await params;
   return handler(request, slug, 'POST');
 }
-export async function PUT(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
-  const { slug } = await params;
+export async function PUT(request: NextRequest, { params }: { params: Promise<{ slug?: string[] }> }) {
+  const { slug = [] } = await params;
   return handler(request, slug, 'PUT');
 }
-export async function DELETE(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
-  const { slug } = await params;
+export async function DELETE(request: NextRequest, { params }: { params: Promise<{ slug?: string[] }> }) {
+  const { slug = [] } = await params;
   return handler(request, slug, 'DELETE');
 }
-export async function PATCH(request: NextRequest, { params }: { params: Promise<{ slug: string[] }> }) {
-  const { slug } = await params;
+export async function PATCH(request: NextRequest, { params }: { params: Promise<{ slug?: string[] }> }) {
+  const { slug = [] } = await params;
   return handler(request, slug, 'PATCH');
 }
 
+/**
+ * Every API route in one door, which is why the request's origin is put on the
+ * async chain here: a change written three calls deep can say which machine and
+ * which place it came from without fifty handlers threading `request` down to
+ * the writer. See infrastructure/observability/requestContext.
+ */
 async function handler(request: NextRequest, slug: string[], method: string) {
+  return withRequestOrigin(request.headers, () => dispatch(request, slug, method));
+}
+
+async function dispatch(request: NextRequest, slug: string[], method: string) {
   const rawIp = request.headers.get('x-forwarded-for') || '';
   const ip = rawIp.split(',')[0].trim();
   const authHeader = request.headers.get('authorization') || '';
   const pathStr = slug.join('/');
   let session: any = null;
   let authMethod: 'cookie' | 'api-key' | 'none' = 'none';
+
 
   try {
     session = await getSession(request);
@@ -610,28 +604,27 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     }).catch(() => {});
   }
 
-  const routes: any[] = [];
-  let blocked: any[] = [];
+  let blocked = false;
   try {
-    blocked = await loadBlocked();
+    blocked = (await isIpBlocked(ip)) || (await isUserBlocked(session?.userId));
   } catch (e: any) {
-    console.error('[HANDLER] loadBlocked failed:', e?.message);
+    console.error('[HANDLER] block check failed:', e?.message);
     return NextResponse.json({ error: 'Database connection error' }, { status: 500 });
   }
 
-  if (isBlocked(ip, session?.userId, blocked)) {
+  if (blocked) {
     console.warn(`[AUTH] Blocked request — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
     return jsonForbidden('Your IP or account has been blocked');
   }
 
   // Redirect user-facing paths to the dashboard instead of returning 404.
-  // The API server only serves /api/* routes; pages live on dashboard.tirbeo.app.
+  // The API server only serves /api/* routes; pages live on dashboard.tirbeo.com.
   // Skip paths that are registered internal API routes (e.g. support/tickets).
   if (!pathStr || pathStr.startsWith('account') || pathStr.startsWith('settings') || pathStr.startsWith('overview') || pathStr.startsWith('support')) {
     const isInternal = INTERNAL_ROUTES.some((r) => pathStr === r || pathStr.startsWith(r + '/'));
     if (!isInternal) {
-      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
       const dashboardBase = `https://dashboard.${appDomain}`;
       if (!pathStr) {
         return NextResponse.json({
@@ -639,8 +632,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           status: 'healthy',
           docs: '/api/health',
           dashboard: dashboardBase,
-          accounts: `https://accounts.${appDomain}`,
-        });
+          accounts: `https://accounts.${appDomain}` });
       }
       const target = `${dashboardBase}/${pathStr}`;
       return NextResponse.redirect(target);
@@ -679,7 +671,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   // without waiting for the query to timeout. Health and auth routes bypass
   // this check since they handle their own DB errors gracefully.
   const SKIP_DB_CHECK = [
-    'health', 'health/pool', 'captcha/status', 'captcha/challenge',
+    'health', 'health/pool',
     'public/app-config', 'public/help-config', 'public/faq', 'public/theme',
     'public/branding', 'public/landing', 'public/landing-config', 'admin/check-setup',
     'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
@@ -723,12 +715,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/email-otp/verify':
         resp = await verifyEmailOtpHandler(request);
-        break;
-      case 'auth/phone-otp/request':
-        resp = await requestPhoneOtpHandler(request);
-        break;
-      case 'auth/phone-otp/verify':
-        resp = await verifyPhoneOtpHandler(request);
         break;
       case 'auth/signup-otp/request':
         resp = await requestSignupOtpHandler(request);
@@ -836,6 +822,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'profile':
         resp = await extendedProfileHandler(request);
         break;
+      case 'internal/profile':
+        resp = await internalProfileHandler(request);
+        break;
       case 'security/password':
         resp = await changePasswordHandler(request);
         break;
@@ -869,12 +858,6 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'security/phones':
         resp = (method.toUpperCase() === 'POST') ? await phonesAddHandler(request) : await phonesRemoveHandler(request);
         break;
-      case 'security/phones/send-otp':
-        resp = await phonesSendOtpHandler(request);
-        break;
-      case 'security/phones/verify-otp':
-        resp = await phonesVerifyOtpHandler(request);
-        break;
       case 'security/recovery-email':
         resp = await recoveryEmailHandler(request);
         break;
@@ -886,6 +869,9 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'security/password-check':
         resp = await passwordCheckHandler(request);
+        break;
+      case 'security/status':
+        resp = await securityStatusHandler(request);
         break;
       case 'security/sessions/revoke-all':
         resp = await sessionsRevokeAllHandler(request);
@@ -918,8 +904,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'notifications/prefs/categories':
         resp = await notificationCategoriesHandler(request);
         break;
-      case 'notifications/prefs/digest':
-        resp = await notificationDigestHandler(request);
+      case 'notifications/prefs/summary':
+        resp = await notificationSummaryHandler(request);
         break;
       case 'notifications/prefs/tips':
         resp = await notificationTipsHandler(request);
@@ -936,6 +922,21 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         break;
       case 'preferences':
         resp = await preferencesHandler(request);
+        break;
+      case 'preferences/data-usage':
+        resp = await dataUsageHandler(request);
+        break;
+      case 'user/account-status':
+        resp = await accountStatusHandler(request);
+        break;
+      case 'user/account-checks':
+        resp = await accountChecksHandler(request);
+        break;
+      case 'admin/account-status':
+        resp = await adminAccountStatusHandler(request);
+        break;
+      case 'settings':
+        resp = await settingsHandler(request);
         break;
       case 'consent-history':
         resp = await consentHistoryHandler(request);
@@ -964,7 +965,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           break;
         }
         await processUnsubscribe(decoded.userId, decoded.category);
-        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.app';
+        const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
         resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
         break;
       }
@@ -972,59 +973,14 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await adminEmailsHandler(request);
         break;
 
-      // ── Email Brain ──
-      case 'admin/email-brain/overview':
-        resp = await emailBrainOverviewHandler(request);
-        break;
-      case 'admin/email-brain/events':
-        resp = await emailBrainEventsHandler(request);
-        break;
-      case 'admin/email-brain/ai-usage':
-        resp = await emailBrainAiUsageHandler(request);
-        break;
-      case 'admin/email-brain/digests':
-        resp = await emailBrainDigestsHandler(request);
-        break;
-      case 'admin/email-brain/suppressions':
-        resp = await emailBrainSuppressionsHandler(request);
-        break;
-      case 'admin/email-brain/ai':
-        resp = await emailBrainAiHandler(request);
-        break;
-      case 'admin/email-brain/preview':
-        resp = await emailBrainPreviewHandler(request);
-        break;
-      case 'admin/email-brain/test':
-        resp = await emailBrainTestHandler(request);
-        break;
-      case 'admin/email-brain/definitions':
-        resp = await emailBrainDefinitionsHandler(request);
-        break;
-      case 'admin/email-brain/definitions/action': {
-        // POST /admin/email-brain/definitions/action {definitionId, ...} — the
-        // catch-all router matches flat paths; id comes in the body.
-        const body = await request.json().catch(() => ({} as any));
-        resp = await emailBrainDefinitionActionHandler(request, (body as any)?.definitionId || '');
-        break;
-      }
-      case 'admin/email-brain/versions': {
-        const body = await request.json().catch(() => ({} as any));
-        resp = await emailBrainVersionsHandler(request, (body as any)?.definitionId || '');
-        break;
-      }
-
-      case 'emails/preferences':
-        resp = await emailPreferencesHandler(request);
-        break;
       case 'admin/emails/reply':
         resp = await adminEmailReplyHandler(request);
         break;
       case 'admin/email-preview': {
         const adminSess = await requireSession(request);
         if (adminSess instanceof NextResponse) { resp = adminSess; break; }
-        const { isAdmin: checkAdmin } = await import('@/features/auth/http-guards');
-        const admUser = await prisma.user.findUnique({ where: { id: adminSess.userId }, select: { adminRole: true } });
-        if (!admUser?.adminRole) { resp = jsonForbidden('Admin only'); break; }
+        const admUser = await prisma.user.findUnique({ where: { id: adminSess.userId }, select: { isAdmin: true } });
+        if (!admUser?.isAdmin) { resp = jsonForbidden('Admin only'); break; }
         const epUrl = new URL(request.url);
         const epTemplate = epUrl.searchParams.get('template') || 'welcome';
         const { getFallbackTemplates } = await import('@/features/email/email');
@@ -1032,53 +988,17 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         const tmpl = templates[epTemplate];
         if (tmpl) {
           const { renderTemplate } = await import('@/features/email/email');
-          const sampleVars: Record<string, string> = {
-            name: 'John Doe', email: 'john@example.com', otp: '123456',
-            dashboardUrl: getDashboardBaseUrl(), adminUrl: getAdminBaseUrl(),
-            loginUrl: getAccountsBaseUrl() + '/login', resetUrl: getAccountsBaseUrl() + '/reset',
-            magicLink: getAccountsBaseUrl() + '/auth/magic/abc',
-            recoveryUrl: getAccountsBaseUrl() + '/recover/abc',
-            formTitle: 'Contact Form', formUrl: getFormsBaseUrl() + '/form/abc',
-            respondentName: 'Jane Doe', submittedAt: 'Aug 25, 2026, 2:05 PM UTC',
-            ticketId: 'TKT-001', ticketSubject: 'Login issue', ticketStatus: 'open',
-            ticketUrl: getSupportBaseUrl() + '/support/tickets/abc',
-            subject: 'Test Alert', message: 'This is a test alert.', details: '<p>Details here</p>',
-            service: 'PostgreSQL', alertTime: 'Aug 25, 2026, 2:05 PM UTC',
-            location: 'New York, US', device: 'Chrome on macOS', loginTime: 'Aug 25, 2026, 2:05 PM UTC',
-            ipAddress: '192.168.1.1', revokeUrl: getDashboardBaseUrl() + '/account/sessions',
-            changedAt: 'Aug 25, 2026, 2:05 PM UTC',
-            company: 'Acme Inc', companyName: 'Acme Inc',
-            adminRole: 'admin', temporaryPassword: 'Temp123!',
-            title: 'New Feature: Real-time Notifications',
-            ctaUrl: getDashboardBaseUrl() + '/overview', ctaLabel: 'Try it now',
-            count: '5', digestItems: '<div style="padding:12px;background:#f8f9fa;border-radius:8px;"><strong>New submission</strong></div>',
-            periodLabel: 'Aug 19 – Aug 25, 2026',
-            statRows: '<div style="padding:12px 0;"><strong>Logins:</strong> 12<br/><strong>Submissions:</strong> 47</div>',
-            suspiciousSection: '',
-            tipTitle: 'Enable Two-Factor Authentication', tipBody: 'Secure your account.',
-            actionUrl: getDashboardBaseUrl() + '/account/security',
-            statusType: 'suspended', reason: 'Violation of terms', untilLabel: 'Until further notice.',
-            dateLabel: 'Sep 25, 2026',
-            updateMessage: "We're looking into your issue.",
-            responseId: 'resp_abc', answers: '<div><strong>Name:</strong> Jane</div>',
-            submissionData: '<div><strong>Name:</strong> Jane<br/><strong>Email:</strong> jane@example.com</div>',
-            rejectionReason: 'Insufficient documentation',
-            requestId: 'REQ-001', requestedRole: 'admin',
-            flowsUrl: 'https://flows.tirbeo.app',
-            flowName: 'My Flow', errorMessage: 'Connection timeout', failedAt: 'Aug 25, 2026',
-            duration: '2.3s', stepsExecuted: '5',
-            connectionName: 'Google OAuth', expiresAt: 'Sep 25, 2026', affectedFlows: 'My Flow',
-            connectionsUrl: 'https://flows.tirbeo.app/connections',
-            plan: 'Pro', amount: '$29/mo', date: 'Aug 25, 2026',
-            exportedAt: 'Aug 25, 2026', downloadUrl: getDashboardBaseUrl() + '/download',
-            milestone: '100',
-            responseCount: '23', totalResponses: '156',
-            webhookUrl: 'https://example.com/webhook', httpStatus: '500',
-            webhookFailedReason: 'Connection timeout',
-            role: 'editor', addedByName: 'Admin',
-            limit: '1000', settingsUrl: 'https://tirbeo.app/account/preferences',
-            logins: '12', submissions: '47',
-          };
+          // One shared manifest — see features/email/sample-vars.ts. This
+          // block used to carry its own 44-name list that had drifted out of
+          // sync with the catalogue: 60 of 91 real placeholders were missing,
+          // so previews rendered literal {{submissionId}} to the admin.
+          const { sampleVars: buildSampleVars } = await import(
+            '@/features/email/sample-vars'
+          );
+          const sampleVars = buildSampleVars({
+            accountsUrl: getAccountsBaseUrl(),
+            dashboardUrl: getDashboardBaseUrl(),
+            adminUrl: getAdminBaseUrl() });
           const html = renderTemplate(tmpl.html, sampleVars);
           resp = NextResponse.json({ html });
         } else {
@@ -1093,11 +1013,13 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         const emUrl = new URL(request.url);
         const emLimit = Math.min(parseInt(emUrl.searchParams.get('limit') || '50', 10), 200);
         const emOffset = parseInt(emUrl.searchParams.get('offset') || '0', 10);
-        const emUser = await emPrisma.user.findUnique({ where: { id: emSession.userId }, select: { email: true, role: true } });
-        const emWhere: any = emUser?.role === 'admin' ? {} : { toEmail: emUser?.email };
+        const emUser = await emPrisma.user.findUnique({ where: { id: emSession.userId }, select: { isAdmin: true } });
+        // User.email/role are gone — admins see every job, everyone else only
+        // their own email jobs (userId covers all of a user's addresses).
+        const emWhere: any = emUser?.isAdmin ? {} : { userId: emSession.userId };
         const [emItems, emTotal] = await Promise.all([
-          emPrisma.email_logs.findMany({ where: emWhere, orderBy: { createdAt: 'desc' }, take: emLimit, skip: emOffset }),
-          emPrisma.email_logs.count({ where: emWhere }),
+          emPrisma.email_jobs.findMany({ where: emWhere, orderBy: { createdAt: 'desc' }, take: emLimit, skip: emOffset }),
+          emPrisma.email_jobs.count({ where: emWhere }),
         ]);
         resp = NextResponse.json({ items: emItems, total: emTotal, limit: emLimit, offset: emOffset });
         break;
@@ -1107,6 +1029,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         const euSuccess = euUrl.searchParams.get('success') === '1';
         const euError = euUrl.searchParams.get('error') || '';
         const euPrefill = euUrl.searchParams.get('email') || '';
+        const euToken = euUrl.searchParams.get('token') || '';
         if (request.method === 'GET') {
           const escH = (s: string) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
@@ -1119,6 +1042,15 @@ async function handler(request: NextRequest, slug: string[], method: string) {
               <div style="margin-bottom:20px">${checkIcon}</div>
               <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribed</h1>
               <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:0">You won't receive non-essential emails anymore.<br/>Security alerts are always sent.</p>`;
+          } else if (!euToken) {
+            // No token means the visitor arrived without an email link — do NOT
+            // let them mute an account by typing an arbitrary address. They must
+            // use the signed link from their own inbox.
+            bodyContent = `
+              <div style="margin-bottom:20px">${mailIcon}</div>
+              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribe from emails</h1>
+              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:28px">Use the unsubscribe link that was sent to your email.</p>
+              ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}`;
           } else {
             bodyContent = `
               <div style="margin-bottom:20px">${mailIcon}</div>
@@ -1126,46 +1058,68 @@ async function handler(request: NextRequest, slug: string[], method: string) {
               <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:28px">Enter your email to stop receiving non-essential emails.</p>
               ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}
               <form method="POST" action="/api/emails/unsubscribe">
+                <input type="hidden" name="token" value="${escH(euToken)}" />
                 <input id="eu-email" type="email" name="email" placeholder="you@example.com" value="${escH(euPrefill)}" required autocomplete="email" style="width:100%;padding:11px 14px;background:#000000;border:1px solid #222222;border-radius:8px;font-size:14px;color:#ffffff;outline:none;transition:border-color .15s;margin-bottom:14px" onfocus="this.style.borderColor='#444444'" onblur="this.style.borderColor='#222222'" />
                 <button type="submit" style="width:100%;padding:11px;background:#ffffff;color:#000000;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">Unsubscribe</button>
               </form>`;
           }
 
-          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #111111;font-size:11px;color:#444444;line-height:1.7"><a href="https://tirbeo.app" style="color:#666666;text-decoration:none">tirbeo.app</a></div></div></body></html>`;
+          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #111111;font-size:11px;color:#444444;line-height:1.7"><a href="https://tirbeo.com" style="color:#666666;text-decoration:none">tirbeo.com</a></div></div></body></html>`;
           resp = new NextResponse(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         } else {
-          // POST — process email-based unsubscribe
+          // POST — process email-based unsubscribe. REQUIRES a valid signed
+          // token (proof the caller owns this inbox) + a matching email.
           try {
             const ct = request.headers.get('content-type') || '';
             let euAddr = '';
+            let euTokenIn = euToken;
             if (ct.includes('application/json')) {
               const body: any = await request.json();
               euAddr = (body.email || '').trim().toLowerCase();
+              euTokenIn = euTokenIn || (body.token || '');
             } else if (ct.includes('multipart/form-data')) {
               const fd = await request.formData();
               euAddr = (fd.get('email') as string || '').trim().toLowerCase();
+              euTokenIn = euTokenIn || (fd.get('token') as string || '');
             } else {
               const txt = await request.text();
               const m = txt.match(/email=([^&]+)/);
               if (m) euAddr = decodeURIComponent(m[1]).trim().toLowerCase();
+              const tm = txt.match(/token=([^&]+)/);
+              if (tm) euTokenIn = euTokenIn || decodeURIComponent(tm[1]).trim();
             }
-            if (!euAddr || !euAddr.includes('@')) {
-              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=Please+enter+a+valid+email+address`, 302);
+
+            if (!euTokenIn) {
+              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+link+is+missing+its+authorization+token.+Please+use+the+link+from+your+email.`, 302);
             } else {
-              const euUser = await prisma.user.findUnique({ where: { email: euAddr }, select: { id: true, notificationPreferences: true, emailUnsubscribed: true } });
-              if (euUser) {
-                const prefs: any = (euUser as any).notificationPreferences || {};
-                const eu: any = (euUser as any).emailUnsubscribed || {};
-                prefs.email = false; prefs.productEmail = false; prefs.formsEmail = false; prefs.supportEmail = false;
-                eu.all = true; eu.product = true; eu.forms = true; eu.support = true;
-                await prisma.$executeRaw`UPDATE "users" SET "notification_preferences" = ${JSON.stringify(prefs)}::jsonb, "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb WHERE "id" = ${euUser.id}`;
-                console.log(`[EMAIL/UNSUBSCRIBE] ${euAddr} unsubscribed from all non-essential emails`);
+              const { verifyUnsubscribeToken } = await import('@/features/email/emailPrefs');
+              const decoded = verifyUnsubscribeToken(euTokenIn);
+              if (!decoded) {
+                resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+unsubscribe+link+is+invalid+or+has+expired.+Please+use+the+link+from+a+recent+email.`, 302);
+              } else if (!euAddr || !euAddr.includes('@')) {
+                resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?token=${encodeURIComponent(euTokenIn)}&email=${encodeURIComponent(euAddr)}&error=Please+enter+a+valid+email+address`, 302);
+              } else {
+                // Bind the token to the address: the token is for a specific
+                // account, so an address that isn't one of the account's
+                // recorded emails means it's the wrong inbox. (User.email is
+                // gone — addresses live in user_email now.)
+                const euMatch = await prisma.userEmail.findFirst({
+                  where: { userId: decoded.userId, address: euAddr },
+                  select: { id: true } });
+                if (!euMatch) {
+                  resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+link+belongs+to+a+different+email+address.`, 302);
+                } else {
+                  const { processUnsubscribe } = await import('@/features/email/emailPrefs');
+                  await processUnsubscribe(decoded.userId, decoded.category);
+                  console.log(`[EMAIL/UNSUBSCRIBE] ${euAddr} unsubscribed (signed token)`);
+                  const apiBase = process.env.NEXT_PUBLIC_API_URL || 'https://api.tirbeo.com';
+                  resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
+                }
               }
-              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?success=1&email=${encodeURIComponent(euAddr)}`, 302);
             }
           } catch (err: any) {
             console.error('[EMAIL/UNSUBSCRIBE] Error:', err?.message);
-            resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=Something+went+wrong.+Please+try+again.`, 302);
+            resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=` + encodeURIComponent('Something went wrong. Please try the link again.'), 302);
           }
         }
         break;
@@ -1173,14 +1127,14 @@ async function handler(request: NextRequest, slug: string[], method: string) {
       case 'pushes': {
         const psSession = await requireSession(request);
         if (psSession instanceof NextResponse) { resp = psSession; break; }
-        const { prisma: psPrisma } = await import('@/infrastructure/db/prisma');
-        const psUser = await psPrisma.user.findUnique({ where: { id: psSession.userId }, select: { notificationPreferences: true } });
-        const psPrefs: any = (psUser as any)?.notificationPreferences || {};
+        // Push registrations ride in the notification-preference blob; read them
+        // through the merged view so they show up whichever store the write landed in.
+        const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
+        const psPrefs: any = await loadNotificationPrefs(psSession.userId);
         const psSubs = psPrefs.pushSubscriptions || [];
         const psItems = psSubs.map((sub: any, i: number) => ({
           id: i, endpoint: sub.endpoint ? `${sub.endpoint.slice(0, 30)}...` : 'unknown',
-          createdAt: sub.createdAt || null, userAgent: sub.userAgent || null, enabled: sub.enabled !== false,
-        }));
+          createdAt: sub.createdAt || null, userAgent: sub.userAgent || null, enabled: sub.enabled !== false }));
         resp = NextResponse.json({ items: psItems, total: psItems.length });
         break;
       }
@@ -1282,57 +1236,24 @@ async function handler(request: NextRequest, slug: string[], method: string) {
         resp = await adminEmailDetailHandler(request, (route as any).meta.emailId);
         break;
       case 'content/incident-events':
-        if (method === 'GET') resp = await incidentEventsListHandler(request);
-        else if (method === 'POST') resp = await incidentEventsCreateHandler(request);
-        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-        break;
-      // Support routes
       case 'support/tickets':
-        if (method === 'POST') resp = await ticketCreateHandler(request);
-        else resp = await ticketListHandler(request);
-        break;
       case 'support/tickets/create':
-        resp = await ticketCreateHandler(request);
-        break;
       case 'support/appeal':
-        resp = await supportAppealCreateHandler(request);
+        resp = await appealFileHandler(request);
         break;
       case 'support/tickets/appeals':
-        resp = await ticketAppealsHandler(request);
-        break;
-      case 'support/tickets/appeals/[rayId]/unblock':
-        resp = await ticketAppealUnblockHandler(request, (route as any).meta.appealRayId);
+        resp = await appealsListHandler(request);
         break;
       case 'support/tickets/[id]':
-        if (method === 'GET') resp = await ticketDetailHandler(request, (route as any).meta.ticketId);
-        else if (method === 'PATCH' || method === 'PUT') resp = await ticketUpdateHandler(request, (route as any).meta.ticketId);
-        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-        break;
       case 'support/tickets/[id]/messages':
-        resp = await ticketMessageHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/reply':
-        resp = await ticketMessageHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/read':
-        resp = await ticketMarkReadHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/assign':
-        resp = await ticketAssignHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/close':
-        resp = await ticketCloseHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/reopen':
-        resp = await ticketReopenHandler(request, (route as any).meta.ticketId);
-        break;
       case 'support/tickets/[id]/attachments':
-        if (method === 'GET') resp = await ticketAttachmentsListHandler(request, (route as any).meta.ticketId);
-        else if (method === 'POST') resp = await ticketAttachmentsUploadHandler(request, (route as any).meta.ticketId);
-        else resp = NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-        break;
       case 'support/tickets/[id]/attachments/[attachmentId]':
-        resp = await ticketAttachmentDownloadHandler(request, (route as any).meta.ticketId, (route as any).meta.attachmentId);
+        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
         break;
       case 'health':
         resp = await publicHealthHandler();
@@ -1358,6 +1279,10 @@ async function handler(request: NextRequest, slug: string[], method: string) {
           : await queryPerfConfigDebugHandler(request);
         break;
       case 'debug/rate-limits/reset': {
+        // Admin-gated (mirrors every other debug/* handler).
+        const { requireDebugAccess } = await import('@/features/admin/debugHandlers');
+        const denied = await requireDebugAccess(request);
+        if (denied) { resp = denied; break; }
         const { clearRateLimits } = await import('@/features/captcha/risk');
         clearRateLimits();
         resp = NextResponse.json({ success: true, message: 'Rate limits cleared' });
@@ -1389,11 +1314,11 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   let userRole = 'guest';
   if (session?.userId) {
     try {
+      // adminRole string is gone — the consolidated schema has a boolean.
       const user = await prisma.user.findUnique({
         where: { id: session.userId },
-        select: { adminRole: true },
-      });
-      userRole = user?.adminRole?.toLowerCase() || 'member';
+        select: { isAdmin: true } });
+      userRole = user?.isAdmin ? 'admin' : 'member';
     } catch (e: any) {
       console.error('[HANDLER] DB query failed during role lookup:', e?.message);
       userRole = 'guest';
@@ -1410,30 +1335,32 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '169.254.169.254', 'metadata.google.internal', 'metadata.internal', '100.100.100.200', '::1'];
     const blockedIpRanges = [/^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./, /^169\.254\./, /^fe80:/i, /^fc/i, /^fd/i, /^::1$/];
     const hostname = parsedTarget.hostname.toLowerCase();
-    if (blockedHosts.includes(hostname) || blockedIpRanges.some(r => r.test(hostname))) {
-      await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
-      return jsonForbidden('Proxy target not allowed');
-    }
-    if (/^[a-z0-9.-]+$/i.test(hostname) && !/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
-      try {
-        const { lookup } = await import('node:dns/promises');
-        const resolved = await lookup(hostname, { all: true });
-        const isPrivate = resolved.some(({ address }) =>
-          blockedHosts.includes(address) ||
-          blockedIpRanges.some(r => r.test(address))
-        );
-        if (isPrivate) {
-          await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
-          return jsonForbidden('Proxy target not allowed');
+    const isTrustedTarget = trustedInternalOrigins().has(parsedTarget.origin);
+    if (!isTrustedTarget) {
+      if (blockedHosts.includes(hostname) || blockedIpRanges.some(r => r.test(hostname))) {
+        await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
+        return jsonForbidden('Proxy target not allowed');
+      }
+      if (/^[a-z0-9.-]+$/i.test(hostname) && !/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
+        try {
+          const { lookup } = await import('node:dns/promises');
+          const resolved = await lookup(hostname, { all: true });
+          const isPrivate = resolved.some(({ address }) =>
+            blockedHosts.includes(address) ||
+            blockedIpRanges.some(r => r.test(address))
+          );
+          if (isPrivate) {
+            await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
+            return jsonForbidden('Proxy target not allowed');
+          }
+        } catch (e: any) {
+          await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 400 });
+          return jsonError('Proxy target could not be resolved', 400);
         }
-      } catch (e: any) {
-        await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 400 });
-        return jsonError('Proxy target could not be resolved', 400);
       }
     }
     targetUrl = `${route.target}${request.nextUrl.search}`;
-  } else {
-    const [subdomain, ...rest] = route.path.split('/');
+  } else {      const [subdomain, ...rest] = route.path.split('/');
     const targetBase = appUrl(subdomain, '/' + rest.join('/'));
     targetUrl = `${targetBase}${request.nextUrl.search}`;
   }
@@ -1442,10 +1369,8 @@ async function handler(request: NextRequest, slug: string[], method: string) {
     method,
     headers: {
       ...(session?.userId && { 'x-user-id': session.userId }),
-      'content-type': request.headers.get('content-type') || '',
-    },
-    body: method !== 'GET' && method !== 'HEAD' ? await request.text() : undefined,
-  };
+      'content-type': request.headers.get('content-type') || '' },
+    body: method !== 'GET' && method !== 'HEAD' ? await request.text() : undefined };
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
@@ -1464,8 +1389,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
   const responseHeaders = new Headers(upstreamResponse.headers);
   const response = new NextResponse(await upstreamResponse.text(), {
     status: upstreamResponse.status,
-    headers: responseHeaders,
-  });
+    headers: responseHeaders });
 
   await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: upstreamResponse.status });
   return addRateLimitHeaders(response);

@@ -55,7 +55,7 @@ async function batchSend(
   for (let i = 0; i < users.length; i += batchSize) {
     const batch = users.slice(i, i + batchSize);
     const results = await Promise.allSettled(
-      batch.map(user => sendTemplateEmail(user.email, templateName, { ...baseVars, name: user.name || 'User' })),
+      batch.map(user => sendTemplateEmail(user.email, templateName, { ...baseVars, name: user.name || 'User' }, { userId: user.id })),
     );
     // Also deliver an in-app notification (DB + WebSocket) per user. The
     // dedicated maintenance template is the email channel (skipEmail avoids a
@@ -117,7 +117,7 @@ export async function sendMaintenanceCompleteNotification(options: MaintenanceCo
     completionMessage,
     completedAt: completedAt.toLocaleString(),
     duration,
-    dashboardUrl: process.env.NEXT_PUBLIC_DASHBOARD_URL || 'https://dashboard.tirbeo.app',
+    dashboardUrl: process.env.NEXT_PUBLIC_DASHBOARD_URL || 'https://dashboard.tirbeo.com',
   }, title);
 
   console.log(`[MAINTENANCE] Sent ${result.sent} maintenance complete notifications, ${result.failed} failed`);

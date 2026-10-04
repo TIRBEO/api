@@ -87,12 +87,21 @@ export async function switchAccountHandler(request: NextRequest) {
       undefined;
     const userAgent = request.headers.get('user-agent') || undefined;
 
-    const { token, refreshToken } = await createSession(target.id, userAgent, ip);
+    // require2FA overrides the recognized-device skip: switching to this
+    // account must present a fresh second factor, same as signing in.
+    const { isRequire2FA } = await import('@/features/auth/second-factor');
+    if (await isRequire2FA(target.id)) {
+      const { signTemp2faToken } = await import('@/features/auth/jwt');
+      const tempToken = await signTemp2faToken(target.id);
+      return NextResponse.json({ needs2FA: true, tempToken });
+    }
+
+    const { token, refreshToken, saveLoginInfo } = await createSession(target.id, userAgent, ip);
     const res = NextResponse.json({
       user: { id: target.id, email: target.email, name: target.name, photoUrl: target.photoUrl },
       switched: true,
     });
-    setSessionCookie(res, token, refreshToken, request);
+    setSessionCookie(res, token, refreshToken, request, { shortSession: !saveLoginInfo });
     return res;
   } catch (err: any) {
     console.error('[SWITCH-ACCOUNT]', err?.message || err);

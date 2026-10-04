@@ -1,4 +1,5 @@
 import { prisma } from '@/infrastructure/db/prisma';
+import { isEmailPaused } from '@/features/email/emailPrefs';
 
 /** Delete notifications older than 30 days. Runs on startup + hourly. */
 export async function cleanupOldNotifications(olderThanDays = 30) {
@@ -38,21 +39,20 @@ export function startPeriodicCleanup() {
 }
 
 /**
- * Send email digests based on user preferences.
- * Two independent periodic emails:
- *  1. Unread-notifications digest — digestEnabled + digestFrequency (daily/weekly/monthly)
- *  2. Weekly activity summary — weeklySummary flag; real audit/security logs of the past week
- * Both are rate-limited with last_digest_sent_at / last_weekly_sent_at so the
- * hourly job never double-sends.
+ * The periodic account recap — the only recurring mail Tirbeo sends.
+ *
+ * There used to be two: a digest of unread notifications and a separate activity
+ * summary, each on its own cadence, so someone who turned both on got two
+ * overlapping mails about the same week. There is one now, and it lists what the
+ * account actually did — grouped the way the activity chart in the settings app
+ * groups it — on the rhythm the person chose.
  */
-export interface DigestPrefs {
-  digestEnabled: boolean;
-  digestFrequency: 'daily' | 'weekly' | 'monthly';
-  weeklySummary: boolean;
-  weeklySummaryFrequency: 'daily' | 'weekly' | 'monthly';
-  lastDigestSentAt?: string | null;
-  lastWeeklySentAt?: string | null;
-}
+type RecapChoice = {
+  summaryEnabled: boolean;
+  summaryFrequency: string;
+  lastSummarySentAt: string | null;
+  mailBlocked: boolean;
+};
 
 /** Cadence → minimum interval (ms) between sends. */
 export function frequencyToMs(freq: string | null | undefined): number {
@@ -65,157 +65,141 @@ export function isCadenceDue(lastSentAt: string | Date | null | undefined, now: 
   return now.getTime() - last >= freqMs;
 }
 
-export async function sendEmailDigests() {
+const obj = (raw: unknown): Record<string, any> =>
+  raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, any>) : {};
+
+const SUMMARY_FREQUENCIES = ['daily', 'weekly', 'monthly'];
+
+/**
+ * One person's recap choice, read out of the two stores that both hold part of
+ * the answer.
+ *
+ * `off` wins wherever it is found: a preference that only half got cleared must
+ * never be read as consent to mail somebody. Opting in has to be an explicit
+ * `true` in one of the two, so a column default or a missing field is never a
+ * subscription. The cadence comes from the account row first, because that is
+ * what the settings screen writes; the send clock lives in the mirror alone and
+ * this job is its only writer.
+ */
+/** Exported for the tests: this is the whole decision the sweep makes about one
+    account, and it is worth pinning without mailing anybody to prove it. */
+export function recapChoice(mirrorRaw: unknown, accountRaw: unknown): RecapChoice {
+  const mirror = obj(mirrorRaw);
+  const account = obj(accountRaw);
+  const raw = account.summaryFrequency ?? mirror.summaryFrequency;
+  // The unsubscribe map is an object keyed by category; the older literal `true`
+  // is still honoured because a store that once held it must keep holding a no.
+  const unsubscribedAll = [mirror, account].some(
+    (p) => p.unsubscribed === true || obj(p.unsubscribed).all === true,
+  );
+  return {
+    summaryEnabled: mirror.summaryEnabled !== false && account.summaryEnabled !== false
+      && (mirror.summaryEnabled === true || account.summaryEnabled === true),
+    summaryFrequency: SUMMARY_FREQUENCIES.includes(raw) ? raw : 'weekly',
+    lastSummarySentAt: mirror.lastSummarySentAt ?? null,
+    /* A paused account is not due for a recap, and saying so here is what saves
+       the letter rather than losing it: the mailer answers a suppressed send
+       with a plain "success", so a sweep that mailed into a pause would move the
+       send clock forward on a mail nobody got — and the person who paused for a
+       week would come back to nothing. Held back at the sweep instead, the clock
+       stays where it was and the recap arrives when the pause lapses. */
+    mailBlocked: mirror.email === false || account.email === false
+      || unsubscribedAll
+      || isEmailPaused(mirror) || isEmailPaused(account),
+  };
+}
+
+/**
+ * Move the send clock forward, but only if it still says what this run read.
+ * Cron, the per-request kick and the in-process timer can all be sweeping the
+ * same account in the same minute; without this, each of them sees "due" and
+ * each of them posts.
+ */
+async function claimSummarySlot(userId: string, expected: string | null, value: string | null): Promise<boolean> {
   try {
-    // SQL-filter users who opted in — only digestEnabled or weeklySummary users
-    // are loaded, so the hourly sweep never iterates the whole user table.
-    const users = await prisma.$queryRaw<Array<{
-      id: string; email: string; name: string | null;
-      digestEnabled: boolean; digestFrequency: string | null;
-      weeklySummary: boolean;
-      weeklySummaryFrequency: string | null;
-      lastDigestSentAt: string | null; lastWeeklySentAt: string | null;
-    }>>`
-      SELECT
-        u."id", u."email", u."name",
-        COALESCE((u."notification_preferences"->>'digestEnabled')::boolean, false) AS "digestEnabled",
-        u."notification_preferences"->>'digestFrequency' AS "digestFrequency",
-        COALESCE((u."notification_preferences"->>'weeklySummary')::boolean, false) AS "weeklySummary",
-        u."notification_preferences"->>'weeklySummaryFrequency' AS "weeklySummaryFrequency",
-        u."notification_preferences"->>'lastDigestSentAt' AS "lastDigestSentAt",
-        u."notification_preferences"->>'lastWeeklySentAt' AS "lastWeeklySentAt"
-      FROM "users" u
-      WHERE u."deleted_at" IS NULL AND u."is_banned" = false
-        AND (u."notification_preferences"->>'email')::boolean IS NOT FALSE
-        AND (
-          COALESCE((u."notification_preferences"->>'digestEnabled')::boolean, false) = true
-          OR COALESCE((u."notification_preferences"->>'weeklySummary')::boolean, false) = true
-        )
-      LIMIT 5000`;
-
-    const now = new Date();
-    const { sendTemplateEmail } = await import('@/features/email/email');
-    const { getDashboardBaseUrl } = await import('@/config/app-urls');
-    const dashboardUrl = getDashboardBaseUrl();
-
-    for (const row of users) {
-      const digestEnabled = row.digestEnabled === true;
-      const weeklySummary = row.weeklySummary === true;
-      if (!digestEnabled && !weeklySummary) continue;
-      // Keep the shape the rest of the function already reads.
-      const prefs: Partial<DigestPrefs> = {
-        digestEnabled,
-        weeklySummary,
-        digestFrequency: (row.digestFrequency === 'weekly' || row.digestFrequency === 'monthly')
-          ? row.digestFrequency as 'weekly' | 'monthly'
-          : 'daily',
-        lastDigestSentAt: row.lastDigestSentAt,
-        lastWeeklySentAt: row.lastWeeklySentAt,
-      };
-      const u = { id: row.id, email: row.email, name: row.name, notificationPreferences: prefs };
-      const freqMs = frequencyToMs(prefs.digestFrequency);
-      try {
-        // ── 1. Unread-notifications digest ──
-        if (digestEnabled) {
-          if (isCadenceDue(prefs.lastDigestSentAt, now, freqMs)) {
-            const lastSentMs = prefs.lastDigestSentAt ? new Date(prefs.lastDigestSentAt).getTime() : 0;
-            const cutoff = new Date(Math.max(lastSentMs, now.getTime() - freqMs));
-
-            // Gather notifications + activity in parallel
-            const [notifs, audits, secEvents] = await Promise.all([
-              prisma.notification.findMany({
-                where: { userId: u.id, isRead: false, createdAt: { gte: cutoff }, type: { notIn: ['product'] } },
-                orderBy: { createdAt: 'desc' }, take: 50,
-                select: { id: true, title: true, body: true, createdAt: true },
-              }),
-              prisma.auditEvent.findMany({
-                where: { actorId: u.id, createdAt: { gte: cutoff } },
-                select: { action: true, severity: true, createdAt: true },
-                take: 200,
-              }),
-              prisma.securityEvent.findMany({
-                where: { userId: u.id, createdAt: { gte: cutoff } },
-                select: { eventType: true, severity: true, createdAt: true },
-                take: 200,
-              }),
-            ]);
-
-            const totalCount = notifs.length + audits.length + secEvents.length;
-            // Always send when enabled — even if quiet, user gets a summary of the period (per PRD: daily/weekly/monthly even without login/activity)
-            {
-              // Build notification items HTML — show last activity even when 0
-              const itemsHtml = notifs.length > 0
-                ? notifs.map(n =>
-                    `<div style="padding:12px 14px;background:#111111;border:1px solid rgba(245,245,245,0.13);border-radius:10px;margin-bottom:8px;"><strong style="color:#F5F5F5;font-size:14px;">${esc(n.title)}</strong><br/><span style="color:rgba(245,245,245,0.74);font-size:13px;">${esc(n.body || '')}</span></div>`
-                  ).join('')
-                : '<p style="margin:0;font-size:14px;color:rgba(245,245,245,0.5);">No new notifications — everything is quiet. Here’s your activity for this period.</p>';
-
-              // Build activity summary HTML — always show, even when 0
-              const allEvents = [
-                ...audits.map(a => ({ action: a.action, severity: a.severity, at: a.createdAt })),
-                ...secEvents.map(s => ({ action: s.eventType, severity: s.severity, at: s.createdAt })),
-              ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
-
-              const activityCounts = new Map<string, number>();
-              for (const e of allEvents) {
-                const label = labelFor(e.action);
-                activityCounts.set(label, (activityCounts.get(label) || 0) + 1);
-              }
-
-              const activityHtml = activityCounts.size > 0
-                ? `<div style="margin-top:20px;">
-                    <p style="margin:0 0 10px;font-size:14px;font-weight:600;color:#F5F5F5;">Activity Summary</p>
-                    ${[...activityCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label, n]) =>
-                      `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(245,245,245,0.13);font-size:14px;color:rgba(245,245,245,0.74);"><span>${esc(label)}</span><strong style="color:#F5F5F5;">${n}</strong></div>`
-                    ).join('')}
-                    <div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#F5F5F5;"><span><strong>Total events</strong></span><strong>${allEvents.length}</strong></div>
-                  </div>`
-                : `<div style="margin-top:20px;padding:12px 14px;background:#111111;border-radius:10px;border:1px solid rgba(245,245,245,0.13);"><p style="margin:0;font-size:13px;color:rgba(245,245,245,0.5);">No account activity in this period — no logins, changes, or security events. We’ll keep watching.</p></div>`;
-
-              const freqLabel = prefs.digestFrequency || 'daily';
-              await sendTemplateEmail(u.email, 'notification_digest', {
-                name: u.name || u.email,
-                count: String(totalCount),
-                digestItems: itemsHtml,
-                activitySection: activityHtml,
-                dashboardUrl,
-              }, { rawVars: ['digestItems', 'activitySection'], categoryOverride: 'digest' }).catch(() => {});
-
-              savePrefsSnapshot(u.id, { digestEnabled, digestFrequency: freqLabel, weeklySummary, lastDigestSentAt: now.toISOString(), lastWeeklySentAt: prefs.lastWeeklySentAt ?? null }).catch(() => {});
-
-              console.log(`[DIGEST] Sent ${totalCount} items (${notifs.length} notifs + ${allEvents.length} activity) to ${u.email} (${freqLabel})`);
-            }
-          }
-        }
-
-        // ── 2. Activity summary (weeklySummary opt-in, user-chosen cadence) ──
-        if (weeklySummary) {
-          const summaryFreq = prefs.weeklySummaryFrequency || 'weekly';
-          const periodMs = frequencyToMs(summaryFreq);
-          if (isCadenceDue(prefs.lastWeeklySentAt, now, periodMs)) {
-            const sent = await sendWeeklySummary(u.id, new Date(now.getTime() - periodMs), now, sendTemplateEmail, dashboardUrl);
-            if (sent) {
-              savePrefsSnapshot(u.id, { digestEnabled, digestFrequency: prefs.digestFrequency || 'daily', weeklySummary, weeklySummaryFrequency: summaryFreq, lastDigestSentAt: prefs.lastDigestSentAt ?? null, lastWeeklySentAt: now.toISOString() }).catch(() => {});
-            }
-          }
-        }
-      } catch (err: any) {
-        console.error(`[DIGEST] Failed for user ${u.id}:`, err?.message);
-      }
-    }
+    return await prisma.$transaction(async (tx) => {
+      const row = await tx.userPreferences.findUnique({ where: { userId }, select: { notif: true } });
+      const current = obj(row?.notif).lastSummarySentAt ?? null;
+      if (current !== expected) return false;
+      const next = { ...obj(row?.notif), lastSummarySentAt: value };
+      await tx.userPreferences.upsert({
+        where: { userId },
+        create: { userId, notif: next as any },
+        update: { notif: next as any },
+      });
+      return true;
+    });
   } catch (err: any) {
-    console.error('[DIGEST] Error:', err?.message);
+    console.error('[RECAP CLAIM]', err?.message || err);
+    return false;
   }
 }
 
-/** Persist only the digest-related fields into the user jsonb column without overwriting other prefs. */
-async function savePrefsSnapshot(userId: string, updates: Record<string, unknown>) {
-  // Read current prefs, merge only the digest fields, write back
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { notificationPreferences: true } });
-  const current = (user as any)?.notificationPreferences;
-  const merged = (current && typeof current === 'object' && !Array.isArray(current)) ? { ...current } : {};
-  Object.assign(merged, updates);
-  await prisma.$executeRaw`UPDATE "users" SET "notification_preferences" = ${JSON.stringify(merged)}::jsonb WHERE "id" = ${userId}`;
+/**
+ * Send one period's recap, having claimed the slot first, and hand the claim
+ * back if the mail fails — so a provider hiccup costs a late recap rather than
+ * a silently skipped one.
+ */
+async function sendOnceClaimed(
+  userId: string,
+  from: string | null,
+  now: Date,
+  work: () => Promise<boolean>,
+): Promise<boolean> {
+  const stamp = now.toISOString();
+  if (!(await claimSummarySlot(userId, from, stamp))) return false;
+  let sent = false;
+  try {
+    sent = await work();
+  } catch (err: any) {
+    console.error('[RECAP SEND]', err?.message || err);
+  }
+  if (!sent) await claimSummarySlot(userId, stamp, from);
+  return sent;
+}
+
+/** One pass over every account that asked for a recap and is due for one. */
+export async function sendAccountSummaries() {
+  try {
+    // Either store can hold the answer, so both are asked. The settings screen
+    // used to write the account row while the senders read the `notif` mirror,
+    // so a person could opt in and never be mailed, or opt out and keep being
+    // mailed.
+    const candidates = await prisma.$queryRaw<{ userId: string }[]>`
+      SELECT "id" AS "userId" FROM "user"."users"
+        WHERE COALESCE("notification_preferences" ->> 'summaryEnabled', '') = 'true'
+      UNION
+      SELECT "user_id" FROM "preferences"."user_preferences"
+        WHERE COALESCE("notif" ->> 'summaryEnabled', '') = 'true'
+      LIMIT 5000`;
+    if (!candidates.length) return;
+
+    const rows = await prisma.user.findMany({
+      where: { id: { in: candidates.map((c) => c.userId) } },
+      select: {
+        id: true,
+        status: true,
+        notificationPreferences: true,
+        emails: { where: { isDefault: true }, select: { address: true }, take: 1 },
+        preferences: { select: { notif: true } },
+      },
+    });
+
+    const now = new Date();
+    for (const row of rows) {
+      if (row.status !== 'active' || !row.emails?.[0]?.address) continue;
+      const choice = recapChoice(row.preferences?.notif, row.notificationPreferences);
+      if (!choice.summaryEnabled || choice.mailBlocked) continue;
+      const periodMs = frequencyToMs(choice.summaryFrequency);
+      if (!isCadenceDue(choice.lastSummarySentAt, now, periodMs)) continue;
+      const since = choice.lastSummarySentAt
+        ? new Date(Math.max(new Date(choice.lastSummarySentAt).getTime(), now.getTime() - periodMs))
+        : new Date(now.getTime() - periodMs);
+      await sendOnceClaimed(row.id, choice.lastSummarySentAt, now, () => sendAccountRecap(row.id, since, now));
+    }
+  } catch (err: any) {
+    console.error('[RECAP] Error:', err?.message);
+  }
 }
 
 const esc = (s: string) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] || c));
@@ -250,93 +234,159 @@ function labelFor(action: string): string {
   return action.replace(/[_.]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-/** Build & send one weekly activity summary email. Returns true when actually sent. */
-export async function sendWeeklySummary(
-  userId: string,
-  since: Date,
-  until: Date,
-  sendTemplateEmailFn?: (to: string, t: string, v: Record<string, string>) => Promise<any>,
-  dashboardUrlOverride?: string,
-): Promise<boolean> {
+/** The five groups the activity chart draws, in the order it draws them. */
+const SUMMARY_GROUPS = ['signin', 'security', 'account', 'content', 'other'] as const;
+type SummaryGroup = (typeof SUMMARY_GROUPS)[number];
+
+const GROUP_LABELS: Record<SummaryGroup, string> = {
+  signin: 'Sign-ins',
+  security: 'Security',
+  account: 'Account',
+  content: 'Content',
+  other: 'Other',
+};
+
+/**
+ * Which group a recorded row belongs to — the same rule the settings app's
+ * activity chart uses, matched on the kind's content rather than a fixed list,
+ * so a kind the server starts writing tomorrow still lands somewhere sensible
+ * instead of vanishing from the counts.
+ */
+const SIGN_IN_METHODS = new Set(['password', 'google', 'github', 'discord', 'magic', 'otp', 'passkey']);
+
+function groupFor(kind: string): SummaryGroup {
+  const k = String(kind || '').toLowerCase();
+  if (SIGN_IN_METHODS.has(k)) return 'signin';
+  if (k.includes('login') || k.includes('logout') || k.includes('sign')) return 'signin';
+  if (
+    k.startsWith('security.') || k.includes('password') || k.includes('2fa') || k.includes('totp')
+    || k.includes('passkey') || k.includes('backup_code') || k.includes('recovery') || k.includes('merge')
+  ) return 'security';
+  if (k.startsWith('form.') || k.startsWith('content.') || k.startsWith('application.') || k.startsWith('ai.')) return 'content';
+  if (
+    k.startsWith('profile.') || k.startsWith('user.') || k.startsWith('settings') || k.startsWith('preference')
+    || k.startsWith('notification') || k.startsWith('consent') || k.startsWith('theme') || k.startsWith('language')
+  ) return 'account';
+  return 'other';
+}
+
+const LIST_ROW = 'padding:12px 16px;border-bottom:1px solid #2a2a2c;';
+
+/** One line of the recap: what happened, when, and where it came from. */
+function recapLine(title: string, at: Date, note?: string | null): string {
+  const when = at.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `<div style="${LIST_ROW}"><div style="color:#ffffff;font-size:14px;line-height:22px;">${esc(title)}</div>`
+    + `<div style="color:#8a8a8e;font-size:13px;line-height:20px;padding-top:2px;">${esc(when)}${note ? ` · ${esc(note)}` : ''}</div></div>`;
+}
+
+/** Build & send one account recap. Returns true only when the mail went out. */
+export async function sendAccountRecap(userId: string, since: Date, until: Date): Promise<boolean> {
   try {
-    const [audits, security] = await Promise.all([
-      prisma.auditEvent.findMany({
-        where: { actorId: userId, createdAt: { gte: since, lte: until } },
-        select: { action: true, severity: true },
-        take: 500,
-      }),
-      prisma.securityEvent.findMany({
+    const [events, logins] = await Promise.all([
+      prisma.activityEvent.findMany({
         where: { userId, createdAt: { gte: since, lte: until } },
-        select: { eventType: true, severity: true },
+        orderBy: { createdAt: 'desc' },
         take: 500,
+        select: { kind: true, title: true, detail: true, severity: true, createdAt: true },
+      }),
+      prisma.userLogin.findMany({
+        where: { userId, createdAt: { gte: since, lte: until } },
+        orderBy: { createdAt: 'desc' },
+        take: 200,
+        select: { method: true, success: true, location: true, userAgent: true, createdAt: true },
       }),
     ]);
 
-    const total = audits.length + security.length;
-
-    // Group by friendly label
-    const counts = new Map<string, number>();
-    let suspicious = 0;
-    for (const e of [...audits.map(a => ({ ...a, src: 'a' })), ...security.map(s => ({ ...s, src: 's' }))]) {
-      const action = 'action' in e ? e.action : (e as any).eventType;
-      const label = labelFor(action);
-      counts.set(label, (counts.get(label) || 0) + 1);
-      const sev = String((e as any).severity || '').toLowerCase();
-      const failed = /failed|locked|suspicious|denied/.test(String(action).toLowerCase());
-      if (sev === 'warning' || sev === 'error' || sev === 'critical' || failed) suspicious++;
+    const lists = new Map<SummaryGroup, string[]>();
+    const add = (group: SummaryGroup, line: string) => {
+      const existing = lists.get(group) || [];
+      existing.push(line);
+      lists.set(group, existing);
+    };
+    for (const login of logins) {
+      const from = login.location || login.userAgent || '';
+      add('signin', recapLine(
+        login.success ? `Signed in with ${labelFor(login.method)}` : `Failed sign-in with ${labelFor(login.method)}`,
+        login.createdAt, from,
+      ));
     }
+    for (const event of events) add(groupFor(event.kind), recapLine(event.title, event.createdAt, event.detail));
 
-    const statRows = counts.size === 0
-      ? `<p style="margin:0;font-size:14px;color:rgba(245,245,245,0.5);">It was a quiet week — no account activity recorded.</p>`
-      : [...counts.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 7)
-          .map(([label, n]) =>
-            `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(245,245,245,0.13);font-size:14px;color:rgba(245,245,245,0.74);"><span>${esc(label)}</span><strong style="color:#F5F5F5;">${n}</strong></div>`
-          ).join('') +
-          `<div style="display:flex;justify-content:space-between;padding:10px 0 0;font-size:14px;color:#F5F5F5;"><span><strong>Total events</strong></span><strong>${total}</strong></div>`;
-
-    const suspiciousSection = suspicious > 0
-      ? `<div style="margin:0 0 20px;padding:14px 18px;background:rgba(243,182,75,0.10);border-radius:10px;border:1px solid rgba(243,182,75,0.35);"><p style="margin:0;font-size:14px;line-height:22px;color:#F3B64B;"><strong>${suspicious} event${suspicious === 1 ? '' : 's'} need your attention</strong> — failed sign-ins or other security warnings. <a href="${dashboardUrlOverride}/activity/history" style="color:#F3B64B;text-decoration:underline;">Review them</a>.</p></div>`
+    const groupsHtml = SUMMARY_GROUPS
+      .filter((group) => (lists.get(group) || []).length)
+      .map((group) => {
+        const lines = lists.get(group)!;
+        const shown = lines.slice(0, 12);
+        return `<div>`
+          + `<p style="margin:0;padding:14px 16px 4px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${GROUP_LABELS[group]}`
+          + ` <span style="color:#8a8a8e;font-weight:400;">· ${lines.length}</span></p>`
+          + shown.join('')
+          + (lines.length > shown.length
+            ? `<div style="padding:10px 16px;font-size:13px;line-height:20px;color:#8a8a8e;">${lines.length - shown.length} more in your activity history</div>`
+            : '')
+          + `</div>`;
+      })
+      .join('');
+    const listsHtml = groupsHtml
+      ? `<div style="background:#18181a;border:1px solid #2a2a2c;border-radius:14px;margin:0 0 20px;">${groupsHtml}</div>`
       : '';
 
-    const periodLabel = `${since.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${until.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+    const attention = [
+      ...logins.filter((l) => !l.success)
+        .map((l) => `Failed sign-in${l.location ? ` from ${l.location}` : ''} on ${l.createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`),
+      ...events
+        .filter((e) => ['warning', 'error', 'critical'].includes(String(e.severity || '').toLowerCase()))
+        .map((e) => e.title),
+    ];
+    const suspiciousSection = attention.length
+      ? `<div style="margin:0 0 20px;">`
+        + `<p style="margin:0 0 6px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${attention.length} thing${attention.length === 1 ? '' : 's'} to look at</p>`
+        + attention.slice(0, 6).map((line) =>
+            `<p style="margin:0;font-size:13px;line-height:20px;color:#8a8a8e;">· ${esc(line)}</p>`).join('')
+        + `</div>`
+      : '';
 
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } });
+    const total = events.length + logins.length;
+    const statRows = total
+      ? listsHtml
+      : `<p style="margin:0;font-size:14px;line-height:22px;color:#8a8a8e;">Nothing was recorded on your account in this period — no sign-ins, no changes, no security events.</p>`;
+
+    const day = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const periodLabel = `${day(since)} – ${day(until)}`;
+
+    const { fetchLoginUserById } = await import('@/features/identity/tirbeo');
+    const user = await fetchLoginUserById(userId);
     if (!user?.email) return false;
 
-    const send = sendTemplateEmailFn ?? (await import('@/features/email/email')).sendTemplateEmail;
-    const dash = dashboardUrlOverride ?? (await import('@/config/app-urls')).getDashboardBaseUrl();
-    const result = await (send as any)(user.email, 'weekly_summary', {
+    const { sendTemplateEmail } = await import('@/features/email/email');
+    const result = await sendTemplateEmail(user.email, 'weekly_summary', {
       name: user.name || user.email,
       periodLabel,
       statRows,
       suspiciousSection,
-      dashboardUrl: dash,
-    }, { categoryOverride: 'digest' }).catch(() => ({ success: false }));
+    }, { categoryOverride: 'digest', userId }).catch(() => ({ success: false }));
 
-    if (result?.success) console.log(`[WEEKLY] Summary (${total} events, ${suspicious} suspicious) → ${user.email}`);
+    if (result?.success) console.log(`[RECAP] ${total} rows (${logins.length} sign-ins, ${events.length} changes) → ${user.email} · ${periodLabel}`);
     return !!result?.success;
   } catch (err: any) {
-    console.error('[WEEKLY] Failed:', err?.message);
+    console.error('[RECAP] Failed:', err?.message);
     return false;
   }
 }
 
-/** Start periodic digest sending. Checks every hour. */
-let digestTimer: ReturnType<typeof setTimeout> | null = null;
-export function startPeriodicDigests() {
-  if (digestTimer) return;
-  // Run once on startup after 60s, then every hour via setTimeout recursion
-  setTimeout(() => { sendEmailDigests().catch(() => {}); }, 60_000);
-  function scheduleDigest() {
-    digestTimer = setTimeout(() => {
-      sendEmailDigests().catch(() => {});
-      scheduleDigest();
+/** Start periodic recap sending. Checks every hour; each account's own cadence decides who is due. */
+let summaryTimer: ReturnType<typeof setTimeout> | null = null;
+export function startPeriodicSummaries() {
+  if (summaryTimer) return;
+  setTimeout(() => { sendAccountSummaries().catch(() => {}); }, 60_000);
+  function scheduleSummary() {
+    summaryTimer = setTimeout(() => {
+      sendAccountSummaries().catch(() => {});
+      scheduleSummary();
     }, 3_600_000);
   }
-  scheduleDigest();
-  console.log('[DIGEST] Periodic email digest started (hourly)');
+  scheduleSummary();
+  console.log('[RECAP] Periodic account recap started (hourly check)');
 }
 
 // ─── SCHEDULED ACCOUNT DELETIONS ───
@@ -374,6 +424,8 @@ export function startPeriodicPushPrune() {
 
 // ─── REACTIVATION EMAILS ───
 // Sends a "we miss you" email to users who haven't been active for 7+ days.
+// It is campaign mail, so it answers to the settings page's own
+// "Offers and promotions" switch (offersEmail) and nothing sends without it.
 // Rate-limited: one reactivation email per user per 30 days.
 
 export async function sendReactivationEmails() {
@@ -381,69 +433,85 @@ export async function sendReactivationEmails() {
     const cutoff7d = new Date(Date.now() - 7 * 86400_000);
     const cutoff30d = new Date(Date.now() - 30 * 86400_000);
 
-    // Find users inactive for 7+ days who are eligible
-    const users = await prisma.user.findMany({
-      where: {
-        deletedAt: null,
-        isBanned: false,
-        lastActiveAt: { lt: cutoff7d },
-        // Must have opted into product/tips emails
-        // We filter in JS below since it's a JSONB column
-      },
+    // Find users inactive for 7+ days who are eligible. Reactivation mail is
+    // opt-in: offersEmail must be explicitly true. Either store can hold the
+    // answer — the settings screen writes the account row and mirrors it into
+    // `notif` — so both are asked, the same way the recap sweep asks both.
+    const candidates = await prisma.$queryRaw<{ userId: string }[]>`
+      SELECT "id" AS "userId" FROM "user"."users"
+        WHERE COALESCE("notification_preferences" ->> 'offersEmail', '') = 'true'
+      UNION
+      SELECT "user_id" FROM "preferences"."user_preferences"
+        WHERE COALESCE("notif" ->> 'offersEmail', '') = 'true'
+      LIMIT 2000`;
+    if (!candidates.length) return;
+
+    const rows = await prisma.user.findMany({
+      where: { id: { in: candidates.map((c) => c.userId) } },
       select: {
         id: true,
-        email: true,
-        name: true,
-        lastActiveAt: true,
+        status: true,
         createdAt: true,
-        notificationPreferences: true,
+        updatedAt: true,
+        profile: { select: { name: true } },
+        emails: { where: { isDefault: true }, select: { address: true }, take: 1 },
       },
-      take: 2000,
     });
+
+    const users = rows
+      .filter(r => r.status === 'active' && new Date(r.updatedAt) < cutoff7d)
+      .map(r => ({
+        id: r.id,
+        email: r.emails?.[0]?.address || '',
+        name: r.profile?.name || null,
+        lastActiveAt: r.updatedAt,
+        createdAt: r.createdAt,
+      }))
+      .filter(u => u.email);
 
     if (users.length === 0) return;
 
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { getDashboardBaseUrl } = await import('@/config/app-urls');
+    const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
     const dashboardUrl = getDashboardBaseUrl();
 
-    // Check recent reactivation logs to avoid re-sending within 30 days
-    const userIds = users.map(u => u.id);
-    const recentLogs = await prisma.email_logs.findMany({
+    // Check recent sends to avoid re-mailing within 30 days
+    const recentLogs = await prisma.email_jobs.findMany({
       where: {
-        toEmail: { in: users.map(u => u.email) },
-        template: 'reactivation',
+        toAddress: { in: users.map(u => u.email) },
+        templateSlug: 'reactivation',
         createdAt: { gt: cutoff30d },
       },
-      select: { toEmail: true },
-      distinct: ['toEmail'],
+      select: { toAddress: true },
+      distinct: ['toAddress'],
     }).catch(() => [] as any[]);
-    const alreadySent = new Set(recentLogs.map(r => r.toEmail));
+    const alreadySent = new Set(recentLogs.map(r => r.toAddress));
 
     let sentCount = 0;
     for (const u of users) {
       if (!u.email) continue;
       if (alreadySent.has(u.email)) continue;
 
-      // Check notification preferences — reactivation emails are OPT-IN:
-      // unset toggles mean no email (prevents mailing every inactive user).
-      const prefs: any = (u as any).notificationPreferences;
-      if (prefs && typeof prefs === 'object') {
-        if (prefs.email === false) continue;
-        // product category covers reactivation emails
-        const productOn = prefs.product !== undefined ? prefs.product !== false : true;
-        const productEmailOn = prefs.productEmail === true;
-        if (!productOn || !productEmailOn) continue;
-      } else {
-        continue; // no prefs saved — don't email
-      }
+      // Ask the one function that reads a preference, merged, rather than
+      // whichever store this sweep happened to query: reading only the mirror
+      // is how a person who turned the switch off on the page kept being
+      // mailed. Opt-in still means an explicit true — no stored answer is a no.
+      const prefs: any = await loadNotificationPrefs(u.id);
+      if (!prefs || prefs.email === false) continue;
+      if (prefs.offers === false || prefs.offersEmail !== true) continue;
+      const unsub = obj(prefs.unsubscribed);
+      if (prefs.unsubscribed === true || unsub.all === true || unsub.offers === true) continue;
+      // A paused account gets no campaign mail either — and, unlike the mailer,
+      // this sweep has no send clock to mislead afterwards.
+      if (isEmailPaused(prefs)) continue;
 
       // Calculate days since last active
       const lastActive = u.lastActiveAt ? new Date(u.lastActiveAt).getTime() : new Date(u.createdAt).getTime();
       const daysSince = Math.max(1, Math.floor((Date.now() - lastActive) / 86400_000));
 
       // Build a brief activity summary
-      let activitySummary = '<p style="margin:0;font-size:14px;color:#64748b;">No recent activity recorded. Your workspace is waiting.</p>';
+      let activitySummary = '<p style="margin:0;font-size:14px;line-height:22px;color:#8a8a8e;">No recent activity recorded. Your workspace is waiting.</p>';
       try {
         const recentNotifs = await prisma.notification.findMany({
           where: { userId: u.id, createdAt: { gte: cutoff7d } },
@@ -452,7 +520,7 @@ export async function sendReactivationEmails() {
         });
         if (recentNotifs.length > 0) {
           activitySummary = recentNotifs.map(n =>
-            `<div style="padding:8px 14px;background:#111111;border-radius:8px;margin-bottom:6px;font-size:13px;color:#9a9a9a;">${esc(n.title)}</div>`
+            `<div style="padding:14px 16px;background:#18181a;border:1px solid #2a2a2c;border-radius:14px;margin-bottom:8px;font-size:14px;line-height:22px;color:#ffffff;">${esc(n.title)}</div>`
           ).join('');
         }
       } catch {}
@@ -462,7 +530,7 @@ export async function sendReactivationEmails() {
         daysSince: String(daysSince),
         activitySummary,
         dashboardUrl,
-      }, { rawVars: ['activitySummary'] }).catch(() => ({ success: false }));
+      }, { rawVars: ['activitySummary'], userId: u.id }).catch(() => ({ success: false }));
 
       if (result?.success) sentCount++;
     }

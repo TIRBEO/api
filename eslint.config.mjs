@@ -134,7 +134,7 @@ const sharedRules = {
 const configRules = sharedRules; // config/ is also a bottom layer
 
 export default tseslint.config(
-  { ignores: ['node_modules/**', '.next/**', 'scripts/tmp-*', 'scripts/*.mjs', 'scripts/*.cjs'] },
+  { ignores: ['node_modules/**', '.next/**', '.next.*/**', 'scripts/tmp-*', 'scripts/*.mjs', 'scripts/*.cjs'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   // General rules first — area overrides below must come AFTER to win.
@@ -159,6 +159,14 @@ export default tseslint.config(
       'no-empty': ['error', { allowEmptyCatch: true }],
       'no-control-regex': 'off', // intentional control-char matching in security sanitizers
       'no-useless-escape': 'warn',
+    },
+  },
+  // Tests assert on literal markup, so zero-width/invisible characters are the
+  // subject matter rather than an accident (e.g. react-email <Preview> padding).
+  {
+    files: ['tests/**/*.ts', 'tests/**/*.tsx'],
+    rules: {
+      'no-irregular-whitespace': 'off',
     },
   },
 );

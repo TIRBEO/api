@@ -11,7 +11,7 @@ function addCorsToResponse(res: NextResponse, request?: NextRequest) {
   if (!origin) return res;
   try {
     const u = new URL(origin);
-    if (['localhost', '127.0.0.1'].includes(u.hostname) || u.hostname.endsWith('.tirbeo.app') || u.hostname === 'api-tirbeo.vercel.app') {
+    if (['localhost', '127.0.0.1'].includes(u.hostname) || u.hostname.endsWith('.tirbeo.com') || u.hostname === 'api-tirbeo.vercel.app') {
       res.headers.set('Access-Control-Allow-Origin', origin);
       res.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
       res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, x-turnstile-token');

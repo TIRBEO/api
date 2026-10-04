@@ -31,11 +31,23 @@ vi.mock('@/features/auth/totp', () => ({
 // Rate limiter: per-test control via mocks.checkWindowLimitDB.
 vi.mock('@/features/captcha/risk', () => ({ checkWindowLimitDB: mocks.checkWindowLimitDB }));
 
-// Prisma user lookups: per-test config via mocks.prismaUser.
+// Prisma user lookups: per-test config via mocks.prismaUser. The source now
+// reads the TOTP secret from UserSecurity — the fixtures keep it flat on the
+// user, so adapt both lookups from the same fixture.
 vi.mock('@/infrastructure/db/prisma', () => ({
   prisma: {
     user: {
-      findUnique: vi.fn(async () => mocks.prismaUser),
+      findUnique: vi.fn(async () => {
+        const u = mocks.prismaUser;
+        if (!u) return null;
+        const security = 'security' in u ? u.security : (u.totpSecret ? { totpSecret: u.totpSecret } : null);
+        return { ...u, security };
+      }),
+    },
+    userSecurity: {
+      findUnique: vi.fn(async () =>
+        mocks.prismaUser?.totpSecret ? { totpSecret: mocks.prismaUser.totpSecret } : null
+      ),
     },
   },
 }));

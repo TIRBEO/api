@@ -14,7 +14,6 @@ export async function analyticsHandler(request: NextRequest) {
     totalUsers,
     adminUsers,
     newToday,
-    totalMedia,
     totalNotifications,
     totalAuditEvents,
     topActions,
@@ -25,24 +24,23 @@ export async function analyticsHandler(request: NextRequest) {
     prisma.user.count(),
     prisma.user.count({ where: { adminRole: { not: null } } }),
     prisma.user.count({ where: { createdAt: { gte: todayStart } } }),
-    prisma.media.count(),
     prisma.notification.count(),
     // Audit events (last 30 days)
-    prisma.auditEvent.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
+    prisma.activityEvent.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
     // Top 10 actions (last 30 days)
-    prisma.auditEvent.groupBy({
-      by: ['action'],
+    prisma.activityEvent.groupBy({
+      by: ['kind'],
       where: { createdAt: { gte: thirtyDaysAgo } },
-      _count: { action: true },
-      orderBy: { _count: { action: 'desc' } },
+      _count: { kind: true },
+      orderBy: { _count: { kind: 'desc' } },
       take: 10,
     }),
     // Recent audit events (last 20)
-    prisma.auditEvent.findMany({
+    prisma.activityEvent.findMany({
       where: { createdAt: { gte: thirtyDaysAgo } },
       orderBy: { createdAt: 'desc' },
       take: 20,
-      include: { actor: { select: { id: true, email: true, name: true } } },
+      include: { user: { select: { id: true, email: true, name: true } } },
     }),
     // Users by day (last 30 days)
     prisma.user.groupBy({
@@ -51,7 +49,7 @@ export async function analyticsHandler(request: NextRequest) {
       _count: { createdAt: true },
     }),
     // Activity by day (last 30 days)
-    prisma.auditEvent.groupBy({
+    prisma.activityEvent.groupBy({
       by: ['createdAt'],
       where: { createdAt: { gte: thirtyDaysAgo } },
       _count: { createdAt: true },
@@ -62,7 +60,7 @@ export async function analyticsHandler(request: NextRequest) {
     totalUsers,
     adminUsers,
     newToday,
-    totalMedia,
+    totalMedia: 0,
     totalNotifications,
     auditByResult: {
       success: totalAuditEvents,
@@ -70,8 +68,8 @@ export async function analyticsHandler(request: NextRequest) {
       totalWithResult: totalAuditEvents,
       total: totalAuditEvents,
     },
-    topActions: topActions.map(a => ({ action: a.action, count: a._count.action })),
-    recentAudit,
+    topActions: topActions.map(a => ({ action: a.kind, count: a._count.kind })),
+    recentAudit: recentAudit.map((l: any) => ({ ...l, actor: l.user })),
     usersByDay,
     activityByDay,
   });
@@ -124,11 +122,12 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
     },
   });
 
-  // Enrich with login history summary for consented users
+  // Enrich with login history summary for consented users (login_history was
+  // merged into security_events: 'login' / 'login_failed').
   const userIds = users.map(u => u.id);
-  const recentLogins = userIds.length ? await prisma.login_history.groupBy({
+  const recentLogins = userIds.length ? await prisma.securityEvent.groupBy({
     by: ['userId'],
-    where: { userId: { in: userIds } },
+    where: { userId: { in: userIds }, eventType: { in: ['login', 'login_failed'] } },
     _count: { id: true },
   }) : [];
   const loginMap = new Map(recentLogins.map(r => [r.userId, r._count.id]));

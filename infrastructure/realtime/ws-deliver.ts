@@ -1,6 +1,6 @@
 /**
  * Shared WebSocket delivery helper — tries local WS server first,
- * falls back to Cloudflare Worker publish (wss://ws.tirbeo.app).
+ * falls back to Cloudflare Worker publish (wss://ws.tirbeo.com).
  *
  * Used by notifications, support handlers, audit, and form handlers.
  */

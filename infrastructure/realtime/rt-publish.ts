@@ -1,9 +1,8 @@
-import { randomUUID } from 'crypto';
 
 /**
- * Publish events from api.tirbeo.app into the Tirbeo Realtime Platform.
+ * Publish events from api.tirbeo.com into the Tirbeo Realtime Platform.
  *
- * The realtime platform (wss://ws.tirbeo.app/ws) is a Cloudflare Worker that
+ * The realtime platform (wss://ws.tirbeo.com/ws) is a Cloudflare Worker that
  * only accepts events over HTTP `POST /api/publish` (Bearer token) — it has no
  * shared Redis channel. This module fans api events out to that endpoint.
  * Fire-and-forget: never throws, never blocks callers. If the Worker is
@@ -64,8 +63,7 @@ function buildEvent(target: RtPublishTarget, input: RtEventInput): Record<string
     workspace: input.workspace,
     payload: input.payload,
     version: input.version ?? 1,
-    timestamp: new Date().toISOString(),
-  };
+    timestamp: new Date().toISOString() };
 }
 
 export function publishToRealtime(target: RtPublishTarget, input: RtEventInput): boolean {
@@ -77,11 +75,9 @@ export function publishToRealtime(target: RtPublishTarget, input: RtEventInput):
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${token}`,
-      },
+        authorization: `Bearer ${token}` },
       body: JSON.stringify({ ...target, event }),
-      signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS),
-    }).catch(() => {
+      signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS) }).catch(() => {
       /* non-fatal: local delivery still happens */
     });
     return true;

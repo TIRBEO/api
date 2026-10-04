@@ -1,14 +1,13 @@
-// ═══ RESEND COOLDOWN (Redis-first, DB fallback) ═══
-// The 30s "please wait between sends" gate + 5-per-15min attempt window used
-// to cost 2 awaited DB round-trips per request (Cooldown findUnique + create/
-// update). Now: one atomic Redis Lua script (single round-trip, ~1-3ms), with
-// the DB Cooldown row kept as a durable fallback when Redis is unavailable
-// (and mirrored best-effort so DB-backed admin views stay roughly accurate).
+// ═══ RESEND COOLDOWN (Redis-only) ═══
+// The 30s "please wait between sends" gate + 5-per-15min attempt window is
+// one atomic Redis Lua script (single round-trip, ~1-3ms). The durable DB
+// mirror was dropped with the consolidated schema (no cooldowns table); when
+// Redis is unavailable the gate fails open — the per-flow verify-limits and
+// risk checks still apply.
 //
 // All keys are email-scoped, so the cooldown holds across incognito, other
 // browsers, and other devices.
 
-import { prisma } from '@/infrastructure/db/prisma';
 import { getRedis } from '@/features/auth/redis';
 
 const DEFAULT_COOLDOWN_MS = 30_000;
@@ -52,7 +51,7 @@ redis.call('PEXPIRE', KEYS[1], ttlMs)
 return {1, 0, ''}
 `;
 
-const g = globalThis as any;
+
 function redisClient(): any {
   try {
     return getRedis() || null;
@@ -80,100 +79,18 @@ export async function enforceResendCooldown(
   const redis = redisClient();
   if (redis) {
     try {
-      const [allowed, remain, kind] = (await redis.eval(
+      const [allowed, remain] = (await redis.eval(
         COOLDOWN_LUA, 1, rKey,
         now, cooldownMs, ATTEMPT_WINDOW_MS, MAX_ATTEMPTS_PER_WINDOW,
         TTL_HOURS * 3600 * 1000,
       )) as [number, number, string];
       const remainingMs = Math.max(0, Number(remain));
-      if (!allowed) {
-        // Mirror the block decision into the DB so admin/DB views stay close.
-        mirrorToDb(key, kind === 'window' ? 'window' : 'cooldown').catch(() => {});
-        return { allowed: false, remainingMs };
-      }
-      // Mirror the allowed consume best-effort (non-blocking).
-      mirrorToDb(key, 'allow', cooldownMs).catch(() => {});
+      if (!allowed) return { allowed: false, remainingMs };
       return { allowed: true, remainingMs: 0 };
     } catch {
-      // Redis error → fall through to DB path.
+      // Redis error → fail open.
     }
   }
-
-  // 2. DB fallback (original logic, unchanged semantics).
-  return enforceResendCooldownDb(key, cooldownMs);
-}
-
-/** Best-effort DB mirror so the Cooldown table stays useful for admins. */
-async function mirrorToDb(key: string, kind: 'allow' | 'window' | 'cooldown', cooldownMs = DEFAULT_COOLDOWN_MS): Promise<void> {
-  try {
-    const now = new Date();
-    const existing = await prisma.cooldown.findUnique({ where: { key } }).catch(() => null);
-    if (!existing) {
-      await prisma.cooldown.create({
-        data: { key, lastSent: kind === 'allow' ? now : new Date(0), count: kind === 'allow' ? 1 : MAX_ATTEMPTS_PER_WINDOW, windowStart: now, expiresAt: new Date(now.getTime() + TTL_HOURS * 3600 * 1000) },
-      }).catch(() => {});
-      return;
-    }
-    if (kind === 'allow') {
-      const windowExpired = now.getTime() - existing.windowStart.getTime() >= ATTEMPT_WINDOW_MS;
-      await prisma.cooldown.update({
-        where: { key },
-        data: {
-          count: windowExpired ? 1 : { increment: 1 },
-          windowStart: windowExpired ? now : existing.windowStart,
-          lastSent: now,
-          expiresAt: new Date(now.getTime() + TTL_HOURS * 3600 * 1000),
-        },
-      }).catch(() => {});
-    } else if (kind === 'window') {
-      // Attempt window exhausted in Redis — reflect it in the DB for reads.
-      await prisma.cooldown.update({
-        where: { key },
-        data: { count: MAX_ATTEMPTS_PER_WINDOW, expiresAt: new Date(now.getTime() + TTL_HOURS * 3600 * 1000) },
-      }).catch(() => {});
-    }
-    // 'cooldown' blocks are transient (30s) — no DB mirror needed.
-  } catch {}
-}
-
-/** Original DB-only path, used when Redis is unavailable. */
-async function enforceResendCooldownDb(
-  key: string,
-  cooldownMs = DEFAULT_COOLDOWN_MS
-): Promise<{ allowed: boolean; remainingMs: number }> {
-  const now = new Date();
-  const nowMs = now.getTime();
-
-  const existing = await prisma.cooldown.findUnique({ where: { key } }).catch(() => null);
-
-  if (!existing) {
-    await prisma.cooldown.create({
-      data: { key, lastSent: now, count: 1, windowStart: now, expiresAt: new Date(nowMs + TTL_HOURS * 3600 * 1000) },
-    }).catch(() => {});
-    return { allowed: true, remainingMs: 0 };
-  }
-
-  if (nowMs - existing.windowStart.getTime() >= ATTEMPT_WINDOW_MS) {
-    await prisma.cooldown.update({
-      where: { key },
-      data: { count: 1, windowStart: now, lastSent: now, expiresAt: new Date(nowMs + TTL_HOURS * 3600 * 1000) },
-    }).catch(() => {});
-    return { allowed: true, remainingMs: 0 };
-  }
-
-  if (existing.count >= MAX_ATTEMPTS_PER_WINDOW) {
-    const remainingMs = Math.max(0, ATTEMPT_WINDOW_MS - (nowMs - existing.windowStart.getTime()));
-    return { allowed: false, remainingMs };
-  }
-
-  if (nowMs - existing.lastSent.getTime() < cooldownMs) {
-    return { allowed: false, remainingMs: cooldownMs - (nowMs - existing.lastSent.getTime()) };
-  }
-
-  await prisma.cooldown.update({
-    where: { key },
-    data: { count: { increment: 1 }, lastSent: now, expiresAt: new Date(nowMs + TTL_HOURS * 3600 * 1000) },
-  }).catch(() => {});
 
   return { allowed: true, remainingMs: 0 };
 }
@@ -203,38 +120,15 @@ export async function getRemainingAttempts(key: string): Promise<{ remaining: nu
           if (remaining === 0) return { remaining: 0, resetsInMs };
           return {
             remaining: Math.min(remaining, cooldownRemaining > 0 ? 1 : remaining),
-            resetsInMs: Math.max(resetsInMs, cooldownRemaining),
-          };
+            resetsInMs: Math.max(resetsInMs, cooldownRemaining) };
         }
       }
-    } catch {
-      // fall through to DB
-    }
+    } catch {}
   }
 
-  // DB fallback (original logic).
-  const nowD = new Date();
-  const cd = await prisma.cooldown.findUnique({ where: { key } }).catch(() => null);
-
-  if (!cd || nowD.getTime() - cd.windowStart.getTime() >= ATTEMPT_WINDOW_MS) {
-    return { remaining: MAX_ATTEMPTS_PER_WINDOW, resetsInMs: 0 };
-  }
-
-  const remaining = Math.max(0, MAX_ATTEMPTS_PER_WINDOW - cd.count);
-  const resetsInMs = Math.max(0, ATTEMPT_WINDOW_MS - (nowD.getTime() - cd.windowStart.getTime()));
-
-  if (remaining === 0 && resetsInMs > 0) {
-    return { remaining: 0, resetsInMs };
-  }
-
-  const cooldownRemaining = Math.max(0, DEFAULT_COOLDOWN_MS - (nowD.getTime() - cd.lastSent.getTime()));
-  return { remaining: Math.min(remaining, cooldownRemaining > 0 ? 1 : remaining), resetsInMs: Math.max(resetsInMs, cooldownRemaining) };
+  return { remaining: MAX_ATTEMPTS_PER_WINDOW, resetsInMs: 0 };
 }
 
 export async function cleanupExpiredCooldowns(): Promise<void> {
-  try {
-    await prisma.cooldown.deleteMany({
-      where: { expiresAt: { lt: new Date() } },
-    }).catch(() => {});
-  } catch {}
+  // Redis keys self-expire (PEXPIRE in the Lua script); nothing to sweep.
 }

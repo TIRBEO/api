@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { signToken, verifyToken, COOKIE_NAME } from '@/features/auth/jwt';
 import { DEVICE_COOKIE_NAME, ensureDeviceId, rememberDeviceAccount, wasRecentlyRemoved } from '@/features/auth/device-accounts';
+import { TIRBEO_MAIL_DOMAIN, tirbeoEmailFor } from '@/features/identity/tirbeo';
 import {
   hashRefreshToken,
   generateRefreshToken,
@@ -12,9 +13,9 @@ import {
   revokeSessionState,
   getCachedSessionIdentity,
   setCachedSessionIdentity,
-  deleteCachedSessionIdentity,
-} from '@/features/auth/redis';
+  deleteCachedSessionIdentity } from '@/features/auth/redis';
 import { createTtlCache } from '@/infrastructure/cache';
+import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
 
 // Short-TTL in-memory cache for session lookups. Authenticated requests hit
 // this instead of the DB on every call (the DB lookup is the dominant cost,
@@ -37,18 +38,36 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
-export const COOKIE_DOMAIN = process.env.NEXT_PUBLIC_COOKIE_DOMAIN || '.tirbeo.app';
+export const COOKIE_DOMAIN = process.env.NEXT_PUBLIC_COOKIE_DOMAIN || '.tirbeo.com';
 
 const ACCESS_COOKIE_MAX_AGE = 60 * 15;
 const REFRESH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
+
+// Idle window is 1h by product decision ("logout once user is offline for 1 hr"):
+// accounts with saveLoginInfo OFF get a session whose expiresAt slides to
+// last-activity + 1h, so no request path and no refresh can extend it past an
+// hour of quiet.
+export const SAVE_LOGIN_IDLE_MS = 60 * 60 * 1000;
 
 export const REFRESH_COOKIE_NAME = '__refresh';
 
 const IS_PROD = process.env.NODE_ENV !== 'development';
 
+// Google-style cookie posture, env-tunable so a deployment can widen sharing
+// without code changes:
+//   COOKIE_SAMESITE = 'lax' (default) | 'none'  — 'none' enables cross-SITE
+//     (different top-level domain) sharing; browsers then REQUIRE Secure.
+//   COOKIE_PARTITIONED = 'false' opts out of the storage-access partition that
+//     SameSite=None needs to survive Chrome third-party-cookie phase-out.
+// Secure is ALWAYS on in production (a missing/overridden domain must never
+// silently downgrade the session cookie to plaintext-transport).
+const COOKIE_SAMESITE = (process.env.COOKIE_SAMESITE === 'none' ? 'none' : 'lax') as 'lax' | 'none';
+const COOKIE_SECURE = IS_PROD || COOKIE_SAMESITE === 'none';
+const COOKIE_PARTITIONED = COOKIE_SAMESITE === 'none' && process.env.COOKIE_PARTITIONED !== 'false';
+
 /**
  * Determine the correct cookie domain for the current request.
- * In production use COOKIE_DOMAIN (.tirbeo.app) so the session is shared
+ * In production use COOKIE_DOMAIN (.tirbeo.com) so the session is shared
  * across all subdomains (accounts/dashboard/forms/cdn). On localhost the
  * cookie must be host-only (no Domain attribute) — browsers reject
  * Domain=localhost and host-only cookies are automatically sent to every
@@ -62,41 +81,32 @@ function getCookieDomain(request?: NextRequest): string | undefined {
   return COOKIE_DOMAIN;
 }
 
-function getAccessCookieOptions(request?: NextRequest) {
+function baseCookieOptions(request?: NextRequest) {
   const domain = getCookieDomain(request);
   return {
-    httpOnly: true,
-    secure: IS_PROD && !!domain,
-    sameSite: 'lax' as const,
-    path: '/',
-    maxAge: ACCESS_COOKIE_MAX_AGE,
-    ...(domain ? { domain } : {}),
-  };
+    secure: COOKIE_SECURE,
+    sameSite: COOKIE_SAMESITE,
+    ...(COOKIE_PARTITIONED ? { partitioned: true } : {}),
+    path: '/' as const,
+    ...(domain ? { domain } : {}) };
 }
 
-function getRefreshCookieOptions(request?: NextRequest) {
-  const domain = getCookieDomain(request);
-  return {
-    httpOnly: true,
-    secure: IS_PROD && !!domain,
-    sameSite: 'lax' as const,
-    path: '/',
-    maxAge: REFRESH_COOKIE_MAX_AGE,
-    ...(domain ? { domain } : {}),
-  };
+function getAccessCookieOptions(request?: NextRequest) {
+  return { httpOnly: true, maxAge: ACCESS_COOKIE_MAX_AGE, ...baseCookieOptions(request) };
+}
+
+function getRefreshCookieOptions(request?: NextRequest, shortSession?: boolean) {
+  // Short (idle-capped) sessions must not leave a 30-day refresh token in the
+  // browser — the cookie dies with the policy window instead of lingering as a
+  // token the server already refuses.
+  return { httpOnly: true, maxAge: shortSession ? SAVE_LOGIN_IDLE_MS / 1000 : REFRESH_COOKIE_MAX_AGE, ...baseCookieOptions(request) };
 }
 
 const CSRF_COOKIE_NAME = '__csrf';
 function getCsrfCookieOptions(request?: NextRequest) {
-  const domain = getCookieDomain(request);
-  return {
-    httpOnly: false,
-    secure: IS_PROD && !!domain,
-    sameSite: 'lax' as const,
-    path: '/',
-    maxAge: ACCESS_COOKIE_MAX_AGE,
-    ...(domain ? { domain } : {}),
-  };
+  // CSRF cookie is read by client JS for the double-submit token, so httpOnly
+  // must stay false; it carries no authority on its own.
+  return { httpOnly: false, maxAge: ACCESS_COOKIE_MAX_AGE, ...baseCookieOptions(request) };
 }
 
 export function generateCsrfToken(): string {
@@ -125,60 +135,82 @@ export function validateCsrf(request: NextRequest): boolean {
   return diff === 0;
 }
 
+/** The account's "save login info" preference (default ON). */
+export async function getSaveLoginInfo(userId: string): Promise<boolean> {
+  const sec = await prisma.userSecurity
+    .findUnique({ where: { userId }, select: { saveLoginInfo: true } })
+    .catch(() => null);
+  return sec?.saveLoginInfo ?? true;
+}
+
 export async function createSession(
   userId: string,
   userAgent?: string,
   ipAddress?: string,
   adminRole?: string,
   shortTerm?: boolean,
-): Promise<{ token: string; sessionId: string; refreshToken: string }> {
+): Promise<{ token: string; sessionId: string; refreshToken: string; saveLoginInfo: boolean }> {
   const now = new Date();
+  const saveLoginInfo = await getSaveLoginInfo(userId);
+  // saveLoginInfo OFF: idle-capped session (1h sliding window) regardless of
+  // the login method.
   // Short-term session: 3 days (for OTP/magic link login)
   // Long-term session: 30 days (for password login)
-  const maxAge = shortTerm ? 60 * 60 * 24 * 3 : REFRESH_COOKIE_MAX_AGE;
+  const maxAge = !saveLoginInfo
+    ? SAVE_LOGIN_IDLE_MS / 1000
+    : shortTerm
+      ? 60 * 60 * 24 * 3
+      : REFRESH_COOKIE_MAX_AGE;
   const expiresAt = new Date(now.getTime() + maxAge * 1000);
 
   const refreshToken = generateRefreshToken();
   const refreshTokenHash = await hashRefreshToken(refreshToken);
-  const refreshExpiresAt = new Date(now.getTime() + maxAge * 1000);
 
-  const session = await prisma.session.create({
+  // SECURITY: the signed access JWT is deliberately NOT persisted (the old
+  // sessions.token column leaked live bearer tokens into the database). The
+  // JWT is stateless — only the rotating refresh-token hash lives in storage.
+  const session = await prisma.userSession.create({
     data: {
       userId,
       expiresAt,
       userAgent,
       ipAddress,
-      refreshTokenHash,
-      refreshTokenIssuedAt: now,
-      refreshExpiresAt,
-    },
-  });
+      location: currentRequestOrigin()?.location ?? null,
+      tokenHash: refreshTokenHash,
+      deviceName: userAgent?.split(')')[0]?.split('(')[1]?.trim().slice(0, 120) || null } });
 
   const token = await signToken(userId, session.id, adminRole);
 
-  await prisma.session.update({
-    where: { id: session.id },
-    data: { token },
-  });
+  // Registry of known devices for this account (dashboard "your devices" list).
+  prisma.userDevice
+    .create({
+      data: {
+        userId,
+        deviceName: session.deviceName,
+        userAgent: userAgent || null,
+        ipAddress: ipAddress || null,
+        location: session.location,
+        status: 'active',
+        lastUsedAt: now } })
+    .catch(() => {});
 
   await seedSessionState(session.id, userId, ipAddress || null, userAgent || null);
 
-  // Update last login tracking fields on User
-  await prisma.user.update({
-    where: { id: userId },
-    data: {
-      lastLoginAt: now,
-      lastLoginIp: ipAddress || null,
-      loginCount: { increment: 1 },
-      lastActiveAt: now,
-    },
-  }).catch(() => {});
+  return { token, sessionId: session.id, refreshToken, saveLoginInfo };
+}
 
-  return { token, sessionId: session.id, refreshToken };
+/** The account's login address, as shown in session identities. */
+export async function userEmailForSession(userId: string, username: string | null): Promise<string> {
+  if (username) return tirbeoEmailFor(username);
+  const row = await prisma.userEmail.findFirst({
+    where: { userId },
+    orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
+    select: { address: true } });
+  return row?.address || `${userId}@${TIRBEO_MAIL_DOMAIN}`;
 }
 
 export async function issueAccessAndRefreshTokens(sessionId: string) {
-  const session = await prisma.session.findUnique({ where: { id: sessionId } });
+  const session = await prisma.userSession.findUnique({ where: { id: sessionId } });
   if (!session) return null;
   const token = await signToken(session.userId, session.id);
   return { token, sessionId: session.id };
@@ -191,87 +223,60 @@ export async function seedSessionState(sessionId: string, userId: string, ip: st
     revoked: false,
     createdAt: Date.now(),
     lastSeenIp: ip || null,
-    deviceInfo: ua || null,
-  }).catch(() => {});
+    deviceInfo: ua || null }).catch(() => {});
 }
 
 export async function rotateRefreshToken(refreshToken: string, ipAddress?: string, userAgent?: string) {
   const presentedHash = await hashRefreshToken(refreshToken);
   const now = new Date();
 
-  // Reuse detection (DB-backed one-deep + Redis deeper history).
+  // Reuse detection (Redis-backed spent-token history).
   const isSpent = await isRefreshSpent(presentedHash);
   if (isSpent) {
-    // Check if session is still active — if so, this is likely a concurrent
-    // request with the old token (both tabs/requests hitting refresh simultaneously).
-    const session = await prisma.session.findUnique({
-      where: { id: isSpent },
-      select: { id: true, userId: true, refreshTokenHash: true, expiresAt: true, status: true, revokedAt: true },
-    });
-
-    if (session && session.expiresAt > new Date() && session.status !== 'revoked' && !session.revokedAt && session.refreshTokenHash) {
-      // Session still active — this is a concurrent request with the old token.
-      // Issue a new token pair using the current session state.
-      const newRefreshToken = generateRefreshToken();
-      const [newAccessToken, newRefreshHash] = await Promise.all([
-        signToken(session.userId, isSpent),
-        hashRefreshToken(newRefreshToken),
-      ]);
-      await Promise.all([
-        prisma.session.update({
-          where: { id: isSpent },
-          data: { refreshTokenHash: newRefreshHash, lastUsedAt: new Date() },
-        }),
-        markRefreshSpent(presentedHash, isSpent),
-      ]);
-      return { token: newAccessToken, refreshToken: newRefreshToken, sessionId: isSpent };
-    }
-
-    // Session expired or revoked — revoke the family
+    // A presented token whose hash is ALREADY marked spent means it has been
+    // rotated before — i.e. at least two parties have held it, or a legit
+    // client is replaying it. Either way this is the theft signature: the
+    // secure response is to kill the whole session family, NOT to mint a
+    // fresh pair (that would let a stolen token replay forever).
     await revokeSessionFamily(isSpent);
     return null;
   }
 
-  const session = await prisma.session.findUnique({ where: { refreshTokenHash: presentedHash } });
+  const session = await prisma.userSession.findFirst({
+    where: { tokenHash: presentedHash },
+    include: { user: { select: { security: { select: { saveLoginInfo: true } } } } } });
   if (!session) return null;
 
-  if (session.status === 'revoked' || session.revokedAt || session.refreshExpiresAt! < now) {
+  // Idle-capped accounts: an hour of quiet ends the session here too — the
+  // sliding expiresAt is the idle deadline, and a refresh must NOT extend a
+  // session that has gone idle past it (the check below revokes).
+  const saveLoginInfo = session.user?.security?.saveLoginInfo ?? true;
+
+  if (session.revokedAt || session.expiresAt < now) {
     await revokeSession(session.id);
     if (isSpent === null) await markRefreshSpent(presentedHash, session.id);
     return null;
   }
 
-  // Reuse: presented token is the previously-spent one (still stored on the row).
-  if (session.previousRefreshTokenHash && presentedHash === session.previousRefreshTokenHash) {
-    await revokeSessionFamily(session.id);
-    await markRefreshSpent(presentedHash, session.id);
-    return null;
-  }
-
   const newRefreshToken = generateRefreshToken();
   const newHash = await hashRefreshToken(newRefreshToken);
-  const refreshExpiresAt = new Date(now.getTime() + REFRESH_COOKIE_MAX_AGE * 1000);
 
-  await prisma.session.update({
+  await prisma.userSession.update({
     where: { id: session.id },
     data: {
-      refreshTokenHash: newHash,
-      previousRefreshTokenHash: session.refreshTokenHash,
-      refreshTokenIssuedAt: now,
-      refreshExpiresAt,
+      tokenHash: newHash,
       lastUsedAt: now,
-    },
-  });
+      ...(!saveLoginInfo ? { expiresAt: new Date(now.getTime() + SAVE_LOGIN_IDLE_MS) } : {}) } });
 
   const [token] = await Promise.all([
     signToken(session.userId, session.id),
     markRefreshSpent(presentedHash, session.id),
   ]);
-  return { token, sessionId: session.id, refreshToken: newRefreshToken };
+  return { token, sessionId: session.id, refreshToken: newRefreshToken, saveLoginInfo };
 }
 
 async function revokeSessionFamily(sessionId: string): Promise<void> {
-  const session = await prisma.session.findUnique({ where: { id: sessionId } });
+  const session = await prisma.userSession.findUnique({ where: { id: sessionId } });
   if (!session) return;
   await revokeSession(session.id);
 }
@@ -285,14 +290,13 @@ export async function revokeSession(sessionId: string): Promise<void> {
   void deleteCachedSessionIdentity(sessionId);
   // Look up the owner BEFORE the row flips to revoked, so we can push a
   // realtime revocation event to their other tabs (Pusher Channels).
-  const owner = await prisma.session
+  const owner = await prisma.userSession
     .findUnique({ where: { id: sessionId }, select: { userId: true } })
     .catch(() => null);
-  await prisma.session
+  await prisma.userSession
     .updateMany({
-      where: { id: sessionId, status: { not: 'revoked' } },
-      data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
-    })
+      where: { id: sessionId, revokedAt: null },
+      data: { revokedAt: new Date(), status: 'revoked' } })
     .catch(() => {});
   try {
     await revokeSessionState(sessionId);
@@ -305,14 +309,55 @@ export async function revokeSession(sessionId: string): Promise<void> {
   }
 }
 
-export async function revokeSessionFamilyByUser(userId: string): Promise<void> {
-  await prisma.session
-    .updateMany({
-      where: { userId, status: { not: 'revoked' } },
-      data: { status: 'revoked', revokedAt: new Date(), refreshTokenHash: null, previousRefreshTokenHash: null },
-    })
+/**
+ * Flip-to-OFF enforcement: when saveLoginInfo is turned off the policy for
+ * every existing long-lived session is void, so they are revoked (the session
+ * making the change is kept alive but shortened to the idle window — matching
+ * the keep-current-session behavior of the existing revoke-all endpoint).
+ */
+export async function revokeLongLivedSessions(userId: string, keepSessionId?: string): Promise<void> {
+  const now = new Date();
+  const others = {
+    userId,
+    revokedAt: null,
+    expiresAt: { gt: now },
+    ...(keepSessionId ? { id: { not: keepSessionId } } : {}) };
+  const toRevoke = await prisma.userSession.findMany({ where: others, select: { id: true } }).catch(() => [] as { id: string }[]);
+  await prisma.userSession
+    .updateMany({ where: others, data: { revokedAt: now, status: 'revoked' } })
     .catch(() => {});
-  const sessions = await prisma.session.findMany({ where: { userId }, select: { id: true } });
+  for (const s of toRevoke || []) {
+    sessionCache.delete(s.id);
+    void deleteCachedSessionIdentity(s.id);
+    await revokeSessionState(s.id).catch(() => {});
+  }
+  if (keepSessionId && !/^(cli|apikey:)/.test(keepSessionId)) {
+    await prisma.userSession
+      .updateMany({ where: { id: keepSessionId, revokedAt: null }, data: { expiresAt: new Date(now.getTime() + SAVE_LOGIN_IDLE_MS), lastUsedAt: now } })
+      .catch(() => {});
+    sessionCache.delete(keepSessionId);
+    void deleteCachedSessionIdentity(keepSessionId);
+  }
+  if (toRevoke?.length) {
+    try {
+      const { pusherSessionRevoked } = await import('@/infrastructure/realtime/pusher-deliver');
+      pusherSessionRevoked(userId);
+    } catch { /* pusher not configured */ }
+  }
+}
+
+export async function revokeSessionFamilyByUser(userId: string): Promise<void> {
+  const sessions = await prisma.userSession.findMany({ where: { userId, revokedAt: null }, select: { id: true } });
+  await prisma.userSession
+    .updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date(), status: 'revoked' } })
+    .catch(() => {});
+  await prisma.userDevice
+    .updateMany({
+      where: { userId, status: 'active' },
+      data: { status: 'revoked' } })
+    .catch(() => {});
   for (const s of sessions) {
     sessionCache.delete(s.id);
     void deleteCachedSessionIdentity(s.id);
@@ -331,9 +376,12 @@ export async function getSessionFromToken(token: string) {
     if (!payload) return null;
 
     if ((payload as any).purpose === 'cli' && payload.sub) {
-      const user = await prisma.user.findUnique({ where: { id: payload.sub } });
-      if (!user || user.isBanned || user.isSuspended || user.deletedAt) return null;
-      return { userId: user.id, email: user.email, sessionId: 'cli', adminRole: user.adminRole };
+      const user = await prisma.user.findUnique({
+        where: { id: payload.sub },
+        select: { id: true, username: true, status: true, isAdmin: true } });
+      if (!user || user.status === 'suspended' || user.status === 'deleted') return null;
+      const email = await userEmailForSession(user.id, user.username);
+      return { userId: user.id, email, sessionId: 'cli', adminRole: user.isAdmin ? 'admin' : null };
     }
 
     const sid = (payload as any).sid as string | undefined;
@@ -351,10 +399,9 @@ export async function getSessionFromToken(token: string) {
     let session: any = null;
     try {
       session = await withDeadline(
-        prisma.session.findUnique({
+        prisma.userSession.findUnique({
           where: { id: payload.sid },
-          include: { user: { select: { id: true, email: true, adminRole: true, isBanned: true, isSuspended: true } } },
-        }),
+          include: { user: { select: { id: true, username: true, status: true, isAdmin: true, security: { select: { saveLoginInfo: true } } } } } }),
         SESSION_DB_DEADLINE_MS,
       );
       if (session === null) {
@@ -374,7 +421,7 @@ export async function getSessionFromToken(token: string) {
       return null;
     }
 
-    if (session.status === 'revoked' || session.revokedAt) {
+    if (session.revokedAt) {
       sessionCache.set(payload.sid, null);
       await deleteCachedSessionIdentity(payload.sid);
       return null;
@@ -386,13 +433,23 @@ export async function getSessionFromToken(token: string) {
       return null;
     }
 
-    // Refresh the access token when it is close to expiring (proactive).
     // Track last-active lazily (max once per 5 minutes per session) so the
     // sessions list shows real "last active" data without a DB write per
     // request. Do NOT create new sessions here — this is not an auth boundary.
     if (!session.lastUsedAt || Date.now() - session.lastUsedAt.getTime() > 5 * 60 * 1000) {
-      prisma.session
-        .updateMany({ where: { id: session.id }, data: { lastUsedAt: new Date() } })
+      const saveLoginInfo = session.user?.security?.saveLoginInfo ?? true;
+      // Idle-capped sessions slide their deadline on every touch (the request
+      // path IS where the 1h idle timeout is enforced for them).
+      prisma.userSession
+        .updateMany({
+          where: { id: session.id },
+          data: saveLoginInfo ? { lastUsedAt: new Date() } : { lastUsedAt: new Date(), expiresAt: new Date(Date.now() + SAVE_LOGIN_IDLE_MS) } })
+        .catch(() => {});
+      // Throttled alongside the session row (same 5-minute window).
+      prisma.userDevice
+        .updateMany({
+          where: { userId: session.userId, status: 'active', deviceName: session.deviceName },
+          data: { lastUsedAt: new Date() } })
         .catch(() => {});
     }
 
@@ -406,12 +463,13 @@ export async function getSessionFromToken(token: string) {
     }
 
     const user = session.user;
-    if (!user || user.isBanned || user.isSuspended || user.deletedAt) {
+    if (!user || user.status === 'suspended' || user.status === 'deleted') {
       sessionCache.set(payload.sid, null);
       return null;
     }
 
-    const result = { userId: user.id, email: user.email, sessionId: session.id, adminRole: user.adminRole };
+    const email = await userEmailForSession(user.id, user.username);
+    const result = { userId: user.id, email, sessionId: session.id, adminRole: user.isAdmin ? 'admin' : null };
     sessionCache.set(payload.sid, result);
     void setCachedSessionIdentity(payload.sid, result);
     return result;
@@ -451,12 +509,18 @@ export async function getSessionFromRequest(request: NextRequest) {
   return session;
 }
 
-export function setSessionCookie(response: NextResponse, token: string, refreshToken?: string, request?: NextRequest) {
+export function setSessionCookie(
+  response: NextResponse,
+  token: string,
+  refreshToken?: string,
+  request?: NextRequest,
+  opts?: { shortSession?: boolean },
+) {
   response.cookies.set(COOKIE_NAME, token, getAccessCookieOptions(request));
   const csrfToken = generateCsrfToken();
   setCsrfCookie(response, csrfToken, request);
   if (refreshToken) {
-    response.cookies.set(REFRESH_COOKIE_NAME, refreshToken, getRefreshCookieOptions(request));
+    response.cookies.set(REFRESH_COOKIE_NAME, refreshToken, getRefreshCookieOptions(request, opts?.shortSession));
   }
   // Ensure the device cookie exists so multi-account switching can remember
   // this account on this device. Pass `request` from login/refresh handlers.

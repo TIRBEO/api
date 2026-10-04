@@ -20,7 +20,7 @@ function getRpID(req: NextRequest): string {
   }
   const host = req.headers.get('host') || '';
   if (host.startsWith('localhost') || host.startsWith('127.0.0.1')) return 'localhost';
-  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.app';
+  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
 }
 
 function getOrigin(req: NextRequest): string {
@@ -125,7 +125,7 @@ export async function adminPasskeyVerifyHandler(req: NextRequest) {
       requireUserVerification: false,
       credential: {
         id: passkey.credentialId,
-        publicKey: new Uint8Array(passkey.credentialPublicKey),
+        publicKey: new Uint8Array(passkey.credentialPubkey),
         counter: Number(passkey.counter),
         transports: passkey.transports
           ? (passkey.transports.split(',') as AuthenticatorTransport[])

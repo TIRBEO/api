@@ -1,44 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin, requireRole, canManageRole, getAdminRole } from '@/features/auth/http-guards';
+import { requireAdmin, requireRole, canManageRole } from '@/features/auth/http-guards';
 import { hashPassword } from '@/features/auth/password';
-import { cachedJson, jsonUnauthorized, jsonForbidden } from '@/shared/response';
+import { cachedJson, jsonForbidden } from '@/shared/response';
 import { createAuditEvent } from '@/features/security/audit';
 import { logSecurityEvent } from '@/features/security/security';
 import { generateEventId, refCodeCandidates } from '@/features/users/refcode';
+import { isValidTirbeoUsername, tirbeoEmailFor, upsertMailAccount, recordProvisioning } from '@/features/identity/tirbeo';
+import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
+import { getAccountsBaseUrl } from '@/config/app-urls';
 
-/** Summarize a user's digest/summary email opt-ins from their notification_preferences jsonb. */
+/**
+ * Summarize a user's email opt-ins from their notification_preferences jsonb.
+ *
+ * There used to be two recurring mails — a per-event digest and a weekly
+ * summary. There is one now: the account recap, on whichever cadence the person
+ * picked. The digest fields are gone rather than kept as aliases, so an admin
+ * reading this row cannot be shown a decision nobody can still make.
+ */
 function emailOptIns(notificationPreferences: unknown) {
   const p = (notificationPreferences && typeof notificationPreferences === 'object' && !Array.isArray(notificationPreferences)
     ? notificationPreferences : {}) as Record<string, unknown>;
   const on = (v: unknown) => v === true;
-  const freq = (v: unknown, fallback: 'daily' | 'weekly') =>
+  const freq = (v: unknown, fallback: 'daily' | 'weekly' | 'monthly') =>
     v === 'daily' || v === 'weekly' || v === 'monthly' ? v : fallback;
   return {
     emailEnabled: p.email !== false,
-    digestEnabled: on(p.digestEnabled),
-    digestFrequency: freq(p.digestFrequency, 'daily'),
-    weeklySummary: on(p.weeklySummary),
-    weeklySummaryFrequency: freq(p.weeklySummaryFrequency, 'weekly'),
-    lastDigestSentAt: typeof p.lastDigestSentAt === 'string' ? p.lastDigestSentAt : null,
-    lastWeeklySentAt: typeof p.lastWeeklySentAt === 'string' ? p.lastWeeklySentAt : null,
-  };
+    // A pause in the past is no pause; isEmailPaused says the same on the send path.
+    paused: on(p.emailPaused) && (typeof p.emailPausedUntil !== 'number' || p.emailPausedUntil > Date.now()),
+    summaryEnabled: on(p.summaryEnabled),
+    summaryFrequency: freq(p.summaryFrequency, 'weekly'),
+    lastSummarySentAt: typeof p.lastSummarySentAt === 'string' ? p.lastSummarySentAt : null };
 }
 
 export async function listUsers(request: NextRequest) {
   const session = await requireRole(request, 'manager');
   if (session instanceof NextResponse) return session;
 
-  const search = request.nextUrl.searchParams.get('search') || '';
+
   const page = Number(request.nextUrl.searchParams.get('page')) || 1;
   const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 100, 500);
 
-  const { baseWhere, findWhere, digestCond, summaryCond } = buildUserFilters(request, session);
+  const { baseWhere, findWhere, recapCond, pausedCond } = buildUserFilters(request, session);
 
   // Global opt-in counts (scoped to search/role but ignoring the optIn filter)
-  // for the admin KPI cards. none = totalBase - any.
-  const [users, total, digestCount, summaryCount, anyCount, totalBase] = await Promise.all([
+  // for the admin KPI cards.
+  const [users, total, recapCount, pausedCount, anyCount, totalBase] = await Promise.all([
     prisma.user.findMany({
       where: findWhere,
       select: {
@@ -55,16 +63,14 @@ export async function listUsers(request: NextRequest) {
         lastActiveAt: true,
         lastLoginAt: true,
         consents: true,
-        notificationPreferences: true,
-      },
+        notificationPreferences: true },
       orderBy: { lastActiveAt: 'desc' },
       skip: (page - 1) * limit,
-      take: limit,
-    }),
+      take: limit }),
     prisma.user.count({ where: findWhere }),
-    prisma.user.count({ where: { ...baseWhere, AND: [digestCond] } }),
-    prisma.user.count({ where: { ...baseWhere, AND: [summaryCond] } }),
-    prisma.user.count({ where: { ...baseWhere, AND: [{ OR: [digestCond, summaryCond] }] } }),
+    prisma.user.count({ where: { ...baseWhere, AND: [recapCond] } }),
+    prisma.user.count({ where: { ...baseWhere, AND: [pausedCond] } }),
+    prisma.user.count({ where: { ...baseWhere, AND: [{ OR: [recapCond, pausedCond] }] } }),
     prisma.user.count({ where: baseWhere }),
   ]);
 
@@ -76,8 +82,7 @@ export async function listUsers(request: NextRequest) {
     signupConsent: (u.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     emailOptIns: emailOptIns(u.notificationPreferences),
     lastActiveAt: u.lastActiveAt?.toISOString() || null,
-    lastLoginAt: u.lastLoginAt?.toISOString() || null,
-  }));
+    lastLoginAt: u.lastLoginAt?.toISOString() || null }));
 
   return NextResponse.json({
     users: mapped,
@@ -85,12 +90,10 @@ export async function listUsers(request: NextRequest) {
     page,
     limit,
     optInCounts: {
-      digest: digestCount,
-      summary: summaryCount,
+      recap: recapCount,
+      paused: pausedCount,
       any: anyCount,
-      none: Math.max(0, totalBase - anyCount),
-    },
-  });
+      none: Math.max(0, totalBase - anyCount) } });
 }
 
 /** Shared where-clause builder for the users list + CSV export. */
@@ -101,21 +104,31 @@ function buildUserFilters(request: NextRequest, session: { adminRole?: string | 
     : {};
 
   if (session.adminRole !== 'super_admin') {
-    baseWhere.adminRole = { not: 'super_admin' };
+    /* Hide super_admins from lesser admins — and only super_admins.
+       `adminRole: { not: 'super_admin' }` compiles to `admin_role <> 'super_admin'`,
+       which is UNKNOWN for a NULL column, and every ordinary account has
+       admin_role NULL. So the guard excluded everybody and the list returned
+       nothing at all. `NOT (admin_role = 'super_admin')` is no better: NOT of
+       UNKNOWN is still UNKNOWN. Only `admin_role IS NULL OR admin_role <> ...`
+       keeps the NULLs, so spell it out. */
+    baseWhere.AND = [
+      ...(Array.isArray(baseWhere.AND) ? baseWhere.AND : []),
+      { OR: [{ adminRole: null }, { adminRole: { not: 'super_admin' } }] },
+    ];
   }
 
-  // Opt-in filter (digest / activity summary) — matched against the jsonb prefs.
-  const digestCond = { notificationPreferences: { path: ['digestEnabled'], equals: true } };
-  const summaryCond = { notificationPreferences: { path: ['weeklySummary'], equals: true } };
+  // Opt-in filter — matched against the jsonb prefs.
+  const recapCond = { notificationPreferences: { path: ['summaryEnabled'], equals: true } };
+  const pausedCond = { notificationPreferences: { path: ['emailPaused'], equals: true } };
   const optIn = request.nextUrl.searchParams.get('optIn') || '';
   const optInCondition =
-    optIn === 'digest' ? digestCond :
-    optIn === 'summary' ? summaryCond :
-    optIn === 'any' ? { OR: [digestCond, summaryCond] } :
-    optIn === 'none' ? { NOT: { OR: [digestCond, summaryCond] } } : null;
+    optIn === 'recap' || optIn === 'summary' ? recapCond :
+    optIn === 'paused' ? pausedCond :
+    optIn === 'any' ? { OR: [recapCond, pausedCond] } :
+    optIn === 'none' ? { NOT: { OR: [recapCond, pausedCond] } } : null;
   const findWhere = optInCondition ? { ...baseWhere, AND: [optInCondition] } : baseWhere;
 
-  return { baseWhere, findWhere, optInCondition, digestCond, summaryCond };
+  return { baseWhere, findWhere, optInCondition, recapCond, pausedCond };
 }
 
 /**
@@ -138,10 +151,8 @@ export async function exportUsersCsv(request: NextRequest) {
       isSuspended: true,
       createdAt: true,
       lastActiveAt: true,
-      notificationPreferences: true,
-    },
-    orderBy: { lastActiveAt: 'desc' },
-  });
+      notificationPreferences: true },
+    orderBy: { lastActiveAt: 'desc' } });
 
   const esc = (v: unknown) => {
     const s = String(v ?? '');
@@ -152,10 +163,8 @@ export async function exportUsersCsv(request: NextRequest) {
   const rows = [
     [
       'user_id', 'email', 'name', 'role', 'status',
-      'email_enabled', 'digest_enabled', 'digest_frequency',
-      'summary_enabled', 'summary_frequency',
-      'last_digest_sent_at', 'last_summary_sent_at',
-      'created_at', 'last_active_at',
+      'email_enabled', 'email_paused', 'recap_enabled', 'recap_frequency',
+      'last_recap_sent_at', 'created_at', 'last_active_at',
     ].join(','),
   ];
   for (const u of users) {
@@ -167,12 +176,10 @@ export async function exportUsersCsv(request: NextRequest) {
       u.adminRole || '',
       u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
       o.emailEnabled ? 'yes' : 'no',
-      o.digestEnabled ? 'yes' : 'no',
-      o.digestEnabled ? o.digestFrequency : '',
-      o.weeklySummary ? 'yes' : 'no',
-      o.weeklySummary ? o.weeklySummaryFrequency : '',
-      o.lastDigestSentAt || '',
-      o.lastWeeklySentAt || '',
+      o.paused ? 'yes' : 'no',
+      o.summaryEnabled ? 'yes' : 'no',
+      o.summaryEnabled ? o.summaryFrequency : '',
+      o.lastSummarySentAt || '',
       date(u.createdAt),
       date(u.lastActiveAt),
     ].join(','));
@@ -184,9 +191,7 @@ export async function exportUsersCsv(request: NextRequest) {
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="tirbeo-optins-${optIn}-${stamp}.csv"`,
-      'Cache-Control': 'no-store',
-    },
-  });
+      'Cache-Control': 'no-store' } });
 }
 
 export async function getUserDetail(request: NextRequest, userId: string) {
@@ -215,10 +220,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       sessions: {
         select: { id: true, userAgent: true, ipAddress: true, createdAt: true, expiresAt: true },
         orderBy: { createdAt: 'desc' },
-        take: 10,
-      },
-    },
-  });
+        take: 10 } } });
   if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
   return NextResponse.json({
     ...user,
@@ -227,22 +229,23 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     roles: [],
     signupConsent: (user.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
     emailOptIns: emailOptIns(user.notificationPreferences),
-    roleAssignments: undefined,
-  });
+    roleAssignments: undefined });
 }
 
 const updateUserSchema = z.object({
   displayName: z.string().min(1).optional(),
   adminRole: z.enum(['super_admin', 'admin', 'manager', 'editor']).nullable().optional(),
-  status: z.enum(['ACTIVE', 'SUSPENDED', 'BANNED']).optional(),
-});
+  status: z.enum(['ACTIVE', 'SUSPENDED', 'BANNED']).optional() });
 
 const createUserSchema = z.object({
-  email: z.string().email(),
+  email: z.string().email().optional(),
   name: z.string().min(1).max(120).optional(),
+  firstName: z.string().min(1).max(60).optional(),
+  lastName: z.string().min(1).max(60).optional(),
+  username: z.string().min(1).max(64).optional(),
+  recoveryEmail: z.string().email().optional(),
   adminRole: z.enum(['super_admin', 'admin', 'manager', 'editor']).nullable().optional(),
-  sendEmail: z.boolean().optional(),
-});
+  sendEmail: z.boolean().optional() }).refine((d) => !!d.email || !!d.username, { message: 'An email or Tirbeo username is required' });
 
 function generateTemporaryPassword(length = 16): string {
   const alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*';
@@ -261,11 +264,8 @@ export async function createUser(request: NextRequest) {
   const parsed = createUserSchema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-  const { email, name, adminRole, sendEmail = true } = parsed.data;
-  const normalizedEmail = email.toLowerCase();
-
-  const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } });
-  if (existing) return NextResponse.json({ error: 'A user with this email already exists' }, { status: 409 });
+  const { username, recoveryEmail, firstName, lastName, adminRole, sendEmail = true } = parsed.data;
+  const name = parsed.data.name || `${firstName || ''} ${lastName || ''}`.trim() || null;
 
   if (adminRole === 'super_admin' && session.adminRole !== 'super_admin') {
     return jsonForbidden();
@@ -274,38 +274,168 @@ export async function createUser(request: NextRequest) {
     return jsonForbidden();
   }
 
+  // Tirbeo identity flow: username -> username@tirbeo.com is the account's
+  // login identity and mail address. An externally supplied email may not
+  // become the identity (recovery email never does).
+  if (username) {
+    const userName = username.toString().trim().toLowerCase();
+    if (!isValidTirbeoUsername(userName)) {
+      return NextResponse.json({ error: 'Invalid Tirbeo username. Use letters, numbers, dots, dashes or underscores.' }, { status: 400 });
+    }
+    const tirbeoEmail = tirbeoEmailFor(userName);
+
+    const identityTaken = await prisma.tirbeoIdentity.findUnique({ where: { username: userName }, select: { id: true } });
+    if (identityTaken) {
+      return NextResponse.json({ error: 'This Tirbeo username is already taken' }, { status: 409 });
+    }
+    const emailTaken = await prisma.user.findUnique({ where: { email: tirbeoEmail }, select: { id: true } });
+    if (emailTaken) {
+      return NextResponse.json({ error: 'A user already exists for this Tirbeo email' }, { status: 409 });
+    }
+    if (parsed.data.email && parsed.data.email.toLowerCase() !== tirbeoEmail) {
+      return NextResponse.json({ error: 'Tirbeo accounts use username@tirbeo.com — the email is derived from the username.' }, { status: 400 });
+    }
+    const recovery = recoveryEmail ? recoveryEmail.toString().trim().toLowerCase() : undefined;
+
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await hashPassword(temporaryPassword);
+
+    const user = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.create({
+        data: {
+          email: tirbeoEmail,
+          username: userName,
+          name: name || userName,
+          adminRole: adminRole || null,
+          passwordHash,
+          emailVerified: true,
+          mustChangePassword: true },
+        select: { id: true, email: true, username: true, name: true, adminRole: true, createdAt: true } });
+      await tx.tirbeoIdentity.create({
+        data: { userId: u.id, username: userName, email: tirbeoEmail, verifiedSource: 'admin', verifiedAt: new Date() } });
+      if (recovery) {
+        const addr = recovery.trim().toLowerCase();
+        await tx.userEmail.upsert({
+          where: { userId_address: { userId: u.id, address: addr } },
+          create: { userId: u.id, address: addr, kind: 'recovery', verifiedAt: new Date() },
+          update: { kind: 'recovery', verifiedAt: new Date() } });
+      }
+      return u;
+    });
+
+    // Registry: every @tirbeo.com account gets a mail_accounts row (role
+    // mirrors adminRole). The D1 mailbox itself is provisioned on first sign-in.
+    await upsertMailAccount({
+      userId: user.id,
+      username: userName,
+      role: adminRole ? 'admin' : 'user',
+      provisioned: false,
+      provisionedBy: 'admin' });
+    recordProvisioning({
+      userId: user.id,
+      target: 'tirbeo_identity',
+      status: 'ok',
+      method: 'admin',
+      detail: `Identity ${tirbeoEmail} created by admin ${session.userId}.` });
+
+    // Provision the same identity in Supabase Auth (best-effort, non-fatal).
+    const supabase = await createSupabaseAuthUser({
+      email: tirbeoEmail,
+      password: temporaryPassword,
+      emailConfirm: true,
+      userMetadata: { username: userName, full_name: name, tirbeo: true },
+      appMetadata: { provider: 'tirbeo' } });
+    recordProvisioning({
+      userId: user.id,
+      target: 'supabase_user',
+      status: supabase.ok ? 'ok' : 'failed',
+      method: 'admin',
+      detail: supabase.ok
+        ? `Supabase auth user ${tirbeoEmail} created by admin.`
+        : `Supabase provisioning skipped: ${supabase.reason || 'unknown'}` });
+    if (!supabase.ok) {
+      console.error(`[ADMIN CREATE TIRBEO] Supabase provisioning skipped for ${tirbeoEmail}: ${supabase.reason || 'unknown'}`);
+    }
+
+    await createAuditEvent({
+      actorId: session.userId,
+      action: 'user.created',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: {
+        email: tirbeoEmail,
+        username: userName,
+        recoveryEmail: recovery || null,
+        adminRole: adminRole || null,
+        temporaryPasswordIssued: true,
+        supabaseProvisioned: supabase.ok } });
+
+    let emailSent = false;
+    if (sendEmail && recovery) {
+      const { sendTemplateEmail } = await import('@/features/email/email');
+      const res = await sendTemplateEmail(recovery, 'tirbeo_account_onboarding', {
+        name: name || userName,
+        username: userName,
+        password: temporaryPassword,
+        accountsUrl: getAccountsBaseUrl(),
+        recoveryEmail: recovery });
+      emailSent = res.success;
+      if (!res.success) {
+        console.error(`[ADMIN CREATE TIRBEO] Onboarding email failed for ${recovery}`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[ADMIN CREATE TIRBEO] FALLBACK TEMP PASSWORD for ${tirbeoEmail}: ${temporaryPassword}`);
+        }
+      }
+    } else if (sendEmail) {
+      const { sendTemplateEmail } = await import('@/features/email/email');
+      const res = await sendTemplateEmail(tirbeoEmail, 'welcome', { name: name || userName });
+      emailSent = res.success;
+    }
+
+    // Only echo the temporary password in non-production (email may not be configured).
+    const echoPassword = sendEmail && process.env.NODE_ENV !== 'production';
+    return NextResponse.json({
+      user: { ...user, mustChangePassword: true },
+      ...(echoPassword ? { temporaryPassword } : { temporaryPasswordRef: `tirbeo:${user.id}` }),
+      supabaseProvisioned: supabase.ok,
+      emailSent,
+      emailRecipient: recovery || tirbeoEmail,
+      note: 'The user must set a new password on first sign in.' }, { status: 201 });
+  }
+
+  // Legacy flow: user supplied an explicit email (no Tirbeo username).
+  const email = parsed.data.email!.toLowerCase();
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return NextResponse.json({ error: 'A user with this email already exists' }, { status: 409 });
+
   const temporaryPassword = generateTemporaryPassword();
   const passwordHash = await hashPassword(temporaryPassword);
 
   const user = await prisma.user.create({
     data: {
-      email: normalizedEmail,
+      email,
       name: name || null,
       adminRole: adminRole || null,
       passwordHash,
       emailVerified: true,
-      mustChangePassword: true,
-    },
-    select: { id: true, email: true, name: true, adminRole: true, createdAt: true },
-  });
+      mustChangePassword: true },
+    select: { id: true, email: true, name: true, adminRole: true, createdAt: true } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'user.created',
     targetType: 'user',
     targetId: user.id,
-    metadata: { email: normalizedEmail, adminRole: adminRole || null, temporaryPasswordIssued: true },
-  });
+    metadata: { email, adminRole: adminRole || null, temporaryPasswordIssued: true } });
 
   if (sendEmail) {
     const { sendTemplateEmail } = await import('@/features/email/email');
-    const res = await sendTemplateEmail(normalizedEmail, 'welcome', {
-      name: name || normalizedEmail.split('@')[0],
-    });
+    const res = await sendTemplateEmail(email, 'welcome', {
+      name: name || email.split('@')[0] });
     if (!res.success) {
-      console.error(`[ADMIN CREATE USER] Email failed for ${normalizedEmail}: ${res.error}`);
+      console.error(`[ADMIN CREATE USER] Email failed for ${email}: ${res.error}`);
       if (process.env.NODE_ENV !== 'production') {
-        console.log(`[ADMIN CREATE USER] FALLBACK TEMP PASSWORD for ${normalizedEmail}: ${temporaryPassword}`);
+        console.log(`[ADMIN CREATE USER] FALLBACK TEMP PASSWORD for ${email}: ${temporaryPassword}`);
       }
     }
   }
@@ -316,8 +446,7 @@ export async function createUser(request: NextRequest) {
     user: { ...user, mustChangePassword: true },
     ...(echoPassword ? { temporaryPassword } : {}),
     emailSent: sendEmail,
-    note: 'The user must set a new password on first login.',
-  }, { status: 201 });
+    note: 'The user must set a new password on first login.' }, { status: 201 });
 }
 
 export async function updateUser(request: NextRequest, userId: string) {
@@ -334,6 +463,18 @@ export async function updateUser(request: NextRequest, userId: string) {
   if (parsed.data.adminRole !== undefined) {
     if (!canManageRole(session.adminRole, existing.adminRole)) {
       return NextResponse.json({ error: 'Cannot change role of this user' }, { status: 403 });
+    }
+  }
+
+  // SEC: BAN/SUSPEND is a privileged action — mirror the dedicated endpoints
+  // (requireRole super_admin) and never let a lower-privilege admin act on a
+  // user at/above their own role.
+  if (parsed.data.status === 'BANNED' || parsed.data.status === 'SUSPENDED') {
+    if (session.adminRole !== 'super_admin') {
+      return NextResponse.json({ error: 'Only super admins can ban or suspend users' }, { status: 403 });
+    }
+    if (existing.adminRole === 'super_admin') {
+      return NextResponse.json({ error: 'Cannot ban or suspend a super admin' }, { status: 403 });
     }
   }
 
@@ -365,22 +506,18 @@ export async function updateUser(request: NextRequest, userId: string) {
       photoUrl: true,
       adminRole: true,
       isBanned: true,
-      isSuspended: true,
-    },
-  });
+      isSuspended: true } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'user.updated',
     targetType: 'user',
     targetId: userId,
-    metadata: { changes: parsed.data, previous: { adminRole: existing.adminRole } },
-  });
+    metadata: { changes: parsed.data, previous: { adminRole: existing.adminRole } } });
 
   return NextResponse.json({
     ...updated,
-    status: updated.isBanned ? 'BANNED' : updated.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-  });
+    status: updated.isBanned ? 'BANNED' : updated.isSuspended ? 'SUSPENDED' : 'ACTIVE' });
 }
 
 export async function deleteUser(request: NextRequest, userId: string) {
@@ -397,8 +534,7 @@ export async function deleteUser(request: NextRequest, userId: string) {
     action: 'user.deleted',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, displayName: existing.name },
-  });
+    metadata: { email: existing.email, displayName: existing.name } });
 
   return NextResponse.json({ error: 'User deleted' }, { status: 200 });
 }
@@ -416,15 +552,14 @@ export async function banUser(request: NextRequest, userId: string) {
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
   await prisma.user.update({ where: { id: userId }, data: { isBanned: true, isSuspended: false, suspendReason: reason || 'No reason provided', suspendedUntil: null, banRefCode: existing.banRefCode || generateEventId('ban') } });
-  await prisma.session.deleteMany({ where: { userId } });
+  await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'user.banned',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, reason: reason || 'No reason provided' },
-  });
+    metadata: { email: existing.email, reason: reason || 'No reason provided' } });
   logSecurityEvent({ request, userId, eventType: 'security.account_banned', severity: 'critical', details: { reason: reason || 'No reason provided', byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('@/features/email/email');
@@ -433,9 +568,8 @@ export async function banUser(request: NextRequest, userId: string) {
     statusType: 'permanently banned',
     reason: reason || 'No reason provided',
     untilLabel: '',
-    actionLabel: 'Contact support at support@tirbeo.app if you believe this is a mistake.',
-    dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl(),
-  }, { rawVars: [] }).catch(() => {});
+    actionLabel: 'Contact support at support@tirbeo.com if you believe this is a mistake.',
+    dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }, { rawVars: [] }).catch(() => {});
 
   return NextResponse.json({ message: 'User banned' });
 }
@@ -454,8 +588,7 @@ export async function unbanUser(request: NextRequest, userId: string) {
     action: 'user.unbanned',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email },
-  });
+    metadata: { email: existing.email } });
   logSecurityEvent({ request, userId, eventType: 'security.account_unbanned', details: { byAdmin: session.userId } }).catch(() => {});
 
   return NextResponse.json({ message: 'User unbanned' });
@@ -475,15 +608,14 @@ export async function suspendUser(request: NextRequest, userId: string) {
   const until = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
   await prisma.user.update({ where: { id: userId }, data: { isSuspended: true, isBanned: false, suspendReason: reason, suspendedUntil: until, suspendRefCode: existing.suspendRefCode || generateEventId('suspend') } });
-  await prisma.session.deleteMany({ where: { userId } });
+  await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'user.suspended',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, reason, days },
-  });
+    metadata: { email: existing.email, reason, days } });
   logSecurityEvent({ request, userId, eventType: 'security.account_suspended', severity: 'warning', details: { reason, days, until: until?.toISOString() || null, byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('@/features/email/email');
@@ -493,8 +625,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
     reason,
     untilLabel: until ? ` Your account will be restored automatically on ${until.toUTCString()}.` : ' Contact support to restore access.',
     actionLabel: 'During suspension you cannot sign in or use Tirbeo services.',
-    dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl(),
-  }).catch(() => {});
+    dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }).catch(() => {});
 
   return NextResponse.json({ message: 'User suspended', until: until?.toISOString() || null });
 }
@@ -513,8 +644,7 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
     action: 'user.unsuspended',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email },
-  });
+    metadata: { email: existing.email } });
   logSecurityEvent({ request, userId, eventType: 'security.account_unsuspended', details: { byAdmin: session.userId } }).catch(() => {});
 
   return NextResponse.json({ message: 'User unsuspended' });
@@ -538,14 +668,11 @@ export async function resolveUserByRefCode(request: NextRequest) {
       OR: [
         { banRefCode: { in: candidates, mode: 'insensitive' } },
         { suspendRefCode: { in: candidates, mode: 'insensitive' } },
-      ],
-    },
+      ] },
     select: {
       id: true, email: true, name: true, photoUrl: true, adminRole: true,
       isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true,
-      banRefCode: true, suspendRefCode: true, lastActiveAt: true,
-    },
-  });
+      banRefCode: true, suspendRefCode: true, lastActiveAt: true } });
   if (!user) {
     return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });
   }
@@ -555,9 +682,7 @@ export async function resolveUserByRefCode(request: NextRequest) {
       ...user,
       status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
       eventId: user.isBanned ? user.banRefCode : user.isSuspended ? user.suspendRefCode : null,
-      lastActiveAt: user.lastActiveAt?.toISOString() || null,
-    },
-  });
+      lastActiveAt: user.lastActiveAt?.toISOString() || null } });
 }
 
 
@@ -565,7 +690,8 @@ export async function resolveUserByRefCode(request: NextRequest) {
 
 
 export async function seedAdminHandler(request: NextRequest) {
-  const session = await requireAdmin(request);
+  // SEC: a plain admin must not be able to promote/reset the seed account.
+  const session = await requireRole(request, 'super_admin');
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -587,9 +713,11 @@ export async function seedAdminHandler(request: NextRequest) {
 
   let user = await prisma.user.findUnique({ where: { email } });
   if (!user) {
+    if (!passwordHash) {
+      return NextResponse.json({ error: 'A password is required when creating the seed admin' }, { status: 400 });
+    }
     user = await prisma.user.create({
-      data: { email, passwordHash: passwordHash || '', name: email.split('@')[0], adminRole },
-    });
+      data: { email, passwordHash, name: email.split('@')[0], adminRole } });
     return NextResponse.json({ message: `User ${email} created with role ${adminRole}` });
   }
 
@@ -617,16 +745,14 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
   const passwordHash = await hashPassword(password);
   await prisma.user.update({
     where: { id: userId },
-    data: { passwordHash },
-  });
+    data: { passwordHash } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'password.reset',
     targetType: 'user',
     targetId: userId,
-    metadata: { from: 'admin_panel', resetBy: 'super_admin' },
-  });
+    metadata: { from: 'admin_panel', resetBy: 'super_admin' } });
 
   // Notify the user that their password was reset by an admin
   const { createNotification } = await import('@/features/notifications/notifications');
@@ -635,8 +761,11 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
     type: 'security',
     title: 'Password reset by administrator',
     body: 'Your password was reset by an administrator. If you did not request this, contact support immediately.',
-    link: '/account/security',
-  }).catch(() => {});
+    link: '/account/security' }).catch(() => {});
+
+  // Revoke all existing sessions so a compromised session can't outlive the reset
+  const { revokeSessionFamilyByUser } = await import('@/features/auth/session');
+  await revokeSessionFamilyByUser(userId).catch(() => {});
 
   return NextResponse.json({ message: 'Password reset successfully' });
 }
@@ -649,19 +778,17 @@ export async function getStats(request: NextRequest) {
 
   const [userCount, auditCount, blocklistCount] = await Promise.all([
     prisma.user.count(),
-    prisma.auditEvent.count(),
+    prisma.activityEvent.count(),
     prisma.blocklist.count(),
   ]);
 
   const adminUsers = await prisma.user.findMany({
     where: { adminRole: { not: null } },
-    select: { id: true, email: true, name: true, adminRole: true },
-  });
+    select: { id: true, email: true, name: true, adminRole: true } });
 
   return cachedJson({
     counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
-    adminUsers,
-  }, { ttl: 15, swr: 120 });
+    adminUsers }, { ttl: 15, swr: 120 });
 }
 
 export async function adminMaintenanceHandler(request: NextRequest) {
@@ -692,8 +819,7 @@ export async function adminMaintenanceHandler(request: NextRequest) {
       actorId: session.userId,
       targetType: 'maintenance',
       targetId: 'system',
-      metadata: { message: message || undefined },
-    }).catch(() => {});
+      metadata: { message: message || undefined } }).catch(() => {});
     return NextResponse.json({ ok: true, ...getMaintenanceState() });
   } catch (err: any) {
     console.error('[ADMIN MAINTENANCE]', err?.message || err);

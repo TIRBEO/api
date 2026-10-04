@@ -1,7 +1,10 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import type { Prisma } from '@prisma/client';
+import { getRedis } from '@/features/auth/redis';
 import { sendTemplateEmail } from '@/features/email/email';
 import { getBranding } from '@/features/branding/branding';
+import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
+import { resolveLoginPlace, resolveLoginCoords } from '@/shared/geo';
 
 export type SecuritySeverity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -167,11 +170,15 @@ const NOTIFY_THROTTLE_MS = 60_000;
 
 export async function getAdminUsers() {
   const admins = await prisma.user.findMany({
-    where: { adminRole: { not: null } },
-    select: { id: true, email: true, name: true, adminRole: true },
+    where: { isAdmin: true },
+    select: {
+      id: true, username: true,
+      profile: { select: { name: true } },
+      emails: { where: { kind: 'primary' }, select: { address: true }, take: 1 },
+    },
   });
   return admins
-    .map(a => ({ ...a, roleName: a.adminRole as string }))
+    .map(a => ({ ...a, email: a.emails[0]?.address ?? null, name: a.profile?.name ?? null, roleName: 'admin' }))
     .filter(u => u.email);
 }
 
@@ -224,24 +231,39 @@ export async function logSecurityEvent(input: {
   details?: Record<string, unknown>;
   notifyAdmin?: boolean;
 }): Promise<void> {
-  const ip = input.request ? getClientIp(input.request) : undefined;
+  const ip = input.request ? getClientIp(input.request) : currentRequestOrigin()?.ip ?? undefined;
   const rayId = input.request ? getRayId(input.request) : undefined;
-  const userAgent = input.request ? getUserAgent(input.request) : undefined;
+  const userAgent = input.request ? getUserAgent(input.request) : currentRequestOrigin()?.userAgent ?? undefined;
 
   const metadata: Record<string, unknown> = { ...(input.details || {}) };
   if (rayId) metadata.rayId = rayId;
+  /* The address the edge saw, so a security event reads as "from Pokhara, Nepal"
+     rather than as a bare IP. Whatever the caller passed in wins; a write from a
+     job with no request at all leaves the place out instead of inventing one. */
+  const ctx = currentRequestOrigin();
+  const place = (input.request ? resolveLoginPlace(input.request.headers) : null) ?? ctx?.location ?? null;
+  const coords = (input.request ? resolveLoginCoords(input.request.headers) : null) ?? ctx?.coords ?? null;
+  if (place && metadata.location === undefined) metadata.location = place;
+  if (coords && metadata.coords === undefined) metadata.coords = coords;
 
   try {
-    await prisma.securityEvent.create({
-      data: {
-        userId: input.userId || null,
-        eventType: input.eventType,
-        severity: input.severity || 'info',
-        ipAddress: ip,
-        userAgent: userAgent,
-        metadata: (metadata || {}) as Prisma.InputJsonValue,
-      },
-    });
+    // activity_events.user_id has a NOT-NULL FK to users(id). Anonymous events
+    // (no authenticated user) can't satisfy it, so skip the row write; the
+    // admin/critical notification below still fires for them.
+    if (input.userId) {
+      await prisma.activityEvent.create({
+        data: {
+          userId: input.userId,
+          kind: input.eventType,
+          title: humanizeEventType(input.eventType),
+          detail: input.details?.reason ? String(input.details.reason).slice(0, 500) : null,
+          severity: input.severity || 'info',
+          ipAddress: ip,
+          userAgent: userAgent,
+          metadata: (metadata || {}) as Prisma.InputJsonValue,
+        },
+      });
+    }
   } catch (e) {
     console.error('[SECURITY] Failed to log event:', e instanceof Error ? e.message : e);
   }
@@ -257,10 +279,16 @@ export async function logSecurityEvent(input: {
   }
 }
 
+/** Event kinds are written for machines — `security.password_changed`. A
+    record a person reads wants the other half of that name: the namespace it
+    sits under tells them nothing, and the snake_case is not how anyone
+    sentences. */
 function humanizeEventType(type: string): string {
-  return type
+  const leaf = type.includes('.') ? type.slice(type.lastIndexOf('.') + 1) : type;
+  return leaf
     .replace(/[_\-]+/g, ' ')
-    .replace(/\b\w/g, c => c.toUpperCase());
+    .replace(/\b2fa\b/gi, 'two-factor')
+    .replace(/^\w/, (c) => c.toUpperCase());
 }
 
 function buildDetailsString(parts: Record<string, unknown>): string {
@@ -287,32 +315,48 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
   ]);
 }
 
+interface BlockEntry {
+  targetType: string;
+  targetId: string;
+  reason?: string;
+  blockedBy?: string | null;
+  isActive: boolean;
+  expiresAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+const BLOCKLIST_REDIS_KEY = 'blocklist';
+
+async function redisBlockLookup(field: string): Promise<BlockEntry | null> {
+  try {
+    const redis = getRedis();
+    if (!redis) return null;
+    const raw = await withDeadline(redis.hget(BLOCKLIST_REDIS_KEY, field) as Promise<string | null>, IP_BLOCK_TIMEOUT_MS);
+    if (!raw) return null;
+    return JSON.parse(raw) as BlockEntry;
+  } catch {
+    return null;
+  }
+}
+
 export async function isIpBlocked(ip: string): Promise<boolean> {
   if (!ip || ip === 'unknown') return false;
   const cached = ipBlockCache.get(ip);
   if (cached && cached.expires > Date.now()) return cached.blocked;
-  try {
-    const entry = await withDeadline(
-      prisma.blocklist.findUnique({
-        where: { targetType_targetId: { targetType: 'ip', targetId: ip } },
-      }),
-      IP_BLOCK_TIMEOUT_MS,
-    );
-    // Timed out: serve the (benign) default WITHOUT caching, so the next
-    // request retries instead of locking in a stale verdict for 15s.
-    if (entry === null) return false;
-    const blocked = !!entry && entry.isActive !== false && (!entry.expiresAt || entry.expiresAt >= new Date());
-    ipBlockCache.set(ip, { blocked, expires: Date.now() + IP_BLOCK_CACHE_TTL });
-    if (ipBlockCache.size > 1000) {
-      const now = Date.now();
-      for (const [k, v] of ipBlockCache) {
-        if (v.expires <= now) ipBlockCache.delete(k);
-      }
+  const entry = await redisBlockLookup(`ip:${ip}`);
+  // Redis unavailable: serve the (benign) default WITHOUT caching, so the
+  // next request retries instead of locking in a stale verdict for 15s.
+  if (entry === null) return false;
+  const blocked = entry.isActive !== false && (!entry.expiresAt || new Date(entry.expiresAt) >= new Date());
+  ipBlockCache.set(ip, { blocked, expires: Date.now() + IP_BLOCK_CACHE_TTL });
+  if (ipBlockCache.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of ipBlockCache) {
+      if (v.expires <= now) ipBlockCache.delete(k);
     }
-    return blocked;
-  } catch {
-    return false;
   }
+  return blocked;
 }
 
 export async function blockTarget(input: {
@@ -322,32 +366,27 @@ export async function blockTarget(input: {
   blockedBy?: string;
   expiresAt?: Date | null;
 }): Promise<void> {
-  await prisma.blocklist.upsert({
-    where: { targetType_targetId: { targetType: input.targetType, targetId: input.targetId } },
-    update: {
-      reason: input.reason,
-      blockedBy: input.blockedBy || null,
-      isActive: true,
-      expiresAt: input.expiresAt || null,
-      updatedAt: new Date(),
-    },
-    create: {
-      targetType: input.targetType,
-      targetId: input.targetId,
-      reason: input.reason,
-      blockedBy: input.blockedBy || null,
-      isActive: true,
-      expiresAt: input.expiresAt || null,
-    },
-  });
+  const redis = getRedis();
+  if (!redis) throw new Error('Blocklist storage (Redis) unavailable');
+  const now = new Date().toISOString();
+  const entry: BlockEntry = {
+    targetType: input.targetType,
+    targetId: input.targetId,
+    reason: input.reason,
+    blockedBy: input.blockedBy || null,
+    isActive: true,
+    expiresAt: input.expiresAt ? input.expiresAt.toISOString() : null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await redis.hset(BLOCKLIST_REDIS_KEY, `${input.targetType}:${input.targetId}`, JSON.stringify(entry));
   if (input.targetType === 'ip') ipBlockCache.delete(input.targetId);
 }
 
 export async function unblockTarget(targetType: string, targetId: string): Promise<void> {
-  await prisma.blocklist.updateMany({
-    where: { targetType, targetId },
-    data: { isActive: false, updatedAt: new Date() },
-  });
+  const redis = getRedis();
+  if (!redis) return;
+  await redis.hdel(BLOCKLIST_REDIS_KEY, `${targetType}:${targetId}`);
   if (targetType === 'ip') ipBlockCache.delete(targetId);
 }
 
@@ -370,16 +409,22 @@ export async function listBlocks(options: {
     ];
   }
 
-  const [items, total] = await Promise.all([
-    prisma.blocklist.findMany({
-      where: where as any,
-      orderBy: { createdAt: 'desc' },
-      skip: (page - 1) * limit,
-      take: limit,
-      include: { users: { select: { id: true, email: true, name: true } } },
-    }),
-    prisma.blocklist.count({ where: where as any }),
-  ]);
+  const redis = getRedis();
+  if (!redis) return { items: [], total: 0, page, limit };
+  const all: Record<string, string> = await redis.hgetall(BLOCKLIST_REDIS_KEY).catch(() => ({}));
+  let entries = Object.values(all || {}).map((raw) => {
+    try { return JSON.parse(raw) as BlockEntry & { users?: unknown }; } catch { return null; }
+  }).filter((e): e is BlockEntry & { users?: unknown } => !!e);
+  if (options.targetType) entries = entries.filter((e) => e.targetType === options.targetType);
+  if (options.activeOnly) entries = entries.filter((e) => e.isActive !== false);
+  if (options.search) {
+    const q = options.search.toLowerCase();
+    entries = entries.filter((e) =>
+      e.targetId.toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q));
+  }
+  entries.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  const total = entries.length;
+  const items = entries.slice((page - 1) * limit, page * limit);
 
   return { items, total, page, limit };
 }
@@ -400,9 +445,8 @@ export async function listSecurityEvents(options: {
   const page = Math.max(1, options.page || 1);
   const limit = Math.min(200, options.limit || 50);
   const where: Record<string, unknown> = {};
-  if (options.eventType) where.eventType = options.eventType;
+  if (options.eventType) where.kind = options.eventType;
   if (options.severity) where.severity = options.severity;
-  if (options.ip) where.ipAddress = { contains: options.ip };
   if (options.userId) where.userId = options.userId;
   if (options.from || options.to) {
     const createdAt: Record<string, Date> = {};
@@ -417,18 +461,13 @@ export async function listSecurityEvents(options: {
     skip: (page - 1) * limit,
     take: limit,
   };
-  // Skip the user join when not needed — saves a DB round-trip
-  // for list pages that don't render user info per-row.
-  if (options.includeUser === false) {
-    queryOptions.select = { id: true, userId: true, eventType: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true };
-  } else {
-    queryOptions.include = { user: { select: { id: true, email: true, name: true } } };
-  }
+  queryOptions.select = { id: true, userId: true, kind: true, title: true, detail: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true };
 
-  const [events, total] = await Promise.all([
-    prisma.securityEvent.findMany(queryOptions),
-    prisma.securityEvent.count({ where: where as any }),
+  const [rows, total] = await Promise.all([
+    prisma.activityEvent.findMany(queryOptions),
+    prisma.activityEvent.count({ where: where as any }),
   ]);
+  const events = rows.map((e: any) => ({ ...e, eventType: e.kind }));
 
   return { events, total, page, limit };
 }
@@ -439,15 +478,19 @@ export async function getSecurityStats() {
   const startOfWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
   const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
-  const count = async (gte: Date) => prisma.securityEvent.count({ where: { createdAt: { gte } } });
-  const criticalCount = (gte: Date) => prisma.securityEvent.count({ where: { createdAt: { gte }, severity: { in: ['error', 'critical'] } } });
+  const count = async (gte: Date) => prisma.activityEvent.count({ where: { createdAt: { gte } } });
+  const criticalCount = (gte: Date) => prisma.activityEvent.count({ where: { createdAt: { gte }, severity: { in: ['error', 'critical'] } } });
 
-  const [todayTotal, weekTotal, monthTotal, total, todayCritical, weekCritical, monthCritical, activeBlocks, recentEvents] = await Promise.all([
-    count(startOfDay), count(startOfWeek), count(startOfMonth), prisma.securityEvent.count(),
+  const redis = getRedis();
+  const [todayTotal, weekTotal, monthTotal, total, todayCritical, weekCritical, monthCritical, blockHash, recentEvents] = await Promise.all([
+    count(startOfDay), count(startOfWeek), count(startOfMonth), prisma.activityEvent.count(),
     criticalCount(startOfDay), criticalCount(startOfWeek), criticalCount(startOfMonth),
-    prisma.blocklist.count({ where: { isActive: true } }),
-    prisma.securityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 10 }),
+    redis ? redis.hgetall(BLOCKLIST_REDIS_KEY).catch(() => ({})) : Promise.resolve({}),
+    prisma.activityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 10 }),
   ]);
+  const activeBlocks = Object.values(blockHash || {}).filter((raw: any) => {
+    try { const e = JSON.parse(raw); return e.isActive !== false && (!e.expiresAt || new Date(e.expiresAt) >= new Date()); } catch { return false; }
+  }).length;
 
   return {
     today: { total: todayTotal, critical: todayCritical },
@@ -460,6 +503,9 @@ export async function getSecurityStats() {
 }
 
 // ─── Record login history ────────────────────────────────────────
+// login_history was consolidated into security_events (the single auth-event
+// log): a login is event_type 'login' / 'login_failed'. Call sites keep using
+// this helper so the write shape stays consistent across every auth path.
 export async function recordLoginHistory(input: {
   request?: Request;
   userId: string;
@@ -468,18 +514,37 @@ export async function recordLoginHistory(input: {
   method: string;
 }): Promise<void> {
   try {
-    const ip = input.request ? getClientIp(input.request) : undefined;
-    const userAgent = input.request ? getUserAgent(input.request) : undefined;
-    await prisma.login_history.create({
+    const ctx = currentRequestOrigin();
+    const ip = input.request ? getClientIp(input.request) : ctx?.ip ?? undefined;
+    const userAgent = input.request ? getUserAgent(input.request) : ctx?.userAgent ?? undefined;
+    /* The sign-in list reads this column, so a login has to say where it came
+       from and not only from which address. */
+    const location = (input.request ? resolveLoginPlace(input.request.headers) : null)
+      ?? ctx?.location ?? null;
+    await prisma.userLogin.create({
       data: {
         userId: input.userId,
-        email: input.email,
+        method: input.method,
+        success: input.success,
         ipAddress: ip || null,
         userAgent: userAgent || null,
-        success: input.success,
-        method: input.method,
+        location,
       },
     });
+    if (!input.success) {
+      await prisma.activityEvent.create({
+        data: {
+          userId: input.userId,
+          kind: 'login_failed',
+          title: 'Failed login',
+          detail: input.email,
+          severity: 'warning',
+          ipAddress: ip || null,
+          userAgent: userAgent || null,
+          metadata: { method: input.method },
+        },
+      }).catch(() => {});
+    }
   } catch (e) {
     console.error('[LOGIN_HISTORY] Failed to record:', e instanceof Error ? e.message : e);
   }

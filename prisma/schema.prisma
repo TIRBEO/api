@@ -3,289 +3,424 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider   = "postgresql"
+  schemas = ["user", "preferences", "email", "security", "status", "activity", "ops"]
+}
+
+// ═══ The account ═══════════════════════════════════════════════════
+
+enum UserStatusKind {
+  active
+  restricted
+  suspended
+  deactivated
+  deletion_pending
+  deleted
+
+  @@map("user_status_kind")
+  @@schema("user")
 }
 
 model User {
-  id                      String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  email                   String          @unique
-  passwordHash            String          @default("") @map("password_hash")
-  name                    String?
-  photoUrl                String?         @map("photo_url")
-  bio                     String?
-  secondaryEmail          String?         @map("secondary_email")
-  secondaryEmailVerified  Boolean?        @default(false) @map("secondary_email_verified")
-  phoneNumber             String?         @map("phone_number")
-  phoneVerified           Boolean?        @default(false) @map("phone_verified")
-  emailVerified           Boolean?        @default(false) @map("email_verified")
-  username                String?         @unique
-  gender                  String?
-  birthday                DateTime?       @db.Timestamptz(6)
-  googleId                String?         @unique @map("google_id")
-  githubId                String?         @unique @map("github_id")
-  discordId               String?         @unique @map("discord_id")
-  occupation              String?
-  companyName             String?         @map("company_name")
-  companyRole             String?         @map("company_role")
-  industry                String?
-  companySize             String?         @map("company_size")
-  website                 String?
-  linkedin                String?
-  githubUsername          String?         @map("github_username")
-  twitter                 String?
-  country                 String?
-  timezone                String?
-  language                String?         @default("en")
-  theme                   String?         @default("system")
-  dateFormat              String?         @default("MM/DD/YYYY") @map("date_format")
-  timeFormat              String?         @default("12h") @map("time_format")
-  consents                Json?           @default("{}")
-  totpSecret              String?         @map("totp_secret")
-  is2FAEnabled            Boolean?        @default(false) @map("is_2fa_enabled")
-  backupCodes             Json?           @default("[]")
-  isBanned                Boolean?        @default(false) @map("is_banned")
-  isSuspended             Boolean?        @default(false) @map("is_suspended")
-  suspendReason           String?         @map("suspend_reason")
-  suspendedUntil          DateTime?       @map("suspended_until") @db.Timestamptz(6)
-  banRefCode              String?         @map("ban_ref_code")
-  suspendRefCode          String?         @map("suspend_ref_code")
-  mustChangePassword      Boolean?        @default(false) @map("must_change_password")
-  lastActiveAt            DateTime?       @map("last_active_at") @db.Timestamptz(6)
-  lastLoginAt       DateTime? @map("last_login_at") @db.Timestamptz(6)
-  lastLoginIp       String?   @map("last_login_ip")
-  loginCount        Int?      @default(0) @map("login_count")
-  deletedAt               DateTime?       @map("deleted_at") @db.Timestamptz(6)
-  scheduledDeletionAt     DateTime?       @map("scheduled_deletion_at") @db.Timestamptz(6)
-  deletionReason          String?         @map("deletion_reason")
-  adminRole               String?         @map("admin_role")
-  notificationPreferences Json?           @default("{\"email\":true,\"push\":true,\"security\":true,\"forms\":true,\"product\":false,\"support\":true,\"formsEmail\":true,\"formsPush\":true,\"productEmail\":false,\"productPush\":true,\"supportEmail\":true,\"supportPush\":true,\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
-  emailUnsubscribed       Json?           @default("{}") @map("email_unsubscribed")
-  createdAt               DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt               DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  apiKeys                 ApiKey[]
-  auditEvents             AuditEvent[]    @relation("AuditActor")
-  blocklist               Blocklist[]
-  deviceAccounts          deviceAccount[]
-  forms                   Form[]
-  loginHistory            login_history[]
-  media                   Media[]
-  notifications           Notification[]
-  otps                    Otp[]
-  passkeys                Passkey[]
-  securityEvents          SecurityEvent[]
-  sessions                Session[]
-  magicLinkUses           MagicLinkUse[]
-  magicLinks             MagicLink[]
-  ticketMessages          TicketMessage[] @relation("TicketMessageAuthor")
-  assignedTickets         Ticket[]        @relation("TicketAssignee")
-  customerTickets         Ticket[]        @relation("TicketCustomer")
-  tipLogs                 UserTipLog[]
-  pushSubscriptions       PushSubscription[]
-  cdnFiles                CdnFile[]
+  id           String         @id @default(dbgenerated("(gen_random_uuid())::text"))
+  username     String?        @unique
+  email        String         @unique
+  passwordHash String         @default("") @map("password_hash")
+  name         String?
+  photoUrl     String?        @map("photo_url")
+  status       UserStatusKind @default(active)
+  isAdmin      Boolean        @default(false) @map("is_admin")
+  adminRole    String?        @map("admin_role")
 
-  @@index([adminRole], map: "idx_users_admin_role")
+  emailVerified Boolean?      @default(false) @map("email_verified")
+  phoneVerified Boolean?      @default(false) @map("phone_verified")
+
+  googleId     String?        @unique @map("google_id")
+  githubId     String?        @unique @map("github_id")
+  discordId    String?        @unique @map("discord_id")
+
+  theme        String?        @default("system")
+  language     String?        @default("en")
+  timezone     String?
+  consents     Json?          @default("{}")
+  notificationPreferences Json? @default("{\"email\":true,\"push\":true,\"security\":true,\"forms\":true,\"product\":false,\"support\":true,\"formsEmail\":true,\"formsPush\":true,\"productEmail\":false,\"productPush\":true,\"supportEmail\":true,\"supportPush\":true,\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
+  emailUnsubscribed Json?     @default("{}") @map("email_unsubscribed")
+
+  totpSecret   String?        @map("totp_secret")
+  is2FAEnabled Boolean?       @default(false) @map("is_2fa_enabled")
+  backupCodes  Json?          @default("[]")
+  mustChangePassword Boolean? @default(false) @map("must_change_password")
+
+  isBanned        Boolean?    @default(false) @map("is_banned")
+  isSuspended     Boolean?    @default(false) @map("is_suspended")
+  suspendReason   String?     @map("suspend_reason")
+  suspendedUntil  DateTime?   @map("suspended_until") @db.Timestamptz(6)
+  banRefCode      String?     @map("ban_ref_code")
+  suspendRefCode  String?     @map("suspend_ref_code")
+  deletedAt       DateTime?   @map("deleted_at") @db.Timestamptz(6)
+  scheduledDeletionAt DateTime? @map("scheduled_deletion_at") @db.Timestamptz(6)
+  deletionReason String? @map("deletion_reason")
+  lastActiveAt    DateTime?   @map("last_active_at") @db.Timestamptz(6)
+  lastLoginAt     DateTime?   @map("last_login_at") @db.Timestamptz(6)
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  profile         UserProfile?
+  preferences     UserPreferences?
+  emails          UserEmail[]
+  phone           UserPhone?
+  security        UserSecurity?
+  passkeys        Passkey[]
+  sessions        UserSession[]
+  devices         UserDevice[]
+  statusEvents    UserStatusEvent[]
+  deactivation    UserDeactivation?
+  deletionRequest UserDeletionRequest?
+  restrictions    UserRestriction[]
+  appeals         UserAppeal[]
+  activityEvents  ActivityEvent[]
+  dataExportRequests DataExportRequest[]
+  notifications   Notification[]
+  logins          UserLogin[]
+  emailJobs       email_jobs[]
+  otps            Otp[]
+  apiKeys         ApiKey[]
+  blockedRecords  Blocklist[]
+  securityEvents     SecurityEvent[]
+  deviceAccounts     deviceAccount[]
+  tipLogs            UserTipLog[]
+  pushSubscriptions  PushSubscription[]
+  tirbeoIdentities   TirbeoIdentity[]
+
+  @@index([status], map: "idx_users_status")
   @@index([createdAt], map: "idx_users_created")
-  @@index([email], map: "idx_users_email")
-  @@index([githubId], map: "idx_users_github_id")
-  @@index([googleId], map: "idx_users_google_id")
-  @@index([isBanned], map: "idx_users_is_banned")
   @@index([lastActiveAt], map: "idx_users_last_active")
-  @@index([deletedAt], map: "idx_users_deleted_at")
-  @@index([scheduledDeletionAt], map: "idx_users_scheduled_deletion")
+  @@index([deletedAt], map: "idx_users_deleted")
   @@map("users")
+  @@schema("user")
 }
 
-model Session {
-  id                       String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId                   String          @map("user_id")
-  token                    String?
-  status                   session_status? @default(active)
-  expiresAt                DateTime        @map("expires_at") @db.Timestamptz(6)
-  createdAt                DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  lastUsedAt               DateTime?       @map("last_used_at") @db.Timestamptz(6)
-  userAgent                String?         @map("user_agent")
-  ipAddress                String?         @map("ip_address")
-  location                 String?
-  deviceName               String?         @map("device_name")
-  revokedAt                DateTime?       @map("revoked_at") @db.Timestamptz(6)
-  refreshTokenHash         String?         @unique @map("refresh_token_hash")
-  previousRefreshTokenHash String?         @map("previous_refresh_token_hash")
-  refreshTokenIssuedAt     DateTime?       @map("refresh_token_issued_at") @db.Timestamptz(6)
-  refreshExpiresAt         DateTime?       @map("refresh_expires_at") @db.Timestamptz(6)
-  user                     User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+// ═══ user.profile ══════════════════════════════════════════════════
 
-  @@index([expiresAt], map: "idx_sessions_expires")
-  @@index([status], map: "idx_sessions_status")
-  @@index([token], map: "idx_sessions_token")
-  @@index([userId], map: "idx_sessions_user")
-  @@index([refreshTokenHash], map: "idx_sessions_refresh_token")
-  @@index([refreshExpiresAt], map: "idx_sessions_refresh_expires")
-  @@map("sessions")
+model UserProfile {
+  userId     String   @id @map("user_id")
+  name       String?
+  bio        String?
+  gender     String?
+  birthday   DateTime? @db.Date
+  photoUrl   String?  @map("photo_url")
+  bannerUrl  String?  @map("banner_url")
+  pronouns   String?
+  location   String?
+  website    String?
+  jobRole    String?  @map("job_role")
+  jobCompany String?  @map("job_company")
+  jobPlace   String?  @map("job_place")
+  jobStarted String?  @map("job_started")
+  skills     Json     @default("[]")
+  followers  Int      @default(0)
+  following  Int      @default(0)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profile")
+  @@schema("user")
 }
 
-model deviceAccount {
+// ═══ user.preferences ══════════════════════════════════════════════
+
+model UserPreferences {
+  userId     String   @id @map("user_id")
+  appearance Json     @default("{}")
+  notif      Json     @default("{}")
+  privacy    Json     @default("{}")
+  misc       Json     @default("{}")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+  @@schema("preferences")
+}
+
+// ═══ user.email ════════════════════════════════════════════════════
+
+model UserEmail {
   id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  deviceId   String    @map("device_id")
   userId     String    @map("user_id")
-  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  address    String
+  kind       String    @default("primary") // primary | secondary | recovery
+  verifiedAt DateTime? @map("verified_at") @db.Timestamptz(6)
+  isDefault  Boolean   @default(false) @map("is_default")
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
-  @@unique([deviceId, userId], map: "idx_device_accounts_device_user")
-  @@index([userId], map: "idx_device_accounts_user")
-  @@map("device_accounts")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, address])
+  @@index([userId], map: "idx_user_email_user")
+  @@map("user_email")
+  @@schema("email")
+}
+
+model UserPhone {
+  userId     String    @id @map("user_id")
+  number     String?
+  verifiedAt DateTime? @map("verified_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_phone")
+  @@schema("user")
+}
+
+// ═══ user.security ═════════════════════════════════════════════════
+
+model UserSecurity {
+  userId       String   @id @map("user_id")
+  totpSecret   String?  @map("totp_secret")
+  totpEnabled  Boolean  @default(false) @map("totp_enabled")
+  backupCodes  Json     @default("[]") @map("backup_codes")
+  mustChangePw Boolean  @default(false) @map("must_change_pw")
+  saveLoginInfo Boolean @default(true) @map("save_login_info")
+  require2FA   Boolean  @default(false) @map("require_2fa")
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_security")
+  @@schema("security")
+}
+
+model Passkey {
+  id             String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId         String    @map("user_id")
+  credentialId   String    @unique @map("credential_id")
+  credentialPubkey Bytes   @map("credential_pubkey")
+  counter        BigInt    @default(0)
+  transports     String?
+  deviceName     String?   @map("device_name")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt     DateTime? @map("last_used_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_passkeys_user")
+  @@map("passkeys")
+  @@schema("security")
+}
+
+model UserSession {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String    @map("user_id")
+  tokenHash   String    @map("token_hash")
+  status      session_status? @default(active)
+  ipAddress   String?   @map("ip_address")
+  userAgent   String?   @map("user_agent")
+  deviceName  String?   @map("device_name")
+  location    String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_user_sessions_user")
+  @@index([tokenHash], map: "idx_user_sessions_hash")
+  @@index([expiresAt], map: "idx_user_sessions_expires")
+  @@map("user_sessions")
+  @@schema("security")
+}
+
+model UserDevice {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId     String    @map("user_id")
+  deviceName String?   @map("device_name")
+  userAgent  String?   @map("user_agent")
+  ipAddress  String?   @map("ip_address")
+  location   String?
+  status     String    @default("active") // active | revoked
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_user_devices_user")
+  @@map("user_devices")
+  @@schema("security")
 }
 
 model Otp {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String   @map("user_id")
-  type      String
+  userId    String?  @map("user_id")
+  kind      String
+  address   String?
   otpHash   String   @map("otp_hash")
   expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  attempts  Int?     @default(0)
+  attempts  Int      @default(0)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  users     User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
-  @@index([expiresAt], map: "idx_otps_expires")
-  @@index([type], map: "idx_otps_type")
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([kind, address])
   @@index([userId], map: "idx_otps_user")
+  @@index([expiresAt], map: "idx_otps_expires")
   @@map("otps")
+  @@schema("security")
 }
 
-model SignupOtp {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  email     String
-  otpHash   String   @map("otp_hash")
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  attempts  Int?     @default(0)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+// ═══ user.status ═══════════════════════════════════════════════════
 
-  @@index([email], map: "idx_signup_otps_email")
-  @@index([expiresAt], map: "idx_signup_otps_expires")
-  @@map("signup_otps")
-}
-
-model ApiKey {
-  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String    @map("user_id")
-  name        String
-  keyHash     String    @unique @map("key_hash")
-  keyPrefix   String    @map("key_prefix")
-  permissions Json?     @default("{}")
-  isActive    Boolean?  @default(true) @map("is_active")
-  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(6)
-  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
-  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([keyHash], map: "idx_api_keys_hash")
-  @@index([keyPrefix], map: "idx_api_keys_prefix")
-  @@index([userId], map: "idx_api_keys_user")
-  @@map("api_keys")
-}
-
-model Passkey {
-  id                  String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId              String   @map("user_id")
-  credentialId        String   @unique @map("credential_id")
-  credentialPublicKey Bytes    @map("credential_public_key")
-  counter             BigInt   @default(0)
-  transports          String?
-  deviceName          String?  @map("device_name")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
-  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([credentialId])
-  @@index([userId])
-  @@map("passkeys")
-}
-
-model UserTipLog {
-  id     String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId String   @map("user_id")
-  tipId  String   @map("tip_id")
-  sentAt DateTime @default(now()) @map("sent_at") @db.Timestamptz(6)
-  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([userId, tipId])
-  @@index([userId], map: "idx_tip_logs_user")
-  @@map("user_tip_logs")
-}
-
-model Blocklist {
-  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  targetType String    @map("target_type")
-  targetId   String    @map("target_id")
-  reason     String?
-  blockedBy  String?   @map("blocked_by")
-  isActive   Boolean?  @default(true) @map("is_active")
-  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  users      User?     @relation(fields: [blockedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
-
-  @@unique([targetType, targetId])
-  @@index([isActive], map: "idx_blocklist_active")
-  @@index([targetType], map: "idx_blocklist_type")
-  @@map("blocklist")
-}
-
-model SecurityEvent {
-  id        String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String?         @map("user_id")
-  eventType String          @map("event_type")
-  severity  severity_level? @default(info)
-  ipAddress String?         @map("ip_address")
-  userAgent String?         @map("user_agent")
-  metadata  Json?           @default("{}")
-  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  user      User?           @relation(fields: [userId], references: [id], onUpdate: NoAction)
-
-  @@index([createdAt], map: "idx_security_events_created")
-  @@index([eventType], map: "idx_security_events_type")
-  @@index([userId], map: "idx_security_events_user")
-  @@index([userId, createdAt(sort: Desc)], map: "idx_security_events_user_created")
-  @@index([severity, createdAt(sort: Desc)], map: "idx_security_events_severity_created")
-  @@map("security_events")
-}
-
-model AuditEvent {
+model UserStatusEvent {
   id         String          @id @default(dbgenerated("(gen_random_uuid())::text"))
-  actorId    String?         @map("actor_id")
-  action     String
-  targetType String?         @map("target_type")
-  targetId   String?         @map("target_id")
-  metadata   Json?           @default("{}")
-  severity   severity_level? @default(info)
-  ipAddress  String?         @map("ip_address")
-  userAgent  String?         @map("user_agent")
+  userId     String          @map("user_id")
+  fromStatus UserStatusKind? @map("from_status")
+  toStatus   UserStatusKind  @map("to_status")
+  reason     String?
+  actor      String          @default("user") // user | admin | system
+  metadata   Json            @default("{}")
   createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
-  actor      User?           @relation("AuditActor", fields: [actorId], references: [id], onUpdate: NoAction)
 
-  @@index([action], map: "idx_audit_events_action")
-  @@index([actorId, createdAt(sort: Desc)], map: "idx_audit_events_actor_created")
-  @@index([actorId], map: "idx_audit_events_actor")
-  @@map("audit_events")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)], map: "idx_user_status_events_user")
+  @@map("user_status_events")
+  @@schema("status")
 }
 
-model login_history {
+model UserDeletionRequest {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String    @unique @map("user_id")
+  reason      String?
+  requestedAt DateTime  @default(now()) @map("requested_at") @db.Timestamptz(6)
+  finalAt     DateTime  @map("final_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  executedAt  DateTime? @map("executed_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([finalAt], map: "idx_user_deletion_pending")
+  @@map("user_deletion_requests")
+  @@schema("status")
+}
+
+model UserDeactivation {
+  userId    String    @id @map("user_id")
+  reason    String?
+  pausedAt  DateTime  @default(now()) @map("paused_at") @db.Timestamptz(6)
+  resumedAt DateTime? @map("resumed_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_deactivations")
+  @@schema("status")
+}
+
+model UserRestriction {
+  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String    @map("user_id")
+  guideline String
+  title     String
+  detail    String?
+  severity  String    @default("warning") // notice | warning | strike
+  startedAt DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  endsAt    DateTime? @map("ends_at") @db.Timestamptz(6)
+  readAt    DateTime? @map("read_at") @db.Timestamptz(6)
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  appeals UserAppeal[]
+
+  @@index([userId], map: "idx_user_restrictions_user")
+  @@map("user_restrictions")
+  @@schema("status")
+}
+
+model UserAppeal {
+  id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  restrictionId String    @map("restriction_id")
+  userId        String    @map("user_id")
+  note          String
+  decision      String? // upheld | overturned | pending
+  decidedAt     DateTime? @map("decided_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  restriction UserRestriction @relation(fields: [restrictionId], references: [id], onDelete: Cascade)
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([restrictionId], map: "idx_user_appeals_restriction")
+  @@map("user_appeals")
+  @@schema("status")
+}
+
+// ═══ activity ══════════════════════════════════════════════════════
+
+enum Severity {
+  info
+  warning
+  error
+  critical
+
+  @@map("severity")
+  @@schema("activity")
+}
+
+model ActivityEvent {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String   @map("user_id")
-  email     String?
+  kind      String
+  title     String
+  detail    String?
+  severity  Severity @default(info)
   ipAddress String?  @map("ip_address")
   userAgent String?  @map("user_agent")
-  success   Boolean  @default(true)
-  method    String?
-  metadata  Json?
+  metadata  Json     @default("{}")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
-  @@index([email])
-  @@index([userId, createdAt(sort: Desc)], map: "idx_login_history_user_created")
-  @@map("login_history")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)], map: "idx_activity_user")
+  @@index([kind], map: "idx_activity_kind")
+  @@index([createdAt(sort: Desc)], map: "idx_activity_created")
+  @@map("activity_events")
+  @@schema("activity")
+}
+
+/**
+ * One line per "download my data" request.
+ *
+ * The archive itself is never stored — it is written at the moment it is asked
+ * for and handed straight to the browser — so what this table keeps is the
+ * *request*: which format the person chose, whether the file was actually
+ * produced, and what it was made of at the time. The format lives in a column
+ * rather than only in metadata because the download and the history list both
+ * have to honour it, and a row whose format is unknown is a JSON download
+ * (that is what every request was before the choice existed).
+ */
+model DataExportRequest {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String    @map("user_id")
+  /** 'json' | 'html'. Anything unrecognised reads as 'json'. */
+  format      String    @default("json")
+  /** 'pending' while the file has not been produced, then 'ready' or 'failed'. */
+  status      String    @default("pending")
+  fileName    String    @map("file_name")
+  bytes       Int?
+  counts      Json?     @default("{}")
+  missing     Json?
+  truncated   Json?
+  error       String?
+  requestedAt DateTime  @default(now()) @map("requested_at") @db.Timestamptz(6)
+  builtAt     DateTime? @map("built_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, requestedAt(sort: Desc)], map: "idx_data_export_requests_user")
+  @@index([status], map: "idx_data_export_requests_status")
+  @@map("data_export_requests")
+  @@schema("activity")
 }
 
 model Notification {
@@ -307,115 +442,185 @@ model Notification {
   @@index([userId, isRead], map: "idx_notifications_user_read")
   @@index([userId, createdAt(sort: Desc)], map: "idx_notifications_user_created")
   @@map("notifications")
+  @@schema("user")
 }
 
-model PushSubscription {
+model UserLogin {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
   userId    String   @map("user_id")
-  endpoint  String   @unique
-  p256dh    String   @map("p256dh")
-  auth      String   @map("auth")
+  method    String // password | google | github | magic | passkey
+  success   Boolean  @default(true)
+  ipAddress String?  @map("ip_address")
   userAgent String?  @map("user_agent")
+  location  String?
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  lastUsedAt DateTime @default(now()) @map("last_used_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
-  @@index([userId], map: "idx_push_subscriptions_user")
-  @@index([endpoint], map: "idx_push_subscriptions_endpoint")
-  @@map("push_subscriptions")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)], map: "idx_user_logins_user")
+  @@map("user_logins")
+  @@schema("security")
 }
 
-model Media {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  uploadedBy String   @map("uploaded_by")
-  url        String
-  filename   String?
-  mimeType   String?  @map("mime_type")
-  sizeBytes  BigInt?  @map("size_bytes")
-  width      Int?
-  height     Int?
-  duration   Float?
-  altText    String?  @map("alt_text")
-  isPublic   Boolean? @default(true) @map("is_public")
-  metadata   Json?    @default("{}")
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user       User     @relation(fields: [uploadedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+// ═══ email ═════════════════════════════════════════════════════════
 
-  @@index([mimeType], map: "idx_media_mime")
-  @@index([isPublic], map: "idx_media_public")
-  @@index([uploadedBy], map: "idx_media_uploader")
-  @@map("media")
+enum EmailJobKind {
+  otp
+  verify
+  reset
+  digest
+  notice
+  test
+
+  @@map("email_job_kind")
+  @@schema("email")
 }
 
-model emailConfig {
-  id               String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  provider         String   @default("resend")
-  resendApiKey     String?
-  resendDomain     String?  @default("send.tirbeo.app")
-  smtpHost         String?
-  smtpPort         Int?     @default(587)
-  smtpUser         String?
-  smtpPass         String?
-  defaultFromEmail String   @default("noreply@send.tirbeo.app")
-  defaultFromName  String   @default("Tirbeo")
-  welcomeFromEmail String?
-  welcomeFromName  String?
-  otpFromEmail     String?
-  otpFromName      String?
-  resetFromEmail   String?
-  resetFromName    String?
-  notifyFromEmail  String?
-  notifyFromName   String?
-  alertFromEmail   String?
-  alertFromName    String?
-  formsFromEmail   String?  @default("forms@send.tirbeo.app")
-  formsFromName    String?  @default("Tirbeo Forms")
-  customDomain     String?
-  dkimEnabled      Boolean  @default(false)
-  enabled          Boolean  @default(true)
-  createdAt        DateTime @default(now()) @db.Timestamptz(6)
-  updatedAt        DateTime @updatedAt @db.Timestamptz(6)
-
-  @@map("email_configs")
-}
-
-model emailTemplate {
+model EmailTemplate {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  name      String   @unique
+  slug      String   @unique
   label     String?
   subject   String
-  htmlBody  String
-  variables Json?    @default("[]")
-  fromEmail String?
-  fromName  String?
-  createdAt DateTime @default(now()) @db.Timestamptz(6)
-  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+  html      String
+  variables Json     @default("[]")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("email_templates")
+  @@schema("email")
 }
 
-model email_logs {
-  id        String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  toEmail   String    @map("to_email")
-  fromEmail String?   @map("from_email")
-  subject   String
-  template  String?
-  status    String?   @default("pending")
-  threadId  String?   @map("thread_id")
-  replyTo   String?   @map("reply_to")
-  openedAt  DateTime? @map("opened_at") @db.Timestamptz(6)
-  clickedAt DateTime? @map("clicked_at") @db.Timestamptz(6)
-  error     String?
-  metadata  Json?     @default("{}")
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  messageId String?   @map("message_id")
+model email_jobs {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String?  @map("user_id")
+  dedupeKey   String?  @map("dedupe_key")
+  eventKey    String   @default("") @map("event_key")
+  toEmail     String   @default("") @map("to_email")
+  toAddress   String   @default("") @map("to_address")
+  category    String   @default("other")
+  priority    String   @default("normal")
+  kind        EmailJobKind @default(notice)
+  templateSlug String? @map("template_slug")
+  subject     String?
+  payload     Json     @default("{}")
+  status      String   @default("queued")
+  contentVersionId String? @map("content_version_id")
+  definitionId String? @map("definition_id")
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(3) @map("max_attempts")
+  lastError   String?  @map("last_error")
+  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@index([createdAt], map: "idx_email_logs_created")
-  @@index([status], map: "idx_email_logs_status")
-  @@index([threadId], map: "idx_email_logs_thread")
-  @@index([toEmail], map: "idx_email_logs_to")
-  @@map("email_logs")
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([dedupeKey], map: "idx_email_jobs_dedupe")
+  @@index([status, availableAt], map: "idx_email_jobs_poll")
+  @@index([eventKey, createdAt], map: "idx_email_jobs_event_time")
+  @@index([toEmail, createdAt], map: "idx_email_jobs_recipient_time")
+  @@index([status, createdAt], map: "idx_email_jobs_status")
+  @@index([userId], map: "idx_email_jobs_user")
+  @@map("email_jobs")
+  @@schema("email")
+}
+
+model email_deliveries {
+  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  jobId      String?  @map("job_id")
+  userId     String?  @map("user_id")
+  toEmail    String   @default("") @map("to_email")
+  eventKey   String   @default("") @map("event_key")
+  event      String   @default("")
+  category   String   @default("other")
+  subject    String   @default("")
+  status     String   @default("sent")
+  provider   String?
+  providerId String?  @map("provider_id")
+  messageId  String?  @map("message_id")
+  contentVersionId String? @map("content_version_id")
+  openedAt   DateTime? @map("opened_at") @db.Timestamptz(6)
+  clickedAt  DateTime? @map("clicked_at") @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([jobId], map: "idx_email_deliveries_job")
+  @@index([eventKey, createdAt], map: "idx_email_deliveries_event_time")
+  @@index([userId, createdAt], map: "idx_email_deliveries_user_time")
+  @@index([messageId], map: "idx_email_deliveries_message")
+  @@index([status, createdAt], map: "idx_email_deliveries_status")
+  @@map("email_deliveries")
+  @@schema("email")
+}
+
+model email_suppressions {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String?  @map("user_id")
+  address   String?  @unique
+  toEmail   String   @default("") @map("to_email")
+  eventKey  String   @default("") @map("event_key")
+  reason    String   @default("unsubscribe")
+  dedupeKey String?  @map("dedupe_key")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([eventKey, createdAt], map: "idx_email_suppressions_event")
+  @@index([userId, createdAt], map: "idx_email_suppressions_user")
+  @@map("email_suppressions")
+  @@schema("email")
+}
+
+// ═══ app_config ════════════════════════════════════════════════════
+
+model AppConfig {
+  key         String   @id
+  value       Json
+  description String?
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("app_config")
+  @@schema("ops")
+}
+
+// ═══ Restored feature models (from previous schema) ═════════════════
+
+model ApiKey {
+  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String    @map("user_id")
+  name        String
+  keyHash     String    @unique @map("key_hash")
+  keyPrefix   String    @map("key_prefix")
+  permissions Json?     @default("{}")
+  isActive    Boolean?  @default(true) @map("is_active")
+  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([keyHash], map: "idx_api_keys_hash")
+  @@index([keyPrefix], map: "idx_api_keys_prefix")
+  @@index([userId], map: "idx_api_keys_user")
+  @@map("api_keys")
+  @@schema("ops")
+}
+
+model Blocklist {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  targetType String    @map("target_type")
+  targetId   String    @map("target_id")
+  reason     String?
+  blockedBy  String?   @map("blocked_by")
+  isActive   Boolean?  @default(true) @map("is_active")
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  users      User?     @relation(fields: [blockedBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@unique([targetType, targetId])
+  @@index([isActive], map: "idx_blocklist_active")
+  @@index([targetType], map: "idx_blocklist_type")
+  @@map("blocklist")
+  @@schema("security")
 }
 
 model CaptchaChallenge {
@@ -443,6 +648,7 @@ model CaptchaChallenge {
   @@index([rayId])
   @@index([difficulty])
   @@map("captcha_challenges")
+  @@schema("security")
 }
 
 model CaptchaAttempt {
@@ -461,6 +667,7 @@ model CaptchaAttempt {
   @@index([userId])
   @@index([sessionId])
   @@map("captcha_attempts")
+  @@schema("security")
 }
 
 model CaptchaBlock {
@@ -482,6 +689,7 @@ model CaptchaBlock {
   @@index([ipAddress])
   @@index([rayId])
   @@map("captcha_blocks")
+  @@schema("security")
 }
 
 model CaptchaLog {
@@ -501,6 +709,7 @@ model CaptchaLog {
   @@index([eventType])
   @@index([rayId])
   @@map("captcha_logs")
+  @@schema("security")
 }
 
 model CaptchaSettings {
@@ -513,464 +722,7 @@ model CaptchaSettings {
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("captcha_settings")
-}
-
-model incident_events {
-  id        String   @id @default(uuid())
-  type      String
-  message   String?
-  userId    String?  @map("user_id")
-  metadata  Json?    @default("{}")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  severity  String   @default("error")
-  source    String   @default("client")
-  stack     String?
-  url       String?
-  userAgent String?  @map("user_agent")
-
-  @@index([type])
-  @@index([userId])
-  @@index([createdAt])
-  @@map("incident_events")
-}
-
-model Form {
-  id                 String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId             String           @map("user_id")
-  name               String
-  slug               String           @unique
-  description        String?
-  status             String           @default("draft")
-  accessKey          String           @unique @default("") @map("access_key")
-  formType           String           @default("custom") @map("form_type")
-  websiteUrl         String?          @map("website_url")
-  successMessage     String?          @default("Thanks! Your submission has been received.") @map("success_message")
-  successRedirect    String?          @map("success_redirect")
-  redirectTarget     String           @default("_self") @map("redirect_target")
-  customSuccessHtml  String?          @map("custom_success_html")
-  notificationEmails String[]         @map("notification_emails")
-  ccEmails           String[]         @map("cc_emails")
-  bccEmails          String[]         @map("bcc_emails")
-  replyToEmail       String?          @map("reply_to_email")
-  emailSubject       String?          @map("email_subject")
-  fromName           String?          @map("from_name")
-  autoReply          Boolean          @default(false) @map("auto_reply")
-  autoReplySubject   String?          @map("auto_reply_subject")
-  autoReplyBody      String?          @map("auto_reply_body")
-  spamProtection     String           @default("automatic") @map("spam_protection")
-  turnstileKey       String?          @map("turnstile_key")
-  rateLimit          Int              @default(60) @map("rate_limit")
-  allowedOrigins     String[]         @map("allowed_origins")
-  honeypot           Boolean          @default(true)
-  storeResponses     Boolean          @default(true) @map("store_responses")
-  retention          String           @default("forever")
-  showMetadata       Boolean          @default(false) @map("show_metadata")
-  layout             String           @default("comfortable")
-  width              String           @default("full")
-  alignment          String           @default("left")
-  labelPosition      String           @default("above") @map("label_position")
-  theme              String           @default("light")
-  customCss          String?          @map("custom_css")
-  headless           Boolean          @default(false)
-  headerImage        String?          @map("header_image")
-  accentColor        String           @default("#09090b") @map("accent_color")
-  bgColor            String           @default("#ffffff") @map("bg_color")
-  headerFont         String           @default("Roboto") @map("header_font")
-  questionFont       String           @default("Roboto") @map("question_font")
-  headerImageHeight  Int              @default(200) @map("header_image_height")
-  submissionCount    Int              @default(0) @map("submission_count")
-  lastSubmissionAt   DateTime?        @map("last_submission_at") @db.Timestamptz(6)
-  conversionRate     Float            @default(0) @map("conversion_rate")
-  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt          DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  analytics          FormAnalytic[]
-  connections        FormConnection[]
-  fields             FormField[]
-  submissions        FormSubmission[]
-  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
-  @@index([status])
-  @@index([slug])
-  @@map("forms")
-}
-
-model FormField {
-  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId       String   @map("form_id")
-  label        String
-  name         String
-  type         String   @default("text")
-  required     Boolean  @default(false)
-  placeholder  String?
-  helpText     String?  @map("help_text")
-  defaultValue Json?    @map("default_value")
-  options      Json?
-  validation   Json?
-  appearance   Json?
-  order        Int      @default(0)
-  hidden       Boolean  @default(false)
-  readOnly     Boolean  @default(false) @map("read_only")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  form         Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@index([formId])
-  @@map("form_fields")
-}
-
-model FormSubmission {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId    String   @map("form_id")
-  data      Json     @default("{}")
-  metadata  Json?
-  source    String?
-  ipAddress String?  @map("ip_address")
-  userAgent String?  @map("user_agent")
-  referrer  String?  @map("referrer")
-  country   String?
-  status    String   @default("new")
-  notes     String?
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  form      Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@index([formId])
-  @@index([createdAt])
-  @@index([formId, createdAt(sort: Desc)])
-  @@map("form_submissions")
-}
-
-model FormAnalytic {
-  id                String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId            String   @map("form_id")
-  date              DateTime @db.Date
-  views             Int      @default(0)
-  starts            Int      @default(0)
-  submissions       Int      @default(0)
-  failedSubmissions Int      @default(0) @map("failed_submissions")
-  avgCompletionTime Float?   @map("avg_completion_time")
-  deviceBreakdown   Json?    @map("device_breakdown")
-  countryBreakdown  Json?    @map("country_breakdown")
-  referrerBreakdown Json?    @map("referrer_breakdown")
-  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  form              Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@unique([formId, date])
-  @@index([formId])
-  @@map("form_analytics")
-}
-
-model FormConnection {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  formId    String   @map("form_id")
-  type      String
-  name      String
-  config    Json     @default("{}")
-  isActive  Boolean  @default(true) @map("is_active")
-  order     Int      @default(0)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  form      Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
-
-  @@index([formId])
-  @@map("form_connections")
-}
-
-model Ticket {
-  id          String               @id @default(uuid())
-  customerId  String               @map("customer_id")
-  subject     String
-  description String?
-  category    String               @default("general")
-  priority    String               @default("normal")
-  status      String               @default("open")
-  source      String               @default("web")
-  application String?
-  assignedId  String?              @map("assigned_id")
-  closedAt    DateTime?            @map("closed_at")
-  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime             @updatedAt @map("updated_at")
-  attachments ticket_attachments[]
-  messages    TicketMessage[]
-  assigned    User?                @relation("TicketAssignee", fields: [assignedId], references: [id])
-  customer    User                 @relation("TicketCustomer", fields: [customerId], references: [id])
-
-  @@index([customerId])
-  @@index([status])
-  @@index([assignedId])
-  @@index([createdAt])
-  @@index([priority])
-  @@index([status, createdAt(sort: Desc)], map: "idx_tickets_status_created")
-  @@index([customerId, createdAt(sort: Desc)], map: "idx_tickets_customer_created")
-  @@map("tickets")
-}
-
-model TicketMessage {
-  id         String    @id @default(uuid())
-  ticketId   String    @map("ticket_id")
-  authorId   String    @map("author_id")
-  content    String
-  isInternal Boolean   @default(false) @map("is_internal")
-  readAt     DateTime? @map("read_at")
-  readBy     String?   @map("read_by")
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  author     User      @relation("TicketMessageAuthor", fields: [authorId], references: [id])
-  ticket     Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-
-  @@index([ticketId])
-  @@index([authorId])
-  @@map("ticket_messages")
-}
-
-model ticket_attachments {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  ticketId  String   @map("ticket_id")
-  messageId String?  @map("message_id")
-  fileName  String   @map("file_name")
-  fileUrl   String   @map("file_url")
-  fileSize  Int?     @map("file_size")
-  mimeType  String?  @map("mime_type")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-
-  @@index([ticketId])
-  @@index([messageId])
-  @@map("ticket_attachments")
-}
-
-model CdnFile {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  path            String   @unique
-  filename        String
-  /// Folder rows are synthetic (path ends with '/'); mirrored from live DB.
-  folder          Boolean  @default(false)
-  mimeType        String   @map("mime_type")
-  /// BYTES — always an integer byte count, never a formatted string.
-  size            Int
-  /// Owning bucket slug, e.g. "production".
-  bucketId        String?  @map("bucket_id")
-  /// Object-store key, e.g. "production/images/hero.webp".
-  storageKey      String?  @map("storage_key")
-  /// public | private. Private files require signed URLs.
-  visibility      String?  @default("public")
-  etag            String?
-  width           Int?
-  height          Int?
-  /// milliseconds of audio/video, if known.
-  durationMs      Int?     @map("duration_ms")
-  /// SHA-256 hex for duplicate detection / integrity.
-  checksum        String?
-  cacheControl    String?  @map("cache_control")
-  contentDisposition String? @map("content_disposition")
-  /// Controlled custom metadata JSON (size/type limited by API).
-  metadata        Json?    @default("{}")
-  /// Soft delete (PRD §111) — CDN visibility removed immediately.
-  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
-  projectId       String?  @map("project_id")
-  commitSha       String?  @map("commit_sha")
-  githubCommitSha String?  @map("github_commit_sha")
-  uploadedBy      String?  @map("uploaded_by")
-  status          String   @default("published")
-  tags            String[] @default([])
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  user            User?    @relation(fields: [uploadedBy], references: [id], onDelete: SetNull)
-
-  @@index([uploadedBy], map: "idx_cdn_files_uploader")
-  @@index([status], map: "idx_cdn_files_status")
-  @@index([mimeType], map: "idx_cdn_files_mime")
-  @@index([createdAt(sort: Desc)], map: "idx_cdn_files_created")
-  @@index([filename], map: "idx_cdn_files_filename")
-  @@index([bucketId], map: "idx_cdn_files_bucket")
-  @@map("cdn_files")
-}
-
-/// Top-level CDN container (INTERNAL ONLY — never exposed publicly).
-/// The public model is Project → path. Buckets are a storage detail.
-model CdnBucket {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  projectId       String   @default("default") @map("project_id")
-  name            String
-  /// URL-safe slug, unique per project.
-  slug            String
-  /// public | private
-  visibility      String   @default("public")
-  storageProvider String   @default("tirbeo") @map("storage_provider")
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@unique([projectId, slug], map: "uq_cdn_buckets_project_slug")
-  @@index([projectId], map: "idx_cdn_buckets_project")
-  @@map("cdn_buckets")
-}
-
-/// A CDN project: the public top-level container. Files live at
-/// canonical paths inside a project (`avatars/u/profile.webp`).
-model CdnProject {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  ownerId   String?  @map("owner_id")
-  name      String
-  /// URL-safe slug, unique per owner scope.
-  slug      String
-  settings  Json?    @default("{}")
-  /// Quotas in BYTES / counts: { storageBytes, bandwidthBytes, maxFiles, maxFileBytes }.
-  quotas    Json?    @default("{}")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@unique([ownerId, slug], map: "uq_cdn_projects_owner_slug")
-  @@index([ownerId], map: "idx_cdn_projects_owner")
-  @@map("cdn_projects")
-}
-
-/// Custom domains: CDN, API, or static-hosting hostnames.
-/// Types: cdn | api | hosting. States: pending|verifying|verified|ssl_pending|active|failed|disabled.
-model CdnDomain {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  projectId   String   @default("default") @map("project_id")
-  domain      String   @unique
-  /// cdn | api | hosting
-  type        String   @default("cdn")
-  /// Optional path prefix the domain maps to (custom CDN).
-  pathPrefix  String?  @map("path_prefix")
-  /// pending | verifying | verified | ssl_pending | active | failed | disabled
-  status      String   @default("pending")
-  /// TXT ownership token (`_tirbeo.<domain>`).
-  txtToken    String?  @map("txt_token")
-  /// active | pending | failed
-  sslStatus   String?  @default("pending") @map("ssl_status")
-  sslExpiresAt DateTime? @map("ssl_expires_at") @db.Timestamptz(6)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([projectId], map: "idx_cdn_domains_project")
-  @@index([status], map: "idx_cdn_domains_status")
-  @@index([type], map: "idx_cdn_domains_type")
-  @@map("cdn_domains")
-}
-
-/// Static website hosting configs: a domain serving a path root.
-model CdnHostingConfig {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  projectId   String   @default("default") @map("project_id")
-  name        String
-  /// Path root served, e.g. `websites/marketing`.
-  rootPath    String   @map("root_path")
-  index       String   @default("index.html")
-  notFound    String?  @map("not_found")
-  spaFallback Boolean  @default(false) @map("spa_fallback")
-  domainId    String?  @map("domain_id")
-  /// [{ from, to, status }]
-  redirects   Json?    @default("[]")
-  /// { "pathGlob": { header: value } }
-  headers     Json?    @default("{}")
-  status      String   @default("active")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([projectId], map: "idx_cdn_hosting_project")
-  @@map("cdn_hosting_configs")
-}
-
-/// Webhook endpoints: HMAC-signed event deliveries with retry state.
-model CdnWebhook {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  projectId String   @default("default") @map("project_id")
-  name      String?
-  url       String
-  events    String[] @default([])
-  secret    String?
-  /// active | disabled | failing
-  status    String   @default("active")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([projectId], map: "idx_cdn_webhooks_project")
-  @@map("cdn_webhooks")
-}
-
-model CdnWebhookDelivery {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  webhookId  String   @map("webhook_id")
-  event      String
-  /// success | retrying | failed
-  status     String   @default("retrying")
-  attempts   Int      @default(0)
-  lastStatus Int?     @map("last_status")
-  nextRetry  DateTime? @map("next_retry") @db.Timestamptz(6)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@index([webhookId], map: "idx_cdn_webhook_deliveries_hook")
-  @@index([status], map: "idx_cdn_webhook_deliveries_status")
-  @@map("cdn_webhook_deliveries")
-}
-
-/// Cache purge log (purge itself is executed by the CDN provider layer).
-model CdnCachePurge {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  projectId String   @default("default") @map("project_id")
-  paths     String[] @default([])
-  /// queued | completed | failed
-  status    String   @default("queued")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([projectId], map: "idx_cdn_cache_purges_project")
-  @@map("cdn_cache_purges")
-}
-
-model CdnActivity {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  type        String
-  fileId      String?  @map("file_id")
-  path        String?
-  result      String   @default("ok")
-  actor       String?
-  actorLabel  String?  @map("actor_label")
-  metadata    Json?    @default("{}")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([type], map: "idx_cdn_activity_type")
-  @@index([fileId], map: "idx_cdn_activity_file")
-  @@index([actor], map: "idx_cdn_activity_actor")
-  @@index([createdAt(sort: Desc)], map: "idx_cdn_activity_created")
-  @@map("cdn_activity")
-}
-
-model CdnSettings {
-  id                String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  key               String   @unique
-  value             Json
-  description       String?
-  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
-
-  @@map("cdn_settings")
-}
-
-model CdnCategory {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  key             String   @unique
-  label           String
-  pathPrefix      String   @map("path_prefix")
-  suggestedNames  String[] @default([]) @map("suggested_names")
-  order           Int      @default(0)
-  isActive        Boolean  @default(true) @map("is_active")
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([key], map: "idx_cdn_categories_key")
-  @@index([order], map: "idx_cdn_categories_order")
-  @@map("cdn_categories")
-}
-
-model AuthLog {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  type      String
-  data      Json
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([type])
-  @@index([createdAt])
-  @@map("auth_logs")
+  @@schema("security")
 }
 
 model VerificationLimit {
@@ -982,6 +734,7 @@ model VerificationLimit {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("verification_limits")
+  @@schema("ops")
 }
 
 model Cooldown {
@@ -996,255 +749,7 @@ model Cooldown {
 
   @@index([expiresAt], map: "idx_cooldowns_expires")
   @@map("cooldowns")
-}
-
-model MagicLink {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  jti       String   @unique @map("jti")
-  userId    String   @map("user_id")
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([userId], map: "idx_magic_links_user")
-  @@map("magic_links")
-}
-
-enum session_status {
-  active
-  expired
-  revoked
-}
-
-enum severity_level {
-  info
-  warning
-  error
-  critical
-}
-
-model MagicLinkUse {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  jti       String   @unique @map("jti")
-  userId    String   @map("user_id")
-  usedAt    DateTime @default(now()) @map("used_at") @db.Timestamptz(6)
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([userId], map: "idx_magic_link_uses_user")
-  @@index([expiresAt], map: "idx_magic_link_uses_expires")
-  @@map("magic_link_uses")
-}
-
-model LandingPage {
-  id               String                    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  slug             String                    @unique @default("home")
-  draft            Json                      @default("{}")
-  publishedConfig  Json?                     @map("published_config")
-  draftVersion     Int                       @default(1) @map("draft_version")
-  publishedVersion Int?                      @map("published_version")
-  publishedAt      DateTime?                 @map("published_at") @db.Timestamptz(6)
-  editedBy         String?                   @map("edited_by")
-  createdAt        DateTime                  @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt        DateTime                  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  publications     LandingPagePublication[]
-
-  @@index([publishedAt(sort: Desc)], map: "idx_landing_pages_published_at")
-  @@map("landing_pages")
-}
-
-model LandingPagePublication {
-  id          String      @id @default(dbgenerated("(gen_random_uuid())::text"))
-  landingPageId String    @map("landing_page_id")
-  version     Int
-  config      Json
-  publishedBy String?     @map("published_by")
-  publishedAt DateTime    @default(now()) @map("published_at") @db.Timestamptz(6)
-  landingPage LandingPage @relation(fields: [landingPageId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([landingPageId, version], map: "idx_landing_page_publications_page_version")
-  @@index([landingPageId, publishedAt(sort: Desc)], map: "idx_landing_page_publications_page_published")
-  @@map("landing_page_publications")
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// Email Brain — event registry, versioned content, queue, digests, AI ledger
-// Docs: docs/email-brain/01-architecture.md
-// ══════════════════════════════════════════════════════════════════════
-
-model email_events {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  eventKey        String   @unique @map("event_key")
-  category        String // security | transactional | activity | product | marketing
-  delivery        String   @default("immediate") // immediate | digest | manual
-  mandatory       Boolean  @default(false) // user preferences cannot suppress
-  description     String?
-  defaultVars     Json?    @map("default_vars")
-  enabled         Boolean  @default(true)
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  definitions email_definitions[]
-
-  @@index([category])
-  @@map("email_events")
-}
-
-model email_definitions {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  eventKey        String   @map("event_key")
-  name            String
-  status          String   @default("draft") // draft | approved | active | archived
-  activeVersionId String?  @map("active_version_id")
-  createdBy       String?  @map("created_by")
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  event    email_events     @relation(fields: [eventKey], references: [eventKey], onDelete: Cascade)
-  versions email_versions[]
-
-  @@unique([eventKey, name], map: "idx_email_definitions_event_name")
-  @@index([status])
-  @@map("email_definitions")
-}
-
-model email_versions {
-  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  definitionId String   @map("definition_id")
-  version      Int
-  subject      String
-  blocks       Json
-  language     String   @default("en")
-  origin       String   @default("ai") // ai | manual | translated
-  status       String   @default("draft") // draft | approved | active | archived
-  createdBy    String?  @map("created_by")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  definition email_definitions @relation(fields: [definitionId], references: [id], onDelete: Cascade)
-
-  @@unique([definitionId, language, version], map: "idx_email_versions_def_lang_ver")
-  @@index([definitionId, status], map: "idx_email_versions_def_status")
-  @@map("email_versions")
-}
-
-model email_jobs {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  dedupeKey   String?  @map("dedupe_key")
-  eventKey    String   @map("event_key")
-  userId      String?  @map("user_id")
-  toEmail     String   @map("to_email")
-  category    String
-  priority    String   @default("normal") // security events → high
-  status      String   @default("queued") // queued | processing | sent | failed | dead | suppressed | digest_queued
-  payload     Json     @default("{}") // variable keys + non-sensitive values
-  contentVersionId String? @map("content_version_id")
-  definitionId String? @map("definition_id")
-  attempts    Int      @default(0)
-  maxAttempts Int      @default(3) @map("max_attempts")
-  lastError   String?  @map("last_error")
-  availableAt DateTime @default(now()) @map("available_at") @db.Timestamptz(6)
-  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@unique([dedupeKey], map: "idx_email_jobs_dedupe")
-  @@index([status, availableAt], map: "idx_email_jobs_poll")
-  @@index([eventKey, createdAt], map: "idx_email_jobs_event_time")
-  @@index([toEmail, createdAt], map: "idx_email_jobs_recipient_time")
-  @@map("email_jobs")
-}
-
-model email_deliveries {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  jobId      String   @map("job_id")
-  userId     String?  @map("user_id")
-  toEmail    String   @map("to_email")
-  eventKey   String   @map("event_key")
-  category   String
-  subject    String
-  status     String   @default("sent") // sent | failed | bounced | complained | opened | clicked
-  provider   String?
-  messageId  String?  @map("message_id")
-  contentVersionId String? @map("content_version_id")
-  openedAt   DateTime? @map("opened_at") @db.Timestamptz(6)
-  clickedAt  DateTime? @map("clicked_at") @db.Timestamptz(6)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([eventKey, createdAt], map: "idx_email_deliveries_event_time")
-  @@index([userId, createdAt], map: "idx_email_deliveries_user_time")
-  @@index([messageId], map: "idx_email_deliveries_message")
-  @@map("email_deliveries")
-}
-
-model email_preferences {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String   @map("user_id")
-  eventKey   String   @map("event_key")
-  frequency  String   @default("default") // immediate | daily | weekly | monthly | never | default
-  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@unique([userId, eventKey], map: "idx_email_prefs_user_event")
-  @@map("email_preferences")
-}
-
-model email_digest_items {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String   @map("user_id")
-  category   String // activity | product | transactional
-  entityGroup String  @map("entity_group") // e.g. project:abc, form:xyz
-  title      String
-  body       String?
-  importance Int      @default(0)
-  dedupeKey  String?  @map("dedupe_key")
-  payload    Json     @default("{}")
-  consumed   Boolean  @default(false)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@unique([userId, dedupeKey], map: "idx_email_digest_items_dedupe")
-  @@index([userId, consumed, createdAt], map: "idx_email_digest_items_poll")
-  @@map("email_digest_items")
-}
-
-model email_digests {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String   @map("user_id")
-  cadence     String // daily | weekly | monthly
-  itemCount   Int      @default(0) @map("item_count")
-  rangeStart  DateTime @map("range_start") @db.Timestamptz(6)
-  rangeEnd    DateTime @map("range_end") @db.Timestamptz(6)
-  aiEnhanced  Boolean  @default(false) @map("ai_enhanced")
-  contentVersionId String? @map("content_version_id")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([userId, cadence, createdAt], map: "idx_email_digests_user")
-  @@map("email_digests")
-}
-
-model email_suppressions {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String?  @map("user_id")
-  toEmail    String   @map("to_email")
-  eventKey   String   @map("event_key")
-  reason     String // preference | quiet_hours | rate_limit | duplicate | global_unsub | disabled
-  dedupeKey  String?  @map("dedupe_key")
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([eventKey, createdAt], map: "idx_email_suppressions_event")
-  @@map("email_suppressions")
-}
-
-model email_provider_events {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  provider   String
-  eventType  String   @map("event_type") // delivered | bounced | complained | opened | clicked
-  messageId  String?  @map("message_id")
-  toEmail    String   @map("to_email")
-  payload    Json     @default("{}")
-  processed  Boolean  @default(false)
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([messageId], map: "idx_email_provider_events_message")
-  @@index([processed], map: "idx_email_provider_events_processed")
-  @@map("email_provider_events")
+  @@schema("ops")
 }
 
 model ai_generations {
@@ -1271,4 +776,230 @@ model ai_generations {
   @@index([fingerprint], map: "idx_ai_generations_fingerprint")
   @@index([task, createdAt], map: "idx_ai_generations_task_time")
   @@map("ai_generations")
+  @@schema("ops")
+}
+
+enum session_status {
+  active
+  expired
+  revoked
+  @@schema("security")
+}
+
+model SecurityEvent {
+  id        String          @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String?         @map("user_id")
+  eventType String          @map("event_type")
+  severity  Severity        @default(info)
+  ipAddress String?         @map("ip_address")
+  userAgent String?         @map("user_agent")
+  metadata  Json?           @default("{}")
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  user      User?           @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([createdAt], map: "idx_security_events_created")
+  @@index([eventType], map: "idx_security_events_type")
+  @@index([userId], map: "idx_security_events_user")
+  @@index([userId, createdAt(sort: Desc)], map: "idx_security_events_user_created")
+  @@index([severity, createdAt(sort: Desc)], map: "idx_security_events_severity_created")
+  @@map("security_events")
+  @@schema("security")
+}
+
+model deviceAccount {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  deviceId   String    @map("device_id")
+  userId     String    @map("user_id")
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([deviceId, userId], map: "idx_device_accounts_device_user")
+  @@index([userId], map: "idx_device_accounts_user")
+  @@map("device_accounts")
+  @@schema("security")
+}
+
+model UserTipLog {
+  id     String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId String   @map("user_id")
+  tipId  String   @map("tip_id")
+  sentAt DateTime @default(now()) @map("sent_at") @db.Timestamptz(6)
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, tipId])
+  @@index([userId], map: "idx_tip_logs_user")
+  @@map("user_tip_logs")
+  @@schema("activity")
+}
+
+model PushSubscription {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String   @map("user_id")
+  endpoint  String   @unique
+  p256dh    String   @map("p256dh")
+  auth      String   @map("auth")
+  userAgent String?  @map("user_agent")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt DateTime @default(now()) @map("last_used_at") @db.Timestamptz(6)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_push_subscriptions_user")
+  @@index([endpoint], map: "idx_push_subscriptions_endpoint")
+  @@map("push_subscriptions")
+  @@schema("user")
+}
+
+model TirbeoIdentity {
+  id             String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId         String?   @map("user_id")
+  username       String    @unique
+  email          String?
+  verifiedSource String?   @map("verified_source")
+  verifiedAt     DateTime? @map("verified_at") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user           User?     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([userId], map: "idx_tirbeo_identities_user")
+  @@map("identities")
+  @@schema("user")
+}
+
+model emailConfig {
+  id               String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  provider         String   @default("resend")
+  resendApiKey     String?
+  resendDomain     String?  @default("send.tirbeo.com")
+  smtpHost         String?
+  smtpPort         Int?     @default(587)
+  smtpUser         String?
+  smtpPass         String?
+  defaultFromEmail String   @default("noreply@send.tirbeo.com")
+  defaultFromName  String   @default("Tirbeo")
+  welcomeFromEmail String?
+  welcomeFromName  String?
+  otpFromEmail     String?
+  otpFromName      String?
+  resetFromEmail   String?
+  resetFromName    String?
+  notifyFromEmail  String?
+  notifyFromName   String?
+  alertFromEmail   String?
+  alertFromName    String?
+  formsFromEmail   String?  @default("forms@send.tirbeo.com")
+  formsFromName    String?  @default("Tirbeo Forms")
+  customDomain     String?
+  dkimEnabled      Boolean  @default(false)
+  enabled          Boolean  @default(true)
+  createdAt        DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("email_configs")
+  @@schema("email")
+}
+
+model email_events {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  eventKey     String   @unique @map("event_key")
+  category     String
+  delivery     String   @default("immediate")
+  mandatory    Boolean  @default(false)
+  description  String?
+  defaultVars  Json?    @map("default_vars")
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  definitions email_definitions[]
+
+  @@index([category])
+  @@map("email_events")
+  @@schema("email")
+}
+
+model email_definitions {
+  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  eventKey        String   @map("event_key")
+  name            String
+  status          String   @default("draft")
+  activeVersionId String?  @map("active_version_id")
+  createdBy       String?  @map("created_by")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  event    email_events     @relation(fields: [eventKey], references: [eventKey], onDelete: Cascade)
+  versions email_versions[]
+
+  @@unique([eventKey, name], map: "idx_email_definitions_event_name")
+  @@index([status])
+  @@map("email_definitions")
+  @@schema("email")
+}
+
+model email_versions {
+  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  definitionId String   @map("definition_id")
+  version      Int
+  subject      String
+  blocks       Json
+  language     String   @default("en")
+  origin       String   @default("ai")
+  status       String   @default("draft")
+  createdBy    String?  @map("created_by")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  definition email_definitions @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, language, version], map: "idx_email_versions_def_lang_ver")
+  @@index([definitionId, status], map: "idx_email_versions_def_status")
+  @@map("email_versions")
+  @@schema("email")
+}
+
+model email_preferences {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId    String   @map("user_id")
+  eventKey  String   @map("event_key")
+  frequency String   @default("default")
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@unique([userId, eventKey], map: "idx_email_prefs_user_event")
+  @@map("email_preferences")
+  @@schema("email")
+}
+
+model email_digest_items {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String   @map("user_id")
+  category    String
+  entityGroup String   @map("entity_group")
+  title       String
+  body        String?
+  importance  Int      @default(0)
+  dedupeKey   String?  @map("dedupe_key")
+  payload     Json     @default("{}")
+  consumed    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([userId, dedupeKey], map: "idx_email_digest_items_dedupe")
+  @@index([userId, consumed, createdAt], map: "idx_email_digest_items_poll")
+  @@map("email_digest_items")
+  @@schema("email")
+}
+
+model email_digests {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  userId      String   @map("user_id")
+  cadence     String
+  itemCount   Int      @default(0) @map("item_count")
+  rangeStart  DateTime @map("range_start") @db.Timestamptz(6)
+  rangeEnd    DateTime @map("range_end") @db.Timestamptz(6)
+  aiEnhanced  Boolean  @default(false) @map("ai_enhanced")
+  contentVersionId String? @map("content_version_id")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, cadence, createdAt], map: "idx_email_digests_user")
+  @@map("email_digests")
+  @@schema("email")
 }

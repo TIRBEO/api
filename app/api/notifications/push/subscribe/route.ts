@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/features/auth/http-guards';
 import { subscribeToPush, isPushConfigured, getVapidPublicKey } from '@/infrastructure/push/push-notifications';
+import { isSafeExternalUrl } from '@/infrastructure/push/endpoint-guard';
 import { hasConsent } from '@/features/users/consent';
 
 export const runtime = 'nodejs';
@@ -41,6 +42,13 @@ export async function POST(request: NextRequest) {
 
     if (!endpoint || !p256dh || !auth) {
       return NextResponse.json({ error: 'Missing subscription keys' }, { status: 400 });
+    }
+
+    // SEC/SSRF: reject endpoints pointing at private/loopback/metadata hosts
+    // before storing — otherwise a compromised user could exfiltrate internal
+    // data through the push delivery pipeline.
+    if (!(await isSafeExternalUrl(endpoint))) {
+      return NextResponse.json({ error: 'Invalid push endpoint URL' }, { status: 400 });
     }
 
     const userAgent = request.headers.get('user-agent') || undefined;

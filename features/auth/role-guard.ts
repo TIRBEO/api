@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getSession, getAdminRole, roleAtLeast } from '@/features/auth/http-guards';
+import { getSession, getAdminRole } from '@/features/auth/http-guards';
 import { jsonUnauthorized, jsonForbidden, jsonTooManyRequests } from '@/shared/response';
 import { checkRateLimit } from '@/features/auth/rate-limit';
 
@@ -11,8 +11,7 @@ export const ROLE_LEVELS: Record<string, number> = {
   editor: 1,
   manager: 2,
   admin: 3,
-  super_admin: 4,
-};
+  super_admin: 4 };
 
 /**
  * Get the numeric level for a role
@@ -66,15 +65,15 @@ interface RoleGuardOptions {
 
 /**
  * Wrapper that adds role-based protection to a route handler.
- * 
+ *
  * @example
  * // Require any admin
  * export const GET = withRole(handler);
- * 
+ *
  * @example
  * // Require super_admin only
  * export const POST = withRole(handler, { minimumRole: 'super_admin' });
- * 
+ *
  * @example
  * // Require specific roles
  * export const DELETE = withRole(handler, { allowedRoles: ['super_admin'] });
@@ -115,12 +114,12 @@ export function withRole(
 
     // Apply role-based rate limiting
     if (!options.skipRateLimit) {
-      const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
-        || request.headers.get('x-real-ip') 
+      const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+        || request.headers.get('x-real-ip')
         || 'unknown';
       const route = request.nextUrl.pathname;
       const isAdmin = userRole != null;
-      
+
       const allowed = await checkRateLimit(
         `${ip}:${route}`,
         true, // isAuthenticated
@@ -129,7 +128,7 @@ export function withRole(
         session.userId,
         userRole || undefined
       );
-      
+
       if (!allowed) {
         return jsonTooManyRequests();
       }
@@ -139,8 +138,7 @@ export function withRole(
     return handler(request, {
       userId: session.userId,
       email: session.email,
-      adminRole: userRole,
-    });
+      adminRole: userRole });
   };
 }
 

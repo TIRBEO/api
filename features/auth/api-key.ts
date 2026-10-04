@@ -59,7 +59,11 @@ export async function authenticateApiKey(request: NextRequest): Promise<ApiKeyAu
 
     const keyHash = hashApiKey(rawToken);
 
-    const record = await prisma.apiKey.findUnique({ where: { keyHash } });
+    // Generated Prisma client doesn't yet expose the restored ApiKey model
+    // (schema.prisma "Restored feature models"), so query api_keys directly.
+    interface ApiKeyRow { id: string; userId: string; permissions: unknown; isActive: boolean | null }
+    const rows = await prisma.$queryRaw<ApiKeyRow[]>`SELECT id, user_id AS "userId", permissions, is_active AS "isActive" FROM "ops"."api_keys" WHERE key_hash = ${keyHash} LIMIT 1`;
+    const record = rows[0];
     if (!record) {
       console.warn('[API_KEY_AUTH] Key not found in database. Hash:', keyHash.substring(0, 8) + '...');
       return null;
@@ -71,10 +75,8 @@ export async function authenticateApiKey(request: NextRequest): Promise<ApiKeyAu
     }
 
     // Update lastUsedAt fire-and-forget
-    prisma.apiKey.update({
-      where: { id: record.id },
-      data: { lastUsedAt: new Date() },
-    }).catch((e: any) => console.error('[API_KEY_AUTH] Failed to update lastUsedAt:', e?.message));
+    prisma.$executeRaw`UPDATE "ops"."api_keys" SET last_used_at = NOW() WHERE id = ${record.id}`
+      .catch((e: any) => console.error('[API_KEY_AUTH] Failed to update lastUsedAt:', e?.message));
 
     console.log('[API_KEY_AUTH] Authenticated user:', record.userId, 'key:', record.id);
     const scope = cdnKeyScope(record.permissions);

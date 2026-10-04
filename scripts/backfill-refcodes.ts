@@ -57,8 +57,10 @@ function randomToken(): string {
 interface Row {
   id: string;
   email: string;
-  isBanned: boolean;
-  isSuspended: boolean;
+  // Nullable to match the users table (both are optional columns with no
+  // default). needsBackfill() below already tests them by truthiness.
+  isBanned: boolean | null;
+  isSuspended: boolean | null;
   banRefCode: string | null;
   suspendRefCode: string | null;
 }
@@ -66,8 +68,8 @@ interface Row {
 function needsBackfill(row: Row): boolean {
   const banLegacy = !!row.banRefCode && !isSegmented(row.banRefCode);
   const susLegacy = !!row.suspendRefCode && !isSegmented(row.suspendRefCode);
-  const missingBan = row.isBanned && !row.banRefCode;
-  const missingSus = row.isSuspended && !row.suspendRefCode;
+  const missingBan = !!row.isBanned && !row.banRefCode;
+  const missingSus = !!row.isSuspended && !row.suspendRefCode;
   return banLegacy || susLegacy || missingBan || missingSus;
 }
 

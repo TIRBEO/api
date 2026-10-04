@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { createAuditEvent } from '@/features/security/audit';
+import { originFromRequest } from '@/shared/changeOrigin';
 import { logSecurityEvent } from '@/features/security/security';
 import { requireReauth } from '@/features/auth/reauth';
 
@@ -16,7 +17,7 @@ export async function GET(req: NextRequest) {
 
     const passkeys = await prisma.passkey.findMany({
       where: { userId: session.userId },
-      select: { id: true, credentialId: true, transports: true, deviceName: true, createdAt: true, updatedAt: true },
+      select: { id: true, credentialId: true, transports: true, deviceName: true, createdAt: true, lastUsedAt: true },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -62,6 +63,7 @@ export async function DELETE(req: NextRequest) {
       targetType: 'user',
       targetId: session.userId,
       metadata: { passkeyId: passkey.id, deviceName: passkey.deviceName, reauthMethod: proof.method },
+      origin: originFromRequest(req.headers),
     }).catch(() => {});
 
     logSecurityEvent({

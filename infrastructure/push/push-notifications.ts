@@ -1,7 +1,7 @@
 // ═══ PUSH NOTIFICATIONS (Web Push / VAPID) — DB-backed with in-memory fallback ═══
 const PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || '';
 const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
-const SUBJECT = process.env.VAPID_SUBJECT || 'mailto:support@tirbeo.app';
+const SUBJECT = process.env.VAPID_SUBJECT || 'mailto:support@tirbeo.com';
 
 let configured = false;
 if (PUBLIC_KEY && PRIVATE_KEY) {
@@ -131,7 +131,7 @@ export async function sendPushNotification(userIdOrSubscription: string | { endp
         body: payload?.body || '',
         icon: payload?.icon || getAppUrl('/icons/notification.png'),
         badge: getAppUrl('/icons/badge.png'),
-        url: payload?.url ? getAppUrl(payload.url) : getAppUrl('/account/inbox'),
+        url: payload?.url ? getAppUrl(payload.url) : getAppUrl('/account/notifications'),
         tag: payload?.tag || 'tirbeo-notification',
         timestamp: Date.now(),
       }), { TTL: 3600 });

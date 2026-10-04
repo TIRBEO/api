@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 
 export const runtime = 'nodejs';
 
@@ -10,8 +10,7 @@ export async function POST(req: NextRequest) {
     headers: req.headers,
     body: req.body,
     // @ts-expectable — duplex needed for streaming body forwarding
-    duplex: 'half',
-  } as RequestInit);
+    duplex: 'half' } as RequestInit);
 
   return fetch(forwarded);
 }

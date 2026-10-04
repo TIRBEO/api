@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
 
@@ -6,7 +6,7 @@ export const GET = withAdmin(async (request, session) => {
 
   const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
   if (!config) {
-    return NextResponse.json({ provider: 'resend', fromEmail: 'noreply@send.tirbeo.app', fromName: 'Tirbeo', enabled: false });
+    return NextResponse.json({ provider: 'resend', fromEmail: 'noreply@send.tirbeo.com', fromName: 'Tirbeo', enabled: false });
   }
   return NextResponse.json({ ...config, apiKey: config.resendApiKey, fromEmail: config.defaultFromEmail, fromName: config.defaultFromName, enabled: true });
 });
@@ -23,9 +23,8 @@ export const PUT = withAdmin(async (request, session) => {
     smtpPort: smtpPort ? Number(smtpPort) : null,
     smtpUser: smtpUser || null,
     smtpPass: smtpPass || null,
-    defaultFromEmail: fromEmail || 'noreply@send.tirbeo.app',
-    defaultFromName: fromName || 'Tirbeo',
-  };
+    defaultFromEmail: fromEmail || 'noreply@send.tirbeo.com',
+    defaultFromName: fromName || 'Tirbeo' };
 
   let config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
   if (config) {

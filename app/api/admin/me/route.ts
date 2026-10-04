@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSession } from '@/features/auth/http-guards';
 import { prisma } from '@/infrastructure/db/prisma';
-import { cachedJson } from '@/shared/response';
 import { getEffectivePermissions } from '@/features/auth/roles';
 
 export async function GET(request: NextRequest) {
@@ -16,12 +15,12 @@ export async function GET(request: NextRequest) {
 
   const permissions = await getEffectivePermissions(user.id);
 
-  return cachedJson({
+  return NextResponse.json({
     id: user.id,
     email: user.email,
     name: user.name,
     adminRole: user.adminRole,
     permissions,
     roles: [],
-  });
+  }, { headers: { 'Cache-Control': 'private, no-store' } });
 }

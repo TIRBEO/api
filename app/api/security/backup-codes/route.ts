@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { createAuditEvent } from '@/features/security/audit';
+import { originFromRequest } from '@/shared/changeOrigin';
 import { jsonUnauthorized } from '@/shared/response';
 import { generateRecoveryCodes } from '@/features/auth/totp';
 import { hashRecoveryCode } from '@/features/auth/password';
 
-// Backup codes live on users.backup_codes: [{ code: <hash>, used: boolean }]
+// Backup codes live on user_security.backup_codes: [{ code: <hash>, used: boolean }]
 // Codes are stored hashed; plaintext is shown exactly once at generation time.
 
 // GET /api/security/backup-codes - Status only (codes are hashed at rest)
@@ -14,11 +15,11 @@ export async function GET(request: NextRequest) {
   const session = await getSession(request);
   if (!session) return jsonUnauthorized();
 
-  const user = await prisma.user.findUnique({
-    where: { id: session.userId },
+  const sec = await prisma.userSecurity.findUnique({
+    where: { userId: session.userId },
     select: { backupCodes: true },
   });
-  const codes = Array.isArray((user as any)?.backupCodes) ? (user as any).backupCodes as any[] : [];
+  const codes = Array.isArray((sec as any)?.backupCodes) ? (sec as any).backupCodes as any[] : [];
   const unused = codes.filter((c) => c && c.used !== true).length;
 
   return NextResponse.json({
@@ -34,12 +35,13 @@ export async function POST(request: NextRequest) {
   if (!session) return jsonUnauthorized();
 
   const newCodes = generateRecoveryCodes(8);
+  const mintedAt = new Date().toISOString();
+  const minted = newCodes.map((code) => ({ code: hashRecoveryCode(code), used: false, createdAt: mintedAt })) as any;
 
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: {
-      backupCodes: newCodes.map((code) => ({ code: hashRecoveryCode(code), used: false })),
-    },
+  await prisma.userSecurity.upsert({
+    where: { userId: session.userId },
+    update: { backupCodes: minted },
+    create: { userId: session.userId, backupCodes: minted },
   });
 
   await createAuditEvent({
@@ -48,6 +50,7 @@ export async function POST(request: NextRequest) {
     targetType: 'user',
     targetId: session.userId,
     severity: 'info',
+    origin: originFromRequest(request.headers),
   });
 
   return NextResponse.json({

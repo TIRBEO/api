@@ -14,7 +14,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 // ─── Types ───
 export type JobName =
   | 'cleanup'
-  | 'digest'
+  | 'recap'
   | 'weekly_summary'
   | 'permanent_deletion'
   | 'deletion_sweep'
@@ -26,7 +26,7 @@ export type JobName =
 // How often each job is allowed to run (ms)
 const JOB_INTERVALS: Record<JobName, number> = {
   cleanup:           12 * 3600_000,  // every 12h
-  digest:            23 * 3600_000,  // ~daily (cron runs daily; gate allows slightly less)
+  recap:             23 * 3600_000,  // ~daily (cron runs daily; gate allows slightly less)
   weekly_summary:    6 * 86400_000,  // weekly
   permanent_deletion: 23 * 3600_000, // daily
   deletion_sweep:    23 * 3600_000,  // daily
@@ -40,7 +40,7 @@ const JOB_INTERVALS: Record<JobName, number> = {
 
 async function ensureTable() {
   await prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS job_runs (
+    CREATE TABLE IF NOT EXISTS "ops"."job_runs" (
       job_name TEXT PRIMARY KEY,
       last_run TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_duration_ms INT DEFAULT 0,
@@ -54,7 +54,7 @@ async function getLastRun(job: JobName): Promise<number> {
   await ensureTable();
   try {
     const rows = await prisma.$queryRawUnsafe<{ last_run: string }[]>(
-      `SELECT last_run FROM job_runs WHERE job_name = $1`, job
+      `SELECT last_run FROM "ops"."job_runs" WHERE job_name = $1`, job
     );
     if (rows.length === 0) return 0;
     return new Date(rows[0].last_run).getTime();
@@ -67,13 +67,13 @@ async function recordRun(job: JobName, durationMs: number, status: string) {
   await ensureTable();
   try {
     await prisma.$executeRawUnsafe(`
-      INSERT INTO job_runs (job_name, last_run, last_duration_ms, last_status, run_count)
+      INSERT INTO "ops"."job_runs" (job_name, last_run, last_duration_ms, last_status, run_count)
       VALUES ($1, NOW(), $2, $3, 1)
       ON CONFLICT (job_name) DO UPDATE SET
         last_run = NOW(),
         last_duration_ms = EXCLUDED.last_duration_ms,
         last_status = EXCLUDED.last_status,
-        run_count = job_runs.run_count + 1
+        run_count = "ops"."job_runs".run_count + 1
     `, job, Math.round(durationMs), status);
   } catch {}
 }
@@ -134,9 +134,9 @@ export async function runDueJobs(): Promise<{ job: string; ran: boolean; duratio
       const { cleanupOldNotifications } = await import('@/jobs/jobs');
       await cleanupOldNotifications();
     }],
-    ['digest', async () => {
-      const { sendEmailDigests } = await import('@/jobs/jobs');
-      await sendEmailDigests();
+    ['recap', async () => {
+      const { sendAccountSummaries } = await import('@/jobs/jobs');
+      await sendAccountSummaries();
     }],
     ['permanent_deletion', async () => {
       const m = await import('@/jobs/jobs-permanent-deletion');
@@ -157,12 +157,6 @@ export async function runDueJobs(): Promise<{ job: string; ran: boolean; duratio
     ['tips', async () => {
       const m = await import('@/features/users/tips');
       await m.runAutoTipsSweep();
-    }],
-    ['cdn_purge', async () => {
-      const { purgeAllExpiredTrash, selfDestructSweep, purgeExpiredShareLinks } = await import('@/features/media/cdnStorage');
-      await purgeAllExpiredTrash();
-      await selfDestructSweep();
-      await purgeExpiredShareLinks();
     }],
   ];
 

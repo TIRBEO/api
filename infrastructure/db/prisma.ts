@@ -22,8 +22,7 @@ const POOL_CONFIG = {
   idleTimeoutMillis: process.env.NODE_ENV === 'production' ? 30_000 : 45_000,
   // Allow idle clients to be reaped faster in development
   // where instances are short-lived.
-  connectionTimeoutMillis: 15_000,
-};
+  connectionTimeoutMillis: 15_000 };
 
 // ─── Pool Creation ───
 function createPool(): Pool {
@@ -61,8 +60,7 @@ function createPool(): Pool {
     // (EAI_AGAIN / ETIMEDOUT) queries never reach the server, so a server-side
     // statement_timeout can't help — this client-side timer fails them fast
     // instead of letting requests hang for 10+ minutes.
-    query_timeout: 15_000,
-  });
+    query_timeout: 15_000 });
 
   // Surface pool errors so they don't go silent — throttled so routine idle
   // resets from the pooler don't flood the logs.
@@ -100,16 +98,16 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
   if (now - lastWarmupTime < MIN_WARMUP_INTERVAL && !isColdStart) return;
   isWarming = true;
   lastWarmupTime = now;
-  
+
   const start = performance.now();
   const maxRetries = isColdStart ? 8 : 5; // more retries for cold starts
-  
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       // Force the pool to create `min` clients by checking out and releasing them
       const warmupPromises: Promise<void>[] = [];
       const connectionsToCreate = isColdStart ? 2 : (POOL_CONFIG.min || 2); // start small on cold start
-      
+
       for (let i = 0; i < connectionsToCreate; i++) {
         warmupPromises.push(
           pool.connect().then((client) => {
@@ -121,7 +119,7 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
         );
       }
       await Promise.all(warmupPromises);
-      
+
       // On cold start, after initial connections succeed, warm up the rest
       if (isColdStart && connectionsToCreate < (POOL_CONFIG.min || 2)) {
         const remaining = (POOL_CONFIG.min || 2) - connectionsToCreate;
@@ -133,7 +131,7 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
           } catch { break; }
         }
       }
-      
+
       recordActivity();
       const elapsed = (performance.now() - start).toFixed(0);
       console.log(`[DB-POOL] Warmed up ${POOL_CONFIG.min} connections in ${elapsed}ms (attempt ${attempt}${isColdStart ? ', cold start' : ''})`);
@@ -159,13 +157,13 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
 export async function reWarmAfterColdStart(): Promise<void> {
   if (isRewarming) return; // prevent concurrent re-warm attempts
   isRewarming = true;
-  
+
   try {
     const pool = globalForPrisma.pgPool;
     if (!pool) return;
-    
+
     console.log(`[DB-POOL] Re-warming pool after cold start (avg wake time: ${coldStartState.coldStartWakeTimeMs}ms)...`);
-    
+
     // Re-warm with cold-start awareness
     await warmPool(pool, true);
   } finally {
@@ -178,8 +176,7 @@ function createPrismaClient(pool: Pool): PrismaClient {
   const adapter = new PrismaPg(pool);
   return new PrismaClient({
     adapter,
-    log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
-  });
+    log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'] });
 }
 
 // ─── Singleton Initialization ───
@@ -254,8 +251,7 @@ if (!g7.__tirbeoColdStartState) {
     lastActivity: Date.now(),
     lastColdStartDetected: 0,
     coldStartCount: 0,
-    coldStartWakeTimeMs: 0,
-  };
+    coldStartWakeTimeMs: 0 };
 }
 const coldStartState: ColdStartState = g7.__tirbeoColdStartState;
 
@@ -299,7 +295,7 @@ function recordColdStart() {
 function recordActivity() {
   if (coldStartState.isColdStart && coldStartState.lastColdStartDetected > 0) {
     const wakeTime = Date.now() - coldStartState.lastColdStartDetected;
-    coldStartState.coldStartWakeTimeMs = 
+    coldStartState.coldStartWakeTimeMs =
       coldStartState.coldStartWakeTimeMs === 0 ? wakeTime :
       Math.round((coldStartState.coldStartWakeTimeMs + wakeTime) / 2);
     console.log(`[DB-COLD] Database warmed up in ${wakeTime}ms (avg: ${coldStartState.coldStartWakeTimeMs}ms)`);
@@ -322,8 +318,7 @@ export async function withRetry<T>(
   baseDelay = 500
 ): Promise<T> {
   let lastError: any;
-  const startTime = performance.now();
-  
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const result = await fn();
@@ -331,7 +326,7 @@ export async function withRetry<T>(
       return result;
     } catch (err: any) {
       lastError = err;
-      
+
       const isColdStart = isColdStartError(err);
       const isRetryable = isColdStart ||
         err?.message?.includes('timeout') ||
@@ -344,11 +339,11 @@ export async function withRetry<T>(
         err?.code === '08003' || // connection_does_not_exist
         err?.code === '08004' || // sqlserver_rejected_establishment
         err?.code === '53300';    // too_many_connections
-      
+
       if (isColdStart) {
         recordColdStart();
       }
-      
+
       if (isRetryable && attempt < maxRetries) {
         // Exponential backoff with jitter to avoid thundering herd
         // Cold starts use longer delays (DB needs time to wake)
@@ -356,7 +351,7 @@ export async function withRetry<T>(
         const baseCalc = baseDelay * Math.pow(2, attempt) * delayMultiplier;
         const jitter = Math.random() * baseCalc * 0.3; // 0-30% jitter
         const delay = Math.min(baseCalc + jitter, isColdStart ? 15000 : 5000);
-        
+
         console.warn(`[DB-RETRY] Query failed (attempt ${attempt + 1}/${maxRetries + 1}), ` +
           `retrying in ${Math.round(delay)}ms... ${isColdStart ? '(cold start)' : ''}`);
         await new Promise(r => setTimeout(r, delay));
@@ -377,17 +372,17 @@ const CONNECTION_REFRESH_INTERVAL = 4 * 60 * 1000; // refresh every 4 min (befor
 async function refreshIdleConnections() {
   const pool = globalForPrisma.pgPool;
   if (!pool) return;
-  
+
   const now = Date.now();
   const gRefresh = globalThis as any;
   if (now - (gRefresh.__tirbeoLastRefreshTime || 0) < CONNECTION_REFRESH_INTERVAL) return;
   gRefresh.__tirbeoLastRefreshTime = now;
-  
+
   try {
     // Rotate out old idle connections by running a lightweight query on each idle client
     const idleCount = pool.idleCount;
     if (idleCount <= 0) return;
-    
+
     const refreshPromises: Promise<void>[] = [];
     for (let i = 0; i < Math.min(idleCount, 3); i++) { // refresh max 3 at a time
       refreshPromises.push(
@@ -423,8 +418,7 @@ const poolAlertState: PoolAlertState = {
   lastAlertAt: null,
   alertCount: 0,
   lastWarningAt: null,
-  lastCriticalAt: null,
-};
+  lastCriticalAt: null };
 
 const POOL_WARN_MS = 10_000;   // warn after 10s of waiting
 const POOL_CRIT_MS = 30_000;   // critical after 30s of waiting
@@ -493,8 +487,7 @@ export function getPoolAlertState() {
     ...poolAlertState,
     waitingDurationMs: poolAlertState.waitingSince ? Date.now() - poolAlertState.waitingSince : 0,
     isExhausted: poolAlertState.waitingSince !== null,
-    thresholds: { warnMs: POOL_WARN_MS, critMs: POOL_CRIT_MS },
-  };
+    thresholds: { warnMs: POOL_WARN_MS, critMs: POOL_CRIT_MS } };
 }
 
 // ─── Health Check ───
@@ -516,24 +509,21 @@ export async function checkDatabaseConnection(): Promise<{
       poolStats: {
         idle: pool.idleCount,
         waiting: pool.waitingCount,
-        total: pool.totalCount,
-      },
-    };
+        total: pool.totalCount } };
   } catch (err: any) {
     const latencyMs = performance.now() - start;
-    
+
     // Detect cold start and trigger reconnection
     if (isColdStartError(err) && isIdleLongEnough()) {
       recordColdStart();
       reWarmAfterColdStart().catch(() => {});
     }
-    
+
     return {
       ok: false,
       latencyMs: Math.round(latencyMs),
       poolStats: { idle: 0, waiting: 0, total: 0 },
-      isColdStart: isColdStartError(err),
-    };
+      isColdStart: isColdStartError(err) };
   }
 }
 
@@ -544,8 +534,7 @@ export function getPoolStatus() {
   return {
     totalCount: pool.totalCount,
     idleCount: pool.idleCount,
-    waitingCount: pool.waitingCount,
-  };
+    waitingCount: pool.waitingCount };
 }
 
 // ─── Detailed Pool Metrics (for /api/health/pool) ───
@@ -566,8 +555,7 @@ export function getDetailedPoolStatus() {
       max: pool.options.max,
       min: pool.options.min,
       idleTimeoutMillis: pool.options.idleTimeoutMillis,
-      connectionTimeoutMillis: pool.options.connectionTimeoutMillis,
-    },
+      connectionTimeoutMillis: pool.options.connectionTimeoutMillis },
 
     // Utilization metrics
     utilization: {
@@ -577,8 +565,7 @@ export function getDetailedPoolStatus() {
         : 0,
       saturationPercent: pool.options.max && pool.options.max > 0
         ? Math.round((pool.waitingCount / pool.options.max) * 100)
-        : 0,
-    },
+        : 0 },
 
     // Health indicators
     health: {
@@ -586,8 +573,7 @@ export function getDetailedPoolStatus() {
       isNearMaxCapacity: pool.options.max ? pool.totalCount >= pool.options.max * 0.8 : false,
       idleRatio: pool.totalCount > 0
         ? Math.round((pool.idleCount / pool.totalCount) * 100)
-        : 100,
-    },
+        : 100 },
 
   // Cold start state
   coldStart: {
@@ -597,8 +583,7 @@ export function getDetailedPoolStatus() {
     lastColdStartAt: coldStartState.lastColdStartDetected
       ? new Date(coldStartState.lastColdStartDetected).toISOString()
       : null,
-    idleThresholdMs: COLD_START_IDLE_THRESHOLD_MS,
-  },
+    idleThresholdMs: COLD_START_IDLE_THRESHOLD_MS },
 
   // Uptime
   uptimeMs: Date.now() - poolCreated_at,
@@ -608,9 +593,7 @@ export function getDetailedPoolStatus() {
     memory: {
       heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       heapTotalMB: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    },
-  };
+      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024) } };
 }
 
 function formatUptime(ms: number): string {
@@ -696,8 +679,7 @@ if (!g6.__tirbeoDbHealthCache) {
     ok: true,
     lastCheck: 0,
     consecutiveFailures: 0,
-    lastError: '',
-  };
+    lastError: '' };
 }
 const dbHealthCache: DbHealthCache = g6.__tirbeoDbHealthCache;
 
@@ -706,7 +688,7 @@ const DB_HEALTH_FAIL_THRESHOLD = 5; // consider DB down after 5 consecutive fail
 
 /**
  * Fast cached DB health check — returns immediately if recently checked.
- * 
+ *
  * Design notes:
  *  - Uses a direct pg pool query (bypasses Prisma) for the health check to
  *    avoid occupying a Prisma adapter slot during the probe.
@@ -743,13 +725,13 @@ export async function isDbHealthy(): Promise<boolean> {
     dbHealthCache.consecutiveFailures++;
     dbHealthCache.lastError = err?.message || 'Unknown DB error';
     dbHealthCache.lastCheck = now;
-    
+
     // Detect cold start scenario
     if (isColdStartError(err) && isIdleLongEnough()) {
       recordColdStart();
       reWarmAfterColdStart().catch(() => {});
     }
-    
+
     // Only mark DB as down after consecutive failures to avoid false positives
     if (dbHealthCache.consecutiveFailures >= DB_HEALTH_FAIL_THRESHOLD) {
       dbHealthCache.ok = false;
@@ -781,15 +763,12 @@ export function dbErrorResponse(error?: string) {
       error: 'Service temporarily unavailable',
       message: error || 'Database connection is currently unavailable. Please try again later.',
       code: 'DATABASE_UNAVAILABLE',
-      retryAfter: 30,
-    }),
+      retryAfter: 30 }),
     {
       status: 503,
       headers: {
         'Content-Type': 'application/json',
         'Retry-After': '30',
-        'Cache-Control': 'no-store',
-      },
-    }
+        'Cache-Control': 'no-store' } }
   );
 }

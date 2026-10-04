@@ -27,8 +27,7 @@ if (!g4.__tirbeoRateLimitMetrics) {
     hitsByRoute: new Map(),
     recentBlocks: [],
     recentBypasses: [],
-    windowStart: Date.now(),
-  };
+    windowStart: Date.now() };
 }
 const metrics: RateLimitMetrics = g4.__tirbeoRateLimitMetrics;
 
@@ -38,7 +37,7 @@ const METRICS_WINDOW_MS = 60 * 60 * 1000; // 1 hour window
 
 function recordMetrics(ip: string, route: string, blocked: boolean): void {
   metrics.totalHits++;
-  
+
   // Reset metrics if window expired
   if (Date.now() - metrics.windowStart > METRICS_WINDOW_MS) {
     metrics.totalHits = 0;
@@ -48,21 +47,21 @@ function recordMetrics(ip: string, route: string, blocked: boolean): void {
     metrics.recentBlocks = [];
     metrics.windowStart = Date.now();
   }
-  
+
   // Track by IP
   const ipEntry = metrics.hitsByIp.get(ip) || { count: 0, blocked: 0, lastSeen: 0 };
   ipEntry.count++;
   if (blocked) ipEntry.blocked++;
   ipEntry.lastSeen = Date.now();
   metrics.hitsByIp.set(ip, ipEntry);
-  
+
   // Track by route
   const routeKey = route.split('?')[0]; // Remove query params
   const routeEntry = metrics.hitsByRoute.get(routeKey) || { count: 0, blocked: 0 };
   routeEntry.count++;
   if (blocked) routeEntry.blocked++;
   metrics.hitsByRoute.set(routeKey, routeEntry);
-  
+
   // Record blocked events
   if (blocked) {
     metrics.totalBlocked++;
@@ -75,7 +74,7 @@ function recordMetrics(ip: string, route: string, blocked: boolean): void {
 
 export function recordBypass(ip: string, route: string, userId: string): void {
   metrics.totalBypassed++;
-  
+
   // Reset metrics if window expired
   if (Date.now() - metrics.windowStart > METRICS_WINDOW_MS) {
     metrics.totalHits = 0;
@@ -87,7 +86,7 @@ export function recordBypass(ip: string, route: string, userId: string): void {
     metrics.recentBypasses = [];
     metrics.windowStart = Date.now();
   }
-  
+
   metrics.recentBypasses.unshift({ ip, route: route.split('?')[0], userId, timestamp: Date.now() });
   if (metrics.recentBypasses.length > MAX_RECENT_BYPASSES) {
     metrics.recentBypasses.pop();
@@ -100,18 +99,18 @@ export function getRateLimitMetrics() {
     .map(([ip, data]) => ({ ip, ...data }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 50);
-  
+
   const topRoutes = Array.from(metrics.hitsByRoute.entries())
     .map(([route, data]) => ({ route, ...data }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 50);
-  
+
   return {
     totalHits: metrics.totalHits,
     totalBlocked: metrics.totalBlocked,
     totalBypassed: metrics.totalBypassed,
-    blockRate: metrics.totalHits > 0 
-      ? Math.round((metrics.totalBlocked / metrics.totalHits) * 100) 
+    blockRate: metrics.totalHits > 0
+      ? Math.round((metrics.totalBlocked / metrics.totalHits) * 100)
       : 0,
     bypassRate: metrics.totalHits > 0
       ? Math.round((metrics.totalBypassed / metrics.totalHits) * 100)
@@ -121,8 +120,7 @@ export function getRateLimitMetrics() {
     recentBlocks: metrics.recentBlocks.slice(0, 20),
     recentBypasses: metrics.recentBypasses.slice(0, 20),
     windowStart: metrics.windowStart,
-    windowDuration: METRICS_WINDOW_MS,
-  };
+    windowDuration: METRICS_WINDOW_MS };
 }
 
 interface RateLimitConfig {
@@ -138,8 +136,7 @@ const DEFAULT_ADMIN_ROLE_MULTIPLIERS: Record<string, number> = {
   'editor': 5,
   'manager': 10,
   'admin': 15,
-  'super_admin': 20,
-};
+  'super_admin': 20 };
 
 let cachedConfig: RateLimitConfig | null = null;
 let cachedConfigAt = 0;
@@ -151,8 +148,8 @@ const DEFAULT_ALERT_CONFIG = {
   blockRateAlertCooldown: 15,   // 15 minutes between alerts
 };
 
-const lastAlertTime = 0;
-const alertTriggered = false;
+
+
 
 async function getRateLimitConfig(): Promise<RateLimitConfig> {
   if (cachedConfig && Date.now() - cachedConfigAt < CONFIG_TTL) return cachedConfig;
@@ -160,8 +157,7 @@ async function getRateLimitConfig(): Promise<RateLimitConfig> {
     rateLimitEnabled: true,
     rateLimitPerMinute: MAX_REQUESTS,
     adminRoleMultipliers: DEFAULT_ADMIN_ROLE_MULTIPLIERS,
-    ...DEFAULT_ALERT_CONFIG,
-  };
+    ...DEFAULT_ALERT_CONFIG };
   cachedConfig = config;
   cachedConfigAt = Date.now();
   return config;
@@ -191,8 +187,7 @@ if (!g5.__tirbeoRateLimitAlerts) {
   g5.__tirbeoRateLimitAlerts = {
     recentAlerts: [],
     lastAlertTime: 0,
-    alertTriggered: false,
-  };
+    alertTriggered: false };
 }
 const alertState = g5.__tirbeoRateLimitAlerts as {
   recentAlerts: BlockRateAlert[];
@@ -205,14 +200,14 @@ const MAX_RECENT_ALERTS = 50;
 async function checkBlockRateAlert(): Promise<void> {
   const config = await getRateLimitConfig();
   if (!config.blockRateAlertEnabled) return;
-  
-  const currentBlockRate = metrics.totalHits > 0 
-    ? Math.round((metrics.totalBlocked / metrics.totalHits) * 100) 
+
+  const currentBlockRate = metrics.totalHits > 0
+    ? Math.round((metrics.totalBlocked / metrics.totalHits) * 100)
     : 0;
-  
+
   const now = Date.now();
   const cooldownMs = config.blockRateAlertCooldown * 60 * 1000;
-  
+
   // Check if block rate exceeds threshold
   if (currentBlockRate >= config.blockRateAlertThreshold) {
     // Check cooldown
@@ -224,19 +219,18 @@ async function checkBlockRateAlert(): Promise<void> {
         threshold: config.blockRateAlertThreshold,
         totalHits: metrics.totalHits,
         totalBlocked: metrics.totalBlocked,
-        message: `Block rate ${currentBlockRate}% exceeds threshold ${config.blockRateAlertThreshold}%`,
-      };
-      
+        message: `Block rate ${currentBlockRate}% exceeds threshold ${config.blockRateAlertThreshold}%` };
+
       alertState.recentAlerts.unshift(alert);
       if (alertState.recentAlerts.length > MAX_RECENT_ALERTS) {
         alertState.recentAlerts.pop();
       }
       alertState.lastAlertTime = now;
       alertState.alertTriggered = true;
-      
+
       // Send notification
       await sendBlockRateAlert(alert);
-      
+
       console.log(`[RATE-LIMIT-ALERT] ${alert.message}`);
     }
   } else {
@@ -252,17 +246,22 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
     // Send email notification to admins
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { prisma } = await import('@/infrastructure/db/prisma');
-    
-    // Get admin emails
+
+    // Get admin emails (consolidated schema: isAdmin flag; emails live in
+    // user_email, names in user_profile)
     const admins = await prisma.user.findMany({
-      where: { adminRole: { not: null } },
-      select: { email: true, name: true },
-      take: 10,
-    });
-    
+      where: { isAdmin: true },
+      select: {
+        id: true,
+        profile: { select: { name: true } },
+        emails: { where: { isDefault: true }, select: { address: true } } },
+      take: 10 });
+
     for (const admin of admins) {
-      await sendTemplateEmail(admin.email, 'admin_alert', {
-        name: admin.name || 'Admin',
+      const adminEmail = admin.emails[0]?.address;
+      if (!adminEmail) continue;
+      await sendTemplateEmail(adminEmail, 'admin_alert', {
+        name: admin.profile?.name || 'Admin',
         subject: 'Rate Limit Alert: High Block Rate Detected',
         message: alert.message,
         details: `<div style="padding:16px;border:2px solid #17150f;border-radius:0;box-shadow:3px 3px 0 0 #17150f;">
@@ -272,8 +271,7 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
           <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Total Blocked:</strong> ${alert.totalBlocked}</p>
           <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Time:</strong> ${new Date(alert.timestamp).toLocaleString()}</p>
         </div>`,
-        dashboardUrl: process.env.NEXT_PUBLIC_ADMIN_URL || (await import('@/config/app-urls')).getAdminBaseUrl(),
-      }, { rawVars: ['details'] }).catch(() => {});
+        dashboardUrl: process.env.NEXT_PUBLIC_ADMIN_URL || (await import('@/config/app-urls')).getAdminBaseUrl() }, { rawVars: ['details'] }).catch(() => {});
     }
   } catch (err) {
     console.error('[RATE-LIMIT-ALERT] Failed to send alert email:', err);
@@ -284,8 +282,7 @@ export function getBlockRateAlerts() {
   return {
     recentAlerts: alertState.recentAlerts.slice(0, 20),
     lastAlertTime: alertState.lastAlertTime,
-    alertTriggered: alertState.alertTriggered,
-  };
+    alertTriggered: alertState.alertTriggered };
 }
 
 // Start periodic alert checking (every 30 seconds, skip on Vercel)
@@ -311,7 +308,6 @@ const ROUTE_LIMITS: Record<string, number> = {
   'auth/email-exists': 20,
   'auth/username-exists': 20,
   'auth/email-otp/request': 5,
-  'auth/phone-otp/request': 5,
   'auth/magic-link/request': 5,
   'auth/password-reset/request': 5,
   'auth/signup-otp/request': 5,
@@ -327,9 +323,14 @@ const ROUTE_LIMITS: Record<string, number> = {
   'auth/switch-account': 30,
   'auth/accounts/remove': 30,
   'forms/public/[publicId]/submit': 10,
+  /* The profile service calls this on behalf of every account it serves, and it
+     all arrives from one server address. This bucket is meant to stop one client
+     hammering the API; applied to a service that fans out for many users it
+     throttles the service rather than its abusers — and the endpoint already
+     proves the caller with a shared token, which is the actual control here. */
+  'internal/profile': 600,
   'feedback': 5,
-  'waitlist': 5,
-};
+  'waitlist': 5 };
 
 import { getCachedRedisClient } from '@/infrastructure/db/redis';
 let redis: any = null; // Redis or false or null
@@ -389,34 +390,34 @@ export async function checkRateLimitWithInfo(
   adminRole?: string
 ): Promise<RateLimitResult> {
   const resetSeconds = Math.ceil((WINDOW_MS - (Date.now() % WINDOW_MS)) / 1000);
-  
+
   // Always allow in development (no config needed)
   if (!ENABLE_RATE_LIMITING) {
     const devLimit = isAuth ? AUTH_MAX : MAX_REQUESTS;
     return { allowed: true, limit: devLimit, remaining: devLimit, reset: resetSeconds };
   }
-  
+
   const config = await getRateLimitConfig();
   const configuredMax = config.rateLimitPerMinute;
   const defaultMax = isAuth ? AUTH_MAX : MAX_REQUESTS;
-  
+
   // Get role-specific multiplier
   const multiplier = isAdmin && adminRole
     ? (config.adminRoleMultipliers[adminRole] ?? 10)
     : (isAdmin ? 10 : 1);
-  
+
   // Admins get higher limits based on their role
   const baseMax = isAdmin ? defaultMax * multiplier : defaultMax;
   const max = Math.min(routeLimit ?? baseMax, isAdmin ? configuredMax * multiplier : configuredMax);
-  
+
   if (!config.rateLimitEnabled) return { allowed: true, limit: max, remaining: max, reset: resetSeconds };
-  
+
   // Log bypass if admin would have been rate limited with normal limits
   if (isAdmin) {
     const normalMax = Math.min(routeLimit ?? defaultMax, configuredMax);
     const r2 = await getRedis();
     let currentCount = 0;
-    
+
     if (r2) {
       try {
         const window = Math.floor(Date.now() / WINDOW_MS);
@@ -430,7 +431,7 @@ export async function checkRateLimitWithInfo(
         currentCount = entry.count;
       }
     }
-    
+
     // If normal user would have been blocked, log the bypass
     if (currentCount > normalMax && currentCount <= max) {
       recordBypass(ipFromKey(key), key, userId || 'unknown');
@@ -477,7 +478,7 @@ export async function checkRateLimitWithInfo(
     recordMetrics(ipFromKey(key), key, true);
     return { allowed: false, limit: max, remaining: 0, reset: resetSeconds };
   }
-  
+
   // Record successful hit
   recordMetrics(ipFromKey(key), key, false);
   return { allowed: true, limit: max, remaining: Math.max(0, max - entry.count), reset: resetSeconds };

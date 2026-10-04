@@ -1,52 +1,38 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/features/auth/http-guards';
 import { prisma } from '@/infrastructure/db/prisma';
-import { checkRateLimit, DEFAULT_PREFS } from '@/features/notifications/notifications';
+import { checkRateLimit, loadNotificationPrefs, saveNotificationPrefs } from '@/features/notifications/notifications';
 
 export const runtime = 'nodejs';
 
-// Preferences live directly on users.notification_preferences (jsonb).
-// Security is compulsory — no toggle for it.
+// What a settings screen is allowed to decide. Security is not on this list:
+// nobody can opt out of being told their own account was breached.
 const ALLOWED_FIELDS = [
   // Global channels
   'email', 'push',
-  // Category toggles (forms, product, support only — security is compulsory)
+  // Category toggles (forms, product, support)
   'forms', 'product', 'support',
   // Per-category x channel matrix
   'formsEmail', 'formsPush',
   'productEmail', 'productPush',
   'supportEmail', 'supportPush',
-  // Digest
-  'digestEnabled', 'digestFrequency',
-  // Weekly activity summary (separate opt-in email, its own cadence)
-  'weeklySummary', 'weeklySummaryFrequency',
+  'offers', 'offersEmail', 'offersPush',
+  'tips', 'tipsEmail', 'tipsPush',
+  // Periodic account recap: whether it comes at all, and how often
+  'summaryEnabled', 'summaryFrequency',
+  // Pause everything at once — codes and security alerts still get through.
+  // `emailPausedUntil` is the epoch ms it lapses at, or null for "until I say
+  // so", so an expired date reads as unpaused without anyone running a job.
+  'emailPaused', 'emailPausedUntil',
 ] as const;
 
-const DIGEST_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);
-
-function readPrefs(raw: unknown): Record<string, any> {
-  return raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...DEFAULT_PREFS, ...(raw as object) } : { ...DEFAULT_PREFS };
-}
-
-async function loadPrefs(userId: string): Promise<Record<string, any>> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { notificationPreferences: true },
-  });
-  return readPrefs((user as any)?.notificationPreferences);
-}
-
-async function savePrefs(userId: string, prefs: Record<string, any>) {
-  await prisma.$executeRaw`
-    UPDATE "users" SET "notification_preferences" = ${JSON.stringify(prefs)}::jsonb
-    WHERE "id" = ${userId}`;
-}
+const SUMMARY_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);
 
 export async function GET(request: NextRequest) {
   try {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
-    return NextResponse.json(await loadPrefs(session.userId));
+    return NextResponse.json(await loadNotificationPrefs(session.userId));
   } catch (err: any) {
     console.error('[NOTIFICATIONS] Get prefs error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch preferences' }, { status: 500 });
@@ -74,25 +60,32 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 });
     }
 
-    if (data.digestFrequency !== undefined && !DIGEST_FREQUENCIES.has(data.digestFrequency)) {
-      return NextResponse.json({ error: 'Invalid digestFrequency' }, { status: 400 });
+    if (data.summaryFrequency !== undefined && !SUMMARY_FREQUENCIES.has(data.summaryFrequency)) {
+      return NextResponse.json({ error: 'Invalid summaryFrequency' }, { status: 400 });
     }
-    if (data.weeklySummaryFrequency !== undefined && !DIGEST_FREQUENCIES.has(data.weeklySummaryFrequency)) {
-      return NextResponse.json({ error: 'Invalid weeklySummaryFrequency' }, { status: 400 });
+    // A pause that says nothing about when it ends is a real number or nothing
+    // at all; anything else would be read as "unpaused" by isEmailPaused and the
+    // person would keep getting mail while the screen shows the switch on.
+    if (data.emailPausedUntil !== undefined
+        && data.emailPausedUntil !== null
+        && !(typeof data.emailPausedUntil === 'number' && Number.isFinite(data.emailPausedUntil))) {
+      return NextResponse.json({ error: 'Invalid emailPausedUntil' }, { status: 400 });
     }
 
-    const prefs = await loadPrefs(session.userId);
-    Object.assign(prefs, data);
-    await savePrefs(session.userId, prefs);
-
-    // If the user re-enabled email globally, clear the emailUnsub flags
-    // AND re-enable all category email toggles that were disabled by the global unsubscribe.
+    // Re-enabling mail globally means the person wants it back, so the category
+    // emails that the global switch turned off come back too — unless this same
+    // request said otherwise. This has to happen before the write: it used to run
+    // after, so the reply promised the toggles were back while the account still
+    // had them off.
     if (data.email === true) {
-      // Re-enable category email toggles (formsEmail, productEmail, supportEmail)
-      // so the user gets all emails back after re-subscribing.
       if (data.formsEmail === undefined) data.formsEmail = true;
       if (data.productEmail === undefined) data.productEmail = true;
       if (data.supportEmail === undefined) data.supportEmail = true;
+    }
+
+    const prefs = await saveNotificationPrefs(session.userId, data);
+
+    if (data.email === true) {
       try {
         const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { emailUnsubscribed: true } });
         const eu: any = (user as any)?.emailUnsubscribed || {};
@@ -102,7 +95,7 @@ export async function PUT(request: NextRequest) {
           eu.forms = false;
           eu.support = false;
           await prisma.$executeRaw`
-            UPDATE "users" SET "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb
+            UPDATE "user"."users" SET "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb
             WHERE "id" = ${session.userId}`;
           console.log(`[NOTIFICATIONS] Cleared emailUnsub flags for user ${session.userId} (email re-enabled)`);
         }

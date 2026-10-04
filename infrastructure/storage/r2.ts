@@ -109,7 +109,14 @@ export async function putObject(params: PutObjectParams): Promise<void> {
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`R2 upload failed (${res.status}): ${err}`);
+    // Sanitize S3 error response — don't leak RequestId, HostId, etc.
+    const sanitized = err
+      .replace(/<RequestId>[^<]+<\/RequestId>/gi, '')
+      .replace(/<HostId>[^<]+<\/HostId>/gi, '')
+      .replace(/RequestId:\s*[^\s]+/gi, '')
+      .replace(/HostId:\s*[^\s]+/gi, '')
+      .trim();
+    throw new Error(`R2 upload failed (${res.status}): ${sanitized || 'storage error'}`);
   }
 }
 

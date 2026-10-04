@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllCacheStats, resetAllCacheStats } from '@/infrastructure/cache';
-import { getPoolStatus, getDetailedPoolStatus } from '@/infrastructure/db/prisma';
+import { getDetailedPoolStatus } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { getQueryPerformanceStats, resetQueryStats, updateAlertConfig, getAlertConfig } from '@/infrastructure/observability/queryMonitor';
 
@@ -14,7 +14,7 @@ function isAdmin(user: any): boolean {
  * role required in production; in development any session (or none) is kept
  * for local debugging convenience.
  */
-async function requireDebugAccess(req: NextRequest): Promise<NextResponse | null> {
+export async function requireDebugAccess(req: NextRequest): Promise<NextResponse | null> {
   const session = await getSession(req).catch(() => null);
   if (process.env.NODE_ENV === 'development') return null;
   if (!session?.userId || !isAdmin(session)) {
@@ -50,8 +50,7 @@ export async function cacheDebugHandler(req: NextRequest) {
       totalMaxSize,
       totalHits,
       totalMisses,
-      overallHitRate: totalRequests > 0 ? Math.round((totalHits / totalRequests) * 100) : 0,
-    },
+      overallHitRate: totalRequests > 0 ? Math.round((totalHits / totalRequests) * 100) : 0 },
     caches: cacheStats.map(c => ({
       name: c.name,
       size: c.size,
@@ -61,21 +60,17 @@ export async function cacheDebugHandler(req: NextRequest) {
       hits: c.hits,
       misses: c.misses,
       hitRate: c.hitRate,
-      utilization: c.maxSize > 0 ? Math.round((c.size / c.maxSize) * 100) : 0,
-    })),
+      utilization: c.maxSize > 0 ? Math.round((c.size / c.maxSize) * 100) : 0 })),
     pool: poolStatus ? {
       totalCount: poolStatus.totalCount,
       idleCount: poolStatus.idleCount,
       waitingCount: poolStatus.waitingCount,
-      utilizationPercent: poolStatus.utilization.utilizationPercent,
-    } : null,
+      utilizationPercent: poolStatus.utilization.utilizationPercent } : null,
     uptime: Math.floor(process.uptime()),
     memory: {
       heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
       heapTotalMB: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    },
-  });
+      rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024) } });
 }
 
 /**

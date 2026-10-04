@@ -13,7 +13,7 @@ export async function GET(request: NextRequest) {
 
     let sessionTableExists = false;
     try {
-      await prisma.session.count();
+      await prisma.userSession.count();
       sessionTableExists = true;
     } catch {
       sessionTableExists = false;

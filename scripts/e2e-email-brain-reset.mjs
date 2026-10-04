@@ -88,7 +88,7 @@ async function main() {
     // Legit alternate outcome: secure store failed closed → inline fallback path,
     // or the API fell back to legacy send. Detect and report honestly.
     const logs = await pool.query(
-      `SELECT id FROM email_logs WHERE to_email = $1 AND template = 'password_reset_otp' AND created_at > NOW() - INTERVAL '2 minutes'`,
+      `SELECT id FROM email_deliveries WHERE to_email = $1 AND event_key = 'legacy.password_reset_otp' AND created_at > NOW() - INTERVAL '2 minutes'`,
       [EMAIL],
     );
     if (logs.rows.length > 0) {
@@ -177,7 +177,7 @@ async function main() {
   // ── 6. Cleanup ──
   step('Cleanup');
   await pool.query(`DELETE FROM email_jobs WHERE to_email = $1`, [EMAIL]);
-  await pool.query(`DELETE FROM email_logs WHERE to_email = $1`, [EMAIL]);
+  await pool.query(`DELETE FROM email_deliveries WHERE to_email = $1`, [EMAIL]);
   await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
   ok('test rows removed');
 }

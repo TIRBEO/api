@@ -8,7 +8,7 @@
 // The client may be connected to any of the 5 regional Channels apps, so the
 // request carries the app name and we sign with that app's credentials.
 //
-// CORS: the accounts frontend (accounts.tirbeo.app / localhost:3002) calls
+// CORS: the accounts frontend (accounts.tirbeo.com / localhost:3002) calls
 // this cross-origin with `credentials: 'include'`, so the same-origin allow
 // list from lib/response.ts is applied here (including the OPTIONS preflight
 // pusher-js issues for its XHR auth transport).
@@ -25,7 +25,7 @@ function corsHeaders(request: NextRequest): Record<string, string> {
   if (!origin) return {};
   try {
     const u = new URL(origin);
-    if (ALLOWED_ORIGINS.includes(u.hostname) || u.hostname.endsWith('.tirbeo.app')) {
+    if (ALLOWED_ORIGINS.includes(u.hostname) || u.hostname.endsWith('.tirbeo.com')) {
       return {
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'POST, OPTIONS',

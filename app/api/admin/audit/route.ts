@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { withAdmin } from '@/features/auth/role-guard';
 import { listAuditEvents, createAuditEvent } from '@/features/security/audit';
 
@@ -13,8 +13,7 @@ export const GET = withAdmin(async (request, session) => {
     targetType: sp.get('targetType') || undefined,
     severity: sp.get('severity') || undefined,
     from: sp.get('from') || undefined,
-    to: sp.get('to') || undefined,
-  });
+    to: sp.get('to') || undefined });
   return NextResponse.json(result);
 });
 
@@ -27,7 +26,6 @@ export const POST = withAdmin(async (request, session) => {
     targetType: body.targetType,
     targetId: body.targetId,
     metadata: body.metadata,
-    severity: body.severity,
-  });
+    severity: body.severity });
   return NextResponse.json({ ok: true });
 });

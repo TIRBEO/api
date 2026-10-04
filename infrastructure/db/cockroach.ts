@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import type { QueryResult } from 'pg';
 import { randomUUID } from 'node:crypto';
 
 /**
@@ -150,16 +151,20 @@ async function backfillLegacyFolderPaths(pool: Pool): Promise<void> {
       const parts = String(row.filename).split('/').map((s: string) => s.trim()).filter(Boolean);
       if (parts.length < 2) continue;
       const name = parts.pop() as string;
+      // Annotated explicitly: `parent` feeds the next query's parameter list, so
+      // leaving it to inference makes found/created circularly dependent on it.
       let parent: string | null = null;
       for (const segment of parts) {
-        const found = await pool.query(
+        // Result type pinned explicitly: pg infers it from the params array,
+        // which itself contains `parent` — inferring both ways is circular.
+        const found: QueryResult<{ id: string }> = await pool.query(
           `SELECT id FROM cdn_files WHERE folder = true AND deleted = false AND filename = $1 AND ${parent ? 'parent_id = $2' : '(parent_id IS NULL)'} LIMIT 1`,
           parent ? [segment, parent] : [segment],
         );
         if (found.rows.length > 0) {
           parent = found.rows[0].id;
         } else {
-          const created = await pool.query(
+          const created: QueryResult<{ id: string }> = await pool.query(
             `INSERT INTO cdn_files (user_id, filename, s3_key, mime_type, size, content, folder, parent_id)
              VALUES ($1, $2, $3, 'application/x-tirbeo-folder', 0, $4, true, $5) RETURNING id`,
             [row.user_id ?? 'system', segment, `folder-${randomUUID()}`, Buffer.alloc(0), parent],

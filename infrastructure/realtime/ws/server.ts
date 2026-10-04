@@ -3,6 +3,22 @@ import type { IncomingMessage } from 'http';
 import { getSessionFromToken } from '@/features/auth/session';
 import { publishToRealtime } from '@/infrastructure/realtime/rt-publish';
 
+/**
+ * The WS server binds 0.0.0.0 directly, so `X-Forwarded-For` is client-
+ * controllable from a raw socket and MUST NOT drive rate limiting/blocking.
+ * Prefer the socket peer address; only fall back to headers when the socket
+ * address is unavailable (never trusts spoofable headers for limits).
+ */
+function deriveClientIp(req: IncomingMessage): string {
+  const peer = req.socket?.remoteAddress;
+  if (peer) {
+    // Normalize IPv4-mapped IPv6 (`::ffff:1.2.3.4` → `1.2.3.4`).
+    const norm = peer.replace(/^::ffff:/, '');
+    if (norm && norm !== 'unknown') return norm;
+  }
+  return 'unknown';
+}
+
 interface WsClient {
   ws: WebSocket;
   userId: string;
@@ -26,6 +42,17 @@ const lastSeenTimes: Map<string, number> = g.__tirbeoLastSeen;
 const channelSubs: Map<string, Set<string>> = g.__tirbeoWsChannelSubs;
 
 let wss: WebSocketServer | null = null;
+
+/**
+ * Non-browser clients (node/curl/CLI probes, mobile backends) legitimately
+ * connect without an Origin header. Treat them as allowed when the user
+ * agent is not browser-like; browsers MUST present a valid Origin.
+ */
+function isNonBrowserClient(req: IncomingMessage): boolean {
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  if (!ua) return false;
+  return !/mozilla|chrome|safari|firefox|edg|opr|trident/i.test(ua);
+}
 
 // Server health and hints
 interface ServerHints {
@@ -342,9 +369,9 @@ function broadcastMaintenanceStatus(): void {
 export function startWsServer(port: number): WebSocketServer {
   if (wss) return wss;
 
-  wss = new WebSocketServer({ port });
+  wss = new WebSocketServer({ port, maxPayload: 16 * 1024 });
 
-  const { getAllowedOrigins } = require('@/config/app-urls');
+  const { getAllowedOrigins, isHostAllowed } = require('@/config/app-urls');
   const allowedOrigins = new Set(getAllowedOrigins());
   // Dev convenience: any localhost/LAN host on any port may connect (Vite dev
   // servers don't fixed ports — "host:4400", "localhost:5173", etc).
@@ -352,18 +379,27 @@ export function startWsServer(port: number): WebSocketServer {
 
   wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
     const origin = req.headers.origin;
-    if (origin && !allowedOrigins.has(origin)) {
+    if (!origin) {
+      // SEC: a missing Origin must not bypass origin enforcement in prod.
+      if (process.env.NODE_ENV === 'production' && !isNonBrowserClient(req)) {
+        ws.close(1008, 'Origin required');
+        return;
+      }
+    } else if (!allowedOrigins.has(origin)) {
       const isLocalOrigin = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?$/.test(origin)
         || /^https?:\/\/(?:\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(origin);
-      if (!(devOriginsOk && isLocalOrigin)) {
+      // Fall back to the shared host allow-list so any tirbeo.com subdomain or
+      // an extra deployment host (CORS_ALLOWED_HOSTS) can connect, not just the
+      // fixed enumerated origins above.
+      let hostOk = false;
+      try { hostOk = isHostAllowed(new URL(origin).hostname); } catch { hostOk = false; }
+      if (!((devOriginsOk && isLocalOrigin) || hostOk)) {
         ws.close(1008, 'Origin not allowed');
         return;
       }
     }
     
-    const clientIp = req.headers['x-forwarded-for'] as string || 
-                     req.headers['x-real-ip'] as string ||
-                     req.socket.remoteAddress || 'unknown';
+    const clientIp = deriveClientIp(req);
     
     const connRateLimit = checkConnectionRateLimit(clientIp);
     if (!connRateLimit.allowed) {
@@ -466,6 +502,11 @@ export function startWsServer(port: number): WebSocketServer {
 
         if (msg.type === 'get_hints') {
           const hints = calculateServerHints(clientIp);
+          // SEC: connection-count/loadFactor hints are auth-gated (info leak).
+          if (!authenticated) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+            return;
+          }
           ws.send(JSON.stringify({ type: 'server_hints', hints }));
           return;
         }
@@ -484,20 +525,6 @@ export function startWsServer(port: number): WebSocketServer {
 
         if (!authenticated) {
           ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated. Send { type: "auth", token: "..." }' }));
-          return;
-        }
-
-        if (msg.type === 'typing_start' || msg.type === 'typing_stop') {
-          if (msg.ticketId && msg.recipientId) {
-            try {
-              sendToUser(msg.recipientId, {
-                type: msg.type,
-                ticketId: msg.ticketId,
-                userId,
-                userName: email?.split('@')[0] || 'User',
-              });
-            } catch {}
-          }
           return;
         }
 
@@ -541,8 +568,12 @@ export function startWsServer(port: number): WebSocketServer {
         if (msg.type === 'publish' && typeof msg.channel === 'string' && msg.event) {
           const client = clients.get(clientId);
           const isAdmin = client?.adminRole && ['admin', 'super_admin'].includes(client.adminRole);
-          if (!isAdmin && !msg.channel.startsWith('user:')) {
-            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Publish not allowed on this channel' }));
+          // SEC: non-admins may publish ONLY to their own user channel (mirrors
+          // the subscribe guard). Otherwise any user could forge events into
+          // another user's private channel.
+          const isOwnUserChannel = msg.channel === `user:${userId}`;
+          if (!isAdmin && !isOwnUserChannel) {
+            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Publish only allowed on your own user channel' }));
             return;
           }
           sendToChannel(msg.channel, msg.event, clientId);
@@ -621,7 +652,7 @@ export function sendToUser(userId: string, data: unknown) {
     }
   }
 
-  // Mirror into the realtime platform (wss://ws.tirbeo.app/ws) via shared Redis.
+  // Mirror into the realtime platform (wss://ws.tirbeo.com/ws) via shared Redis.
   const evt = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'message', payload: data };
   publishToRealtime(
     { userId },
@@ -673,7 +704,7 @@ export function getWsChannelCounts(): Record<string, number> {
 /**
  * Deliver a realtime event to every client subscribed to a channel
  * (local protocol parity with the realtime platform), and mirror it into
- * wss://ws.tirbeo.app/ws via shared Redis.
+ * wss://ws.tirbeo.com/ws via shared Redis.
  */
 export function sendToChannel(channel: string, data: unknown, excludeClientId?: string) {
   const set = channelSubs.get(channel);

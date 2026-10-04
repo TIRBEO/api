@@ -1,4 +1,4 @@
-// ═══ AUTH VERIFY LIMITS (Redis-first, in-memory mirror, DB-configured maxes) ═══
+// ═══ AUTH VERIFY LIMITS (Redis-first, in-memory mirror, Redis-configurable maxes) ═══
 // The auth hot path used to run 4 serial checkWindowLimitDB() calls per request:
 // each did a VerificationLimit lookup (30s cache), a blocklist findUnique, an
 // in-memory INCR, then a fire-and-forget securityEvent.create → a JSONB insert
@@ -11,19 +11,18 @@
 //   2. An in-memory mirror of the same counters: when a window is ALREADY
 //      exhausted, rejected requests are answered from process memory without
 //      touching Redis at all (the "hot reject" path).
-//   3. Memory-only fallback when Redis is unavailable. Maxes always come from
-//      the VerificationLimit table (30s cache) so admins can tune limits
-//      without a deploy.
+//   3. Memory-only fallback when Redis is unavailable. Maxes come from the
+//      Redis key `vl:max:<method>` (30s cache) with in-code defaults, so admins
+//      can tune limits without a deploy.
 //
 // Window shape is fixed (15 min, matching the previous behavior) so the
 // remaining endpoint and the send handlers agree on one source of truth.
 
-import { prisma } from '@/infrastructure/db/prisma';
 import { getRedis } from '@/features/auth/redis';
 
 export const VERIFY_WINDOW_MS = 15 * 60 * 1000;
 
-/** DB-configurable maxes (VerificationLimit table) — cached 30s. */
+/** In-code default maxes (Redis `vl:max:<method>` overrides these). */
 const DEFAULT_MAXES: Record<string, number> = {
   'login-otp': 5,
   'magic-link': 3,
@@ -36,7 +35,7 @@ const DEFAULT_MAXES: Record<string, number> = {
 
 const g = globalThis as any;
 
-// ─── VerificationLimit cache (30s) ───
+// ─── Max-config cache (30s) ───
 if (!g.__verifyLimitConfigCache) g.__verifyLimitConfigCache = new Map<string, { max: number; exp: number }>();
 const limitCache: Map<string, { max: number; exp: number }> = g.__verifyLimitConfigCache;
 
@@ -44,14 +43,19 @@ export async function getVerifyMax(method: string): Promise<number> {
   const fallback = DEFAULT_MAXES[method] ?? 3;
   const cached = limitCache.get(method);
   if (cached && cached.exp > Date.now()) return cached.max;
+  let max = fallback;
   try {
-    const row = await (prisma as any).verificationLimit.findUnique({ where: { method } }).catch(() => null);
-    const max = row && typeof row.max === 'number' && row.max > 0 ? row.max : fallback;
-    limitCache.set(method, { max, exp: Date.now() + 30_000 });
-    return max;
+    const redis = redisClient();
+    if (redis) {
+      const v = await redis.get(`vl:max:${method}`);
+      const n = v == null ? NaN : parseInt(String(v), 10);
+      if (Number.isFinite(n) && n > 0) max = n;
+    }
   } catch {
-    return fallback;
+    // Redis unavailable or bad value → keep the in-code default.
   }
+  limitCache.set(method, { max, exp: Date.now() + 30_000 });
+  return max;
 }
 
 export async function getAllVerifyMaxes(): Promise<Record<string, number>> {

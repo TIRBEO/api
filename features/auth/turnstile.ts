@@ -2,7 +2,15 @@ const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET_KEY || '';
 const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || '';
 
 export async function verifyTurnstile(token: string, ip?: string): Promise<boolean> {
-  if (!TURNSTILE_SECRET) return true;
+  // Fail closed outside local dev: a missing server secret must never silently
+  // disable CAPTCHA in production. In dev, allow running without a secret.
+  if (!TURNSTILE_SECRET) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[TURNSTILE] Server secret not configured — denying verification.');
+      return false;
+    }
+    return true;
+  }
   if (!token) return false;
 
   try {

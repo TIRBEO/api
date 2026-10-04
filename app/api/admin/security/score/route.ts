@@ -11,7 +11,7 @@ export async function GET(request: NextRequest) {
     // Calculate security score based on various factors
     const factors = [];
     let totalScore = 0;
-    const maxScore = 100;
+
 
     // Parallelize all count queries instead of sequential awaits
     const [
@@ -24,8 +24,8 @@ export async function GET(request: NextRequest) {
     ] = await Promise.all([
       prisma.user.count(),
       prisma.user.count({ where: { is2FAEnabled: true } }),
-      prisma.session.count({ where: { status: 'active' } }),
-      prisma.session.count({ where: { status: 'revoked' } }),
+      prisma.userSession.count({ where: { status: 'active' } }),
+      prisma.userSession.count({ where: { status: 'revoked' } }),
       prisma.blocklist.count({ where: { targetType: 'ip' } }),
       prisma.blocklist.count({ where: { targetType: 'user' } }),
     ]);
@@ -37,8 +37,7 @@ export async function GET(request: NextRequest) {
       score: passwordScore,
       maxScore: 20,
       status: passwordScore >= 16 ? 'good' : passwordScore >= 12 ? 'warning' : 'critical',
-      description: 'Strong password requirements enforced',
-    });
+      description: 'Strong password requirements enforced' });
     totalScore += passwordScore;
 
     // 2. 2FA Adoption (20 points)
@@ -49,8 +48,7 @@ export async function GET(request: NextRequest) {
       score: twoFAScore,
       maxScore: 20,
       status: twoFAScore >= 16 ? 'good' : twoFAScore >= 12 ? 'warning' : 'critical',
-      description: `${Math.round(twoFAAdoption)}% of users have 2FA enabled`,
-    });
+      description: `${Math.round(twoFAAdoption)}% of users have 2FA enabled` });
     totalScore += twoFAScore;
 
     // 3. Session Security (20 points)
@@ -60,8 +58,7 @@ export async function GET(request: NextRequest) {
       score: sessionScore,
       maxScore: 20,
       status: sessionScore >= 16 ? 'good' : sessionScore >= 12 ? 'warning' : 'critical',
-      description: `${activeSessions} active sessions, ${revokedSessions} revoked`,
-    });
+      description: `${activeSessions} active sessions, ${revokedSessions} revoked` });
     totalScore += sessionScore;
 
     // 4. Rate Limiting (20 points)
@@ -71,8 +68,7 @@ export async function GET(request: NextRequest) {
       score: rateLimitScore,
       maxScore: 20,
       status: rateLimitScore >= 16 ? 'good' : rateLimitScore >= 12 ? 'warning' : 'critical',
-      description: 'Effective rate limiting configured',
-    });
+      description: 'Effective rate limiting configured' });
     totalScore += rateLimitScore;
 
     // 5. Blocklist Coverage (20 points)
@@ -82,8 +78,7 @@ export async function GET(request: NextRequest) {
       score: blocklistScore,
       maxScore: 20,
       status: blocklistScore >= 16 ? 'good' : blocklistScore >= 12 ? 'warning' : 'critical',
-      description: `${blockedIPs} blocked IPs, ${blockedUsers} blocked users`,
-    });
+      description: `${blockedIPs} blocked IPs, ${blockedUsers} blocked users` });
     totalScore += blocklistScore;
 
     // Determine threat level based on score
@@ -102,8 +97,7 @@ export async function GET(request: NextRequest) {
       trackQuery('security_events_by_severity_created', () => prisma.securityEvent.findMany({
         where: {
           severity: 'critical',
-          createdAt: { gte: thirtyDaysAgo },
-        },
+          createdAt: { gte: thirtyDaysAgo } },
         orderBy: { createdAt: 'desc' },
         take: 5,
         select: {
@@ -112,38 +106,31 @@ export async function GET(request: NextRequest) {
           eventType: true,
           createdAt: true,
           ipAddress: true,
-          user: { select: { email: true, name: true } },
-        },
-      })),
+          user: { select: { email: true, name: true } } } })),
       trackQuery('security_events_group_by_ip', () => prisma.securityEvent.groupBy({
         by: ['ipAddress'],
         where: {
           createdAt: { gte: thirtyDaysAgo },
-          ipAddress: { not: null },
-        },
+          ipAddress: { not: null } },
         _count: { id: true },
         orderBy: { _count: { id: 'desc' } },
-        take: 10,
-      })),
+        take: 10 })),
       trackQuery('security_events_group_by_type', () => prisma.securityEvent.groupBy({
         by: ['eventType'],
         where: { createdAt: { gte: thirtyDaysAgo } },
         _count: { id: true },
         orderBy: { _count: { id: 'desc' } },
-        take: 10,
-      })),
+        take: 10 })),
     ]);
 
     const topIPs = ipCounts.map(ip => ({
       ip: ip.ipAddress || 'Unknown',
       count: ip._count.id,
-      lastSeen: new Date().toISOString(),
-    }));
+      lastSeen: new Date().toISOString() }));
 
     const topEventTypes = eventTypes.map(et => ({
       type: et.eventType,
-      count: et._count.id,
-    }));
+      count: et._count.id }));
 
     return NextResponse.json({
       score: totalScore,
@@ -157,9 +144,7 @@ export async function GET(request: NextRequest) {
         usersWith2FA,
         activeSessions,
         blockedIPs,
-        blockedUsers,
-      },
-    });
+        blockedUsers } });
   } catch (err: any) {
     console.error('[SECURITY_SCORE]', err?.message || err);
     return NextResponse.json({ error: 'Failed to calculate security score' }, { status: 500 });

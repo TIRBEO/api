@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server';
 import { getBranding, type Branding } from '@/features/branding/branding';
 import { cachedJson } from '@/shared/response';
 
@@ -7,7 +6,7 @@ export const dynamic = 'force-dynamic';
 export async function GET() {
   try {
     const branding = await getBranding();
-    
+
     // Return public-safe branding data
     const publicBranding: Record<string, unknown> = {
       logoUrl: branding.logoUrl,
@@ -16,8 +15,7 @@ export async function GET() {
       faviconUrl: branding.logoUrl,
       primaryColor: '#3b82f6',
       emailFromName: branding.emailFromName,
-      emailFromAddress: branding.emailFromAddress,
-    };
+      emailFromAddress: branding.emailFromAddress };
 
     return cachedJson(publicBranding, { ttl: 60, swr: 300 });
   } catch (err: any) {
@@ -30,7 +28,6 @@ export async function GET() {
       faviconUrl: '',
       primaryColor: '#3b82f6',
       emailFromName: 'Tirbeo',
-      emailFromAddress: 'noreply@send.tirbeo.app',
-    }, { ttl: 60 });
+      emailFromAddress: 'noreply@send.tirbeo.com' }, { ttl: 60 });
   }
 }

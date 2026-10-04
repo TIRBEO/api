@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireRole } from '@/features/auth/http-guards';
-import { listBlocks, blockTarget, getSecurityStats } from '@/features/security/security';
+import { listBlocks, blockTarget } from '@/features/security/security';
 import { createAuditEvent } from '@/features/security/audit';
 
 export async function GET(request: NextRequest) {
@@ -53,16 +53,14 @@ export async function POST(request: NextRequest) {
     targetId,
     reason: reason || 'Blocked by admin',
     blockedBy: session.userId,
-    expiresAt,
-  });
+    expiresAt });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'security.block_created',
     targetType: 'blocklist',
     metadata: { targetType, targetId, reason, expiresAt: expiresAt?.toISOString() },
-    severity: 'warning',
-  });
+    severity: 'warning' });
 
   const blocks = await listBlocks({ page: 1, limit: 50, activeOnly: true });
   return NextResponse.json({ ok: true, ...blocks }, { status: 201 });

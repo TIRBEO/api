@@ -11,7 +11,7 @@ export async function GET(request: NextRequest) {
 
     const result: any[] = await prisma.$queryRaw`
       SELECT COUNT(*)::int AS unread
-      FROM notifications
+      FROM "user"."notifications"
       WHERE user_id = ${session.userId} AND is_read = false
     `;
 

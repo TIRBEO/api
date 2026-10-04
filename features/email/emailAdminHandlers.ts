@@ -4,6 +4,15 @@ import { requireAdmin } from '@/features/auth/http-guards';
 import { sendEmail } from '@/features/email/email';
 import { z } from 'zod';
 
+// The email_settings table is gone — admin config now lives in the
+// app_config row keyed 'email.config' (JSON), same source email.ts reads.
+const EMAIL_CONFIG_KEY = 'email.config';
+
+async function readEmailConfig(): Promise<Record<string, any>> {
+  const row = await prisma.appConfig.findUnique({ where: { key: EMAIL_CONFIG_KEY } }).catch(() => null);
+  return row && typeof row.value === 'object' && row.value !== null ? row.value as Record<string, any> : {};
+}
+
 // GET /api/email/config — get current email config
 export async function emailConfigHandler(request: NextRequest) {
   try {
@@ -11,12 +20,13 @@ export async function emailConfigHandler(request: NextRequest) {
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'GET') {
-      const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
-      if (!config) return NextResponse.json({ provider: 'resend', enabled: false, fromEmail: 'noreply@send.tirbeo.app', fromName: 'Tirbeo' });
-      const { apiKey, smtpPass, ...safeConfig } = config as any;
+      const config = await readEmailConfig();
+      if (!Object.keys(config).length) return NextResponse.json({ provider: 'resend', enabled: false, fromEmail: 'noreply@send.tirbeo.com', fromName: 'Tirbeo' });
+      const { apiKey, smtpPass, resendApiKey, ...safeConfig } = config;
       return NextResponse.json({
         ...safeConfig,
-        apiKey: apiKey ? '••••' + apiKey.slice(-4) : null,
+        apiKey: apiKey ? '••••' + String(apiKey).slice(-4) : null,
+        resendApiKey: resendApiKey ? '••••' + String(resendApiKey).slice(-4) : null,
         smtpPass: smtpPass ? '••••' : null,
       });
     }
@@ -50,13 +60,13 @@ export async function emailConfigHandler(request: NextRequest) {
       const parsed = schema.safeParse(body);
       if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-      const existing = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
-      if (existing) {
-        const updated = await prisma.emailConfig.update({ where: { id: existing.id }, data: parsed.data });
-        return NextResponse.json(updated);
-      }
-      const created = await prisma.emailConfig.create({ data: parsed.data });
-      return NextResponse.json(created, { status: 201 });
+      const merged = { ...(await readEmailConfig()), ...parsed.data };
+      const row = await prisma.appConfig.upsert({
+        where: { key: EMAIL_CONFIG_KEY },
+        update: { value: merged },
+        create: { key: EMAIL_CONFIG_KEY, value: merged, description: 'Email provider + sender configuration' },
+      });
+      return NextResponse.json(row.value, { status: 200 });
     }
 
     return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
@@ -64,6 +74,13 @@ export async function emailConfigHandler(request: NextRequest) {
     console.error('[EMAIL CONFIG]', err?.message || err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
+}
+
+// The admin UI was built against { name, htmlBody } — keep that shape on the
+// wire while the table uses slug/html.
+function templateForUi(t: any) {
+  if (!t) return t;
+  return { ...t, name: t.slug, htmlBody: t.html };
 }
 
 // GET /api/email/templates — list all templates
@@ -75,7 +92,7 @@ export async function emailTemplatesHandler(request: NextRequest) {
 
     if (request.method === 'GET') {
       const templates = await prisma.emailTemplate.findMany({ orderBy: { createdAt: 'asc' } });
-      return NextResponse.json(templates);
+      return NextResponse.json(templates.map(templateForUi));
     }
 
     if (request.method === 'POST') {
@@ -92,11 +109,20 @@ export async function emailTemplatesHandler(request: NextRequest) {
       const parsed = schema.safeParse(body);
       if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-      const existing = await prisma.emailTemplate.findUnique({ where: { name: parsed.data.name } });
+      const slug = parsed.data.name.trim().toLowerCase();
+      const existing = await prisma.emailTemplate.findUnique({ where: { slug } });
       if (existing) return NextResponse.json({ error: 'Template name already exists' }, { status: 409 });
 
-      const template = await prisma.emailTemplate.create({ data: parsed.data as any });
-      return NextResponse.json(template, { status: 201 });
+      const template = await prisma.emailTemplate.create({
+        data: {
+          slug,
+          label: parsed.data.label,
+          subject: parsed.data.subject,
+          html: parsed.data.htmlBody,
+          variables: (parsed.data.variables ?? []) as any,
+        },
+      });
+      return NextResponse.json(templateForUi(template), { status: 201 });
     }
 
     return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
@@ -114,11 +140,12 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
     const session = await requireAdmin(request);
     if (session instanceof NextResponse) return session;
 
-    const existing = await prisma.emailTemplate.findUnique({ where: { name } });
+    const slug = name.trim().toLowerCase();
+    const existing = await prisma.emailTemplate.findUnique({ where: { slug } });
     if (!existing) return NextResponse.json({ error: 'Template not found' }, { status: 404 });
 
     if (request.method === 'GET') {
-      return NextResponse.json(existing);
+      return NextResponse.json(templateForUi(existing));
     }
 
     if (request.method === 'PATCH') {
@@ -134,12 +161,20 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
       const parsed = schema.safeParse(body);
       if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-      const updated = await prisma.emailTemplate.update({ where: { name }, data: parsed.data as any });
-      return NextResponse.json(updated);
+      const updated = await prisma.emailTemplate.update({
+        where: { slug },
+        data: {
+          ...(parsed.data.label !== undefined ? { label: parsed.data.label } : {}),
+          ...(parsed.data.subject !== undefined ? { subject: parsed.data.subject } : {}),
+          ...(parsed.data.htmlBody !== undefined ? { html: parsed.data.htmlBody } : {}),
+          ...(parsed.data.variables !== undefined ? { variables: parsed.data.variables as any } : {}),
+        },
+      });
+      return NextResponse.json(templateForUi(updated));
     }
 
     if (request.method === 'DELETE') {
-      await prisma.emailTemplate.delete({ where: { name } });
+      await prisma.emailTemplate.delete({ where: { slug } });
       return NextResponse.json({ error: 'Deleted' }, { status: 200 });
     }
 
@@ -164,11 +199,12 @@ export async function emailTestHandler(request: NextRequest) {
     const parsed = schema.safeParse(body);
     if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-    const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
+    const config = await readEmailConfig();
+    const hasDbConfig = !!Object.keys(config).length;
     const diagnostics = {
-      hasDbConfig: !!config,
+      hasDbConfig,
       dbEnabled: config?.enabled ?? null,
-      dbApiKey: config?.resendApiKey ? '••••' + config.resendApiKey.slice(-4) : null,
+      dbApiKey: config?.resendApiKey ? '••••' + String(config.resendApiKey).slice(-4) : null,
       dbProvider: config?.provider ?? null,
       envApiKey: process.env.RESEND_API_KEY ? '••••' + process.env.RESEND_API_KEY.slice(-4) : null,
     };
@@ -184,7 +220,7 @@ export async function emailTestHandler(request: NextRequest) {
   }
 }
 
-// GET /api/admin/emails — list sent emails
+// GET /api/admin/emails — list sent emails (email_jobs + delivery events)
 export async function adminEmailsHandler(request: NextRequest) {
   try {
     const session = await requireAdmin(request);
@@ -201,33 +237,47 @@ export async function adminEmailsHandler(request: NextRequest) {
 
       const where: Record<string, any> = {};
       if (status) where.status = status;
-      if (template) where.template = template;
-      if (to) where.toEmail = { contains: to };
+      if (template) where.templateSlug = { contains: template };
+      if (to) where.toAddress = { contains: to };
 
-      const [emails, total] = await Promise.all([
-        prisma.email_logs.findMany({
+      const [jobs, total] = await Promise.all([
+        prisma.email_jobs.findMany({
           where,
           orderBy: { createdAt: 'desc' },
           skip,
           take: limit,
-          select: {
-            id: true,
-            toEmail: true,
-            fromEmail: true,
-            subject: true,
-            template: true,
-            status: true,
-            threadId: true,
-            replyTo: true,
-            openedAt: true,
-            clickedAt: true,
-            error: true,
-            metadata: true,
-            createdAt: true,
-          },
         }),
-        prisma.email_logs.count({ where }),
+        prisma.email_jobs.count({ where }),
       ]);
+
+      // Attach opened/delivery events for the visible page in one query.
+      const deliveries = jobs.length
+        ? await prisma.email_deliveries.findMany({
+            where: { jobId: { in: jobs.map((j) => j.id) } },
+            orderBy: { createdAt: 'asc' },
+          }).catch(() => [])
+        : [];
+      const openedByJob = new Set(deliveries.filter((d) => d.event === 'opened').map((d) => d.jobId));
+
+      const emails = jobs.map((j) => {
+        const payload: any = (j.payload && typeof j.payload === 'object' ? j.payload : {}) as any;
+        return {
+          id: j.id,
+          toEmail: j.toAddress,
+          fromEmail: payload.fromEmail ?? null,
+          subject: j.subject,
+          eventKey: j.templateSlug,
+          status: j.status,
+          category: j.kind,
+          provider: payload.provider ?? null,
+          messageId: payload.messageId ?? null,
+          openedAt: openedByJob.has(j.id) ? j.sentAt : null,
+          clickedAt: null,
+          error: j.lastError,
+          metadata: payload.metadata ?? null,
+          createdAt: j.createdAt,
+        };
+      });
 
       return NextResponse.json({ emails, total, page, limit });
     }
@@ -259,10 +309,10 @@ export async function adminEmailReplyHandler(request: NextRequest) {
 
       const { to, subject, html, threadId, replyTo } = parsed.data;
       const result = await sendEmail(to, subject, html, {
-        replyTo: replyTo || 'alerts@send.tirbeo.app',
+        replyTo: replyTo || 'alerts@send.tirbeo.com',
         threadId,
         templateName: 'admin_reply',
-        fromEmail: 'alerts@send.tirbeo.app',
+        fromEmail: 'alerts@send.tirbeo.com',
         fromName: 'Tirbeo Support',
       });
 
@@ -285,10 +335,13 @@ export async function adminEmailDetailHandler(request: NextRequest, id: string) 
     const session = await requireAdmin(request);
     if (session instanceof NextResponse) return session;
 
-    const email = await prisma.email_logs.findUnique({ where: { id } });
-    if (!email) return NextResponse.json({ error: 'Email not found' }, { status: 404 });
-
-    return NextResponse.json(email);
+    const job = await prisma.email_jobs.findUnique({ where: { id } }).catch(() => null);
+    if (!job) return NextResponse.json({ error: 'Email not found' }, { status: 404 });
+    const deliveries = await prisma.email_deliveries.findMany({
+      where: { jobId: id },
+      orderBy: { createdAt: 'asc' },
+    }).catch(() => []);
+    return NextResponse.json({ ...job, deliveries });
   } catch (err: any) {
     console.error('[ADMIN EMAIL DETAIL]', err?.message || err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

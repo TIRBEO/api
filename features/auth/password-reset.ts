@@ -5,11 +5,45 @@ import { addMinutes } from 'date-fns';
 import { randomInt } from 'crypto';
 import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
 import { getAccountsBaseUrl } from '@/config/app-urls';
-import { emitEmailEvent } from '@/features/email-brain/decide';
-import { putSecureVars } from '@/features/email-brain/secureVars';
+import { fetchLoginUserByEmail, fetchLoginUserById } from '@/features/identity/tirbeo';
+import { verifiedRecoveryAddress } from '@/features/auth/recovery-email';
+import { eventIdFor } from '@/features/users/refcode';
 
 const RESET_TTL_MINUTES = 15;
-const SECURE_TTL_S = RESET_TTL_MINUTES * 60;
+const MAX_OTP_ATTEMPTS = 5;
+const RESET_OTP_KIND = 'email';
+
+/**
+ * Fetch the latest live reset OTP for a user, enforcing the
+ * 5-attempt cap (mirrors signup-otp.ts). A code that has been guessed wrong
+ * MAX_OTP_ATTEMPTS times is invalidated so a fresh code is required.
+ */
+async function findLiveResetOtp(userId: string) {
+  const otp = await prisma.otp.findFirst({
+    where: { userId, kind: RESET_OTP_KIND },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!otp) return null;
+  if (otp.expiresAt < new Date()) {
+    await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
+    return null;
+  }
+  if ((otp.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
+    return null;
+  }
+  return otp;
+}
+
+/** Register a failed guess; invalidates the code once the cap is hit. */
+async function registerResetFailedAttempt(otpId: string, attempts: number) {
+  const next = (attempts ?? 0) + 1;
+  if (next >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.delete({ where: { id: otpId } }).catch(() => {});
+  } else {
+    await prisma.otp.update({ where: { id: otpId }, data: { attempts: next } }).catch(() => {});
+  }
+}
 
 /**
  * Shared send helper — routes through the Email Brain decision engine.
@@ -18,7 +52,7 @@ const SECURE_TTL_S = RESET_TTL_MINUTES * 60;
  * not be secured (Redis down) — callers then log and fall back to the legacy
  * inline send so the reset request still reaches the user.
  */
-async function sendViaEmailBrain(opts: {
+async function sendViaEmailBrain(_opts: {
   eventKey: string;
   toEmail: string;
   userId: string;
@@ -26,20 +60,11 @@ async function sendViaEmailBrain(opts: {
   secureVars: Record<string, string>;
   dedupeKey: string;
 }): Promise<boolean> {
-  const secure = await putSecureVars(opts.secureVars, SECURE_TTL_S);
-  if (!secure) return false; // fail closed — caller decides fallback
-
-  const outcome = await emitEmailEvent({
-    eventKey: opts.eventKey,
-    userId: opts.userId,
-    toEmail: opts.toEmail,
-    dedupeKey: opts.dedupeKey,
-    // Only NON-sensitive values in the payload: display name + the one-time
-    // reference id the worker's resolver consumes for the actual secret.
-    vars: { 'user.name': opts.name, secureRef: secure.ref },
-  });
-  // Note: outcome 'duplicate' is fine — a job for this request already exists.
-  return outcome.outcome === 'queued' || outcome.outcome === 'duplicate';
+  // Email Brain is retired. Its queue wrote to a legacy `email_jobs` shape
+  // (dedupe_key / event_key columns) that no longer exists, so it threw and
+  // broke password reset. Always fall through to the caller's inline send,
+  // which delivers via the working features/email pipeline.
+  return false;
 }
 
 /** Legacy inline send (existing delivery layer + suppression rules). */
@@ -59,7 +84,7 @@ async function sendInline(
 
 // Request password reset with OTP only — sends to primary email ONLY
 export async function requestPasswordResetOtp(email: string): Promise<{ success: boolean; error?: string; code?: string }> {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: true };
 
   const code = (randomInt as Function)(100000, 1000000).toString();
@@ -67,7 +92,7 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
   const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
   await prisma.otp.create({
-    data: { userId: user.id, type: 'email', otpHash, expiresAt },
+    data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
   });
 
   const requestId = crypto.randomUUID();
@@ -89,7 +114,7 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
 
 // Request password reset with magic link ONLY — sends to primary email ONLY
 export async function requestPasswordResetMagicLink(email: string): Promise<{ success: boolean; error?: string; resetUrl?: string }> {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const user = await fetchLoginUserByEmail(email);
   if (!user) {
     return { success: true };
   }
@@ -116,12 +141,26 @@ export async function requestPasswordResetMagicLink(email: string): Promise<{ su
 
 // Request password reset — send the OTP to the user's recovery (secondary) email ONLY
 export async function requestPasswordResetRecovery(email: string): Promise<{ success: boolean; error?: string; code?: string; retryAfterMs?: number }> {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-  if (!user || !user.secondaryEmail) {
-    return { success: false, error: 'No recovery email on file for this account' };
+  const user = await fetchLoginUserByEmail(email);
+  if (!user) {
+    // Don't reveal if user exists or has recovery email
+    return { success: true };
+  }
+  // 'banned' is not a UserStatusKind — banning is tracked by users.is_banned, not
+  // by status. Only compare statuses the enum can actually hold.
+  if (user.status === 'suspended' || user.status === 'deleted') {
+    return { success: true };
+  }
+  // The login address may itself be the recovery address somebody typed into
+  // the forgot-password field — deliver to the recovery row, never to itself.
+  const recoveryEmail = await verifiedRecoveryAddress(user.id);
+  if (!recoveryEmail || recoveryEmail.toLowerCase() === (user.email || '').toLowerCase()) {
+    // Nothing proven to deliver to. Say nothing, send nothing: a code posted to
+    // an unverified mailbox is a reset handed to whoever reads that inbox.
+    return { success: true };
   }
 
-  const cooldown = await enforceResendCooldown(`password-reset-recovery:${user.secondaryEmail.toLowerCase()}`);
+  const cooldown = await enforceResendCooldown(`password-reset-recovery:${recoveryEmail.toLowerCase()}`);
   if (!cooldown.allowed) {
     return { success: false, error: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs };
   }
@@ -130,14 +169,16 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
   const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
+  // Recorded against the mailbox it was actually posted to; verification looks
+  // the code up by account, so the person can confirm with either address.
   await prisma.otp.create({
-    data: { userId: user.id, type: 'email', otpHash, expiresAt },
+    data: { userId: user.id, kind: RESET_OTP_KIND, address: recoveryEmail.toLowerCase(), otpHash, expiresAt },
   });
 
   const requestId = crypto.randomUUID();
   const sent = await sendViaEmailBrain({
     eventKey: 'auth.password_reset',
-    toEmail: user.secondaryEmail,
+    toEmail: recoveryEmail,
     userId: user.id,
     name: user.name || 'there',
     secureVars: { otpCode: code, 'reset.code': code },
@@ -146,11 +187,11 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
   if (!sent) {
     console.warn('[PASSWORD RESET RECOVERY] secure store unavailable — falling back to inline send');
     sendInline(
-      user.secondaryEmail,
+      recoveryEmail,
       'password_reset_otp_recovery',
       {
         OTP: code, otp: code, name: user.name || 'there',
-        primaryEmail: email.toLowerCase(), targetEmail: email.toLowerCase(), recoveryEmail: user.secondaryEmail,
+        primaryEmail: (user.email || email).toLowerCase(), targetEmail: recoveryEmail, recoveryEmail,
       },
       'PASSWORD RESET RECOVERY',
     );
@@ -183,7 +224,7 @@ async function __requestPasswordResetInner(
     return { success: false, error: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs };
   }
 
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const user = await fetchLoginUserByEmail(email);
   if (!user) {
     // Don't reveal if user exists
     return { success: true };
@@ -215,7 +256,7 @@ async function __requestPasswordResetInner(
     const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
     await prisma.otp.create({
-      data: { userId: user.id, type: 'email', otpHash, expiresAt },
+      data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
     });
 
     const requestId = crypto.randomUUID();
@@ -241,23 +282,22 @@ export async function verifyPasswordReset(
   email: string,
   params: { code?: string; token?: string }
 ): Promise<{ success: boolean; error?: string; resetToken?: string }> {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: false, error: 'Invalid or expired reset request' };
 
   let verified = false;
 
   // Try code verification
   if (params.code) {
-    const otp = await prisma.otp.findFirst({
-      where: { userId: user.id, type: 'email' },
-      orderBy: { createdAt: 'desc' },
-    });
-    if (otp && otp.expiresAt >= new Date()) {
+    const otp = await findLiveResetOtp(user.id);
+    if (otp) {
       const ok = await verifyOtpCode(otp.otpHash, params.code);
       if (ok) {
         verified = true;
         // Delete ALL OTPs for this user (expires the other method)
-        await prisma.otp.deleteMany({ where: { userId: user.id, type: 'email' } });
+        await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
+      } else {
+        await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
       }
     }
   }
@@ -268,7 +308,7 @@ export async function verifyPasswordReset(
     if (tokenUserId === user.id) {
       verified = true;
       // Delete ALL OTPs for this user (expires the other method)
-      await prisma.otp.deleteMany({ where: { userId: user.id, type: 'email' } });
+      await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
     }
   }
 
@@ -329,14 +369,19 @@ export async function confirmPasswordReset(
   const hash = await hashPassword(newPassword);
   await prisma.user.update({
     where: { id: user.id },
-    data: { passwordHash: hash, mustChangePassword: false },
+    data: { passwordHash: hash },
+  });
+  await prisma.userSecurity.upsert({
+    where: { userId: user.id },
+    create: { userId: user.id, mustChangePw: false },
+    update: { mustChangePw: false },
   });
 
   // Clean up any remaining OTPs
-  await prisma.otp.deleteMany({ where: { userId: user.id, type: 'email' } });
+  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
 
   // Invalidate all sessions (they need to re-authenticate with new password)
-  await prisma.session.deleteMany({ where: { userId: user.id } });
+  await prisma.userSession.deleteMany({ where: { userId: user.id } });
 
   // Notify user that their password was changed (skipEmail — Email Brain sends dedicated template)
   try {
@@ -353,14 +398,16 @@ export async function confirmPasswordReset(
     // Non-blocking
   }
 
-  // Notify via email through the Email Brain (non-blocking, never suppressed).
-  emitEmailEvent({
-    eventKey: 'auth.password_changed',
-    userId: user.id,
-    toEmail: user.email,
-    dedupeKey: `password-changed:${user.id}:${Date.now()}`,
-    vars: { 'user.name': user.name || 'there', changedAt: new Date().toISOString() },
-  }).catch(() => {});
+  // Notify the user their password changed (non-blocking, inline send).
+  const loginUser = await fetchLoginUserById(user.id).catch(() => null);
+  if (loginUser?.email) {
+    sendInline(
+      loginUser.email,
+      'password_changed',
+      { name: loginUser.name || 'there', changedAt: new Date().toISOString(), ipAddress: '' },
+      'PASSWORD CHANGED',
+    );
+  }
 
   return { success: true };
 }
@@ -370,50 +417,43 @@ export async function quickLoginWithOtp(
   email: string,
   code: string
 ): Promise<{ success: boolean; error?: string; sessionToken?: string; refreshToken?: string; userId?: string }> {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+  const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: false, error: 'Invalid or expired code' };
-  if (user.deletedAt) return { success: false, error: 'This account has been deleted.' };
-  if (user.isBanned) {
-    return {
-      success: false,
-      error: 'ACCOUNT_BANNED',
-      banned: true,
-      block: { kind: 'banned', eventId: (user as any).banRefCode || null, message: 'Your account has been permanently banned.' },
-    } as any;
-  }
-  if (user.isSuspended) {
+  if (user.status === 'deleted') return { success: false, error: 'This account has been deleted.' };
+  if (user.status === 'suspended') {
     return {
       success: false,
       error: 'ACCOUNT_SUSPENDED',
       suspended: true,
       block: {
         kind: 'suspended',
-        eventId: (user as any).suspendRefCode || null,
-        reason: (user as any).suspendReason || null,
-        until: (user as any).suspendedUntil || null,
+        eventId: eventIdFor(user.id, 'suspend'),
+        reason: null,
+        until: null,
         message: 'Your account is temporarily suspended.',
       },
     } as any;
   }
-  if (!user.emailVerified) return { success: false, error: 'Please verify your email before signing in' };
-
-  // Find the latest OTP for this user
-  const otp = await prisma.otp.findFirst({
-    where: { userId: user.id, type: 'email' },
-    orderBy: { createdAt: 'desc' },
+  const emailRow = await prisma.userEmail.findFirst({
+    where: { userId: user.id, address: email.toLowerCase() },
+    select: { verifiedAt: true },
   });
+  if (!emailRow?.verifiedAt) return { success: false, error: 'Please verify your email before signing in' };
 
-  if (!otp || otp.expiresAt < new Date()) {
+  // Find the latest OTP for this user (attempt-capped, mirror signup-otp).
+  const otp = await findLiveResetOtp(user.id);
+  if (!otp) {
     return { success: false, error: 'Invalid or expired code' };
   }
 
   const ok = await verifyOtpCode(otp.otpHash, code);
   if (!ok) {
+    await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
     return { success: false, error: 'Invalid or expired code' };
   }
 
   // Delete all OTPs for this user
-  await prisma.otp.deleteMany({ where: { userId: user.id, type: 'email' } });
+  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
 
   // Create a session (short-term session, same as login OTP / magic link)
   const { createSession } = await import('@/features/auth/session');

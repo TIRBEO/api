@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'node:crypto';
 import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, getPoolAlertState } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
-import { getCachedRedisClient, checkRedisHealth, getAllRedisStates, getRedisHealthSummary, pingAllRedisClients } from '@/infrastructure/db/redis';
+import { getCachedRedisClient, checkRedisHealth, getRedisHealthSummary, pingAllRedisClients } from '@/infrastructure/db/redis';
 
 
 function isAdmin(user: any): boolean {
@@ -30,8 +31,7 @@ function getHealthRedis(): any {
     healthRedis = getCachedRedisClient('health', {
       url: redisUrl,
       enableKeepAlive: true,
-      keepAliveInterval: 25_000,
-    });
+      keepAliveInterval: 25_000 });
     return healthRedis;
   } catch {
     healthRedisFailed = true;
@@ -65,14 +65,12 @@ export async function publicHealthHandler() {
     checks.redis = {
       status: redisHealth.ok ? 'ok' : 'error',
       latencyMs: redisHealth.latencyMs,
-      error: redisHealth.error || undefined,
-    };
+      error: redisHealth.error || undefined };
     if (!redisHealth.ok) healthy = false;
   } else {
     checks.redis = {
       status: process.env.REDIS_URL ? 'error' : 'not-configured',
-      error: process.env.REDIS_URL ? 'Redis client failed to initialize' : undefined,
-    };
+      error: process.env.REDIS_URL ? 'Redis client failed to initialize' : undefined };
   }
 
   // ─── Redis Connection Health ───
@@ -83,8 +81,7 @@ export async function publicHealthHandler() {
     connected: redisSummary.connectedClients,
     reconnects: redisSummary.totalReconnects,
     failedRequests: redisSummary.totalFailedRequests,
-    healthy: redisSummary.totalClients === 0 || redisSummary.connectedClients > 0,
-  };
+    healthy: redisSummary.totalClients === 0 || redisSummary.connectedClients > 0 };
   if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
     healthy = false;
   }
@@ -96,8 +93,7 @@ export async function publicHealthHandler() {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     checks,
-    pool: poolStatus || undefined,
-  };
+    pool: poolStatus || undefined };
   healthCache = { data: result, ts: Date.now() };
   return NextResponse.json(result);
 }
@@ -126,8 +122,7 @@ export async function detailedHealthHandler(req: NextRequest) {
     checks.redis = {
       status: redisHealth.ok ? 'ok' : 'error',
       latencyMs: redisHealth.latencyMs,
-      error: redisHealth.error || undefined,
-    };
+      error: redisHealth.error || undefined };
     if (!redisHealth.ok) healthy = false;
   } else {
     checks.redis = { status: process.env.REDIS_URL ? 'error' : 'not-configured' };
@@ -148,19 +143,17 @@ export async function detailedHealthHandler(req: NextRequest) {
     reconnects: redisSummary.totalReconnects,
     failedRequests: redisSummary.totalFailedRequests,
     allHealthy: redisSummary.totalClients === 0 || redisSummary.connectedClients === redisSummary.totalClients,
-    clients: redisSummary.clients,
-  };
+    clients: redisSummary.clients };
   if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
     healthy = false;
   }
 
   try {
-    const recentCriticalEvents = await prisma.incident_events.findMany({
+    const recentCriticalEvents = await prisma.activityEvent.findMany({
       where: { severity: 'critical', createdAt: { gte: new Date(Date.now() - 24 * 3600_000) } },
       orderBy: { createdAt: 'desc' },
       take: 5,
-      select: { id: true, type: true, message: true, createdAt: true },
-    });
+      select: { id: true, kind: true, detail: true, createdAt: true } });
     checks.recentCriticalEvents = recentCriticalEvents;
   } catch (e: any) {
     checks.recentCriticalEvents = { status: 'error', error: e?.message };
@@ -174,19 +167,24 @@ export async function detailedHealthHandler(req: NextRequest) {
     environment: process.env.NODE_ENV || 'development',
     version: process.env.npm_package_version || '0.0.1',
     checks,
-    pool: poolStatus || undefined,
-  });
+    pool: poolStatus || undefined });
 }
 
 // ─── GET /api/health/pool ───
 // Detailed connection pool metrics for monitoring dashboards.
 // Returns real-time pool state, utilization, health indicators, and memory usage.
 export async function poolHealthHandler(req: NextRequest) {
-  // Optional: require admin auth for detailed pool metrics
-  const authHeader = req.headers.get('authorization');
-  const adminKey = req.headers.get('x-admin-key');
+  // Admin-only details. The optional x-admin-key header is only trusted when
+  // its value matches ADMIN_API_KEY exactly (constant-time), never on presence.
   const session = await getSession(req).catch(() => null);
-  const isAdmin = (session?.userId && isAdminUser(session)) || !!adminKey;
+  const sessionAdmin = session?.userId && isAdminUser(session);
+  const expectedKey = process.env.ADMIN_API_KEY;
+  const suppliedKey = req.headers.get('x-admin-key') || '';
+  const keyAdmin = !!expectedKey && suppliedKey.length > 0 && crypto.timingSafeEqual(
+    Buffer.from(suppliedKey, 'utf8'),
+    Buffer.from(expectedKey, 'utf8'),
+  );
+  const isAdmin = !!sessionAdmin || keyAdmin;
 
   // Allow unauthenticated access for basic metrics, but require admin for full details
   const detailed = getDetailedPoolStatus();
@@ -203,8 +201,7 @@ export async function poolHealthHandler(req: NextRequest) {
     timestamp: new Date().toISOString(),
     database: {
       connected: dbCheck.ok,
-      latencyMs: dbCheck.latencyMs,
-    },
+      latencyMs: dbCheck.latencyMs },
     pool: detailed,
     alerts: {
       isExhausted: alertState.isExhausted,
@@ -215,9 +212,7 @@ export async function poolHealthHandler(req: NextRequest) {
       totalAlerts: alertState.alertCount,
       lastWarningAt: alertState.lastWarningAt ? new Date(alertState.lastWarningAt).toISOString() : null,
       lastCriticalAt: alertState.lastCriticalAt ? new Date(alertState.lastCriticalAt).toISOString() : null,
-      thresholds: alertState.thresholds,
-    },
-  };
+      thresholds: alertState.thresholds } };
 
   // Admin-only: include memory and full config
   if (!isAdmin) {

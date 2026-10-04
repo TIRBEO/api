@@ -19,7 +19,7 @@ export async function GET(
   try {
     if (id && id.length <= 64) {
       await prisma.$executeRaw`
-        UPDATE "email_logs" SET "clicked_at" = NOW()
+        UPDATE "email"."email_deliveries" SET "clicked_at" = NOW()
         WHERE "id" = ${id} AND "clicked_at" IS NULL`;
     }
   } catch { /* tracking is best-effort */ }

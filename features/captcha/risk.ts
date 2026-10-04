@@ -167,38 +167,30 @@ export function clearRateLimitsByPattern(pattern: string): void {
  * counts are per-user in DB, not localStorage. Incognito cannot bypass.
  * Hundreds of attempts → temp IP block (1h), next time → permanent ban.
  */
-const ENABLE_RATE_LIMITING = true;
+
 
 async function handleIpAbuse(ip: string): Promise<void> {
   if (!ip || ip === 'unknown') return;
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-    const count = await prisma.securityEvent.count({
-      where: { eventType: 'auth.attempt', ipAddress: ip, createdAt: { gte: oneHourAgo } },
-    });
+    const count = await prisma.activityEvent.count({
+      where: { kind: 'auth.attempt', ipAddress: ip, createdAt: { gte: oneHourAgo } } });
     if (count >= 100) {
-      const existing = await prisma.blocklist.findUnique({ where: { targetType_targetId: { targetType: 'ip', targetId: ip } } });
-      const isTemp = existing && existing.expiresAt && existing.expiresAt > new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const { getRedis } = await import('@/features/auth/redis');
+      const redis = getRedis();
+      const raw = redis ? await redis.hget('blocklist', `ip:${ip}`).catch(() => null) : null;
+      const existing = raw ? JSON.parse(raw) as { expiresAt?: string | null } : null;
+      const isTemp = existing?.expiresAt && new Date(existing.expiresAt) > new Date(Date.now() - 24 * 60 * 60 * 1000);
       if (existing && !existing.expiresAt) return; // already permanent
+      const { blockTarget } = await import('@/features/security/security');
       if (isTemp) {
         // Second abuse within 24h → permanent ban
-        await prisma.blocklist.upsert({
-          where: { targetType_targetId: { targetType: 'ip', targetId: ip } },
-          update: { isActive: true, reason: 'Permanent ban: repeated hundreds of auth attempts', expiresAt: null },
-          create: { targetType: 'ip', targetId: ip, reason: 'Permanent ban: repeated hundreds of auth attempts', isActive: true, expiresAt: null },
-        });
+        await blockTarget({ targetType: 'ip', targetId: ip, reason: 'Permanent ban: repeated hundreds of auth attempts', expiresAt: null });
       } else {
         // First abuse → temp block 1 hour
-        await prisma.blocklist.upsert({
-          where: { targetType_targetId: { targetType: 'ip', targetId: ip } },
-          update: { isActive: true, reason: 'Temp block: hundreds of auth attempts', expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
-          create: { targetType: 'ip', targetId: ip, reason: 'Temp block: hundreds of auth attempts', isActive: true, expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
-        });
+        await blockTarget({ targetType: 'ip', targetId: ip, reason: 'Temp block: hundreds of auth attempts', expiresAt: new Date(Date.now() + 60 * 60 * 1000) });
       }
-      // Invalidate cache
-      const { isIpBlocked } = await import('@/features/security/security');
-      // clear cache by forcing miss next time (isIpBlocked caches 15s, but we can clear)
-    }
+      }
   } catch {}
 }
 
@@ -240,16 +232,9 @@ export async function checkWindowLimitDB(key: string, max: number, windowMs: num
     const { consumeGenericWindow } = await import('@/features/auth/verify-limits');
     const r = await consumeGenericWindow(key, max, windowMs);
     if (!r.ok) return false;
-    // async log (fire-and-forget) - don't block response
-    prisma.securityEvent.create({
-      data: {
-        eventType: 'auth.attempt',
-        severity: 'info',
-        ipAddress: ip || null,
-        userAgent: null,
-        metadata: { key, max, windowMs, email: email || null } as any,
-      },
-    }).catch(()=>{});
+    // Pre-account attempts (signup/login OTP) have no user row yet, and
+    // activity_events.user_id has a NOT-NULL FK to users(id), so an anonymous
+    // write can never succeed. Skip the DB log; abuse is still handled below.
     if (ip) handleIpAbuse(ip).catch(()=>{});
     return true;
   } catch {
@@ -301,22 +286,18 @@ export async function countAccountsForDevice(fingerprint: string, sinceHours = 2
   const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
   try {
     const [seen, count] = await Promise.all([
-      prisma.securityEvent.findMany({
+      prisma.activityEvent.findMany({
         where: {
-          eventType: 'device.seen',
+          kind: 'device.seen',
           createdAt: { gte: since },
-          metadata: { path: ['deviceFp'], equals: fingerprint },
-        },
+          metadata: { path: ['deviceFp'], equals: fingerprint } },
         select: { userId: true },
-        distinct: ['userId'],
-      }),
-      prisma.securityEvent.count({
+        distinct: ['userId'] }),
+      prisma.activityEvent.count({
         where: {
-          eventType: 'device.seen',
+          kind: 'device.seen',
           createdAt: { gte: since },
-          metadata: { path: ['deviceFp'], equals: fingerprint },
-        },
-      }),
+          metadata: { path: ['deviceFp'], equals: fingerprint } } }),
     ]);
     const users = new Set(seen.map(s => s.userId).filter(Boolean));
     const result = { users: users.size, sessions: count };
@@ -341,17 +322,17 @@ export async function recordDeviceSeen(opts: {
   sessionId?: string;
 }): Promise<void> {
   if (!opts.fingerprint || opts.fingerprint.length < 16) return;
+  if (!opts.userId) return;
   try {
-    await prisma.securityEvent.create({
+    await prisma.activityEvent.create({
       data: {
-        userId: opts.userId || null,
-        eventType: 'device.seen',
+        userId: opts.userId,
+        kind: 'device.seen',
+        title: 'Device seen',
         severity: 'info',
         ipAddress: opts.ip,
         userAgent: opts.ua,
-        metadata: { deviceFp: opts.fingerprint, sessionId: opts.sessionId || null } as never,
-      },
-    });
+        metadata: { deviceFp: opts.fingerprint, sessionId: opts.sessionId || null } as never } });
   } catch {
     // Best effort — device telemetry must never block auth
   }
@@ -373,13 +354,11 @@ export async function hasRecentLoginSuccess(ip?: string, sinceMs = LOGIN_SUCCESS
   if (cached && Date.now() - cached.ts < LOGIN_SUCCESS_CACHE_TTL) return cached.result;
   try {
     const since = new Date(Date.now() - sinceMs);
-    const count = await prisma.securityEvent.count({
+    const count = await prisma.activityEvent.count({
       where: {
-        eventType: { in: LOGIN_SUCCESS_EVENTS },
+        kind: { in: LOGIN_SUCCESS_EVENTS },
         ipAddress: ip,
-        createdAt: { gte: since },
-      },
-    });
+        createdAt: { gte: since } } });
     const result = count > 0;
     loginSuccessCache.set(ip, { result, ts: Date.now() });
     if (loginSuccessCache.size > 5000) {
@@ -443,16 +422,13 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
         try {
           const ok = await recentSuccess;
           const [loginFails, captchaFails] = await Promise.all([
-            prisma.securityEvent.count({
+            prisma.activityEvent.count({
               where: {
-                eventType: { in: ['auth.login_failed', 'auth.signup_failed', 'auth.2fa_failed'] },
+                kind: { in: ['auth.login_failed', 'auth.signup_failed', 'auth.2fa_failed'] },
                 ipAddress: input.ip,
-                createdAt: { gte: since },
-              },
-            }),
-            prisma.captchaLog.count({
-              where: { eventType: 'attempt_failed', ipAddress: input.ip, createdAt: { gte: since } },
-            }),
+                createdAt: { gte: since } } }),
+            prisma.activityEvent.count({
+              where: { kind: 'captcha.attempt_failed', ipAddress: input.ip, createdAt: { gte: since } } }),
           ]);
           if (ok) {
             // Logins are working again — failures happened before the user
@@ -529,6 +505,5 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
     score,
     level,
     reasons: Array.from(new Set(reasons)).slice(0, 8),
-    requireCaptcha: score >= 51,
-  };
+    requireCaptcha: score >= 51 };
 }

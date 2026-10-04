@@ -1,399 +1,292 @@
 import { prisma } from '@/infrastructure/db/prisma';
+import { readRecoveryContact } from '@/features/identity/tirbeo';
+import { loadNotificationPrefs } from '@/features/notifications/notifications';
 
 export interface AccountTip {
   id: string;
   title: string;
   body: string;
-  actionUrl: string;
+  /** Path inside the settings app, e.g. '/settings/two-factor'. */
+  path: string;
   actionLabel: string;
 }
 
-const D = '/dashboard';
-
+/**
+ * Security tips.
+ *
+ * A tip is only ever about something this account does not have. The earlier
+ * version also proposed adding a bio, a profile photo, an API key, or "turn
+ * product updates back on" — that last one especially: mailing somebody to talk
+ * them out of a switch they just turned off is not a tip, it is a dark pattern.
+ * An account with every protection set gets nothing, which is the correct
+ * outcome and why there is no longer a filler tip at the end.
+ */
 export async function computeTips(userId: string): Promise<AccountTip[]> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
-      name: true,
       emailVerified: true,
       is2FAEnabled: true,
-      secondaryEmail: true,
-      secondaryEmailVerified: true,
-      phoneNumber: true,
-      phoneVerified: true,
-      photoUrl: true,
-      username: true,
-      bio: true,
-      occupation: true,
-      lastLoginAt: true,
-      lastActiveAt: true,
-      createdAt: true,
-      googleId: true,
-      githubId: true,
-      discordId: true,
-      notificationPreferences: true,
+      security: { select: { mustChangePw: true, backupCodes: true } },
+      phone: { select: { number: true } },
       _count: { select: { passkeys: true } },
     },
   });
   if (!user) return [];
 
-  // Parallel counts for richer tips — all DB-connected
-  const [formsCount, ticketsCount, apiKeysCount, sessionsCount] = await Promise.all([
-    prisma.form.count({ where: { userId } }).catch(()=>0),
-    prisma.ticket.count({ where: { customerId: userId } }).catch(()=>0),
-    prisma.apiKey.count({ where: { userId } }).catch(()=>0),
-    prisma.session.count({ where: { userId, status: 'active' } }).catch(()=>0),
-  ]);
-
+  const backupCodes = Array.isArray((user.security as any)?.backupCodes)
+    ? (user.security as any).backupCodes.length : 0;
   const tips: AccountTip[] = [];
 
   if (!user.is2FAEnabled) {
     tips.push({
       id: 'enable-2fa',
-      title: 'Add 2FA — 30 seconds, much safer',
-      body: 'Two-factor keeps your account safe even if your password leaks. Use any authenticator app.',
-      actionUrl: `${D}/account/security`,
-      actionLabel: 'Enable 2FA',
+      title: 'A second step at sign-in',
+      body: 'Two-factor keeps your account yours even if your password leaks somewhere else. Any authenticator app works and it takes about half a minute.',
+      path: '/settings/two-factor',
+      actionLabel: 'Turn on two-factor',
     });
   }
 
-  if (!user.secondaryEmail || !user.secondaryEmailVerified) {
+  if (user._count.passkeys === 0) {
+    tips.push({
+      id: 'add-passkey',
+      title: 'Sign in without a password',
+      body: 'A passkey uses your fingerprint or face, so there is nothing to guess, nothing to phish and nothing to remember.',
+      path: '/settings/passkeys',
+      actionLabel: 'Create a passkey',
+    });
+  }
+
+  if (user.is2FAEnabled && backupCodes === 0) {
+    tips.push({
+      id: 'backup-codes',
+      title: 'Keep backup codes for when your phone is gone',
+      body: 'If you lose the device your authenticator lives on, backup codes are the only way back in. Store them somewhere you trust.',
+      path: '/settings/backup-codes',
+      actionLabel: 'Get backup codes',
+    });
+  }
+
+  const recovery = await readRecoveryContact(userId);
+  if (!recovery?.email || !recovery.verified) {
     tips.push({
       id: 'recovery-email',
       title: 'Add a recovery email',
-      body: 'A backup email lets you get back in if you lose your primary inbox.',
-      actionUrl: `${D}/account/profile`,
+      body: 'A second address you verified gives you a way back if you ever lose access to your main inbox.',
+      path: '/settings/personal-details',
       actionLabel: 'Add recovery email',
     });
   }
 
-  if (!user.phoneNumber) {
+  if (!user.phone?.number) {
     tips.push({
       id: 'add-phone',
-      title: 'Add a recovery phone',
-      body: 'A phone gives you another way to verify it’s you — useful for lockouts.',
-      actionUrl: `${D}/account/profile`,
-      actionLabel: 'Add phone',
+      title: 'Add a phone number',
+      body: 'A verified phone is another route back into your account when everything else has failed.',
+      path: '/settings/personal-details',
+      actionLabel: 'Add a phone number',
     });
   }
 
-  const hasLinked = !!(user.googleId || user.githubId || user.discordId);
-  if (user._count.passkeys === 0 && !hasLinked) {
+  if (!user.emailVerified) {
     tips.push({
-      id: 'faster-signin',
-      title: 'Sign in faster — passkey or Google',
-      body: 'Skip passwords: use fingerprint/face or one-click Google/GitHub.',
-      actionUrl: `${D}/account/security`,
-      actionLabel: 'Set up passkey',
-    });
-  } else if (user._count.passkeys === 0 && hasLinked) {
-    tips.push({
-      id: 'add-passkey-anyway',
-      title: 'Try a passkey for instant sign-in',
-      body: 'You have Google/GitHub linked — a passkey is even faster and works offline.',
-      actionUrl: `${D}/account/security`,
-      actionLabel: 'Create passkey',
+      id: 'verify-email',
+      title: 'Confirm your email address',
+      body: 'Until your address is confirmed we cannot reliably reach you about anything on this account, including a sign-in we did not expect.',
+      path: '/settings/personal-details',
+      actionLabel: 'Verify my email',
     });
   }
 
-  if (!user.photoUrl || !user.username) {
+  if (user.security?.mustChangePw) {
     tips.push({
-      id: 'complete-profile',
-      title: 'Complete your profile',
-      body: [!user.photoUrl ? 'Add a photo' : null, !user.username ? 'pick a username' : null].filter(Boolean).join(' and ') + ' so teammates recognize you.',
-      actionUrl: `${D}/account/profile`,
-      actionLabel: 'Complete profile',
+      id: 'set-password',
+      title: 'Set a password of your own',
+      body: 'This account was created without one, so the password it does have was assigned rather than chosen — worth replacing.',
+      path: '/settings/security',
+      actionLabel: 'Choose a password',
     });
   }
 
-  if (!user.bio) {
-    tips.push({
-      id: 'add-bio',
-      title: 'Add a short bio',
-      body: 'A one-line bio helps collaborators understand your role. Takes 10 seconds.',
-      actionUrl: `${D}/account/profile`,
-      actionLabel: 'Add bio',
-    });
-  }
+  const staleSessions = await prisma.userSession.count({
+    where: { userId, status: 'active', lastUsedAt: { lt: new Date(Date.now() - 30 * 86_400_000) } },
+  }).catch(() => 0);
 
-  if (formsCount === 0) {
-    tips.push({
-      id: 'first-form',
-      title: 'Create your first form',
-      body: 'Forms are the fastest way to collect responses. Try a blank form or a template.',
-      actionUrl: `${D}/forms`,
-      actionLabel: 'Create form',
-    });
-  } else if (formsCount === 1) {
-    tips.push({
-      id: 'form-templates',
-      title: 'Try a form template',
-      body: 'You have 1 form — templates save time for contact, feedback, or sign-ups.',
-      actionUrl: `${D}/forms`,
-      actionLabel: 'Browse templates',
-    });
-  }
-
-  if (ticketsCount === 0) {
-    tips.push({
-      id: 'know-support',
-      title: 'Know where to get help',
-      body: 'If something breaks, open a ticket — support replies in-app and by email.',
-      actionUrl: `${D}/support/tickets`,
-      actionLabel: 'Open support',
-    });
-  }
-
-  if (apiKeysCount === 0 && formsCount > 0) {
-    tips.push({
-      id: 'try-api',
-      title: 'Automate with an API key',
-      body: 'You have forms — an API key lets you push submissions to your own app.',
-      actionUrl: `${D}/account/connected-apps`,
-      actionLabel: 'Create API key',
-    });
-  }
-
-  if (sessionsCount > 3) {
+  if (staleSessions > 0) {
     tips.push({
       id: 'review-sessions',
-      title: `You have ${sessionsCount} active sessions`,
-      body: 'Review where you’re signed in and sign out old devices for safety.',
-      actionUrl: `${D}/account/sessions`,
-      actionLabel: 'Review sessions',
+      title: `${staleSessions} sign-in${staleSessions === 1 ? '' : 's'} you have not used in a month`,
+      body: 'Old sessions outlive the device they started on. Ending the ones you do not recognise closes doors you stopped needing.',
+      path: '/settings/devices',
+      actionLabel: 'Review my devices',
     });
   }
 
-  const daysSinceActive = user.lastActiveAt ? Math.floor((Date.now() - new Date(user.lastActiveAt).getTime())/86400000) : 999;
-  if (daysSinceActive > 14) {
-    tips.push({
-      id: 'welcome-back',
-      title: 'Welcome back — pick up where you left off',
-      body: `You haven’t been active for ${daysSinceActive} days. Check your inbox and recent activity.`,
-      actionUrl: `${D}/home`,
-      actionLabel: 'Go to overview',
-    });
-  } else if (daysSinceActive > 7) {
-    tips.push({
-      id: 'stay-active',
-      title: 'Stay in the loop',
-      body: 'Enable the daily digest to get a quick summary even when you don’t log in.',
-      actionUrl: `${D}/account/notifications`,
-      actionLabel: 'Enable digest',
-    });
-  }
+  const concerns = await prisma.securityEvent.count({
+    where: { userId, severity: { in: ['warning', 'error', 'critical'] }, createdAt: { gte: new Date(Date.now() - 30 * 86_400_000) } },
+  }).catch(() => 0);
 
-  // Notifications not enabled for product
-  const prefs: any = (user as any).notificationPreferences;
-  if (prefs && prefs.product === false) {
-    tips.push({
-      id: 'enable-product-updates',
-      title: 'Turn on product updates',
-      body: 'Get notified about new features and improvements — low volume, useful.',
-      actionUrl: `${D}/account/notifications`,
-      actionLabel: 'Enable product updates',
-    });
-  }
-
-  // Suspicious activity
-  try {
-    const since = new Date(Date.now() - 30*86400000);
-    const failed = await prisma.securityEvent.count({ where: { userId, severity: { in: ['warning','error','critical'] }, createdAt: { gte: since } } });
-    if (failed >= 3) {
-      tips.unshift({
-        id: 'review-security',
-        title: `Review ${failed} security events`,
-        body: 'We saw several security events recently — review them to be sure it’s you.',
-        actionUrl: `${D}/activity/history`,
-        actionLabel: 'Review activity',
-      });
-    }
-  } catch {}
-
-  // Ensure at least one tip for new users with nothing to do (onboarding)
-  if (tips.length === 0) {
-    tips.push({
-      id: 'explore-overview',
-      title: 'Explore your dashboard',
-      body: 'Your overview shows recent activity, tickets, and quick actions — a good place to start.',
-      actionUrl: `${D}/home`,
-      actionLabel: 'Open overview',
+  if (concerns >= 3) {
+    tips.unshift({
+      id: 'review-security-events',
+      title: `Look at the ${concerns} security events from the last month`,
+      body: 'We recorded several security events on this account recently. Reading them is how you tell an odd device from an intruder.',
+      path: '/settings/security',
+      actionLabel: 'Review activity',
     });
   }
 
   return tips;
 }
 
+const DAY = 86_400_000;
+const MIN_INTERVAL_DAYS = 3;
+const MAX_INTERVAL_DAYS = 21;
+
+/**
+ * Stable hash — the same input always the same number.
+ */
+function hash32(input: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = (hash * 16777619) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * When this account's next tip is allowed to go out.
+ *
+ * The sweep runs on a clock, and "an account gets mail at the same minute every
+ * time" is a signature people notice. So each account gets its own spacing AND
+ * its own minute and hour, drawn from the account id plus the moment the last
+ * tip went out — which means the time changes with every send rather than
+ * repeating forever. Deterministic per pair, so a restart mid-sweep does not
+ * move the goalposts and send twice.
+ */
+function nextTipDueAt(userId: string, lastSentAt: number, createdAt: Date | null): number {
+  const anchor = lastSentAt || (createdAt ? new Date(createdAt).getTime() + DAY : 0);
+  if (!anchor) return Date.now();
+  const seed = hash32(`${userId}:${lastSentAt}`);
+  const days = MIN_INTERVAL_DAYS + (seed % (MAX_INTERVAL_DAYS * 1440)) / 1440;
+  const jitterMs = (seed % 86_400_000) + ((hash32(`${userId}:h:${lastSentAt}`) % 3_600_000));
+  return anchor + days * DAY + jitterMs;
+}
+
+/**
+ * The candidate set. The jsonb predicates here are a cheap prefilter over the
+ * store the settings screens write; sendNextTipForUser asks the merged view, so
+ * this query only has to avoid obviously unqualified rows.
+ */
+async function eligibleUserIds(): Promise<Array<{ id: string; createdAt: Date | null }>> {
+  return prisma.$queryRaw<{ id: string; createdAt: Date | null }[]>`
+    SELECT "id", "created_at" AS "createdAt"
+    FROM "user"."users"
+    WHERE "deleted_at" IS NULL AND "is_banned" = false AND "is_suspended" = false
+      AND COALESCE(("notification_preferences" ->> 'tipsEmail')::boolean, false)
+      AND COALESCE(("notification_preferences" ->> 'email')::boolean, true)
+    LIMIT 2000`;
+}
+
 export async function nextUnsentTip(userId: string): Promise<AccountTip | null> {
-  const tips = await computeTips(userId);
+  const [tips, sent] = await Promise.all([
+    computeTips(userId),
+    prisma.userTipLog.findMany({ where: { userId }, select: { tipId: true } }),
+  ]);
   if (tips.length === 0) return null;
-  const sent = await prisma.userTipLog.findMany({ where: { userId }, select: { tipId: true } });
   const sentIds = new Set(sent.map((s) => s.tipId));
-  return tips.find((t) => !sentIds.has(t.id)) ?? null;
+  const candidates = tips.filter((tip) => !sentIds.has(tip.id));
+  if (candidates.length === 0) return null;
+  // Random order, not "always the most important one first": whichever gap this
+  // account learns about, it should not be the same one every time.
+  return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
 export async function sendNextTipForUser(userId: string): Promise<boolean> {
   try {
-    const u = await prisma.user.findUnique({ where: { id: userId }, select: { notificationPreferences: true } }).catch(()=>null);
-    const prefs: any = (u as any)?.notificationPreferences;
-    // Tips emails are OPT-IN: unset toggles mean no email.
-    if (prefs && typeof prefs === 'object') {
-      if (prefs.email === false) return false;
-      const tipsOn = prefs.tips !== undefined ? prefs.tips !== false : true;
-      const tipsEmailOn = prefs.tipsEmail === true;
-      if (!tipsOn || !tipsEmailOn) return false;
-    } else {
-      return false; // no prefs saved — don't email
-    }
+    const prefs = await loadNotificationPrefs(userId);
+    if (!tipsEligible(prefs)) return false;
+
     const tip = await nextUnsentTip(userId);
     if (!tip) return false;
+
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } });
     if (!user?.email) return false;
+
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { getDashboardBaseUrl } = await import('@/config/app-urls');
-    const dashboardUrl = getDashboardBaseUrl();
-    const result = await sendTemplateEmail(user.email, 'account_tip', {
+    const result = await sendTemplateEmail(user.email, 'security_tip', {
       name: user.name || user.email,
       tipTitle: tip.title,
       tipBody: tip.body,
-      actionUrl: `${dashboardUrl}${tip.actionUrl.replace(/^\/dashboard/, '')}`,
+      actionUrl: `${getDashboardBaseUrl()}${tip.path}`,
       actionLabel: tip.actionLabel,
-      dashboardUrl,
-    }).catch(()=>({ success:false }));
+    }, { userId }).catch(() => ({ success: false }));
     if (!result.success) return false;
-    await prisma.userTipLog.create({ data: { userId, tipId: tip.id } }).catch(()=>{});
+
+    await prisma.userTipLog.create({ data: { userId, tipId: tip.id } }).catch(() => {});
     console.log(`[TIPS] Sent '${tip.id}' to ${user.email}`);
     return true;
-  } catch (err:any) {
+  } catch (err: any) {
     console.error('[TIPS] sendNextTipForUser failed:', err?.message);
     return false;
   }
 }
 
 /**
- * Dynamic per-user tip interval based on user profile and activity.
- * Active/new users get tips more frequently (1-2 days).
- * Inactive/established users get tips less frequently (3-7 days).
- * The interval is deterministic for the same user data so it stays
- * consistent across sweep runs, but changes if the user's profile changes.
+ * Tips mail is opt-in, and a pause or an unsubscribed address outranks the
+ * opt-in. The senders in emailPrefs enforce the same rules — this only avoids
+ * building a mail for somebody who already said no.
  */
-function userTipIntervalMs(userId: string, user?: {
-  createdAt?: Date | null;
-  lastActiveAt?: Date | null;
-  tipCount?: number;
-}): number {
-  const DAY = 86_400_000;
-  const MIN = 1;   // minimum days
-  const MAX = 7;   // maximum days
-
-  // Base: deterministic hash of userId (stable per user)
-  let hash = 2166136261;
-  for (let i = 0; i < userId.length; i++) {
-    hash ^= userId.charCodeAt(i);
-    hash = (hash * 16777619) >>> 0;
-  }
-  const baseDays = MIN + (hash % ((MAX - MIN) * 1000 + 1)) / 1000; // 1.000 – 7.000
-
-  if (!user) return Math.floor(baseDays * DAY);
-
-  // ── Adjust based on user signals ──
-  let multiplier = 1.0;
-
-  // 1. New users (< 7 days old) → tip faster to onboard
-  if (user.createdAt) {
-    const ageDays = (Date.now() - new Date(user.createdAt).getTime()) / DAY;
-    if (ageDays < 1) multiplier *= 0.3;       // first day: very frequent
-    else if (ageDays < 3) multiplier *= 0.5;   // first 3 days
-    else if (ageDays < 7) multiplier *= 0.7;   // first week
-  }
-
-  // 2. Active users (logged in within 3 days) → tip faster
-  if (user.lastActiveAt) {
-    const inactiveDays = (Date.now() - new Date(user.lastActiveAt).getTime()) / DAY;
-    if (inactiveDays <= 1) multiplier *= 0.6;      // active today: faster
-    else if (inactiveDays <= 3) multiplier *= 0.8;  // active this week
-    else if (inactiveDays <= 7) multiplier *= 1.0;  // normal
-    else if (inactiveDays <= 14) multiplier *= 1.3; // 1-2 weeks idle: slower
-    else multiplier *= 1.8;                         // 2+ weeks idle: much slower
-  }
-
-  // 3. Users with many tips already → slow down to avoid fatigue
-  const tipCount = user.tipCount ?? 0;
-  if (tipCount >= 8) multiplier *= 1.5;
-  else if (tipCount >= 5) multiplier *= 1.2;
-  else if (tipCount <= 1) multiplier *= 0.7; // new user, few tips sent: tip faster
-
-  const adjustedDays = Math.max(MIN, Math.min(MAX, baseDays * multiplier));
-  return Math.floor(adjustedDays * DAY);
+function tipsEligible(prefs: any): boolean {
+  if (!prefs || prefs.email === false) return false;
+  if (prefs.tips === false || prefs.tipsEmail !== true) return false;
+  return true;
 }
 
 export async function runAutoTipsSweep() {
   try {
-    // Fetch eligible users with profile data for dynamic interval calculation.
-    type EligibleRow = { id: string; createdAt: Date | null; lastActiveAt: Date | null; tipCount: number };
-    const eligible = await prisma.$queryRaw<EligibleRow[]>`
-      SELECT
-        u."id",
-        u."created_at" AS "createdAt",
-        u."last_active_at" AS "lastActiveAt",
-        COALESCE((SELECT COUNT(*) FROM "user_tip_logs" WHERE "user_id" = u."id"), 0)::int AS "tipCount"
-      FROM "users" u
-      WHERE u."deleted_at" IS NULL AND u."is_banned" = false
-        AND (u."notification_preferences"->>'email')::boolean IS NOT FALSE
-        AND (u."notification_preferences"->>'tipsEmail')::boolean IS TRUE
-        AND COALESCE((u."notification_preferences"->>'tips')::boolean, (u."notification_preferences"->>'product')::boolean, true) IS NOT FALSE
-      LIMIT 5000`;
+    const eligible = await eligibleUserIds();
     if (eligible.length === 0) return;
 
-    const userIds = eligible.map(u => u.id);
-
-    // Get the most recent tip log for each eligible user
-    const recentLogs = await prisma.$queryRaw<Array<{ userId: string; lastSentAt: Date }>>`
+    const ids = eligible.map((u) => u.id);
+    const lastSentRows = await prisma.$queryRaw<Array<{ userId: string; lastSentAt: Date }>>`
       SELECT "user_id" AS "userId", MAX("sent_at") AS "lastSentAt"
-      FROM "user_tip_logs"
-      WHERE "user_id" = ANY(${userIds})
-      GROUP BY "user_id"
-    `;
-    const lastSentMap = new Map(recentLogs.map(r => [r.userId, new Date(r.lastSentAt).getTime()]));
+      FROM "activity"."user_tip_logs"
+      WHERE "user_id" = ANY(${ids})
+      GROUP BY "user_id"`;
+    const lastSent = new Map(lastSentRows.map((row) => [row.userId, new Date(row.lastSentAt).getTime()]));
 
     const now = Date.now();
     let sentCount = 0;
-
-    for (const u of eligible) {
-      const lastSent = lastSentMap.get(u.id) || 0;
-      const interval = userTipIntervalMs(u.id, {
-        createdAt: u.createdAt,
-        lastActiveAt: u.lastActiveAt,
-        tipCount: u.tipCount,
-      });
-
-      // Only send if enough time has passed since the user's last tip
-      if (now - lastSent < interval) continue;
-
-      const ok = await sendNextTipForUser(u.id);
-      if (ok) sentCount++;
+    for (const user of eligible) {
+      if (now < nextTipDueAt(user.id, lastSent.get(user.id) || 0, user.createdAt)) continue;
+      if (await sendNextTipForUser(user.id)) sentCount++;
     }
-
-    if (sentCount > 0) console.log(`[TIPS] Sweep complete — ${sentCount} tips sent`);
+    if (sentCount > 0) console.log(`[TIPS] Sweep complete — ${sentCount} tip${sentCount === 1 ? '' : 's'} sent`);
   } catch (err: any) {
     console.error('[TIPS] Sweep error:', err?.message);
   }
 }
 
 let tipsTimeout: ReturnType<typeof setTimeout> | null = null;
+
+// Checking often is what makes a random minute-of-day mean anything: with an
+// hourly check the jitter below would be rounded up to the next hour.
+const SWEEP_EVERY_MS = 15 * 60_000;
+
 function scheduleNextSweep() {
   if (tipsTimeout) clearTimeout(tipsTimeout);
-  // Sweep every hour — individual user intervals determine who actually gets a tip
-  const delay = 3_600_000; // 1 hour
-  const nextAt = new Date(Date.now() + delay);
-  console.log(`[TIPS] Next sweep at ${nextAt.toISOString()} (in 60min)`);
-  tipsTimeout = setTimeout(() => { runAutoTipsSweep().catch(() => {}).finally(() => scheduleNextSweep()); }, delay);
+  tipsTimeout = setTimeout(() => {
+    runAutoTipsSweep().catch(() => {}).finally(() => scheduleNextSweep());
+  }, SWEEP_EVERY_MS);
 }
 
 export function startPeriodicTips() {
   if (tipsTimeout) return;
-  // First sweep after 2 minutes, then hourly
   setTimeout(() => { runAutoTipsSweep().catch(() => {}); }, 2 * 60_000);
   scheduleNextSweep();
-  console.log('[TIPS] Periodic auto-tips started (dynamic per-user intervals based on activity, hourly sweep)');
+  console.log(`[TIPS] Periodic security tips started (check every ${SWEEP_EVERY_MS / 60_000}min, one tip per account every 3-21 days)`);
 }

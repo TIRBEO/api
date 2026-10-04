@@ -7,3 +7,6 @@ node_modules/
 .env.*.local
 *.tsbuildinfo
 dist/
+# Local DB snapshots / rebuild backups (never commit)
+prisma/backup-*.json.gz
+prisma/*backup*.sql

@@ -1,5 +1,4 @@
 import { stat } from 'fs/promises';
-import path from 'path';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -9,8 +8,7 @@ const MAGIC_NUMBERS: Record<string, { bytes: number[]; offset: number }> = {
   'image/gif': { bytes: [0x47, 0x49, 0x46, 0x38, 0x37, 0x61], offset: 0 },
   'image/webp': { bytes: [0x52, 0x49, 0x46, 0x46], offset: 0 },
   'image/svg+xml': { bytes: [0x3C, 0x3F, 0x78, 0x6D, 0x6C], offset: 0 },
-  'image/x-icon': { bytes: [0x00, 0x00, 0x01, 0x00], offset: 0 },
-};
+  'image/x-icon': { bytes: [0x00, 0x00, 0x01, 0x00], offset: 0 } };
 
 export async function validateImageFile(filePath: string, claimedContentType: string): Promise<boolean> {
   try {

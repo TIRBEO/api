@@ -305,14 +305,15 @@ export function normalizePermissions(raw: unknown): PermissionSet {
 }
 
 export async function getEffectivePermissions(userId: string): Promise<PermissionSet> {
+  // Consolidated schema: adminRole column replaced by boolean isAdmin; admins
+  // map to the legacy 'admin' role so their permission set is unchanged.
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { adminRole: true },
+    select: { isAdmin: true },
   });
   if (!user) return {};
 
-  // Normalize legacy/underscore variants (e.g. "superadmin" -> "super_admin")
-  const role = (user.adminRole || '').replace(/^superadmin$/, 'super_admin');
+  const role: string = user.isAdmin ? 'admin' : '';
 
   // super_admin gets ALL
   if (role === 'super_admin') {

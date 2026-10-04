@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
       include: {
         notifications: { select: { id: true, type: true, title: true, body: true, createdAt: true } },
         sessions: { select: { id: true, createdAt: true, lastUsedAt: true } },
-        passkeys: { select: { id: true, createdAt: true, updatedAt: true } },
+        passkeys: { select: { id: true } },
       },
     });
 

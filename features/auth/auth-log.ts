@@ -1,10 +1,11 @@
 import { prisma } from '@/infrastructure/db/prisma';
 
 /**
- * Compact JSON logger for all auth links/OTPs — single DB row per event,
- * minimal space (JSON) vs separate columns. Uses AuthLog (auth_logs) with
- * type + data JSON so it survives incognito and is per-user in DB.
- * Also mirrors to SecurityEvent for compatibility. Best-effort: never throws.
+ * Compact JSON logger for all auth links/OTPs — single DB row per event.
+ * activity_events is the ONLY event log in the consolidated schema (auth_logs
+ * and security_events were removed: they duplicated this shape). Secrets are
+ * never stored — OTP hashes are truncated and links are logged by jti only.
+ * Best-effort.
  */
 export async function logAuthJson(
   type: 'signup_otp' | 'login_otp' | 'magic_link' | 'password_reset_otp' | 'password_reset_link' | 'password_recovery_otp' | 'verify' | 'other',
@@ -16,21 +17,23 @@ export async function logAuthJson(
       if (v !== undefined && v !== null && v !== '') compact[k] = v;
     }
     compact._t = Date.now();
-    // Primary: compact JSON in auth_logs (visible, low space)
-    await (prisma as any).authLog.create({
-      data: { type, data: compact as any },
-    }).catch(()=>{});
-    // Mirror to SecurityEvent for existing dashboards
-    await prisma.securityEvent.create({
+    // activity_events.user_id has a NOT-NULL FK to users(id). Pre-account auth
+    // events (signup-otp, login-otp, magic-link) have no user yet, so there is
+    // nothing attributable — skip the DB write instead of violating the FK.
+    const userId = typeof data.userId === 'string' && data.userId ? data.userId : null;
+    if (!userId) return;
+    await prisma.activityEvent.create({
       data: {
-        eventType: `auth.log:${type}`,
+        userId,
+        kind: `auth.log:${type}`,
+        title: `Auth event: ${type}`,
+        detail: (data.email as string) || null,
         severity: 'info',
         ipAddress: (data.ip as string) || null,
         userAgent: (data.ua as string) || null,
-        userId: (data.userId as string) || null,
         metadata: compact as any,
       },
-    }).catch(()=>{});
+    }).catch(() => {});
   } catch {}
 }
 

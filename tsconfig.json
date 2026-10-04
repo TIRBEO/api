@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
-    "types": ["@cloudflare/workers-types"],
+    "types": [
+      "@cloudflare/workers-types"
+    ],
     "target": "ES2017",
     "lib": [
       "dom",
@@ -9,7 +11,7 @@
     ],
     "allowJs": true,
     "skipLibCheck": true,
-    "strict": false,
+    "strict": true,
     "noEmit": true,
     "incremental": true,
     "module": "esnext",
@@ -27,8 +29,7 @@
       {
         "name": "next"
       }
-    ],
-    "ignoreDeprecations": "6.0"
+    ]
   },
   "include": [
     "next-env.d.ts",
@@ -39,7 +40,6 @@
   ],
   "exclude": [
     "node_modules",
-    "scripts/test-*.ts",
-    "scripts/issue-e2e-session.ts"
+    "scripts/tmp-*"
   ]
 }

@@ -23,10 +23,8 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     data: {
       ...(body.label !== undefined && { label: body.label }),
       ...(body.subject !== undefined && { subject: body.subject }),
-      ...(body.htmlBody !== undefined && { htmlBody: body.htmlBody }),
+      ...(body.htmlBody !== undefined && { html: body.htmlBody }),
       ...(body.variables !== undefined && { variables: body.variables }),
-      ...(body.fromEmail !== undefined && { fromEmail: body.fromEmail }),
-      ...(body.fromName !== undefined && { fromName: body.fromName }),
     },
   });
   return NextResponse.json(tpl);

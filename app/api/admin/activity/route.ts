@@ -1,7 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
-import { cachedJson } from '@/shared/response';
 
 export const GET = withAdmin(async (request, session) => {
 
@@ -9,22 +8,18 @@ export const GET = withAdmin(async (request, session) => {
 
   // Parallelize: logs + online users in a single round-trip batch
   const [logs, rawSessions] = await Promise.all([
-    prisma.auditEvent.findMany({
+    prisma.activityEvent.findMany({
       orderBy: { createdAt: 'desc' },
       take: limit,
       include: {
-        actor: {
+        user: {
           select: {
             id: true,
             email: true,
             name: true,
-            photoUrl: true,
-          },
-        },
-      },
-    }),
+            photoUrl: true } } } }),
     // Online users (active in last 5 min) — deduplicate by userId
-    prisma.session.findMany({
+    prisma.userSession.findMany({
       where: { lastUsedAt: { gte: new Date(Date.now() - 5 * 60 * 1000) }, status: 'active' },
       select: { user: { select: { id: true, email: true, name: true, photoUrl: true } } },
       orderBy: { lastUsedAt: 'desc' },
@@ -38,5 +33,5 @@ export const GET = withAdmin(async (request, session) => {
     .filter(s => { if (seenUserIds.has(s.user.id)) return false; seenUserIds.add(s.user.id); return true; })
     .slice(0, limit);
 
-  return cachedJson({ logs, onlineUsers }, { ttl: 5, swr: 15 });
+  return NextResponse.json({ logs: logs.map((l: any) => ({ ...l, actor: l.user })), onlineUsers }, { headers: { 'Cache-Control': 'private, no-store' } });
 });

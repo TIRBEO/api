@@ -1,8 +1,8 @@
 import { NextRequest } from 'next/server';
 import { listUsers, getUserDetail, createUser, updateUser, deleteUser, banUser, unbanUser, suspendUser, unsuspendUser, resolveUserByRefCode, exportUsersCsv } from '@/features/admin/adminHandlers';
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const { action } = await params;
+export async function GET(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
+  const { action = [] } = await params;
   const [userId] = action || [];
   if (userId === 'resolve') return resolveUserByRefCode(request);
   if (userId === 'export') return exportUsersCsv(request);
@@ -10,15 +10,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   return listUsers(request);
 }
 
-export async function POST(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const { action } = await params;
+export async function POST(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
+  const { action = [] } = await params;
   const [userId] = action || [];
   if (userId) return new Response('Invalid route', { status: 400 });
   return createUser(request);
 }
 
-export async function PATCH(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const { action } = await params;
+export async function PATCH(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
+  const { action = [] } = await params;
   const [userId] = action || [];
   if (!userId) return new Response('Missing user id', { status: 400 });
 
@@ -37,8 +37,8 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   return updateUser(request, userId);
 }
 
-export async function DELETE(request: NextRequest, { params }: { params: Promise<{ action: string[] }> }) {
-  const { action } = await params;
+export async function DELETE(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
+  const { action = [] } = await params;
   const [userId] = action || [];
   if (!userId) return new Response('Missing user id', { status: 400 });
   return deleteUser(request, userId);

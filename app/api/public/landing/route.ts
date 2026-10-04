@@ -1,4 +1,3 @@
-import { NextResponse } from 'next/server';
 import { cachedJson } from '@/shared/response';
 
 export async function GET() {

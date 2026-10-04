@@ -1,18 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
+import { getRedis } from '@/features/auth/redis';
+import { tirbeoEmailFor } from '@/features/identity/tirbeo';
 
 /**
  * Device-scoped account memory powering the multi-account switcher.
  *
  * A random, httpOnly `__device` cookie identifies the browser/device. Every
- * account that authenticates on this device is remembered in `device_accounts`
- * so the user can switch between them without re-entering credentials — the
- * same trust model as Google's account switcher (the device cookie is
- * unguessable and only readable server-side).
+ * account that authenticates on this device is remembered (Redis hash,
+ * 90-day TTL) so the user can switch between them without re-entering
+ * credentials — the same trust model as Google's account switcher (the
+ * device cookie is unguessable and only readable server-side).
  */
 
 export const DEVICE_COOKIE_NAME = '__device';
-const DEVICE_COOKIE_DOMAIN = process.env.NEXT_PUBLIC_COOKIE_DOMAIN || '.tirbeo.app';
+const DEVICE_COOKIE_DOMAIN = process.env.NEXT_PUBLIC_COOKIE_DOMAIN || '.tirbeo.com';
 
 const IS_PROD = process.env.NODE_ENV !== 'development';
 
@@ -77,6 +79,9 @@ export function ensureDeviceId(request: NextRequest, response: NextResponse): st
   return getDeviceId(request) || setDeviceCookie(response, request);
 }
 
+const DEVICE_ACCOUNTS_TTL_S = 60 * 60 * 24 * 90; // 90 days
+const deviceAccountsKey = (deviceId: string) => `device:${deviceId}:accounts`;
+
 /**
  * Remember that `userId` signed in on `deviceId`. Fire-and-forget safe
  * (swallows errors) — the switcher just won't show the account if it fails.
@@ -84,23 +89,17 @@ export function ensureDeviceId(request: NextRequest, response: NextResponse): st
 export async function rememberDeviceAccount(deviceId: string, userId: string): Promise<void> {
   if (!deviceId || !userId) return;
   try {
-    await prisma.deviceAccount.upsert({
-      where: { deviceId_userId: { deviceId, userId } },
-      create: { deviceId, userId, lastUsedAt: new Date() },
-      update: { lastUsedAt: new Date() },
-    });
+    const redis = getRedis();
+    if (!redis) return;
+    const key = deviceAccountsKey(deviceId);
+    await redis.hset(key, userId, String(Date.now()));
     // Cap the list so a device doesn't accumulate unbounded history.
-    const overflow = await prisma.deviceAccount.findMany({
-      where: { deviceId },
-      orderBy: { lastUsedAt: 'asc' },
-      skip: MAX_ACCOUNTS_PER_DEVICE,
-      select: { id: true },
-    });
-    if (overflow.length > 0) {
-      await prisma.deviceAccount.deleteMany({
-        where: { id: { in: overflow.map((r) => r.id) } },
-      });
+    const all: Record<string, string> = await redis.hgetall(key);
+    const entries = Object.entries(all).sort((a, b) => Number(b[1]) - Number(a[1]));
+    for (const [uid] of entries.slice(MAX_ACCOUNTS_PER_DEVICE)) {
+      await redis.hdel(key, uid);
     }
+    await redis.expire(key, DEVICE_ACCOUNTS_TTL_S);
   } catch {}
 }
 
@@ -117,25 +116,29 @@ export async function listDeviceAccounts(request: NextRequest): Promise<DeviceAc
   const deviceId = getDeviceId(request);
   if (!deviceId) return [];
   try {
-    const rows = await prisma.deviceAccount.findMany({
-      where: { deviceId },
-      include: {
-        user: {
-          select: { id: true, name: true, email: true, photoUrl: true, isBanned: true, isSuspended: true },
-        },
+    const redis = getRedis();
+    if (!redis) return [];
+    const all: Record<string, string> = await redis.hgetall(deviceAccountsKey(deviceId)) || {};
+    const userIds = Object.keys(all);
+    if (userIds.length === 0) return [];
+    const users = await prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: {
+        id: true, username: true, status: true,
+        profile: { select: { name: true, photoUrl: true } },
+        emails: { where: { kind: 'primary' }, select: { address: true }, take: 1 },
       },
-      orderBy: { lastUsedAt: 'desc' },
     });
-    return rows
-      .filter((r) => r.user)
-      .map((r) => ({
-        id: r.user.id,
-        name: r.user.name,
-        email: r.user.email,
-        photoUrl: r.user.photoUrl,
-        isBlocked: !!(r.user.isBanned || r.user.isSuspended),
-        lastUsedAt: r.lastUsedAt,
-      }));
+    return users
+      .map((u) => ({
+        id: u.id,
+        name: u.profile?.name ?? null,
+        email: u.username ? tirbeoEmailFor(u.username) : (u.emails[0]?.address ?? u.id),
+        photoUrl: u.profile?.photoUrl ?? null,
+        isBlocked: u.status === 'suspended' || u.status === 'deleted',
+        lastUsedAt: all[u.id] ? new Date(Number(all[u.id])) : null,
+      }))
+      .sort((a, b) => (b.lastUsedAt?.getTime() ?? 0) - (a.lastUsedAt?.getTime() ?? 0));
   } catch {
     return [];
   }
@@ -145,7 +148,8 @@ export async function removeDeviceAccount(request: NextRequest, userId: string):
   const deviceId = getDeviceId(request);
   if (!deviceId) return;
   try {
-    await prisma.deviceAccount.deleteMany({ where: { deviceId, userId } });
+    const redis = getRedis();
+    if (redis) await redis.hdel(deviceAccountsKey(deviceId), userId);
     markRemoved(deviceId, userId);
   } catch {}
 }
@@ -155,8 +159,9 @@ export async function isKnownDeviceAccount(request: NextRequest, userId: string)
   const deviceId = getDeviceId(request);
   if (!deviceId) return false;
   try {
-    const count = await prisma.deviceAccount.count({ where: { deviceId, userId } });
-    return count > 0;
+    const redis = getRedis();
+    if (!redis) return false;
+    return !!(await redis.hget(deviceAccountsKey(deviceId), userId));
   } catch {
     return false;
   }

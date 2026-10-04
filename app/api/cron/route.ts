@@ -1,24 +1,11 @@
-/**
- * /api/cron — Vercel Cron Job endpoint.
- *
- * On Vercel free tier: 1 cron job/day (configurable in vercel.json).
- * This endpoint runs all due background jobs (digests, cleanup, tips, etc.).
- *
- * Security: only callable by Vercel Cron (VERCEL_CRON_SECRET) or with a
- * manual CRON_SECRET bearer token.
- */
 import { NextRequest, NextResponse } from 'next/server';
 import { runDueJobs } from '@/jobs/job-gate';
+import { isCronAuthorized, cronUnauthorized } from './_guard';
+
+export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
-  // Verify caller: Vercel Cron or manual secret
-  const authHeader = request.headers.get('authorization');
-  const cronSecret = process.env.CRON_SECRET;
-  const vercelCron = request.headers.get('x-vercel-cron');
-
-  if (cronSecret && vercelCron !== '1' && authHeader !== `Bearer ${cronSecret}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  if (!isCronAuthorized(request)) return cronUnauthorized();
 
   console.log('[CRON] Starting due jobs...');
   const results = await runDueJobs();
@@ -31,4 +18,8 @@ export async function GET(request: NextRequest) {
     ran: ran.length,
     results,
   });
+}
+
+export async function POST(request: NextRequest) {
+  return GET(request);
 }

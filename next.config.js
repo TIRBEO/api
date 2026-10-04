@@ -1,5 +1,15 @@
 /** @type {import('next').NextConfig} */
+const path = require('path');
+
 const nextConfig = {
+  turbopack: {
+    // Pin the monorepo workspace root. Without this, Turbopack can infer
+    // apps/api as the root and refuse to compile the hoisted node_modules
+    // ("Could not find the Next.js package (next/package.json)").
+    root: path.join(__dirname, '..', '..'),
+  },
+  // Dev-only: allow HMR/dev resources when browsing from the LAN device.
+  allowedDevOrigins: ['192.168.1.123', 'localhost'],
   typescript: {
     ignoreBuildErrors: true,
   },
@@ -15,7 +25,7 @@ const nextConfig = {
         { source: '/share-file/:token', destination: '/api/cdn/share/:token/content' },
       ],
       afterFiles: [
-        // Public file URLs: cdn.tirbeo.app/u/<userId>/<folders>/<file>
+        // Public file URLs: cdn.tirbeo.com/u/<userId>/<folders>/<file>
         // (also covers the API origin itself in dev)
         { source: '/u/:path*', destination: '/api/cdn/u/:path*' },
       ],
@@ -41,7 +51,6 @@ const nextConfig = {
       },
     ];
   },
-  turbopack: {},
   webpack: (config, { isServer }) => {
     config.output = config.output || {};
     config.output.hashFunction = 'xxhash64';

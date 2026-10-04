@@ -7,7 +7,7 @@ import { sendBroadcastWs } from '@/infrastructure/realtime/ws-deliver';
 /** Recipient count for the composer preview. */
 export const GET = withAdmin(async () => {
   const rows = await prisma.$queryRaw<Array<{ n: bigint }>>`
-    SELECT COUNT(*)::bigint AS n FROM "users"
+    SELECT COUNT(*)::bigint AS n FROM "user"."users"
     WHERE "deleted_at" IS NULL AND "is_banned" = false
       AND ("notification_preferences"->>'email')::boolean = true
       AND ("notification_preferences"->>'productEmail')::boolean = true
@@ -34,9 +34,9 @@ export const POST = withAdmin(async (request: NextRequest) => {
     return NextResponse.json({ error: 'Message is required (max 5000 chars)' }, { status: 400 });
   }
 
-  type Row = { email: string; name: string | null };
+  type Row = { id: string; email: string; name: string | null };
   const recipients = await prisma.$queryRaw<Row[]>`
-    SELECT "email", "name" FROM "users"
+    SELECT "id", "email", "name" FROM "user"."users"
     WHERE "deleted_at" IS NULL AND "is_banned" = false
       AND ("notification_preferences"->>'email')::boolean = true
       AND ("notification_preferences"->>'productEmail')::boolean = true
@@ -63,7 +63,7 @@ export const POST = withAdmin(async (request: NextRequest) => {
         ctaUrl: ctaUrl.startsWith('http') ? ctaUrl : `${dashboardUrl}${ctaUrl}`,
         ctaLabel,
         dashboardUrl,
-      });
+      }, { userId: u.id });
       if (result.success) sent++; else failed++;
     } catch {
       failed++;
@@ -74,7 +74,7 @@ export const POST = withAdmin(async (request: NextRequest) => {
 
   // Also create in-app notifications for all opted-in users (not just email recipients)
   const allProductUsers = await prisma.$queryRaw<Array<{ id: string }>>`
-    SELECT "id" FROM "users"
+    SELECT "id" FROM "user"."users"
     WHERE "deleted_at" IS NULL AND "is_banned" = false
       AND COALESCE(("notification_preferences"->>'product')::boolean, true) = true`;
   

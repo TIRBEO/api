@@ -41,17 +41,18 @@ app.prepare().then(() => {
       console.log('[SERVER] Vercel mode — periodic jobs disabled (use /api/cron)');
     } else {
       // ── Local / self-hosted: start periodic jobs ──
-      const { startPeriodicCleanup, startPeriodicDigests, startPeriodicDeletionSweep, startPeriodicPushPrune, startPeriodicReactivation } = require('@/jobs/jobs');
+      const { startPeriodicCleanup, startPeriodicSummaries, startPeriodicDeletionSweep, startPeriodicPushPrune, startPeriodicReactivation } = require('@/jobs/jobs');
       const { startPeriodicTips } = require('@/features/users/tips');
-      const { startEmailBrainWorkers } = require('@/features/email-brain/worker');
 
       startPeriodicCleanup();
-      startPeriodicDigests();
+      startPeriodicSummaries();
       startPeriodicDeletionSweep();
       startPeriodicPushPrune();
       startPeriodicTips();
       startPeriodicReactivation();
-      startEmailBrainWorkers();
+      // Email Brain is retired: its queue worker polled deleted tables
+      // (email_jobs.dedupe_key, email_events) and spammed errors every tick.
+      // Transactional + digest email still runs through features/email.
 
       // Query performance alerts
       try {
@@ -59,23 +60,6 @@ app.prepare().then(() => {
         setupQueryAlerts();
       } catch (e: any) {
         console.warn('[QUERY-ALERT] Setup skipped:', e?.message || e);
-      }
-
-      // Company CDN events on the WS channel "cdn" for other apps.
-      try {
-        const { startCdnWsBridge } = require('@/features/media/cdnWsBridge');
-        startCdnWsBridge();
-      } catch (e: any) {
-        console.warn('[CDN-WS] Bridge skipped:', e?.message || e);
-      }
-
-      // CDN control plane follower: execute leader cache commands (warm/clear)
-      // arriving on the CDN event bus, so every instance converges instantly.
-      try {
-        const { bindCdnControlFollower } = require('@/features/media/cdnControl');
-        bindCdnControlFollower();
-      } catch (e: any) {
-        console.warn('[CDN-CTL] Follower binding skipped:', e?.message || e);
       }
 
       // WebSocket server
@@ -86,10 +70,10 @@ app.prepare().then(() => {
           console.log(`> WebSocket server ready on ws://${hostname}:${wsPort}`);
         } catch (e: any) {
           console.warn(`[WS] Embedded WS server skipped: ${e?.message || e}`);
-          console.log(`> WebSocket service: use external realtime server (ws.tirbeo.app)`);
+          console.log(`> WebSocket service: use external realtime server (ws.tirbeo.com)`);
         }
       } else {
-        console.log(`> WebSocket service: external realtime server (ws.tirbeo.app)`);
+        console.log(`> WebSocket service: external realtime server (ws.tirbeo.com)`);
       }
     }
   });
