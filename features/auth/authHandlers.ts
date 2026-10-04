@@ -30,7 +30,7 @@ import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicio
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, isHostAllowed } from '@/config/app-urls';
 import { eventIdFor } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
-import { getRedis } from '@/features/auth/redis';
+import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
 import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
 import { normalizeWorkFields } from '@/features/auth/profile-work';
 
@@ -42,7 +42,11 @@ const emailExistsCache = createTtlCache<EmailExistsResult>(30_000, 5000, 'emailE
 // Cache for GET /api/users/me — dashboard polls this frequently.
 // 10s TTL: stale data is acceptable for profile display, and bust on PATCH.
 const profileCache = createTtlCache<any>(10_000, 2000, 'profile');
-export function bustProfileCache(userId: string) { profileCache.delete(userId); }
+export function bustProfileCache(userId: string) {
+  profileCache.delete(userId);
+  // Also clear the shared Redis copy apps/myprofile reads, and announce it.
+  void deleteCachedProfile(userId);
+}
 
 // ─── Consolidated-schema helpers (identity split across users/user_email/
 //     user_security/user_preferences) ───
@@ -2903,6 +2907,7 @@ export async function profileHandler(request: NextRequest) {
       const result = await buildProfilePayload(session.userId);
       if (!result) return NextResponse.json({ error: 'User not found' }, { status: 404 });
       profileCache.set(session.userId, result);
+      void setCachedProfile(session.userId, result);
       return NextResponse.json(result);
     }
 
@@ -3061,6 +3066,7 @@ export async function profileHandler(request: NextRequest) {
       bustProfileCache(uid);
       const updated = await buildProfilePayload(uid);
       if (updated) profileCache.set(uid, updated);
+      if (updated) void setCachedProfile(uid, updated);
       return NextResponse.json(updated);
     }
 

@@ -152,6 +152,39 @@ export async function deleteCachedSessionIdentity(sid: string): Promise<void> {
   }
 }
 
+// ─── Profile read cache (shared with the myprofile service) ───
+// apps/myprofile answers a profile read from Redis before it pays an HTTP hop
+// or a pooled DB read — it only ever *reads* `profile:cache:<userId>`. The
+// main API is the brain and the sole writer of that key, so every place the
+// in-memory profileCache is populated must also warm Redis, and bustProfileCache
+// must clear it. The stored shape is buildProfilePayload()'s result, a superset
+// of the wire row myprofile normalises. Short TTL keeps a lost invalidation
+// bounded; a miss simply falls through to the DB/HTTP path.
+const PROFILE_CACHE_TTL_MS = 30_000;
+const PROFILE_CACHE_KEY = (userId: string) => `profile:cache:${userId}`;
+
+export async function setCachedProfile(userId: string, data: unknown): Promise<void> {
+  const redis = getRedis();
+  if (!redis) return;
+  try {
+    await redis.setex(PROFILE_CACHE_KEY(userId), Math.ceil(PROFILE_CACHE_TTL_MS / 1000), JSON.stringify(data));
+  } catch {
+    /* ignore cache write failures */
+  }
+}
+
+export async function deleteCachedProfile(userId: string): Promise<void> {
+  const redis = getRedis();
+  if (!redis) return;
+  try {
+    await redis.del(PROFILE_CACHE_KEY(userId));
+    // Tell any subscriber the row changed, so a warm copy is dropped now, not at TTL.
+    await redis.publish('profile:changed', userId);
+  } catch {
+    /* ignore */
+  }
+}
+
 export const REFRESH_TOKEN_BYTES = 32;
 
 export function generateRefreshToken(): string {
