@@ -1849,6 +1849,25 @@ export async function oauthPendingHandler(request: NextRequest) {
   }
 }
 
+/**
+ * The face the person chose on the signup screen, if it is one we can store.
+ *
+ * The editor sends a base64 `data:image/...` URL (a cropped 512×512 JPEG); an
+ * untouched provider thumbnail arrives as an `http(s)` URL. Anything else — a
+ * `javascript:`/`data:text/html` string, or a data URL bloated past what a
+ * column should hold — is dropped so the account falls back to the provider's
+ * photo rather than persisting a hostile or oversized value.
+ */
+const SIGNUP_PHOTO_MAX_CHARS = 2_500_000; // ~1.8 MB of image after base64
+function normalizeSignupPhoto(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim();
+  if (!v || v.length > SIGNUP_PHOTO_MAX_CHARS) return null;
+  if (/^data:image\/(png|jpe?g|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(v)) return v;
+  if (/^https?:\/\/\S+$/i.test(v)) return v;
+  return null;
+}
+
 // POST /api/auth/oauth/complete — create the Tirbeo account from a
 // pending-signup token. The signed token is the authorization; the explicit
 // policyAccepted flag means the account (and its consent record) only ever
@@ -1870,6 +1889,13 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     // Accept name from request body (user may have edited it on the signup
     // screen) — fall back to whatever the OAuth provider supplied in the token.
     const displayName = (typeof body.name === 'string' && body.name.trim()) || data.name || undefined;
+
+    // The signup screen lets the person pick and crop their own face, which
+    // arrives as a base64 data URL; an untouched provider thumbnail arrives as
+    // an http(s) URL. Accept either, reject anything else — a data: URL that
+    // isn't an image, or one bloated past what a column should hold, falls back
+    // to the provider's photo rather than being written through.
+    const chosenPhoto = normalizeSignupPhoto(body.photoUrl) ?? data.photoUrl ?? null;
 
     // Accept username from request body — validate and save (required).
     if (typeof body.username !== 'string' || !body.username.trim()) {
@@ -1924,8 +1950,8 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
         if (!existing.name && displayName) {
           await prisma.userProfile.update({ where: { userId: existing.id }, data: { name: sanitizeInput(displayName, 120) } }).catch(() => {});
         }
-        if (!existing.photoUrl && data.photoUrl) {
-          await prisma.userProfile.update({ where: { userId: existing.id }, data: { photoUrl: data.photoUrl } }).catch(() => {});
+        if (!existing.photoUrl && chosenPhoto) {
+          await prisma.userProfile.update({ where: { userId: existing.id }, data: { photoUrl: chosenPhoto } }).catch(() => {});
         }
       }
 
@@ -1952,7 +1978,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
         profile: {
           create: {
             name: displayName ? sanitizeInput(displayName, 120) : null,
-            photoUrl: data.photoUrl || null,
+            photoUrl: chosenPhoto,
             // The completion screen asks the same questions the password
             // wizard does; nothing it sends may be dropped on the way in.
             ...work,
