@@ -35,15 +35,5 @@
     "PUSHER_KEY_AP4": "30d7c6e7fe9433069371",
     "PUSHER_CLUSTER_AP4": "ap4",
     "BEAMS_INSTANCE_ID": "869b3b95-386f-4984-ae8c-9b9735966bc8"
-  },
-  "build": {
-    "env": {
-      "PUSHER_SECRET_PRIMARY": "@pusher_secret_primary",
-      "PUSHER_SECRET_SECONDARY": "@pusher_secret_secondary",
-      "PUSHER_SECRET_TERTIARY": "@pusher_secret_tertiary",
-      "PUSHER_SECRET_AP2": "@pusher_secret_ap2",
-      "PUSHER_SECRET_AP4": "@pusher_secret_ap4",
-      "BEAMS_PRIMARY_KEY": "@beams_primary_key"
-    }
   }
 }
