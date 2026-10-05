@@ -5,6 +5,19 @@ import { getRateLimitMetrics, getBlockRateAlerts } from '@/features/auth/rate-li
 import { getQueryPerformanceStats } from '@/infrastructure/observability/queryMonitor';
 import { publicHealthHandler } from '@/features/observability/health';
 import { getRedisHealthSummary } from '@/infrastructure/db/redis';
+import { isTurnstileConfigured, getTurnstileSiteKey } from '@/features/auth/turnstile';
+
+/** Captcha gate activity over the last 24h; all kinds, or one specific kind. */
+function captchaGate24h(kind?: 'captcha.blocked' | 'captcha.attempt_failed') {
+  return safe(
+    prisma.activityEvent.count({
+      where: {
+        ...(kind ? { kind } : { kind: { in: ['captcha.blocked', 'captcha.attempt_failed'] } }),
+        createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      },
+    }),
+  );
+}
 
 function safe<T>(p: Promise<T>): Promise<T> {
   return p.catch(() => 0 as any);
@@ -124,12 +137,16 @@ export async function GET(request: NextRequest) {
     Promise.resolve(0),
     Promise.resolve(0),
     Promise.resolve(0),
-    safe(prisma.captchaChallenge.count()),
-    safe(prisma.captchaChallenge.count({ where: { solved: true } })),
-    safe(prisma.captchaAttempt.count()),
-    safe(prisma.captchaBlock.count()),
-    safe(prisma.captchaBlock.count({ where: { unblockedAt: null } })),
-    safe(prisma.captchaLog.count()),
+    // CAPTCHA is Cloudflare Turnstile (features/captcha/gate.ts). The old
+    // Captcha* tables belonged to the removed custom challenge engine and
+    // nothing writes them, so these counters were permanently 0. Report the
+    // gate's own activity events instead — the data that actually exists.
+    captchaGate24h(),
+    captchaGate24h('captcha.blocked'),
+    captchaGate24h('captcha.attempt_failed'),
+    safe(prisma.securityEvent.count({ where: { eventType: { startsWith: 'auth.' }, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } })),
+    Promise.resolve(0),
+    Promise.resolve(0),
     Promise.resolve(0),
     Promise.resolve(0),
     safe(prisma.pushSubscription.count()),
@@ -219,7 +236,21 @@ export async function GET(request: NextRequest) {
     safeMany(prisma.notification.findMany({ orderBy: { createdAt: 'desc' }, take: 10, select: { id: true, type: true, title: true, isRead: true, createdAt: true } })),
     Promise.resolve([] as any[]),
     Promise.resolve([] as any[]),
-    safeMany(prisma.captchaBlock.findMany({ orderBy: { blockedAt: 'desc' }, take: 8, select: { id: true, ipAddress: true, reason: true, difficulty: true, unblockedAt: true, blockedAt: true } })),
+    // captchaBlock belongs to the removed custom challenge engine — it is never
+    // written, so this list was permanently empty. Surface the gate's own
+    // activity events instead.
+    safeMany(prisma.activityEvent.findMany({
+      where: { kind: { in: ['captcha.blocked', 'captcha.attempt_failed'] } },
+      orderBy: { createdAt: 'desc' }, take: 8,
+      select: { id: true, ipAddress: true, kind: true, title: true, detail: true, createdAt: true },
+    }).then((rows) => rows.map((r) => ({
+      id: r.id,
+      ipAddress: r.ipAddress,
+      reason: r.detail ?? r.title,
+      difficulty: r.kind === 'captcha.blocked' ? 1 : 0,
+      blockedAt: r.createdAt.toISOString(),
+      unblockedAt: null as string | null,
+    })))),
   ]);
 
   /* ─────────────── Runtime metrics + health ─────────────── */
@@ -303,6 +334,12 @@ export async function GET(request: NextRequest) {
       total: tables.media, today: mediaToday,
       byMime: mediaByMime.map((m: any) => ({ mimeType: m.mimeType || 'other', count: m._count.mimeType ?? 0 })) },
     captcha: {
+      provider: 'turnstile',
+      // Configuration is what actually breaks in practice (a missing key locks
+      // every login out), so surface it instead of a dead table count.
+      configured: isTurnstileConfigured(),
+      siteKeyPresent: Boolean(getTurnstileSiteKey()),
+      secretPresent: Boolean(process.env.TURNSTILE_SECRET_KEY),
       challenges: captchaChallenges, solved: captchaSolved, solvedRate: captchaChallenges ? Math.round((captchaSolved / captchaChallenges) * 100) : 100,
       attempts: captchaAttempts, blocks: captchaBlocks, activeBlocks: captchaActiveBlocks, logs: captchaLogs },
     incidents: {
