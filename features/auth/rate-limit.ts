@@ -258,6 +258,7 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
       take: 10 });
 
     for (const admin of admins) {
+      const appUrls = await import('@/config/app-urls');
       const adminEmail = admin.emails[0]?.address;
       if (!adminEmail) continue;
       await sendTemplateEmail(adminEmail, 'admin_alert', {
@@ -271,7 +272,7 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
           <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Total Blocked:</strong> ${alert.totalBlocked}</p>
           <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Time:</strong> ${new Date(alert.timestamp).toLocaleString()}</p>
         </div>`,
-        dashboardUrl: process.env.NEXT_PUBLIC_ADMIN_URL || (await import('@/config/app-urls')).getAdminBaseUrl() }, { rawVars: ['details'] }).catch(() => {});
+        dashboardUrl: appUrls.prodSafeEnvUrl(process.env.NEXT_PUBLIC_ADMIN_URL) || appUrls.getAdminBaseUrl() }, { rawVars: ['details'] }).catch(() => {});
     }
   } catch (err) {
     console.error('[RATE-LIMIT-ALERT] Failed to send alert email:', err);

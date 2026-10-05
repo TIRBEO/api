@@ -6,21 +6,37 @@
 // like `https://accounts.localhost/...` in local development.
 
 export function isLocalEnv(): boolean {
+  // Production is never "local", even when a stale env var (copied from
+  // .env.local into the deployment) still names localhost — that used to
+  // rewrite every prod redirect to a loopback URL.
+  if (process.env.NODE_ENV === 'production') return false;
   if (process.env.NODE_ENV === 'development') return true;
   const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || '';
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || '';
   return appDomain.includes('localhost') || apiUrl.includes('localhost');
 }
 
+/**
+ * Returns a URL/domain env value only when it is safe to honour. In
+ * production, values pointing at loopback are dropped (empty string) so
+ * callers fall back to the canonical tirbeo.com URLs instead of shipping
+ * localhost links in emails and redirects.
+ */
+export function prodSafeEnvUrl(value: string | undefined | null): string {
+  if (!value) return '';
+  if (process.env.NODE_ENV !== 'production') return value;
+  return value.includes('localhost') || value.includes('127.0.0.1') ? '' : value;
+}
+
 /** App domain (e.g. "tirbeo.com") */
 export function getAppDomain(): string {
-  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+  return prodSafeEnvUrl(process.env.NEXT_PUBLIC_APP_DOMAIN) || 'tirbeo.com';
 }
 
 /** API base URL */
 export function getApiBaseUrl(): string {
   if (isLocalEnv()) return 'http://localhost:3000';
-  return process.env.NEXT_PUBLIC_API_URL || `https://api.${getAppDomain()}`;
+  return prodSafeEnvUrl(process.env.NEXT_PUBLIC_API_URL) || `https://api.${getAppDomain()}`;
 }
 
 /** Accounts app base URL (e.g. http://localhost:3002 in dev, https://accounts.tirbeo.com in prod). */
@@ -49,7 +65,7 @@ export function getDashboardBaseUrl(): string {
  * address today by history, not by design.
  */
 export function getMyprofileBaseUrl(): string {
-  const explicit = process.env.MYPROFILE_URL || process.env.NEXT_PUBLIC_MYPROFILE_URL || '';
+  const explicit = prodSafeEnvUrl(process.env.MYPROFILE_URL) || prodSafeEnvUrl(process.env.NEXT_PUBLIC_MYPROFILE_URL) || '';
   if (explicit) return explicit.replace(/\/+$/, '');
   return getDashboardBaseUrl();
 }

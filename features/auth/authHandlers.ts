@@ -27,7 +27,7 @@ import { checkWindowLimit, checkWindowLimitDB, computeRiskScore, recordDeviceSee
 import { logAuthJson } from '@/features/auth/auth-log';
 import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
-import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, isHostAllowed } from '@/config/app-urls';
+import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
 import { eventIdFor } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
@@ -557,7 +557,7 @@ function getDashboardBase(): string {
 
 /** URL of the accounts-app merge confirmation screen. */
 function accountsMergeUrl(provider: string, mode: 'login' | 'transfer', token: string): string {
-  const base = (process.env.ACCOUNTS_URL || getAccountsBaseUrl()).replace(/\/$/, '');
+  const base = (prodSafeEnvUrl(process.env.ACCOUNTS_URL) || getAccountsBaseUrl()).replace(/\/$/, '');
   const url = new URL(`${base}/callback`);
   url.searchParams.set('oauth', 'merge');
   url.searchParams.set('mode', mode);
@@ -1129,7 +1129,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     const alertEmail = user.email;
     const isNewIp = !!alertEmail && (!lastSession || lastSession.ipAddress !== ip);
     if (isNewIp && alertEmail) {
-      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+      const appDomain = getAppDomain();
       sendTemplateEmail(alertEmail, 'login_alert', {
         name: alertEmail.split('@')[0],
         location: 'Admin Panel',
@@ -3567,7 +3567,7 @@ export async function accountRecoveryHandler(request: NextRequest) {
       return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
     }
 
-    const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+    const appDomain = getAppDomain();
     // The standalone /recovery page was removed (accounts app is auth-only now);
     // point users at /forgot-password which has the full OTP/magic-link reset flow.
     const recoveryUrl = `https://accounts.${appDomain}/forgot-password`;

@@ -12,6 +12,7 @@ import { getSession, createSession, setSessionCookie } from '@/features/auth/htt
 import { fetchLoginUserById } from '@/features/identity/tirbeo';
 import { createAuditEvent } from '@/features/security/audit';
 import { originFromRequest } from '@/shared/changeOrigin';
+import { getAppDomain } from '@/config/app-urls';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { jsonError, jsonUnauthorized } from '@/shared/response';
 import { signReauthToken } from '@/features/auth/jwt';
@@ -45,8 +46,8 @@ function getRpID(request: NextRequest): string {
   // Fallback to host-based detection
   if (isLocalhost(host)) return 'localhost';
 
-  // Production: use the configured domain
-  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+  // Production: use the configured domain (loopback env values are ignored)
+  return getAppDomain();
 }
 
 function getOrigin(request: NextRequest): string {

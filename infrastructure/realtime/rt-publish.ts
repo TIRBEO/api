@@ -11,16 +11,16 @@
 
 const PUBLISH_TIMEOUT_MS = 5_000;
 
-import { isLocalEnv, getAppDomain } from '@/config/app-urls';
+import { isLocalEnv, getAppDomain, prodSafeEnvUrl } from '@/config/app-urls';
 
 function publishUrl(): string {
   // Local development always publishes to the local realtime server: env vars
   // (RT_PUBLISH_URL / NEXT_PUBLIC_WS_URL) often point at the production worker,
   // and dev events must never fan out into prod clients.
   if (isLocalEnv()) return 'http://localhost:3001/api/publish';
-  const explicit = process.env.RT_PUBLISH_URL;
+  const explicit = prodSafeEnvUrl(process.env.RT_PUBLISH_URL);
   if (explicit) return explicit;
-  const wsUrl = process.env.NEXT_PUBLIC_WS_URL;
+  const wsUrl = prodSafeEnvUrl(process.env.NEXT_PUBLIC_WS_URL);
   if (wsUrl) {
     try {
       const u = new URL(wsUrl);

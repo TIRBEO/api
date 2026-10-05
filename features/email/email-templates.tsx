@@ -13,6 +13,7 @@ import {
   Img } from '@react-email/components';
 import { render } from '@react-email/render';
 import { getApiOrigin } from '@/features/branding/branding';
+import { prodSafeEnvUrl } from '@/config/app-urls';
 
 /**
  * Outlook's VML namespace. Word and Outlook desktop drop `background-color` on
@@ -38,7 +39,7 @@ function tpl(subject: string, html: string): EmailTemplate {
 }
 
 const APP_DOMAIN = (
-  process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com'
+  prodSafeEnvUrl(process.env.NEXT_PUBLIC_APP_DOMAIN) || 'tirbeo.com'
 )
   .replace(/^https?:\/\//, '')
   .replace(/\/$/, '');
@@ -52,8 +53,8 @@ const SESSIONS_URL = `${DASHBOARD_URL}/account/sessions`;
 // it falls back to the dashboard address so no deployment is ever left with a
 // broken "Open your workspace" link.
 const WORKSPACE_URL = (
-  process.env.NEXT_PUBLIC_MYPROFILE_URL ||
-  process.env.NEXT_PUBLIC_WORKSPACE_URL ||
+  prodSafeEnvUrl(process.env.NEXT_PUBLIC_MYPROFILE_URL) ||
+  prodSafeEnvUrl(process.env.NEXT_PUBLIC_WORKSPACE_URL) ||
   DASHBOARD_URL
 )
   .replace(/\/+$/, '');

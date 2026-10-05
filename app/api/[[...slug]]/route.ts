@@ -151,7 +151,7 @@ import {
 
 // jobs module removed
 
-import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl, getApiBaseUrl } from '@/config/app-urls';
+import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl, getApiBaseUrl, getAppDomain } from '@/config/app-urls';
 import { accountChecksHandler } from '@/features/status/accountChecks';
 import { appealFileHandler, appealsListHandler } from '@/features/support/appeals';
 
@@ -624,7 +624,7 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   if (!pathStr || pathStr.startsWith('account') || pathStr.startsWith('settings') || pathStr.startsWith('overview') || pathStr.startsWith('support')) {
     const isInternal = INTERNAL_ROUTES.some((r) => pathStr === r || pathStr.startsWith(r + '/'));
     if (!isInternal) {
-      const appDomain = process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+      const appDomain = getAppDomain();
       const dashboardBase = `https://myprofile.${appDomain}`;
       if (!pathStr) {
         return NextResponse.json({

@@ -3,6 +3,7 @@ import { generateAuthenticationOptions, verifyAuthenticationResponse } from '@si
 import type { AuthenticationResponseJSON, AuthenticatorTransport } from '@simplewebauthn/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { storeChallenge, getAndConsumeChallenge } from '@/features/auth/passkeys/challenge-store';
+import { getAppDomain } from '@/config/app-urls';
 import { createSession, setSessionCookie } from '@/features/auth/session';
 import { logSecurityEvent } from '@/features/security/security';
 import { createAuditEvent } from '@/features/security/audit';
@@ -20,7 +21,7 @@ function getRpID(req: NextRequest): string {
   }
   const host = req.headers.get('host') || '';
   if (host.startsWith('localhost') || host.startsWith('127.0.0.1')) return 'localhost';
-  return process.env.NEXT_PUBLIC_APP_DOMAIN || 'tirbeo.com';
+  return getAppDomain();
 }
 
 function getOrigin(req: NextRequest): string {
