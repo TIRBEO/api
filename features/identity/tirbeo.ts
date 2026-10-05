@@ -138,9 +138,9 @@ export async function fetchLoginUserByUsername(username: string): Promise<LoginU
 
 // Resolve a login identifier to a user. Rules:
 //   - username or username@tirbeo.com  -> the Tirbeo identity user
-//   - any EXTERNAL email               -> allowed only when the account has no
-//     Tirbeo identity; otherwise the identity is authoritative and the external
-//     address must NOT work as a login credential.
+//   - any EXTERNAL email               -> the account that owns that address.
+//     A Tirbeo username is a handle, not a wall: people keep typing the email
+//     they signed up with, and it must keep working.
 export async function resolveTirbeoIdentifier(
   identifier?: string | null,
 ) {
@@ -157,15 +157,13 @@ export async function resolveTirbeoIdentifier(
   const parsed = parseTirbeoIdentifier(raw);
   if (parsed) {
     const user = await fetchLoginUserByUsername(parsed.username);
-    return user ? { user, matchedBy: 'tirbeo_email' as const } : null;
+    if (user) return { user, matchedBy: 'tirbeo_email' as const };
+    // An @tirbeo.com address whose local part is not a username (legacy rows
+    // carry the real email) still resolves through the email table below.
   }
 
-  // External domain: only a user WITHOUT a Tirbeo identity may sign in with it.
-  const [local, domain] = raw.split('@');
-  if (!local || !domain) return null;
   const user = await fetchLoginUserByEmail(raw);
   if (!user) return null;
-  if (user.hasTirbeoIdentity) return null; // identity exists -> external email must not log in
   return { user, matchedBy: 'legacy_email' as const };
 }
 
