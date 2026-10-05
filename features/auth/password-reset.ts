@@ -91,6 +91,9 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
   const otpHash = hashOtpCode(code);
   const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
+  // otps has UNIQUE(kind, address) — a resend to the same mailbox must replace
+  // the old row, not collide with it.
+  await prisma.otp.deleteMany({ where: { kind: RESET_OTP_KIND, address: email.toLowerCase() } });
   await prisma.otp.create({
     data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
   });
@@ -171,6 +174,7 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
 
   // Recorded against the mailbox it was actually posted to; verification looks
   // the code up by account, so the person can confirm with either address.
+  await prisma.otp.deleteMany({ where: { kind: RESET_OTP_KIND, address: recoveryEmail.toLowerCase() } });
   await prisma.otp.create({
     data: { userId: user.id, kind: RESET_OTP_KIND, address: recoveryEmail.toLowerCase(), otpHash, expiresAt },
   });
@@ -255,6 +259,7 @@ async function __requestPasswordResetInner(
     const otpHash = hashOtpCode(code);
     const expiresAt = addMinutes(new Date(), RESET_TTL_MINUTES);
 
+    await prisma.otp.deleteMany({ where: { kind: RESET_OTP_KIND, address: email.toLowerCase() } });
     await prisma.otp.create({
       data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
     });
