@@ -270,13 +270,13 @@ function groupFor(kind: string): SummaryGroup {
   return 'other';
 }
 
-const LIST_ROW = 'padding:12px 16px;border-bottom:1px solid #2a2a2c;';
+const LIST_ROW = 'padding:12px 16px;border-bottom:1px solid #38312b;';
 
 /** One line of the recap: what happened, when, and where it came from. */
 function recapLine(title: string, at: Date, note?: string | null): string {
   const when = at.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
   return `<div style="${LIST_ROW}"><div style="color:#ffffff;font-size:14px;line-height:22px;">${esc(title)}</div>`
-    + `<div style="color:#8a8a8e;font-size:13px;line-height:20px;padding-top:2px;">${esc(when)}${note ? ` · ${esc(note)}` : ''}</div></div>`;
+    + `<div style="color:#bd9d8a;font-size:13px;line-height:20px;padding-top:2px;">${esc(when)}${note ? ` · ${esc(note)}` : ''}</div></div>`;
 }
 
 /** Build & send one account recap. Returns true only when the mail went out. */
@@ -319,16 +319,16 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
         const shown = lines.slice(0, 12);
         return `<div>`
           + `<p style="margin:0;padding:14px 16px 4px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${GROUP_LABELS[group]}`
-          + ` <span style="color:#8a8a8e;font-weight:400;">· ${lines.length}</span></p>`
+          + ` <span style="color:#bd9d8a;font-weight:400;">· ${lines.length}</span></p>`
           + shown.join('')
           + (lines.length > shown.length
-            ? `<div style="padding:10px 16px;font-size:13px;line-height:20px;color:#8a8a8e;">${lines.length - shown.length} more in your activity history</div>`
+            ? `<div style="padding:10px 16px;font-size:13px;line-height:20px;color:#bd9d8a;">${lines.length - shown.length} more in your activity history</div>`
             : '')
           + `</div>`;
       })
       .join('');
     const listsHtml = groupsHtml
-      ? `<div style="background:#18181a;border:1px solid #2a2a2c;border-radius:14px;margin:0 0 20px;">${groupsHtml}</div>`
+      ? `<div style="background:#181008;border:1px solid #38312b;border-radius:12px;margin:0 0 20px;">${groupsHtml}</div>`
       : '';
 
     const attention = [
@@ -342,14 +342,14 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
       ? `<div style="margin:0 0 20px;">`
         + `<p style="margin:0 0 6px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${attention.length} thing${attention.length === 1 ? '' : 's'} to look at</p>`
         + attention.slice(0, 6).map((line) =>
-            `<p style="margin:0;font-size:13px;line-height:20px;color:#8a8a8e;">· ${esc(line)}</p>`).join('')
+            `<p style="margin:0;font-size:13px;line-height:20px;color:#bd9d8a;">· ${esc(line)}</p>`).join('')
         + `</div>`
       : '';
 
     const total = events.length + logins.length;
     const statRows = total
       ? listsHtml
-      : `<p style="margin:0;font-size:14px;line-height:22px;color:#8a8a8e;">Nothing was recorded on your account in this period — no sign-ins, no changes, no security events.</p>`;
+      : `<p style="margin:0;font-size:14px;line-height:22px;color:#bd9d8a;">Nothing was recorded on your account in this period — no sign-ins, no changes, no security events.</p>`;
 
     const day = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const periodLabel = `${day(since)} – ${day(until)}`;
@@ -511,7 +511,7 @@ export async function sendReactivationEmails() {
       const daysSince = Math.max(1, Math.floor((Date.now() - lastActive) / 86400_000));
 
       // Build a brief activity summary
-      let activitySummary = '<p style="margin:0;font-size:14px;line-height:22px;color:#8a8a8e;">No recent activity recorded. Your workspace is waiting.</p>';
+      let activitySummary = '<p style="margin:0;font-size:14px;line-height:22px;color:#bd9d8a;">No recent activity recorded. Your workspace is waiting.</p>';
       try {
         const recentNotifs = await prisma.notification.findMany({
           where: { userId: u.id, createdAt: { gte: cutoff7d } },
@@ -520,7 +520,7 @@ export async function sendReactivationEmails() {
         });
         if (recentNotifs.length > 0) {
           activitySummary = recentNotifs.map(n =>
-            `<div style="padding:14px 16px;background:#18181a;border:1px solid #2a2a2c;border-radius:14px;margin-bottom:8px;font-size:14px;line-height:22px;color:#ffffff;">${esc(n.title)}</div>`
+            `<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;font-size:14px;line-height:22px;color:#ffffff;">${esc(n.title)}</div>`
           ).join('');
         }
       } catch {}

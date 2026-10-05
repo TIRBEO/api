@@ -62,28 +62,28 @@ const WORKSPACE_URL = (
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'admin@tirbeo.com';
 
 const FONT_STACK =
-  "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+  "Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
 const MONO_STACK =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
 /* -------------------------------------------------------------------------- */
-/* Design tokens — the screenshot scheme: pure black canvas, one dark surface
-   for cards and codes, white type, one grey for secondary lines. Monochrome:
-   no coloured fills, no uppercase eyebrows, no tracking. */
+/* Design tokens — tirbeo.com's own scheme: a warm near-black canvas, ember
+   orange as the one action colour, brown-tinted surfaces and hairlines,
+   Inter for type. Same palette the landing page ships. */
 /* -------------------------------------------------------------------------- */
 
-const PAGE = '#000000';
-const SURFACE = '#18181a';
+const PAGE = '#060403';
+const SURFACE = '#181008';
 const TEXT = '#ffffff';
-const MUTED = '#8a8a8e';
-const FAINT = '#6e6e73';
-const BORDER = '#2a2a2c';
-const BORDER_SOFT = '#222224';
-const RULE = '#1f1f22';
-const BTN_BG = '#ffffff';
-const BTN_FG = '#000000';
+const MUTED = '#bd9d8a';
+const FAINT = '#8a7462';
+const BORDER = '#38312b';
+const BORDER_SOFT = '#2a231d';
+const RULE = '#241c14';
+const BTN_BG = '#ff6b2c';
+const BTN_FG = '#140a04';
 const DANGER_BG = '#ff453a';
-const RADIUS = 14;
+const RADIUS = 12;
 
 type Block = React.ReactNode;
 
@@ -177,12 +177,12 @@ function logoBlock(logo: string): Block {
           <td
             style={{
               verticalAlign: 'middle',
-              fontSize: 16,
-              fontWeight: 700,
-              letterSpacing: '-0.01em',
+              fontSize: 17,
+              fontWeight: 900,
+              letterSpacing: '-0.045em',
               color: TEXT }}
           >
-            Tirbeo
+            Tirbeo<span style={{ color: BTN_BG }}>.</span>
           </td>
         </tr>
       </table>

@@ -29,7 +29,7 @@ async function main() {
 
   for (const name of targets) {
     const t = all[name];
-    const vars = { ...SAMPLE, unsubscribeSection: '<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#6e6e73"><a href="#" style="color:#6e6e73;text-decoration:underline;">Unsubscribe from these emails</a></p>' };
+    const vars = { ...SAMPLE, unsubscribeSection: '<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="#" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>' };
     const html = renderTemplate(t.html, vars);
     await writeFile(path.join(outDir, `${name}.html`), html, 'utf8');
   }

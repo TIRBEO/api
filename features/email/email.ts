@@ -521,10 +521,10 @@ export async function sendTemplateEmail(
       const unsubUrl = (await buildUnsubscribeUrl(to)) || `${apiBase}/api/emails/unsubscribe`;
       mergedVars['unsubscribeUrl'] = unsubUrl;
       mergedVars['managePreferencesUrl'] = unsubUrl;
-      /* #6e6e73 on the #000 canvas stays legible — an unsubscribe link is
+      /* #8a7462 on the #000 canvas stays legible — an unsubscribe link is
          legally required to be readable, and a control nobody can read is not
          one they can act on. Matches the template's faint footer tone. */
-      mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#6e6e73"><a href="${unsubUrl}" style="color:#6e6e73;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
+      mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="${unsubUrl}" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
     } else {
       mergedVars['unsubscribeUrl'] = '';
       mergedVars['unsubscribeSection'] = '';
@@ -533,7 +533,7 @@ export async function sendTemplateEmail(
   } catch {
     const apiBase = getApiBaseUrl();
     mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
-    mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#6e6e73"><a href="${apiBase}/api/emails/unsubscribe" style="color:#6e6e73;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
+    mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="${apiBase}/api/emails/unsubscribe" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
     mergedVars['managePreferencesUrl'] = '';
   }
 

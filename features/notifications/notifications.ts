@@ -273,7 +273,7 @@ export async function createNotification(input: CreateNotifInput) {
           : `${base}/account/notifications`;
         return sendTemplateEmail(email, 'notification_digest', {
           name: user.profile?.name || email, count: '1',
-          digestItems: `<div style="padding:14px 16px;background:#18181a;border:1px solid #2a2a2c;border-radius:14px;margin-bottom:8px;"><div style="color:#ffffff;font-size:14px;font-weight:600;line-height:22px;">${escapeHtml(input.title)}</div><div style="color:#8a8a8e;font-size:13px;line-height:20px;padding-top:2px;">${escapeHtml(input.body || '')}</div></div>`,
+          digestItems: `<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="color:#ffffff;font-size:14px;font-weight:600;line-height:22px;">${escapeHtml(input.title)}</div><div style="color:#bd9d8a;font-size:13px;line-height:20px;padding-top:2px;">${escapeHtml(input.body || '')}</div></div>`,
           activitySection: '',
           dashboardUrl: resolved,
         }, { rawVars: ['digestItems', 'activitySection'], categoryOverride: category, userId: targetUserId }).catch(() => {});
