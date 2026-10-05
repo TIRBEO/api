@@ -1,5 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { originFromRequest, type ChangeOrigin } from '@/shared/changeOrigin';
+import { timingSafeEqual } from 'node:crypto';
+import {
+  originFromInternalHeaders,
+  originFromRequest,
+  type ChangeOrigin,
+} from '@/shared/changeOrigin';
 
 type HeaderLike = { get(name: string): string | null };
 
@@ -19,8 +24,30 @@ type HeaderLike = { get(name: string): string | null };
  */
 const store = new AsyncLocalStorage<ChangeOrigin>();
 
+/**
+ * Whose facts a request may carry inside it.
+ *
+ * A browser's own request already holds its address and edge-resolved place —
+ * the edge put them there. A request that reached us through another
+ * first-party service cannot: Vercel overwrites `x-vercel-*` on every hop, so
+ * the relay attaches the browser's facts as the `x-origin-*` set beside the
+ * shared service token. Anyone can send `x-origin-*`; only a caller holding
+ * the token gets believed.
+ */
+function trustedInternalCaller(headers: HeaderLike): boolean {
+  const expected = process.env.INTERNAL_API_SECRET || '';
+  const supplied = headers.get('x-internal-token') || '';
+  if (!expected || !supplied) return false;
+  const a = Buffer.from(supplied, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function withRequestOrigin<T>(headers: HeaderLike, run: () => Promise<T>): Promise<T> {
-  return store.run(originFromRequest(headers), run);
+  return store.run(
+    trustedInternalCaller(headers) ? originFromInternalHeaders(headers) : originFromRequest(headers),
+    run,
+  );
 }
 
 /** The origin of the request we are inside, or null for a write with no request. */

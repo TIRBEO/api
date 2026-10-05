@@ -452,8 +452,12 @@ export async function sessionsHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     if (request.method === 'GET') {
+      // user_sessions has no status column in practice: the revoke paths stamp
+      // revokedAt and leave `status` at its default, so filtering on status
+      // shows signed-out machines forever. revokedAt + expiresAt is the real
+      // definition of a live session.
       const sessions = await prisma.userSession.findMany({
-        where: { userId: session.userId, status: { not: 'revoked' }, expiresAt: { gte: new Date() } },
+        where: { userId: session.userId, revokedAt: null, expiresAt: { gte: new Date() } },
         orderBy: { lastUsedAt: 'desc' },
         select: { id: true, userAgent: true, ipAddress: true, location: true, createdAt: true, expiresAt: true, lastUsedAt: true } });
       /* The session row has a place name but no point; the sign-in that
@@ -1523,7 +1527,32 @@ export async function settingsHandler(request: NextRequest) {
       }
 
       const keys = Object.keys(incoming ?? {});
-      if (keys.length === 0) return NextResponse.json({ ok: true, settings: { ...policy } });
+
+      // The change ledger answers "what changed?" — so every accepted write
+      // files one row naming the settings it moved, whatever shape the bag
+      // came in under. Values are deliberately not recorded, only the names.
+      const FIELD_LABELS: Record<string, string> = {
+        twoFactorRequireForActions: 'two-factor for sensitive actions',
+        twoFactorAlertSuspicious: 'suspicious sign-in alerts',
+        saveLoginInfo: 'saved login info',
+      };
+      const changedFields = [
+        ...(policy.saveLoginInfo !== undefined ? [FIELD_LABELS.saveLoginInfo] : []),
+        ...(policy.require2FA !== undefined ? [FIELD_LABELS.twoFactorRequireForActions] : []),
+        ...keys.map((k) => FIELD_LABELS[k] ?? k.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase()),
+      ];
+
+      if (keys.length === 0) {
+        if (changedFields.length) {
+          await createAuditEvent({
+            actorId: session.userId,
+            action: 'settings.updated',
+            targetType: 'user',
+            targetId: session.userId,
+            metadata: { fields: changedFields } }).catch(() => {});
+        }
+        return NextResponse.json({ ok: true, settings: { ...policy } });
+      }
 
       const row = await prisma.userPreferences.findUnique({
         where: { userId: session.userId },
@@ -1537,6 +1566,15 @@ export async function settingsHandler(request: NextRequest) {
         where: { userId: session.userId },
         create: { userId: session.userId, misc: nextMisc as any },
         update: { misc: nextMisc as any } });
+
+      if (changedFields.length) {
+        await createAuditEvent({
+          actorId: session.userId,
+          action: 'settings.updated',
+          targetType: 'user',
+          targetId: session.userId,
+          metadata: { fields: changedFields } }).catch(() => {});
+      }
 
       return NextResponse.json({ ok: true, settings });
     }
