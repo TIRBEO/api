@@ -35,6 +35,7 @@ import {
   oauthConsentHandler,
   oauthPendingHandler,
   oauthSignupCompleteHandler,
+  oauthAttachHandler,
 
   requestLoginOtpHandler,
   verifyLoginOtpHandler,
@@ -208,7 +209,7 @@ const INTERNAL_ROUTES = [
   'auth/email-otp/request', 'auth/email-otp/verify',
     'auth/signup-otp/request', 'auth/signup-otp/verify',
     'auth/change-email/request', 'auth/change-email/verify',
-  'auth/oauth-consent', 'auth/oauth/consent', 'auth/oauth/pending', 'auth/oauth/complete',
+  'auth/oauth-consent', 'auth/oauth/consent', 'auth/oauth/pending', 'auth/oauth/complete', 'auth/oauth/attach',
   'auth/login-otp/request', 'auth/login-otp/verify',
   'auth/magic-link/request', 'auth/magic-link/verify',
   'auth/google', 'auth/google/callback', 'auth/github', 'auth/github/callback',
@@ -402,6 +403,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'auth/oauth/consent': ['POST'],
       'auth/oauth/pending': ['GET'],
       'auth/oauth/complete': ['POST'],
+      'auth/oauth/attach': ['POST'],
       'auth/login-otp/request': ['POST'],
       'auth/login-otp/verify': ['POST'],
       'auth/magic-link/request': ['POST'],
@@ -737,6 +739,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'auth/oauth/complete':
         resp = await oauthSignupCompleteHandler(request);
+        break;
+      case 'auth/oauth/attach':
+        resp = await oauthAttachHandler(request);
         break;
       case 'auth/login-otp/request':
         resp = await requestLoginOtpHandler(request);

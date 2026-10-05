@@ -62,14 +62,6 @@ function deviceFingerprint(request: NextRequest): string {
   return request.cookies.get('__dfp')?.value || request.headers.get('x-device-fingerprint') || '';
 }
 
-/** OAuth provider ids have no dedicated column anymore — links live in
- *  user_preferences.misc.oauth as { [provider]: providerId }. */
-async function getOauthLinks(userId: string): Promise<Record<string, string>> {
-  const p = await prisma.userPreferences.findUnique({ where: { userId }, select: { misc: true } }).catch(() => null);
-  const misc = (p?.misc as any) || {};
-  return (misc.oauth as Record<string, string>) || {};
-}
-
 async function setOauthLink(userId: string, provider: string, providerId: string): Promise<void> {
   const existing = await prisma.userPreferences.findUnique({ where: { userId }, select: { misc: true } }).catch(() => null);
   const misc = { ...((existing?.misc as any) || {}) };
@@ -115,9 +107,37 @@ async function isLoginUserEmailVerified(user: LoginUser): Promise<boolean> {
   return !!row?.verifiedAt;
 }
 
+// A provider identity can be attached to an account in three places written by
+// different generations of this codebase: user_preferences.misc.oauth (JSONB),
+// the legacy users.{google,github,discord}_id columns, and (by email only) the
+// consolidated user_email table plus the legacy users.email column. Every
+// lookup must consider all of them or an existing account reads as a stranger.
+const LEGACY_LINK_COLUMN: Record<string, 'googleId' | 'githubId' | 'discordId'> = {
+  google: 'googleId',
+  github: 'githubId',
+  discord: 'discordId',
+};
+
+async function findUserByProviderLink(provider: string, providerId: string): Promise<string | null> {
+  const pref = await prisma.userPreferences.findFirst({
+    where: { misc: { path: ['oauth', provider], equals: providerId } } as any,
+    select: { userId: true } }).catch(() => null);
+  if (pref) return pref.userId;
+  const column = LEGACY_LINK_COLUMN[provider];
+  if (!column) return null;
+  const legacy = await prisma.user.findFirst({
+    where: { [column]: providerId },
+    select: { id: true } }).catch(() => null);
+  return legacy?.id || null;
+}
+
 async function userIdForEmail(address: string): Promise<string | null> {
   const row = await prisma.userEmail.findFirst({ where: { address }, select: { userId: true } }).catch(() => null);
   if (row) return row.userId;
+  const byColumn = await prisma.user.findFirst({
+    where: { email: { equals: address, mode: 'insensitive' } },
+    select: { id: true } }).catch(() => null);
+  if (byColumn) return byColumn.id;
   if (isTirbeoEmail(address)) {
     const uname = parseTirbeoIdentifier(address)?.username;
     if (uname) {
@@ -512,6 +532,10 @@ export async function getOauthProviderConfig(provider: string): Promise<OauthPro
 
 function getOauthCookieDomain(request: NextRequest): string | undefined {
   const host = request.headers.get('host') || '';
+  // Loopback is loopback whatever NODE_ENV says — a .tirbeo.com-domain cookie
+  // handed out on localhost is dropped by the browser, and every local
+  // callback then dies on "Invalid OAuth state".
+  if (/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) return undefined;
   if (host.endsWith('.vercel.app')) return host;
   if (process.env.NODE_ENV !== 'development') return COOKIE_DOMAIN;
   return undefined;
@@ -572,16 +596,35 @@ function accountsMergeUrl(provider: string, mode: 'login' | 'transfer', token: s
  * account exists but identity never connected (needs explicit merge).
  */
 async function findProviderUser(provider: string, profile: ProviderProfile) {
+  // The link itself is the strongest evidence — check it first, so the same
+  // Google account presenting an alias/domain email it used to sign in with
+  // still lands back on its own account instead of the create screen.
+  const linkedId = await findUserByProviderLink(provider, profile.providerId);
+  if (linkedId) {
+    const user = await fetchLoginUserById(linkedId);
+    if (user && user.status !== 'deleted') return { user, matchedBy: 'provider' as const };
+  }
+
   if (profile.email) {
     const userId = await userIdForEmail(profile.email.toLowerCase());
     if (userId) {
       const user = await fetchLoginUserById(userId);
-      if (user) {
-        const links = await getOauthLinks(user.id);
-        return { user, matchedBy: links[provider] === profile.providerId ? ('provider' as const) : ('email' as const) };
-      }
+      if (user) return { user, matchedBy: 'email' as const };
     }
   }
+
+  // GitHub noreply addresses are issued by GitHub and derived from the login,
+  // so completing this OAuth already proves control of that account. When the
+  // login matches a Tirbeo username, offer the merge — the person confirms it.
+  if (provider === 'github' && profile.email?.toLowerCase().endsWith('@users.noreply.github.com')) {
+    const login = profile.email.split('@')[0].toLowerCase();
+    const byName = await prisma.user.findUnique({ where: { username: login }, select: { id: true } }).catch(() => null);
+    if (byName) {
+      const user = await fetchLoginUserById(byName.id);
+      if (user) return { user, matchedBy: 'email' as const };
+    }
+  }
+
   return { user: null, matchedBy: null };
 }
 
@@ -766,6 +809,11 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
     const target = await fetchLoginUserById(data.existingUserId);
     if (!target) {
       return NextResponse.json({ error: 'The account to merge with no longer exists.' }, { status: 404 });
+    }
+    // Never let a merge move an identity that another account already owns.
+    const claimedBy = await findUserByProviderLink(data.provider, data.providerId);
+    if (claimedBy && claimedBy !== target.id) {
+      return NextResponse.json({ error: `This ${data.provider} account is already linked to a different Tirbeo account.` }, { status: 409 });
     }
 
     // Link + sign in to the matched account in one step.
@@ -1830,6 +1878,8 @@ export async function oauthConsentHandler(request: NextRequest) {
 
 // GET /api/auth/oauth/pending?token=… — preview the provider profile carried by
 // a pending-signup token, for the in-dashboard account-creation screen.
+// Idempotent by design: it only reads the signed token, so a reload or a
+// dev-time double mount is harmless until the token's own expiry.
 export async function oauthPendingHandler(request: NextRequest) {
   try {
     const token = request.nextUrl.searchParams.get('token') || '';
@@ -1837,14 +1887,74 @@ export async function oauthPendingHandler(request: NextRequest) {
     if (!data) {
       return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
     }
+    // An account may have appeared (or been found by a store the callback
+    // missed) since the token was minted. Say so, so the screen offers the
+    // merge path instead of inviting a duplicate.
+    const existingAccount = !!(await userIdForEmail(data.email.toLowerCase()));
+    const existingLink = await findUserByProviderLink(data.provider, data.providerId);
     return NextResponse.json({
       provider: data.provider,
       email: data.email,
       name: data.name || '',
-      photoUrl: data.photoUrl || null });
+      photoUrl: data.photoUrl || null,
+      existingAccount,
+      existingLink: !!existingLink });
   } catch (err: any) {
     console.error('[OAUTH PENDING]', err?.message || err);
     return NextResponse.json({ error: 'Failed to load signup info' }, { status: 500 });
+  }
+}
+
+/**
+ * POST /api/auth/oauth/attach — session-authorized linking of a pending
+ * provider identity to the account the person just signed into.
+ *
+ * This is the "I already have an account" path from the create screen: the
+ * signed pending token proves the provider handoff is genuine and fresh, the
+ * session cookie proves the account is theirs. If the identity already
+ * belongs to a different account this refuses (409) — that is a transfer
+ * decision, made on the connected-apps screen, not here.
+ */
+export async function oauthAttachHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+    const body: any = await request.json().catch(() => ({}));
+    const data = typeof body.token === 'string' ? await verifyPendingSignupToken(body.token) : null;
+    if (!data) {
+      return NextResponse.json({ error: 'This sign-in request has expired. Start the provider sign-in again.' }, { status: 400 });
+    }
+    if (!SUPPORTED_OAUTH_PROVIDERS.includes(data.provider)) {
+      return NextResponse.json({ error: 'Unsupported provider' }, { status: 400 });
+    }
+    const claimedBy = await findUserByProviderLink(data.provider, data.providerId);
+    if (claimedBy && claimedBy !== session.userId) {
+      return NextResponse.json({ error: `That ${data.provider} account is already linked to a different Tirbeo account.` }, { status: 409 });
+    }
+    if (!claimedBy) await setOauthLink(session.userId, data.provider, data.providerId);
+
+    const label = data.provider.charAt(0).toUpperCase() + data.provider.slice(1);
+    prisma.activityEvent.create({
+      data: {
+        userId: session.userId,
+        kind: `oauth.${data.provider}.connected`,
+        title: `${label} connected`,
+        detail: `user:${session.userId}`,
+        metadata: { via: 'attach', [`${data.provider}Id`]: data.providerId, ...(data.email ? { email: data.email } : {}) },
+        severity: 'info' } }).catch(() => {});
+    createAuditEvent({ actorId: session.userId, action: 'account.merge.attach', targetType: 'user', targetId: session.userId, metadata: { provider: data.provider } }).catch(() => {});
+    createNotification({
+      userId: session.userId,
+      type: 'security',
+      title: `${label} connected`,
+      body: `Your ${label} account was linked to Tirbeo. You can now sign in with it.`,
+      link: '/account/connected-apps' }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+
+    const dashboardBase = getDashboardBase();
+    return NextResponse.json({ ok: true, redirect_to: `${dashboardBase}/account/connected-apps?connected=${data.provider}` });
+  } catch (err: any) {
+    console.error('[OAUTH ATTACH]', err?.message || err);
+    return NextResponse.json({ error: 'Could not connect that account. Please try again.' }, { status: 500 });
   }
 }
 
@@ -1931,9 +2041,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     }
 
     // The provider identity may have been claimed meanwhile — never hijack.
-    const linker = await prisma.userPreferences.findFirst({
-      where: { misc: { path: ['oauth', data.provider], equals: data.providerId } as any },
-      select: { userId: true } });
+    const linker = await findUserByProviderLink(data.provider, data.providerId);
     if (linker) {
       return NextResponse.json({ error: `This ${data.provider} account is already linked.` }, { status: 409 });
     }
@@ -2540,6 +2648,10 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
     const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
     if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+      // Which leg failed — a signature problem (different JWT_SECRET between
+      // the server that started and the one finishing) or a missing/stale
+      // nonce cookie (repeat attempts rotate the nonce).
+      console.warn('[OAUTH:google] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce, nonceMismatch: !!state && !!cookieNonce && state.nonce !== cookieNonce });
       return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
     }
     if (!code) {

@@ -201,7 +201,7 @@ describe('the two clients ask the WORK questions in the same words', () => {
   }
 
   function contractWireNames() {
-    const src = read('apps/myprofile/api/contract.ts');
+    const src = read('apps/myprofile/bridge/contract.ts');
     return [...src.matchAll(/local:\s*"(jobRole|jobCompany|jobPlace|jobStartedOn)",\s*wire:\s*"([^"]+)"/g)].map(
       (m) => [m[1], m[2]] as const,
     );
