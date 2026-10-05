@@ -537,10 +537,12 @@ export async function sendTemplateEmail(
     mergedVars['managePreferencesUrl'] = '';
   }
 
-  // ─── Three-domain sending split ───
-  // send.tirbeo.com → casual/transactional (forms, digests, tips, tickets)
-  // mails.tirbeo.com → security (OTPs, resets, alerts about account safety)
-  // tirbeo.com → admin/internal + human mailbox (admin@)
+  // ─── Sending domain ───
+  // tirbeo.com is the only domain verified on Resend; mails./send. subdomains
+  // were never verified and every send from them fails with a 403. Keep the
+  // per-category sender NAMES (a code email should not read like a digest),
+  // but every address must live on the verified domain until the subdomains
+  // are actually verified there.
   const SECURITY_TEMPLATES = new Set([
     'signup_otp', 'login_otp', 'verify_email', 'password_reset_otp', 'password_reset_link',
     'magic_link', 'account_recovery', 'delete_account_otp', 'password_changed', 'reauth_otp',
@@ -549,13 +551,11 @@ export async function sendTemplateEmail(
   const ADMIN_TEMPLATES = new Set(['admin_alert', 'system_alert', 'admin_crash_report', 'admin_test']);
   const humanMailboxTemplates = ['welcome'];
 
-  // Root domain (tirbeo.com) is mailbox-only via Zoho — NEVER send from it.
-  // Admin mail goes through the verified mails. subdomain unless overridden.
-  const adminFrom = process.env.ADMIN_FROM_EMAIL || 'admin@mails.tirbeo.com';
+  const adminFrom = process.env.ADMIN_FROM_EMAIL || 'admin@tirbeo.com';
 
   const DOMAIN_FROM = {
     casual: { email: 'noreply@tirbeo.com', name: branding.brandName || 'Tirbeo' },
-    security: { email: 'security@mails.tirbeo.com', name: 'Tirbeo Security' },
+    security: { email: 'noreply@tirbeo.com', name: 'Tirbeo Security' },
     admin: { email: adminFrom, name: 'Tirbeo Admin' },
   };
   const category = ADMIN_TEMPLATES.has(templateName) ? 'admin'

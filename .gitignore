@@ -12,3 +12,4 @@ prisma/backup-*.json.gz
 prisma/*backup*.sql
 # the example is the documented contract — it carries no values
 !.env.example
+.vercel
