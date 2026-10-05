@@ -859,9 +859,13 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
 }
 
 function setOauthStateCookie(res: NextResponse, nonce: string, request: NextRequest) {
+  // Secure is about the transport, not NODE_ENV: a localhost server run as
+  // `next start` (NODE_ENV=production over http) used to hand out a Secure
+  // cookie over plain http, which browsers drop silently — every local
+  // callback then failed on a missing nonce cookie, whatever NODE_ENV said.
   res.cookies.set(OAUTH_STATE_COOKIE, nonce, {
     httpOnly: true,
-    secure: process.env.NODE_ENV !== 'development',
+    secure: !isLoopbackRequest(request),
     sameSite: 'lax',
     path: '/',
     maxAge: 600,
@@ -871,11 +875,65 @@ function setOauthStateCookie(res: NextResponse, nonce: string, request: NextRequ
 function clearOauthStateCookie(res: NextResponse, request: NextRequest) {
   res.cookies.set(OAUTH_STATE_COOKIE, '', {
     httpOnly: true,
-    secure: process.env.NODE_ENV !== 'development',
+    secure: !isLoopbackRequest(request),
     sameSite: 'lax',
     path: '/',
     maxAge: 0,
     domain: getOauthCookieDomain(request) });
+}
+
+const OAUTH_CONSUMED_COOKIE = '__oauth_state_consumed';
+/** Marks a state as spent even when the browser will not carry cookies. */
+const devConsumedOauthNonces = new Set<string>();
+
+function isLoopbackRequest(request: NextRequest): boolean {
+  const host = request.headers.get('host') || '';
+  return /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host);
+}
+
+/**
+ * Validate a provider callback's state, returning its payload.
+ *
+ * The signed state JWT (10-minute expiry) and the nonce cookie are the two
+ * halves of the CSRF binding. They agree in production — but not on a dev
+ * machine: an OAuth flow started from the accounts app's port stores the
+ * nonce cookie host-only on, say, localhost:3002, while the callback lands
+ * on the API at localhost:3000, and cookies never cross ports. Every local
+ * sign-in then died right here on "Invalid OAuth state".
+ *
+ * On loopback with cookies unavailable, a valid signed state is still
+ * single-use: the nonce is remembered in process memory for the remainder
+ * of its window, and Google's own one-use code covers the rest. A dev box
+ * is not a threat model; anything else keeps demanding both halves.
+ */
+async function validateOauthState(request: NextRequest, provider: string) {
+  const stateParam = request.nextUrl.searchParams.get('state');
+  const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
+  const consumedNonce = request.cookies.get(OAUTH_CONSUMED_COOKIE)?.value;
+  const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
+  if (!state || !cookieNonce || state.nonce !== cookieNonce) {
+    if (state && consumedNonce === state.nonce) {
+      console.warn(`[OAUTH:${provider}] Repeat callback attempt`, { stateFp: stateParam?.slice(-8) });
+      return { error: 'This sign-in attempt has already been used. Please try again.' as const };
+    }
+    if (state && isLoopbackRequest(request)) {
+      if (devConsumedOauthNonces.has(state.nonce)) {
+        return { error: 'This sign-in attempt has already been used. Please try again.' as const };
+      }
+      devConsumedOauthNonces.add(state.nonce);
+      return { state };
+    }
+    // Which leg failed — a signature problem (different JWT_SECRET between
+    // the server that started and the one finishing) or a missing/stale
+    // nonce cookie (repeat attempts rotate the nonce).
+    console.warn(`[OAUTH:${provider}] State validation failed`, {
+      hasState: !!state,
+      hasNonceCookie: !!cookieNonce,
+      consumedNonceCookie: !!consumedNonce,
+      stateFp: stateParam?.slice(-8) });
+    return { error: 'Invalid OAuth state' as const };
+  }
+  return { state };
 }
 
 const loginSchema = z.object({
@@ -2647,16 +2705,11 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
-    const stateParam = request.nextUrl.searchParams.get('state');
-    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
-    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-      // Which leg failed — a signature problem (different JWT_SECRET between
-      // the server that started and the one finishing) or a missing/stale
-      // nonce cookie (repeat attempts rotate the nonce).
-      console.warn('[OAUTH:google] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce, nonceMismatch: !!state && !!cookieNonce && state.nonce !== cookieNonce });
-      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    const validated = await validateOauthState(request, 'google');
+    if ('error' in validated) {
+      return NextResponse.json({ error: validated.error }, { status: 400 });
     }
+    const { state } = validated;
     if (!code) {
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
@@ -2741,13 +2794,11 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
-    const stateParam = request.nextUrl.searchParams.get('state');
-    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
-    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-      console.warn('[OAUTH:github] State validation failed', { hasState: !!state, hasNonceCookie: !!cookieNonce });
-      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    const validated = await validateOauthState(request, 'github');
+    if ('error' in validated) {
+      return NextResponse.json({ error: validated.error }, { status: 400 });
     }
+    const { state } = validated;
     if (!code) {
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
@@ -2865,12 +2916,11 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
     }
     const code = request.nextUrl.searchParams.get('code');
-    const stateParam = request.nextUrl.searchParams.get('state');
-    const cookieNonce = request.cookies.get(OAUTH_STATE_COOKIE)?.value;
-    const state = stateParam ? await verifyOauthStateToken(stateParam) : null;
-    if (!state || !cookieNonce || state.nonce !== cookieNonce) {
-      return NextResponse.json({ error: 'Invalid OAuth state' }, { status: 400 });
+    const validated = await validateOauthState(request, 'discord');
+    if ('error' in validated) {
+      return NextResponse.json({ error: validated.error }, { status: 400 });
     }
+    const { state } = validated;
     if (!code) {
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
