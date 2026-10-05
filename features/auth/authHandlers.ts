@@ -963,7 +963,7 @@ export async function loginHandler(request: NextRequest) {
 
     const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
     if (forceCaptcha) {
-      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
+      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
         return NextResponse.json({ error: check.error }, { status: 403 });
       }
@@ -979,7 +979,7 @@ export async function loginHandler(request: NextRequest) {
 
     const risk = await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true });
     if (risk?.requireCaptcha) {
-      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
+      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
         return NextResponse.json({ error: check.error }, { status: 403 });
       }
@@ -1105,7 +1105,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     const provenIdentity = await hasRecentLoginSuccess(ip);
     const forceCaptcha = !provenIdentity && (warnings.recentBlocks > 0 || warnings.count >= 2);
     if (forceCaptcha) {
-      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
+      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
         return NextResponse.json({ error: check.error }, { status: 403 });
       }
@@ -1129,7 +1129,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     const risk = await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true });
     if (risk?.requireCaptcha) {
-      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
+      const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
         return NextResponse.json({ error: check.error }, { status: 403 });
       }
@@ -1519,6 +1519,9 @@ export async function signupHandler(request: NextRequest) {
 
     const risk = await computeRiskScore({ ip, ua: userAgent, sessionId: captchaSession, fingerprint, authPath: true });
     if (risk?.requireCaptcha) {
+      // No userId yet — the account doesn't exist at this point, so a gate
+      // failure can't be attributed to one. `requireCaptchaGate` skips the
+      // activity write when userId is empty.
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
       if (!check.ok) {
         return NextResponse.json({ error: check.error }, { status: 403 });
