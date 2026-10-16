@@ -66,7 +66,14 @@ export async function emailConfigHandler(request: NextRequest) {
         update: { value: merged },
         create: { key: EMAIL_CONFIG_KEY, value: merged, description: 'Email provider + sender configuration' },
       });
-      return NextResponse.json(row.value, { status: 200 });
+      // Never echo plaintext secrets back — mask exactly like the GET branch.
+      const { apiKey: patchedKey, smtpPass: patchedPass, resendApiKey: patchedResend, ...patchedSafe } = (row.value as Record<string, any>) || {};
+      return NextResponse.json({
+        ...patchedSafe,
+        apiKey: patchedKey ? '••••' + String(patchedKey).slice(-4) : null,
+        resendApiKey: patchedResend ? '••••' + String(patchedResend).slice(-4) : null,
+        smtpPass: patchedPass ? '••••' : null,
+      }, { status: 200 });
     }
 
     return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });

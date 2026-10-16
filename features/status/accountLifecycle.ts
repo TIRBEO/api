@@ -25,14 +25,8 @@ import { addMinutes } from 'date-fns';
 // ═══════════════════════════════════════════════════════════════════
 
 export type ProviderKey = 'google' | 'github' | 'discord';
-export type ProviderField = 'googleId' | 'githubId' | 'discordId';
 
-export const PROVIDER_FIELDS: Record<ProviderKey, ProviderField> = {
-  google: 'googleId',
-  github: 'githubId',
-  discord: 'discordId',
-};
-export const ALL_PROVIDER_FIELDS: ProviderField[] = ['googleId', 'githubId', 'discordId'];
+export const PROVIDER_KEYS: ProviderKey[] = ['google', 'github', 'discord'];
 export const PROVIDER_NAMES: Record<ProviderKey, string> = {
   google: 'Google',
   github: 'GitHub',
@@ -40,16 +34,13 @@ export const PROVIDER_NAMES: Record<ProviderKey, string> = {
 };
 
 export function isProviderKey(value: unknown): value is ProviderKey {
-  return typeof value === 'string' && value in PROVIDER_FIELDS;
+  return typeof value === 'string' && (PROVIDER_KEYS as string[]).includes(value);
 }
 
 /**
- * OAuth provider ids have no dedicated column anymore — the authoritative link
- * store is `preferences.misc.oauth` ({ [provider]: providerId }). The legacy
- * googleId/githubId/discordId columns still exist and are what the e2e
- * scaffolding writes, so a read that ignored them would "forget" real links.
- * We read the union (misc.oauth wins on conflict) and write BOTH so neither
- * store drifts.
+ * OAuth provider ids have exactly one home: `preferences.misc.oauth`
+ * ({ [provider]: providerId }). The old googleId/githubId/discordId columns
+ * were dropped, so this map is both the read and the write store.
  */
 async function readMisc(userId: string): Promise<Record<string, any>> {
   const p = await prisma.userPreferences.findUnique({ where: { userId }, select: { misc: true } }).catch(() => null);
@@ -69,11 +60,6 @@ export async function writeOauthLink(userId: string, provider: ProviderKey, prov
     update: { misc },
     create: { userId, misc },
   }).catch(() => {});
-  // Keep the legacy column in step so a read that still looks there (and the
-  // e2e fixtures that write there) stays truthful.
-  await prisma.user
-    .update({ where: { id: userId }, data: { [PROVIDER_FIELDS[provider]]: providerId } as any })
-    .catch(() => {});
 }
 
 export async function clearOauthLink(userId: string, provider: ProviderKey): Promise<void> {
@@ -88,25 +74,11 @@ export async function clearOauthLink(userId: string, provider: ProviderKey): Pro
     update: { misc },
     create: { userId, misc },
   }).catch(() => {});
-  await prisma.user
-    .update({ where: { id: userId }, data: { [PROVIDER_FIELDS[provider]]: null } as any })
-    .catch(() => {});
 }
 
-/** The effective link map: legacy columns unioned with misc.oauth (oauth wins). */
+/** The link map: preferences.misc.oauth is the only store. */
 export async function effectiveLinks(userId: string): Promise<Record<string, string>> {
-  const [miscOauth, user] = await Promise.all([
-    readOauthLinks(userId),
-    prisma.user.findUnique({ where: { id: userId }, select: { googleId: true, githubId: true, discordId: true } }).catch(() => null),
-  ]);
-  const out: Record<string, string> = {};
-  for (const provider of Object.keys(PROVIDER_FIELDS) as ProviderKey[]) {
-    const field = PROVIDER_FIELDS[provider];
-    const legacy = user ? ((user as any)[field] as string | null) : null;
-    const link = miscOauth[provider] || legacy || null;
-    if (link) out[provider] = link;
-  }
-  return out;
+  return readOauthLinks(userId);
 }
 
 /**
@@ -151,14 +123,14 @@ export async function listConnections(userId: string): Promise<ConnectionRow[]> 
   const [links, logins] = await Promise.all([
     effectiveLinks(userId),
     prisma.userLogin.findMany({
-      where: { userId, success: true, method: { in: Object.keys(PROVIDER_FIELDS) } },
+      where: { userId, success: true, method: { in: PROVIDER_KEYS } },
       orderBy: { createdAt: 'asc' },
       select: { method: true, createdAt: true },
     }).catch(() => [] as { method: string; createdAt: Date }[]),
   ]);
 
   const rows: ConnectionRow[] = [];
-  for (const provider of Object.keys(PROVIDER_FIELDS) as ProviderKey[]) {
+  for (const provider of PROVIDER_KEYS) {
     const used = logins.filter((row) => row.method === provider);
     const accountId = links[provider] ?? null;
     rows.push({
@@ -465,8 +437,8 @@ export async function activeDeletionFor(userId: string): Promise<{ finalAt: Date
 
 /**
  * Schedule deletion after the code has been verified. Sets the distinct
- * lifecycle state (`status='deletion_pending'` + a UserDeletionRequest with the
- * final date), mirrors the legacy scheduledDeletionAt column, keeps the current
+ * lifecycle state (`status='deletion_pending'`) and writes the final date +
+ * reason to the UserDeletionRequest (the only store for them), keeps the current
  * session (so the pending screen + its cancel work) and revokes the rest.
  */
 export async function scheduleDeletion(userId: string, opts: { reason?: string | null; keepSessionId?: string | null } = {}) {
@@ -475,7 +447,7 @@ export async function scheduleDeletion(userId: string, opts: { reason?: string |
 
   const finalAt = new Date(Date.now() + DELETION_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  await prisma.user.update({ where: { id: userId }, data: { status: 'deletion_pending', scheduledDeletionAt: finalAt, deletionReason: opts.reason ?? null } });
+  await prisma.user.update({ where: { id: userId }, data: { status: 'deletion_pending' } });
 
   await prisma.userDeletionRequest.upsert({
     where: { userId },
@@ -497,9 +469,9 @@ export async function scheduleDeletion(userId: string, opts: { reason?: string |
 }
 
 /**
- * Cancel a scheduled deletion inside the window: request marked cancelled,
- * status restored to active, the legacy mirror cleared. Refuses if there is no
- * live pending request (nothing to cancel).
+ * Cancel a scheduled deletion inside the window: request marked cancelled and
+ * status restored to active. Refuses if there is no live pending request
+ * (nothing to cancel).
  */
 export async function cancelDeletion(userId: string): Promise<{ ok: boolean; error?: string }> {
   const active = await activeDeletionFor(userId);
@@ -510,7 +482,7 @@ export async function cancelDeletion(userId: string): Promise<{ ok: boolean; err
   }
 
   await prisma.userDeletionRequest.updateMany({ where: { userId }, data: { cancelledAt: new Date() } });
-  await prisma.user.update({ where: { id: userId }, data: { status: 'active', scheduledDeletionAt: null, deletionReason: null } });
+  await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
 
   await prisma.userStatusEvent.create({
     data: { userId, fromStatus: 'deletion_pending', toStatus: 'active', reason: 'user_cancelled_deletion', actor: 'user', metadata: {} },
@@ -541,7 +513,7 @@ export interface AccountState {
 
 export async function readAccountState(userId: string): Promise<AccountState> {
   const [user, deactivation, active, methods, connections] = await Promise.all([
-    prisma.user.findUnique({ where: { id: userId }, select: { status: true, deletionReason: true } }).catch(() => null),
+    prisma.user.findUnique({ where: { id: userId }, select: { status: true } }).catch(() => null),
     prisma.userDeactivation.findUnique({ where: { userId } }).catch(() => null),
     activeDeletionFor(userId),
     signInMethods(userId),

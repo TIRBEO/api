@@ -30,6 +30,7 @@ import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicio
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
 import { eventIdFor } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
+import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
 import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
 import { normalizeWorkFields } from '@/features/auth/profile-work';
@@ -107,45 +108,66 @@ async function isLoginUserEmailVerified(user: LoginUser): Promise<boolean> {
   return !!row?.verifiedAt;
 }
 
-// A provider identity can be attached to an account in three places written by
-// different generations of this codebase: user_preferences.misc.oauth (JSONB),
-// the legacy users.{google,github,discord}_id columns, and (by email only) the
-// consolidated user_email table plus the legacy users.email column. Every
-// lookup must consider all of them or an existing account reads as a stranger.
-const LEGACY_LINK_COLUMN: Record<string, 'googleId' | 'githubId' | 'discordId'> = {
-  google: 'googleId',
-  github: 'githubId',
-  discord: 'discordId',
-};
-
+// A provider identity is attached to an account in user_preferences.misc.oauth
+// (JSONB), written by the consolidated lifecycle helpers; email-only matches
+// go through the user_email table plus the users.email column. Every lookup
+// must consider both or an existing account reads as a stranger.
+// These two answer "does an account already own this identity?", so a failed
+// read must never look like "nobody owns it" — that is exactly how an existing
+// person gets routed into the create-account path. No .catch here on purpose:
+// let the failure reach the handler, which answers 500 and creates nothing.
 async function findUserByProviderLink(provider: string, providerId: string): Promise<string | null> {
   const pref = await prisma.userPreferences.findFirst({
     where: { misc: { path: ['oauth', provider], equals: providerId } } as any,
-    select: { userId: true } }).catch(() => null);
-  if (pref) return pref.userId;
-  const column = LEGACY_LINK_COLUMN[provider];
-  if (!column) return null;
-  const legacy = await prisma.user.findFirst({
-    where: { [column]: providerId },
-    select: { id: true } }).catch(() => null);
-  return legacy?.id || null;
+    select: { userId: true } });
+  return pref?.userId || null;
 }
 
 async function userIdForEmail(address: string): Promise<string | null> {
-  const row = await prisma.userEmail.findFirst({ where: { address }, select: { userId: true } }).catch(() => null);
+  const row = await prisma.userEmail.findFirst({ where: { address }, select: { userId: true } });
   if (row) return row.userId;
   const byColumn = await prisma.user.findFirst({
     where: { email: { equals: address, mode: 'insensitive' } },
-    select: { id: true } }).catch(() => null);
+    select: { id: true } });
   if (byColumn) return byColumn.id;
   if (isTirbeoEmail(address)) {
     const uname = parseTirbeoIdentifier(address)?.username;
     if (uname) {
-      const byName = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } }).catch(() => null);
+      const byName = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } });
       return byName?.id || null;
     }
   }
   return null;
+}
+
+/**
+ * A duplicate create can only reach here by losing the race against the
+ * existence checks above. users.email and users.username are UNIQUE, so the
+ * database refuses it — translate that into something the person can act on
+ * instead of a generic failure.
+ */
+function duplicateAccountResponse(err: any): NextResponse | null {
+  if (err?.code !== 'P2002') return null;
+  const target = String(err?.meta?.target ?? '');
+  if (target.includes('username')) {
+    return NextResponse.json({ error: 'This username is already taken. Pick another one.', usernameTaken: true }, { status: 409 });
+  }
+  return NextResponse.json({ error: 'An account with this email already exists. Sign in instead of creating another.', accountExists: true }, { status: 409 });
+}
+
+/**
+ * Did the request fail because the database could not be reached?
+ *
+ * The existence reads above are deliberately uncaught, so a network blip lands
+ * in the handler's catch. That is not the person's mistake, and "Signup failed"
+ * gives them nothing to act on — say what happened and that retrying is the
+ * answer. No account exists either way: nothing got as far as the INSERT.
+ */
+function isDbUnreachable(err: any): boolean {
+  const code = String(err?.code || '');
+  if (code === 'P1001' || code === 'P1017' || code === 'P2024') return true;
+  return /ENETUNREACH|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ETIMEDOUT|EAI_AGAIN|connection (?:terminated|closed)|server closed the connection|network is unreachable|Can't reach database/i.test(
+    `${code} ${err?.message || ''}`);
 }
 
 async function suspensionUntil(userId: string): Promise<Date | null> {
@@ -618,7 +640,7 @@ async function findProviderUser(provider: string, profile: ProviderProfile) {
   // login matches a Tirbeo username, offer the merge — the person confirms it.
   if (provider === 'github' && profile.email?.toLowerCase().endsWith('@users.noreply.github.com')) {
     const login = profile.email.split('@')[0].toLowerCase();
-    const byName = await prisma.user.findUnique({ where: { username: login }, select: { id: true } }).catch(() => null);
+    const byName = await prisma.user.findUnique({ where: { username: login }, select: { id: true } });
     if (byName) {
       const user = await fetchLoginUserById(byName.id);
       if (user) return { user, matchedBy: 'email' as const };
@@ -941,7 +963,6 @@ const loginSchema = z.object({
   username: z.string().min(1).max(64).optional(),
   password: z.string().min(1),
   turnstileToken: z.string().optional(),
-  captchaRayId: z.string().optional(),
   emailVerified: z.boolean().optional(),
   fingerprint: z.string().optional() }).refine((d) => !!d.email || !!d.username, { message: 'Email or username is required' });
 
@@ -953,8 +974,8 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid email or username or password' }, { status: 400 });
     }
     const identifier = (parsed.data.username || parsed.data.email || '').trim();
-    const { password, turnstileToken, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
-    const captchaToken = turnstileToken || captchaRayId || '';
+    const { password, turnstileToken, fingerprint: bodyFingerprint } = parsed.data;
+    const captchaToken = turnstileToken || '';
 
     const fingerprint = bodyFingerprint
       || request.cookies.get('__dfp')?.value
@@ -992,6 +1013,9 @@ export async function loginHandler(request: NextRequest) {
     }
     if (user.status === 'deletion_pending') {
       return NextResponse.json({ error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, message: 'Your account is scheduled for deletion.' }, { status: 403 });
+    }
+    if (user.status === 'banned') {
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), message: 'Your account has been permanently banned.' }, { status: 403 });
     }
     if (user.status === 'suspended') {
       const until = await suspensionUntil(user.id);
@@ -1112,8 +1136,8 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     if (!parsed.success) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
     }
-    const { email, password, turnstileToken, captchaRayId, fingerprint: bodyFingerprint } = parsed.data;
-    const captchaToken = turnstileToken || captchaRayId || '';
+    const { email, password, turnstileToken, fingerprint: bodyFingerprint } = parsed.data;
+    const captchaToken = turnstileToken || '';
     // loginSchema accepts username OR email, but the admin panel only ever
     // authenticates by email. Without this guard a username-only payload would
     // reach email.toLowerCase() below and throw.
@@ -1146,6 +1170,9 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     if (!user) {
       logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
+    }
+    if (user.status === 'banned') {
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), reason: 'No reason provided', message: 'This admin account is banned.' }, { status: 403 });
     }
     if (user.status === 'suspended' || user.status === 'deleted') {
       return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
@@ -1401,7 +1428,6 @@ const signupSchema = z.object({
   policyAccepted: z.boolean(),
   adminDataAccess: z.boolean().optional(),
   turnstileToken: z.string().optional(),
-  captchaRayId: z.string().optional(),
   fingerprint: z.string().optional(),
   // Optional pre-verified signup OTP (requested via auth/signup-otp/request,
   // verified without consuming via auth/signup-otp/verify). When valid, the
@@ -1523,8 +1549,8 @@ export async function signupHandler(request: NextRequest) {
       console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
       return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, photoUrl, companyRole, companyName, jobPlace, jobStarted, role, occupation, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, captchaRayId, turnstileToken, fingerprint, otpCode } = parsed.data;
-    const captchaToken = turnstileToken || captchaRayId || '';
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, companyRole, companyName, jobPlace, jobStarted, role, occupation, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, turnstileToken, fingerprint, otpCode } = parsed.data;
+    const captchaToken = turnstileToken || '';
     const normalizedEmail = email.toLowerCase().trim();
     const normalizedUsername = username.toString().trim().toLowerCase();
     const normalizedPhotoUrl = photoUrl ? photoUrl.toString().trim() : undefined;
@@ -1563,15 +1589,19 @@ export async function signupHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
     }
 
-    const existing = await prisma.userEmail.findFirst({ where: { address: accountEmail }, select: { userId: true } });
-    if (existing) {
-      return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
+    // The same lookup the OAuth path uses: an address can be owned through
+    // user_email, through the users.email column, or through a Tirbeo handle.
+    // Asking user_email alone let a legacy row slip through to the INSERT,
+    // where the UNIQUE column then refused it as an opaque failure.
+    const existingId = await userIdForEmail(accountEmail);
+    if (existingId) {
+      return NextResponse.json({ error: 'An account with this email already exists. Sign in instead of creating another.', accountExists: true }, { status: 409 });
     }
 
     if (normalizedUsername) {
-      const existingUsername = await prisma.user.findUnique({ where: { username: normalizedUsername } });
+      const existingUsername = await prisma.user.findUnique({ where: { username: normalizedUsername }, select: { id: true } });
       if (existingUsername) {
-        return NextResponse.json({ error: 'Username already taken' }, { status: 409 });
+        return NextResponse.json({ error: 'This username is already taken. Pick another one.', usernameTaken: true }, { status: 409 });
       }
     }
 
@@ -1609,47 +1639,53 @@ export async function signupHandler(request: NextRequest) {
     const passwordHash = await hashPassword(password);
     const name = sanitizeInput(`${firstName} ${lastName}`.trim(), 200);
     const birthday = dob ? new Date(dob) : undefined;
-    const user = await prisma.user.create({
-      data: {
-        email: accountEmail,
-        emailVerified: preVerifiedEmail || isTirbeoLogin,
-        username: normalizedUsername,
-        passwordHash,
-        // Stated once, in both stores, so the senders and the settings screen
-        // start out agreeing about a person who has expressed nothing yet.
-        notificationPreferences: NEW_ACCOUNT_PREFS,
-        profile: {
-          create: {
-            name,
-            photoUrl: normalizedPhotoUrl || null,
-            jobRole: work.jobRole,
-            jobCompany: work.jobCompany,
-            jobPlace: work.jobPlace,
-            jobStarted: work.jobStarted,
-            gender: gender ? sanitizeInput(gender, 100) : null,
-            birthday: birthday ?? null } },
-        // Email can ONLY be marked verified through the signup OTP flow — a
-        // client-supplied flag is never trusted (would allow claiming a
-        // verified account without proving email ownership).
-        emails: {
-          create: accountEmail === identityEmail
-            ? [{ address: accountEmail, kind: 'primary', isDefault: true, verifiedAt: preVerifiedEmail ? new Date() : null }]
-            : [
-                { address: accountEmail, kind: 'primary', isDefault: true, verifiedAt: preVerifiedEmail ? new Date() : null },
-                { address: identityEmail, kind: 'secondary', isDefault: false, verifiedAt: new Date() },
-              ] },
-        security: (is2FAEnabled && normalizedTotpSecret) ? {
-          create: { totpSecret: normalizedTotpSecret, totpEnabled: true } } : undefined,
-        preferences: {
-          create: {
-            notif: NEW_ACCOUNT_PREFS,
-            misc: {
-              consents: {
-                signupConsent: {
-                  acceptedAt: new Date().toISOString(),
-                  policyAccepted: true,
-                  adminDataAccess: !!adminDataAccess },
-                allowCrashReports: true } } } } } });
+    // The two existence checks above can lose a race against a concurrent
+    // signup; users.email and users.username are UNIQUE, so the database is
+    // what actually stops a second account for the same person.
+    let user: { id: string };
+    try {
+      user = await prisma.user.create({
+        data: {
+          email: accountEmail,
+          username: normalizedUsername,
+          passwordHash,
+          profile: {
+            create: {
+              name,
+              photoUrl: normalizedPhotoUrl || null,
+              jobRole: work.jobRole,
+              jobCompany: work.jobCompany,
+              jobPlace: work.jobPlace,
+              jobStarted: work.jobStarted,
+              gender: gender ? sanitizeInput(gender, 100) : null,
+              birthday: birthday ?? null } },
+          // Email can ONLY be marked verified through the signup OTP flow — a
+          // client-supplied flag is never trusted (would allow claiming a
+          // verified account without proving email ownership).
+          emails: {
+            create: accountEmail === identityEmail
+              ? [{ address: accountEmail, kind: 'primary', isDefault: true, verifiedAt: (preVerifiedEmail || isTirbeoLogin) ? new Date() : null }]
+              : [
+                  { address: accountEmail, kind: 'primary', isDefault: true, verifiedAt: (preVerifiedEmail || isTirbeoLogin) ? new Date() : null },
+                  { address: identityEmail, kind: 'secondary', isDefault: false, verifiedAt: new Date() },
+                ] },
+          security: (is2FAEnabled && normalizedTotpSecret) ? {
+            create: { totpSecret: normalizedTotpSecret, totpEnabled: true } } : undefined,
+          preferences: {
+            create: {
+              notif: NEW_ACCOUNT_PREFS,
+              misc: {
+                consents: {
+                  signupConsent: {
+                    acceptedAt: new Date().toISOString(),
+                    policyAccepted: true,
+                    adminDataAccess: !!adminDataAccess },
+                  allowCrashReports: true } } } } } });
+    } catch (err: any) {
+      const duplicate = duplicateAccountResponse(err);
+      if (duplicate) return duplicate;
+      throw err;
+    }
 
     // Recovery contact + provisioning bookkeeping (identity row already exists).
     if (normalizedRecoveryEmail) {
@@ -1733,6 +1769,9 @@ export async function signupHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[SIGNUP]', err?.message || err, err?.stack);
+    if (isDbUnreachable(err)) {
+      return NextResponse.json({ error: 'Tirbeo could not reach its database just now. Please try signing up again in a moment.', retryable: true }, { status: 503 });
+    }
     return NextResponse.json({ error: 'Signup failed' }, { status: 400 });
   }
 }
@@ -1949,19 +1988,54 @@ export async function oauthPendingHandler(request: NextRequest) {
       return NextResponse.json({ error: 'This sign-in link has expired. Please sign in again.' }, { status: 400 });
     }
     // An account may have appeared (or been found by a store the callback
-    // missed) since the token was minted. Say so, so the screen offers the
-    // merge path instead of inviting a duplicate.
-    const existingAccount = !!(await userIdForEmail(data.email.toLowerCase()));
-    const existingLink = await findUserByProviderLink(data.provider, data.providerId);
+    // missed) since the token was minted. Say so, and hand over the two moves
+    // that keep one profile: the account to recognise, and a merge link for it.
+    // The create screen never shows its form when either flag is set.
+    const linkedId = await findUserByProviderLink(data.provider, data.providerId);
+    const emailOwnerId = await userIdForEmail(data.email.toLowerCase());
+    const shown = linkedId
+      ? await fetchLoginUserById(linkedId)
+      : (emailOwnerId ? await fetchLoginUserById(emailOwnerId) : null);
+
+    // Only the same-email case is mergeable from here: an identity another
+    // account already owns is a transfer decision, made on the connected-apps
+    // screen with a session, never from a create screen. A deleted account is
+    // not a merge target either. The provider list is checked because this
+    // token's provider string is only ever validated on the way out.
+    const mergeable = !linkedId && !!emailOwnerId && shown?.status !== 'deleted'
+      && SUPPORTED_OAUTH_PROVIDERS.includes(data.provider);
+    let mergeUrl: string | null = null;
+    if (mergeable) {
+      const mergeToken = await signMergeToken({
+        provider: data.provider,
+        providerId: data.providerId,
+        email: data.email,
+        name: data.name || data.email,
+        photoUrl: data.photoUrl,
+        existingUserId: emailOwnerId! });
+      mergeUrl = accountsMergeUrl(data.provider, 'login', mergeToken);
+    }
+
     return NextResponse.json({
       provider: data.provider,
       email: data.email,
       name: data.name || '',
       photoUrl: data.photoUrl || null,
-      existingAccount,
-      existingLink: !!existingLink });
+      existingAccount: !!emailOwnerId,
+      existingLink: !!linkedId,
+      // Enough of the account to recognise it. The person holding this token
+      // got it only after the provider vouched for that email address, which is
+      // the same evidence the callback accepts to mint a merge token.
+      existing: shown ? {
+        name: shown.name || shown.username || '',
+        username: shown.username,
+        photoUrl: shown.photoUrl } : null,
+      mergeUrl });
   } catch (err: any) {
     console.error('[OAUTH PENDING]', err?.message || err);
+    if (isDbUnreachable(err)) {
+      return NextResponse.json({ error: 'Tirbeo could not reach its database just now. Please try again in a moment.', retryable: true }, { status: 503 });
+    }
     return NextResponse.json({ error: 'Failed to load signup info' }, { status: 500 });
   }
 }
@@ -2079,28 +2153,16 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     if (reserved.includes(uname)) {
       return NextResponse.json({ error: 'This username is reserved.' }, { status: 400 });
     }
-    const existingUname = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } });
-    if (existingUname) {
-      return NextResponse.json({ error: 'This username is already taken.' }, { status: 400 });
-    }
     const username: string = uname;
 
     // The four work answers, normalised to the columns the settings app reads.
     const work = normalizeWorkFields(body ?? {});
 
-    // Optional password chosen on the confirmation screen.
-    let passwordHash: string | undefined;
-    if (typeof body.password === 'string' && body.password.length > 0) {
-      if (body.password.length < 8) {
-        return NextResponse.json({ error: 'Password must be at least 8 characters.' }, { status: 400 });
-      }
-      const pwBreach = await checkPasswordBreach(body.password);
-      if (pwBreach.breached) {
-        return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
-      }
-      passwordHash = await hashPassword(body.password);
-    }
-
+    // Existence questions come before the username and password work: if this
+    // email already belongs to an account the person is signing into it, so a
+    // taken username must not dead-end them and a password must not be
+    // breach-checked for an account that will never be created.
+    //
     // The provider identity may have been claimed meanwhile — never hijack.
     const linker = await findUserByProviderLink(data.provider, data.providerId);
     if (linker) {
@@ -2113,14 +2175,18 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       // Account was created for this email between callback and confirm —
       // attach the identity instead of failing.
       const existing = await fetchLoginUserById(existingId);
-      if (existing) {
-        await setOauthLink(existing.id, data.provider, data.providerId);
-        if (!existing.name && displayName) {
-          await prisma.userProfile.update({ where: { userId: existing.id }, data: { name: sanitizeInput(displayName, 120) } }).catch(() => {});
-        }
-        if (!existing.photoUrl && chosenPhoto) {
-          await prisma.userProfile.update({ where: { userId: existing.id }, data: { photoUrl: chosenPhoto } }).catch(() => {});
-        }
+      if (!existing) {
+        return NextResponse.json({ error: 'Could not reach your existing account. Please try again.' }, { status: 500 });
+      }
+      if (existing.status === 'banned' || existing.status === 'suspended' || existing.status === 'deleted') {
+        return blockedAccountResponse(existing);
+      }
+      await setOauthLink(existing.id, data.provider, data.providerId);
+      if (!existing.name && displayName) {
+        await prisma.userProfile.update({ where: { userId: existing.id }, data: { name: sanitizeInput(displayName, 120) } }).catch(() => {});
+      }
+      if (!existing.photoUrl && chosenPhoto) {
+        await prisma.userProfile.update({ where: { userId: existing.id }, data: { photoUrl: chosenPhoto } }).catch(() => {});
       }
 
       const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -2132,46 +2198,70 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       return res;
     }
 
-    const user = await prisma.user.create({
-      select: { id: true },
-      data: {
-        email,
-        emailVerified: true,
-        username,
-        passwordHash: passwordHash ?? '',
-        // Same reason as the password signup: without this the row answers with
-        // the shipped column default, which turned category mail on for people
-        // who never asked for it.
-        notificationPreferences: NEW_ACCOUNT_PREFS,
-        profile: {
-          create: {
-            name: displayName ? sanitizeInput(displayName, 120) : null,
-            photoUrl: chosenPhoto,
-            // The completion screen asks the same questions the password
-            // wizard does; nothing it sends may be dropped on the way in.
-            ...work,
-            gender: typeof body.gender === 'string' && body.gender.trim() ? sanitizeInput(body.gender.trim(), 100) : null,
-            birthday: typeof body.dob === 'string' && body.dob.trim() && !Number.isNaN(new Date(body.dob).getTime()) ? new Date(body.dob) : null } },
-        // The OAuth provider already verified this email — skip the
-        // verification gate so social signups aren't blocked.
-        emails: {
-          create: [{ address: email, kind: 'primary', isDefault: true, verifiedAt: new Date() }] },
-        security: {
-          create: { mustChangePw: !passwordHash } },
-        preferences: {
-          create: {
-            notif: NEW_ACCOUNT_PREFS,
-            misc: {
-              consents: {
-                signupConsent: {
-                  acceptedAt: new Date().toISOString(),
-                  policyAccepted: true,
-                  // The screen offers this as a choice, so it has to be the
-                  // choice the account remembers — same as password signup.
-                  adminDataAccess: !!body.adminDataAccess,
-                  oauth: true },
-                allowCrashReports: true },
-              oauth: { [data.provider]: data.providerId } } } } } as any });
+    // Nothing owns this email, so this really is a new account — which needs a
+    // free username and, if a password was typed, one worth keeping.
+    const existingUname = await prisma.user.findUnique({ where: { username: uname }, select: { id: true } });
+    if (existingUname) {
+      return NextResponse.json({ error: 'This username is already taken.', usernameTaken: true }, { status: 409 });
+    }
+
+    let passwordHash: string | undefined;
+    if (typeof body.password === 'string' && body.password.length > 0) {
+      if (body.password.length < 8) {
+        return NextResponse.json({ error: 'Password must be at least 8 characters.' }, { status: 400 });
+      }
+      const pwBreach = await checkPasswordBreach(body.password);
+      if (pwBreach.breached) {
+        return NextResponse.json({ error: 'This password has been found in known breaches. Please choose a different password.' }, { status: 400 });
+      }
+      passwordHash = await hashPassword(body.password);
+    }
+
+    let user: { id: string };
+    try {
+      user = await prisma.user.create({
+        select: { id: true },
+        data: {
+          email,
+          username,
+          passwordHash: passwordHash ?? '',
+          profile: {
+            create: {
+              name: displayName ? sanitizeInput(displayName, 120) : null,
+              photoUrl: chosenPhoto,
+              // The completion screen asks the same questions the password
+              // wizard does; nothing it sends may be dropped on the way in.
+              ...work,
+              gender: typeof body.gender === 'string' && body.gender.trim() ? sanitizeInput(body.gender.trim(), 100) : null,
+              birthday: typeof body.dob === 'string' && body.dob.trim() && !Number.isNaN(new Date(body.dob).getTime()) ? new Date(body.dob) : null } },
+          // The OAuth provider already verified this email — skip the
+          // verification gate so social signups aren't blocked.
+          emails: {
+            create: [{ address: email, kind: 'primary', isDefault: true, verifiedAt: new Date() }] },
+          security: {
+            create: { mustChangePw: !passwordHash } },
+          preferences: {
+            create: {
+              notif: NEW_ACCOUNT_PREFS,
+              misc: {
+                consents: {
+                  signupConsent: {
+                    acceptedAt: new Date().toISOString(),
+                    policyAccepted: true,
+                    // The screen offers this as a choice, so it has to be the
+                    // choice the account remembers — same as password signup.
+                    adminDataAccess: !!body.adminDataAccess,
+                    oauth: true },
+                  allowCrashReports: true },
+                oauth: { [data.provider]: data.providerId } } } } } as any });
+    } catch (err: any) {
+      // Every check above can lose a race against a concurrent create; the
+      // UNIQUE columns cannot, so whatever the database refuses becomes an
+      // answer the person can act on rather than a dead end.
+      const duplicate = duplicateAccountResponse(err);
+      if (duplicate) return duplicate;
+      throw err;
+    }
 
     prisma.activityEvent.create({
       data: { userId: user.id, kind: 'user.created', title: 'Account created via OAuth', severity: 'info', ipAddress: (request.headers.get('x-forwarded-for') || '').split(',')[0].trim(), metadata: { provider: data.provider, email, via: 'oauth_complete' } } }).catch(() => {});
@@ -2202,6 +2292,9 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[OAUTH COMPLETE]', err?.message || err);
+    if (isDbUnreachable(err)) {
+      return NextResponse.json({ error: 'Tirbeo could not reach its database just now. Please try again in a moment.', retryable: true }, { status: 503 });
+    }
     return NextResponse.json({ error: 'Could not create your account. Please try again.' }, { status: 500 });
   }
 }
@@ -2212,6 +2305,15 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
  * redirect to the signed blocked screen on the dashboard.
  */
 function blockedAccountResponse(user: LoginUser): NextResponse {
+  if (user.status === 'banned') {
+    return NextResponse.json({
+      error: 'ACCOUNT_BANNED',
+      banned: true,
+      eventId: eventIdFor(user.id, 'ban'),
+      reason: null,
+      until: null,
+      message: 'Your account has been banned.' }, { status: 403 });
+  }
   if (user.status === 'suspended') {
     return NextResponse.json({
       error: 'ACCOUNT_SUSPENDED',
@@ -2229,12 +2331,27 @@ function blockedAccountResponse(user: LoginUser): NextResponse {
 
 export async function requestLoginOtpHandler(request: NextRequest) {
   try {
-    const { email } = (await request.json()) as any;
+    const { email, ptr } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    // ptr gate — a live code flow is keyed to the device that started it.
+    const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
+    const ptrGate = await checkPtr('login-otp', email, ptr, ptrDevice);
+    if (ptrGate.state === 'invalid') {
+      const guessesOk = await checkWindowLimitDB(`login-otp:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      if (!guessesOk) {
+        return NextResponse.json(
+          { error: 'Too many invalid attempts from this device. Please try again later.', exceeded: 'global-ip' },
+          { status: 429, headers: { 'Retry-After': '900' } },
+        );
+      }
+      return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
+    }
+
     // Relaxed login OTP rate limits - 10 per hour per IP, 5 per hour per email
     // ── Fast limits (Redis + in-memory mirror; DB-configured maxes) ──
     const [otp, globalEmail, otpIpWin, ipWin] = await Promise.all([
@@ -2289,7 +2406,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     const resolved = await resolveTirbeoIdentifier(email);
     const user = resolved?.user ?? null;
     if (!user) {
-      return NextResponse.json({ message: 'If an account exists, a code has been sent.' });
+      return NextResponse.json({ message: 'If an account exists, a code has been sent.', ptr: issuePtr('login-otp', email, ptrDevice) });
     }
 
     if (user.status === 'deleted') return NextResponse.json({ error: 'ACCOUNT_DELETED', deleted: true, message: 'Your account has been deleted.' }, { status: 403 });
@@ -2297,14 +2414,25 @@ export async function requestLoginOtpHandler(request: NextRequest) {
       const dr = await prisma.userDeletionRequest.findUnique({ where: { userId: user.id }, select: { finalAt: true } }).catch(() => null);
       return NextResponse.json({ error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, scheduledAt: dr?.finalAt ?? null, message: 'Your account is scheduled for deletion.' }, { status: 403 });
     }
+    if (user.status === 'banned') return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), reason: null, until: await suspensionUntil(user.id), message: 'Your account has been banned.' }, { status: 403 });
     if (user.status === 'suspended') return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: eventIdFor(user.id, 'suspend'), reason: null, until: await suspensionUntil(user.id), message: 'Your account is temporarily suspended.' }, { status: 403 });
 
     const code = genSignupOtp();
-    await storeSignupOtp(email, code);
-    logAuthJson('signup_otp', { email: email.toLowerCase(), ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
-    // fire-and-forget: return in <30ms, don't block on 7s email provider
-    sendSignupOtpEmail(email, code, 'login_otp').catch((e) => console.error('[LOGIN OTP] async send error:', e?.message));
-    return NextResponse.json({ message: 'Verification code sent to your email', remaining: remainingInfo }, { status: 200 });
+    // Deliver to (and store under) the account's real address: when somebody
+    // typed a bare username or a `*@tirbeo.com` alias, sending to that raw
+    // string would mail a mailbox the person may not read, and a later
+    // verify with their primary email would find no code.
+    const deliverTo = (user.email || email).toLowerCase();
+    await storeSignupOtp(deliverTo, code);
+    logAuthJson('signup_otp', { email: deliverTo, ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
+    // Await the provider: a "code sent" response after a rejected send
+    // strands the user on the OTP screen waiting for mail that never comes.
+    const send = await sendSignupOtpEmail(deliverTo, code, 'login_otp');
+    if (!send.success) {
+      if (ptrGate.state === 'ok') await releasePtr('login-otp', email, String(ptr));
+      return NextResponse.json({ error: 'Could not send the code. Please try again.', remaining: remainingInfo }, { status: 502 });
+    }
+    return NextResponse.json({ message: 'Verification code sent to your email', remaining: remainingInfo, ptr: issuePtr('login-otp', email, ptrDevice) }, { status: 200 });
   } catch (err: any) {
     console.error('[LOGIN OTP REQUEST]', err?.message || err, err?.stack);
     return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
@@ -2325,7 +2453,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     if (!user) {
       return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
     }
-    if (user.status === 'suspended' || user.status === 'deleted') {
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
       return blockedAccountResponse(user);
     }
     if (!(await isLoginUserEmailVerified(user))) {
@@ -2337,7 +2465,9 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
     }
 
-    const otpOk = await verifySignupOtp(email, otpCode);
+    // Same normalization as the request handler — the code was stored under
+    // the account's real address, not the identifier that was typed.
+    const otpOk = await verifySignupOtp((user.email || email).toLowerCase(), otpCode);
     if (!otpOk) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'invalid_otp' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
@@ -3060,10 +3190,10 @@ async function buildProfilePayload(userId: string): Promise<any | null> {
     hasPassword: !!row.passwordHash,
     adminRole: row.isAdmin ? 'admin' : null,
     status: row.status,
-    isBanned: false,
+    isBanned: row.status === 'banned',
     isSuspended: row.status === 'suspended',
-    suspendReason: row.status === 'suspended' ? restriction?.title ?? null : null,
-    suspendedUntil: row.status === 'suspended' ? restriction?.endsAt ?? null : null,
+    suspendReason: (row.status === 'suspended' || row.status === 'banned') ? restriction?.title ?? null : null,
+    suspendedUntil: (row.status === 'suspended' || row.status === 'banned') ? restriction?.endsAt ?? null : null,
     scheduledDeletionAt: deletion?.finalAt ?? null,
     deletionReason: deletion?.reason ?? null,
     lastLoginAt: lastLogin?.createdAt ?? null,
@@ -3301,9 +3431,17 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {  tr
     if (!(await checkWindowLimitDB(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
       return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
-    await requestPasswordResetOtp(email);
-    // Always return success to prevent email enumeration.
-    // If email fails, the code is logged to console as fallback.
+    const result = await requestPasswordResetOtp(email);
+    // An unknown address returns success without sending, so the response stays
+    // a lie-proof 200 either way. But a provider rejection is not an
+    // enumeration signal — it is our failure, and silently answering "sent"
+    // left the user staring at an inbox that would never fill.
+    if (!result?.success) {
+      return NextResponse.json(
+        { error: result?.error || 'Could not send the verification code. Please try again.' },
+        { status: 502 },
+      );
+    }
     return NextResponse.json({ message: 'If an account exists, a verification code has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET OTP REQUEST]', err?.message || err);
@@ -3329,8 +3467,15 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
     if (!(await checkWindowLimitDB(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
       return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
     }
-    await requestPasswordResetMagicLink(email);
-    // Always return success to prevent email enumeration.
+    const result = await requestPasswordResetMagicLink(email);
+    // Unknown address returns success without sending, so enumeration protection
+    // is intact; only our own delivery failure is surfaced.
+    if (!result?.success) {
+      return NextResponse.json(
+        { error: result?.error || 'Could not send the reset link. Please try again.' },
+        { status: 502 },
+      );
+    }
     return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
   } catch (err: any) {
     console.error('[PASSWORD RESET MAGIC LINK REQUEST]', err?.message || err);
@@ -3341,7 +3486,7 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
 // Password reset — request (legacy — sends both OTP and link for backward compatibility)
 export async function requestPasswordResetHandler(request: NextRequest) {
   try {
-    const { email, method, adminOnly } = (await request.json()) as any;
+    const { email, method, adminOnly, ptr } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
@@ -3356,6 +3501,19 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     // request that skips them because it arrived through the older route would
     // be the cheapest way to spend somebody's mailbox quota.
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    // ptr gate — a live reset flow is keyed to the device that started it.
+    const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
+    const ptrMethod = `pw-reset-${resetMethod}`;
+    const ptrGate = await checkPtr(ptrMethod, email, ptr, ptrDevice);
+    if (ptrGate.state === 'invalid') {
+      const guessesOk = await checkWindowLimitDB(`${ptrMethod}:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      if (!guessesOk) {
+        return NextResponse.json({ error: 'Too many invalid attempts from this device. Please try again later.' }, { status: 429, headers: { 'Retry-After': '900' } });
+      }
+      return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
+    }
+
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
       return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
     }
@@ -3371,14 +3529,25 @@ export async function requestPasswordResetHandler(request: NextRequest) {
         ? await requestPasswordResetRecovery(email)
         : await requestPasswordReset(email, resetMethod);
     if (!result.success && result.retryAfterMs) {
+      if (ptrGate.state === 'ok') await releasePtr(ptrMethod, email, String(ptr));
       return NextResponse.json(
         { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
         { status: 429, headers: { 'Retry-After': String(Math.ceil(result.retryAfterMs / 1000)) } },
       );
     }
-    // Always return success to prevent email enumeration.
-    // If email fails, the resetUrl + code are logged to console as fallback.
-    return NextResponse.json({ message: 'If an account exists, a reset link has been sent.' });
+    if (!result.success) {
+      // Unknown addresses return success from the helper without sending, so
+      // this branch is only reachable when a real account's mail failed. The
+      // wording says nothing about the account; the address and cause stay in
+      // the server log. Silently answering 200 here was the whole reason a
+      // failed send looked like a delivered one.
+      console.error(`[PASSWORD RESET REQUEST] send failed for ${email}: ${result.error || 'unknown'}`);
+      return NextResponse.json(
+        { error: 'We could not reach the email service right now. Please try again in a moment.' },
+        { status: 502 },
+      );
+    }
+    return NextResponse.json({ message: 'If an account exists, a reset link has been sent.', ptr: issuePtr(ptrMethod, email, ptrDevice) });
   } catch (err: any) {
     console.error('[PASSWORD RESET REQUEST]', err?.message || err);
     return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
@@ -3488,12 +3657,31 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
 
 export async function requestMagicLinkHandler(request: NextRequest) {
   try {
-    const { email } = (await request.json()) as any;
+    const { email, redirect_to, ptr } = (await request.json()) as any;
     if (!email || typeof email !== 'string') {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
+    // Allowlisted only — an unvalidated redirect turned a login link into an
+    // open redirect onto whatever host the requester named.
+    const safeRedirect = normalizeOAuthRedirect(typeof redirect_to === 'string' ? redirect_to : null);
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+
+    // ── ptr gate ──
+    // A live send flow for this email is keyed to the device that started it:
+    // resends must present the issued ptr, and wrong guesses are counted.
+    const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
+    const ptrGate = await checkPtr('magic-link', email, ptr, ptrDevice);
+    if (ptrGate.state === 'invalid') {
+      const guessesOk = await checkWindowLimitDB(`magic-link:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      if (!guessesOk) {
+        return NextResponse.json(
+          { error: 'Too many invalid attempts from this device. Please try again later.', exceeded: 'global-ip' },
+          { status: 429, headers: { 'Retry-After': '900' } },
+        );
+      }
+      return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
+    }
 
     // ── Fast limits (Redis + in-memory mirror; DB-configured maxes) ──
     // Per-email method counter + global-email counter are consumed atomically.
@@ -3545,7 +3733,10 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     const user = await fetchLoginUserByEmail(email.toLowerCase());
     // Always return success to prevent email enumeration
     if (!user) {
-      return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
+      // Uniform response shape: a key is issued even when no account matched,
+      // so the sent-page never loses its resend proof and existence stays
+      // unlearnable from the payload.
+      return NextResponse.json({ message: 'If an account exists, a magic link has been sent.', ptr: issuePtr('magic-link', email, ptrDevice) });
     }
 
     const token = await signMagicLinkToken(user.id);
@@ -3566,14 +3757,26 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     // and redirects to the dashboard. This avoids the catch-all route matching
     // issues that occur when hitting the API GET endpoint directly.
     const accountsBase = getAccountsBaseUrl();
-    const callbackUrl = `${accountsBase}/callback?magic_token=${token}`;
+    let callbackUrl = `${accountsBase}/callback?magic_token=${token}`;
+    if (safeRedirect) callbackUrl += `&redirect_to=${encodeURIComponent(safeRedirect)}`;
 
-    // fire-and-forget: 7s provider should not block response
-    sendTemplateEmail(email, 'magic_link', {
+    // Await the provider: the UI promises "check your inbox", so a rejected
+    // send must surface as an error rather than a silent dead end.
+    const send = await sendTemplateEmail(email, 'magic_link', {
       magicLink: callbackUrl,
-      name: user.name || 'there' }).catch((e) => console.error('[MAGIC LINK] async send error:', e?.message));
+      name: user.name || 'there' });
+    if (!send.success) {
+      console.error('[MAGIC LINK] send failed:', send.error);
+      if (ptrGate.state === 'ok') await releasePtr('magic-link', email, String(ptr));
+      return NextResponse.json({ error: 'Could not send the sign-in link. Please try again.', remaining: remainingInfo }, { status: 502 });
+    }
 
-    const resp: any = { message: 'If an account exists, a magic link has been sent.', remaining: remainingInfo };
+    const resp: any = {
+      message: 'If an account exists, a magic link has been sent.',
+      remaining: remainingInfo,
+      // Fresh key every send — the previous one (if any) stops working.
+      ptr: issuePtr('magic-link', email, ptrDevice),
+    };
     return NextResponse.json(resp, { status: 200 });
   } catch (err: any) {
     console.error('[MAGIC LINK REQUEST]', err?.message || err, err?.stack);
@@ -3585,12 +3788,16 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
   try {
     // Support both GET (from email link) and POST (from accounts app)
     let token = '';
+    let redirectCandidate: string | null = null;
     if (request.method === 'GET') {
       token = request.nextUrl.searchParams.get('token') || '';
+      redirectCandidate = request.nextUrl.searchParams.get('redirect_to');
     } else {
       const body = (await request.json()) as any;
       token = body?.token || '';
+      redirectCandidate = typeof body?.redirect_to === 'string' ? body.redirect_to : null;
     }
+    const safeRedirect = normalizeOAuthRedirect(redirectCandidate);
     if (!token || typeof token !== 'string') {
       if (request.method === 'GET') {
         // GET with no token — redirect to accounts login
@@ -3638,7 +3845,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     if (!user) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
-    if (user.status === 'suspended' || user.status === 'deleted' || user.status === 'deletion_pending') {
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted' || user.status === 'deletion_pending') {
       return blockedAccountResponse(user);
     }
     if (!(await isLoginUserEmailVerified(user))) {
@@ -3662,10 +3869,9 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       headers: request.headers,
       method: 'magic_link' });
 
-    // GET request (from email link): create session + redirect to dashboard
+    // GET request (from email link): create session + redirect (allowlisted target or dashboard)
     if (request.method === 'GET') {
-      const dashboardBase = getDashboardBase();
-      const res = NextResponse.redirect(dashboardBase);
+      const res = NextResponse.redirect(safeRedirect || getDashboardBase());
       setSessionCookie(res, sessionToken, refreshToken, request);
 
       await createAuditEvent({
@@ -3686,8 +3892,9 @@ body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP $
       return res;
     }
 
-    // POST request (from accounts app): return JSON
-    const res = NextResponse.json({ email: user.email, token: sessionToken });
+    // POST request (from accounts app): return JSON; the client navigates to
+    // redirect_to when the emailed link carried one.
+    const res = NextResponse.json({ email: user.email, token: sessionToken, redirect_to: safeRedirect || null });
     setSessionCookie(res, sessionToken, refreshToken, request);
 
     await createAuditEvent({
@@ -3732,14 +3939,19 @@ export async function accountRecoveryHandler(request: NextRequest) {
       return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
     }
 
-    const appDomain = getAppDomain();
     // The standalone /recovery page was removed (accounts app is auth-only now);
-    // point users at /forgot-password which has the full OTP/magic-link reset flow.
-    const recoveryUrl = `https://accounts.${appDomain}/forgot-password`;
+    // the sign-in screen hosts the full OTP/magic-link/recovery reset flow.
+    // Derived from config like every other URL — a hardcoded prod host would
+    // send dev/staging mail at real customers' login pages.
+    const recoveryUrl = `${getAccountsBaseUrl()}/login`;
 
-    await sendTemplateEmail(email, 'account_recovery', {
+    const send = await sendTemplateEmail(email, 'account_recovery', {
       recoveryUrl,
-      name: user.name || 'there' }).catch(err => console.error('[ACCOUNT RECOVERY] Email send error:', err));
+      name: user.name || 'there' });
+    if (!send.success) {
+      console.error('[ACCOUNT RECOVERY] Email send failed:', send.error);
+      return NextResponse.json({ error: 'Could not send the recovery email. Please try again.' }, { status: 502 });
+    }
 
     return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
   } catch (err: any) {
@@ -3784,7 +3996,7 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
     if (!user || !recoveryEmail) {
       return NextResponse.json({ error: 'No verified recovery email is set for this account' }, { status: 400 });
     }
-    if (user.status === 'suspended' || user.status === 'deleted') {
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
       return blockedAccountResponse(user);
     }
     const recRow = await prisma.userEmail.findFirst({
@@ -3795,7 +4007,9 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
     }
 
     const code = generateOtpCode();
-    await storeOtp(user.id, 'email', code);
+    // Bound to the recovery mailbox: a password-reset code (unbound, same
+    // otps.kind) and this login code cannot be spent on each other's flow.
+    await storeOtp(user.id, 'email', code, recoveryEmail);
     try {
       const result = await sendSignupOtpEmail(recoveryEmail, code, 'login_otp');
       if (!result.success) {
@@ -3823,10 +4037,12 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
 
     const user = await fetchLoginUserByEmail(email.toLowerCase());
     if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
-    if (user.status === 'suspended' || user.status === 'deleted') return blockedAccountResponse(user);
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') return blockedAccountResponse(user);
     if (!(await isLoginUserEmailVerified(user))) return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
 
-    const ok = await verifyOtpCode(user.id, 'email', code);
+    // The code was bound to the recovery mailbox it was posted to; verify
+    // with the same bind so reset/recovery codes cannot cross-spend.
+    const ok = await verifyOtpCode(user.id, 'email', code, user.recoveryEmail || undefined);
     if (!ok) {
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
@@ -3877,7 +4093,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
     if (!user) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
-    if (user.status === 'suspended' || user.status === 'deleted') {
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
       return blockedAccountResponse(user);
     }
 
@@ -4033,7 +4249,7 @@ export async function cliTokenHandler(request: NextRequest) {
 
     const user = await fetchLoginUserById(session.userId);
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    if (user.status === 'suspended' || user.status === 'deleted') {
+    if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
       return blockedAccountResponse(user);
     }
 

@@ -9,23 +9,21 @@ export async function setup2faHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
+  const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } });
   if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  if (user.is2FAEnabled) return NextResponse.json({ error: '2FA already enabled' }, { status: 409 });
+
+  const security = await prisma.userSecurity.findUnique({ where: { userId: session.userId } });
+  if (security?.totpEnabled) return NextResponse.json({ error: '2FA already enabled' }, { status: 409 });
 
   const secret = generateSecret();
   const uri = generateTotpUri(secret, user.email);
 
   const recoveryCodes = generateRecoveryCodes(8);
 
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { totpSecret: secret },
-  });
-
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+  await prisma.userSecurity.upsert({
+    where: { userId: session.userId },
+    create: { userId: session.userId, totpSecret: secret, backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+    update: { totpSecret: secret, backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 
   await createAuditEvent({
@@ -46,16 +44,16 @@ export async function verify2faSetupHandler(request: NextRequest) {
   const { token } = (await request.json()) as any;
   if (typeof token !== 'string') return NextResponse.json({ error: 'Invalid token' }, { status: 400 });
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user || !user.totpSecret) return NextResponse.json({ error: 'No 2FA secret found. Run setup first.' }, { status: 400 });
+  const security = await prisma.userSecurity.findUnique({ where: { userId: session.userId } });
+  if (!security || !security.totpSecret) return NextResponse.json({ error: 'No 2FA secret found. Run setup first.' }, { status: 400 });
 
-  if (!await verifyTotp(token, user.totpSecret)) {
+  if (!await verifyTotp(token, security.totpSecret)) {
     return NextResponse.json({ error: 'Invalid code' }, { status: 400 });
   }
 
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { is2FAEnabled: true },
+  await prisma.userSecurity.update({
+    where: { userId: session.userId },
+    data: { totpEnabled: true },
   });
 
   await createAuditEvent({
@@ -75,11 +73,13 @@ export async function disable2faHandler(request: NextRequest) {
 
   const { token, password } = (await request.json()) as any;
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
+  const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { passwordHash: true } });
   if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
+  const security = await prisma.userSecurity.findUnique({ where: { userId: session.userId } });
+
   if (token) {
-    if (!user.totpSecret || !await verifyTotp(token, user.totpSecret)) {
+    if (!security?.totpSecret || !await verifyTotp(token, security.totpSecret)) {
       return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 400 });
     }
   } else if (password) {
@@ -90,14 +90,10 @@ export async function disable2faHandler(request: NextRequest) {
     return NextResponse.json({ error: 'Provide either 2FA code or password' }, { status: 400 });
   }
 
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { totpSecret: null, is2FAEnabled: false },
-  });
-
-  await prisma.user.update({
-    where: { id: session.userId },
-    data: { backupCodes: [] },
+  await prisma.userSecurity.upsert({
+    where: { userId: session.userId },
+    create: { userId: session.userId, totpSecret: null, totpEnabled: false, backupCodes: [] },
+    update: { totpSecret: null, totpEnabled: false, backupCodes: [] },
   });
 
   await createAuditEvent({
@@ -115,17 +111,16 @@ export async function status2faHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const user = await prisma.user.findUnique({
-    where: { id: session.userId },
-    select: { is2FAEnabled: true, totpSecret: true },
+  const security = await prisma.userSecurity.findUnique({
+    where: { userId: session.userId },
+    select: { totpEnabled: true, backupCodes: true },
   });
 
-  const fullUser = await prisma.user.findUnique({ where: { id: session.userId }, select: { backupCodes: true } });
-  const allCodes = Array.isArray((fullUser as any)?.backupCodes) ? (fullUser as any).backupCodes as any[] : [];
+  const allCodes = Array.isArray((security as any)?.backupCodes) ? (security as any).backupCodes as any[] : [];
   const recoveryCount = allCodes.filter((c: any) => !c.used).length;
 
   return NextResponse.json({
-    enabled: user?.is2FAEnabled || false,
+    enabled: security?.totpEnabled || false,
     remainingRecoveryCodes: recoveryCount,
   });
 }
@@ -134,14 +129,14 @@ export async function regenerateRecoveryCodesHandler(request: NextRequest) {
   const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const user = await prisma.user.findUnique({ where: { id: session.userId } });
-  if (!user || !user.is2FAEnabled) {
+  const security = await prisma.userSecurity.findUnique({ where: { userId: session.userId } });
+  if (!security || !security.totpEnabled) {
     return NextResponse.json({ error: '2FA must be enabled first' }, { status: 400 });
   }
 
   const codes = generateRecoveryCodes(8);
-  await prisma.user.update({
-    where: { id: session.userId },
+  await prisma.userSecurity.update({
+    where: { userId: session.userId },
     data: { backupCodes: codes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 

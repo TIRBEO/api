@@ -9,13 +9,13 @@ export async function GET(request: NextRequest) {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
 
-    // Get push subscriptions for current user from user_preferences
-    const user = await prisma.user.findUnique({
-      where: { id: session.userId },
-      select: { notificationPreferences: true },
+    // Push subscription bookkeeping lives in user_preferences.notif
+    const user = await prisma.userPreferences.findUnique({
+      where: { userId: session.userId },
+      select: { notif: true },
     });
 
-    const prefs: any = (user as any)?.notificationPreferences || {};
+    const prefs: any = (user?.notif as any) || {};
     const subscriptions = prefs.pushSubscriptions || [];
 
     // Return sanitized list (no full subscription details for security)

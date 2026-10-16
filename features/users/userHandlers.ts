@@ -24,9 +24,10 @@ import { revokeLongLivedSessions } from '@/features/auth/session';
 import { secondFactorBlocker } from '@/features/auth/second-factor';
 import {
   PROVIDER_NAMES, isProviderKey,
-  listConnections, unlinkProvider, writeOauthLink,
+  listConnections, unlinkProvider, writeOauthLink, readOauthLinks,
   issueDeletionCode, consumeDeletionCode, scheduleDeletion, cancelDeletion,
   activeDeletionFor, OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
+import { eventIdFor } from '@/features/users/refcode';
 import {
   completeExportRequest,
   createExportRequest,
@@ -96,25 +97,29 @@ const PROFILE_FIELD_LABELS: Record<string, string> = {
  * value the account does not have.
  */
 const PROFILE_SELECT = {
-  id: true, email: true, username: true, name: true, photoUrl: true,
-  status: true, theme: true, timezone: true, language: true, consents: true,
-  emailVerified: true, phoneVerified: true, is2FAEnabled: true,
-  mustChangePassword: true, scheduledDeletionAt: true, deletionReason: true,
+  id: true, email: true, username: true, status: true,
   lastLoginAt: true, lastActiveAt: true, createdAt: true, updatedAt: true,
-  passwordHash: true, googleId: true, githubId: true, discordId: true,
-  totpSecret: true, backupCodes: true,
+  passwordHash: true,
   profile: {
     select: {
+      name: true, photoUrl: true,
       bio: true, gender: true, birthday: true, website: true,
       jobRole: true, jobCompany: true } },
-  phone: { select: { number: true, verifiedAt: true } } } as const;
+  preferences: { select: { appearance: true, misc: true } },
+  phone: { select: { number: true, verifiedAt: true } },
+  security: { select: { totpEnabled: true, mustChangePw: true, backupCodes: true } },
+  emails: { select: { address: true, kind: true, isDefault: true, verifiedAt: true } },
+  deletionRequest: { select: { reason: true, finalAt: true, cancelledAt: true, executedAt: true } } } as const;
 
 /**
- * Wire field name → `user_profile` column. The two ends differ because the
- * column was named for the employment sense of the word and the wire kept the
- * name the settings form has always used.
+ * Wire field name → `user_profile` column. `name`/`photoUrl` read from here now
+ * that the account row keeps only identity; the two employment keys differ
+ * because the column was named for the job sense of the word and the wire kept
+ * the name the settings form has always used.
  */
 const PROFILE_ROW_FIELDS: Record<string, string> = {
+  name: 'name',
+  photoUrl: 'photoUrl',
   bio: 'bio',
   gender: 'gender',
   website: 'website',
@@ -122,11 +127,14 @@ const PROFILE_ROW_FIELDS: Record<string, string> = {
   companyRole: 'jobRole' };
 
 /**
- * Fields on the `users` row itself. `name` and `photoUrl` live on both the
- * account and the profile row; they stay on the account here, which is where
- * the rest of the API (public profiles, account merge) already reads them from.
+ * Fields that stay on the `users` row itself. Every other concern has moved to
+ * its own table: name/photoUrl → user_profile, theme/language/timezone →
+ * user_preferences.appearance.
  */
-const ACCOUNT_ROW_FIELDS = ['name', 'username', 'photoUrl', 'theme', 'timezone', 'language'] as const;
+const ACCOUNT_ROW_FIELDS = ['username'] as const;
+
+/** Wire field names that map to the `user_preferences.appearance` JSON. */
+const APPEARANCE_ROW_FIELDS = ['theme', 'timezone', 'language'] as const;
 
 type ProfileWire = Record<string, any>;
 
@@ -135,26 +143,36 @@ async function readProfileState(userId: string): Promise<{ wire: ProfileWire; fl
   const user = await prisma.user.findUnique({ where: { id: userId }, select: PROFILE_SELECT });
   if (!user) return null;
   const p = user.profile;
-  const backupCodes = user.backupCodes as unknown;
+  const appearance = (user.preferences?.appearance && typeof user.preferences.appearance === 'object' ? user.preferences.appearance : {}) as Record<string, any>;
+  const misc = (user.preferences?.misc && typeof user.preferences.misc === 'object' ? user.preferences.misc : {}) as Record<string, any>;
+  const consents = (misc.consents && typeof misc.consents === 'object' ? misc.consents : {}) as Record<string, unknown>;
+  const oauth = (misc.oauth && typeof misc.oauth === 'object' ? misc.oauth : {}) as Record<string, string>;
+  const security = user.security;
+  const backupCodes = security?.backupCodes as unknown;
+  const emailRow = user.emails.find((e) => e.address === user.email)
+    || user.emails.find((e) => e.isDefault)
+    || user.emails.find((e) => e.kind === 'primary');
+  const dr = user.deletionRequest;
+  const deletionActive = user.status === 'deletion_pending' && !!dr && !dr.cancelledAt && !dr.executedAt;
   return {
     wire: {
       id: user.id,
       email: user.email,
       username: user.username,
-      name: user.name,
-      photoUrl: user.photoUrl,
+      name: p?.name ?? null,
+      photoUrl: p?.photoUrl ?? null,
       status: user.status,
-      theme: user.theme,
-      timezone: user.timezone,
-      language: user.language,
-      consents: (user.consents as Record<string, unknown>) ?? {},
-      emailVerified: !!user.emailVerified,
-      phoneVerified: !!user.phoneVerified,
+      theme: appearance.theme ?? 'system',
+      timezone: appearance.timezone ?? null,
+      language: appearance.language ?? 'en',
+      consents,
+      emailVerified: emailRow?.verifiedAt != null,
+      phoneVerified: user.phone?.verifiedAt != null,
       phoneVerifiedAt: user.phone?.verifiedAt ?? null,
-      is2FAEnabled: !!user.is2FAEnabled,
-      mustChangePassword: !!user.mustChangePassword,
-      scheduledDeletionAt: user.scheduledDeletionAt,
-      deletionReason: user.deletionReason,
+      is2FAEnabled: !!security?.totpEnabled,
+      mustChangePassword: !!security?.mustChangePw,
+      scheduledDeletionAt: deletionActive ? dr!.finalAt : null,
+      deletionReason: deletionActive ? (dr!.reason ?? null) : null,
       lastLoginAt: user.lastLoginAt,
       lastActiveAt: user.lastActiveAt,
       createdAt: user.createdAt,
@@ -168,10 +186,10 @@ async function readProfileState(userId: string): Promise<{ wire: ProfileWire; fl
       phoneNumber: user.phone?.number ?? null },
     flags: {
       hasPassword: !!user.passwordHash,
-      hasGoogle: !!user.googleId,
-      hasGithub: !!user.githubId,
-      hasDiscord: !!user.discordId,
-      totpEnabled: !!user.totpSecret,
+      hasGoogle: !!oauth.google,
+      hasGithub: !!oauth.github,
+      hasDiscord: !!oauth.discord,
+      totpEnabled: !!security?.totpEnabled,
       recoveryCodesCount: Array.isArray(backupCodes) ? backupCodes.length : 0 } };
 }
 
@@ -261,13 +279,23 @@ export async function extendedProfileHandler(request: NextRequest) {
       const prev = before?.wire ?? {};
 
       // A typed number is a contact, not a proven identity, so replacing it
-      // drops the proof along with the old number.
+      // drops the proof along with the old number (verifiedAt → null).
       const phoneWrite = raw.phoneNumber !== undefined
         ? { upsert: {
             create: { userId: session.userId, number: raw.phoneNumber || null, verifiedAt: null },
             update: { number: raw.phoneNumber || null, verifiedAt: null } } }
         : null;
-      if (phoneWrite) accountData.phoneVerified = false;
+
+      // theme/language/timezone live in the appearance JSON, not on the account.
+      const currentAppearance = (await prisma.userPreferences
+        .findUnique({ where: { userId: session.userId }, select: { appearance: true } })
+        .then((r) => (r?.appearance && typeof r.appearance === 'object' ? r.appearance : {}))
+        .catch(() => ({}))) as Record<string, any>;
+      const nextAppearance: Record<string, any> = { ...currentAppearance };
+      let appearanceChanged = false;
+      for (const field of APPEARANCE_ROW_FIELDS) {
+        if (raw[field] !== undefined) { nextAppearance[field] = raw[field]; appearanceChanged = true; }
+      }
 
       if (Object.keys(accountData).length > 0 || Object.keys(profileData).length > 0 || phoneWrite) {
         await prisma.user.update({
@@ -281,15 +309,24 @@ export async function extendedProfileHandler(request: NextRequest) {
           select: { id: true } });
       }
 
+      if (appearanceChanged) {
+        await prisma.userPreferences.upsert({
+          where: { userId: session.userId },
+          create: { userId: session.userId, appearance: nextAppearance as any },
+          update: { appearance: nextAppearance as any } });
+      }
+
       // What this write intended, in wire terms, so it can be diffed against
-      // what was read a moment ago. `phoneVerified` is bookkeeping for the
-      // phone write rather than a profile field, so it is not part of it.
+      // what was read a moment ago.
       const next: ProfileWire = {};
       for (const field of ACCOUNT_ROW_FIELDS) {
         if (field in accountData) next[field] = accountData[field];
       }
       for (const [wireKey, column] of Object.entries(PROFILE_ROW_FIELDS)) {
         if (column in profileData) next[wireKey] = profileData[column];
+      }
+      for (const field of APPEARANCE_ROW_FIELDS) {
+        if (field in nextAppearance) next[field] = nextAppearance[field];
       }
       if ('birthday' in profileData) next.birthday = profileData.birthday;
       if (raw.phoneNumber !== undefined) next.phoneNumber = raw.phoneNumber || null;
@@ -409,7 +446,11 @@ export async function changePasswordHandler(request: NextRequest) {
     }
 
     const newHash = await hashPassword(newPassword);
-    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: newHash, mustChangePassword: false } });
+    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: newHash } });
+    await prisma.userSecurity.upsert({
+      where: { userId: session.userId },
+      create: { userId: session.userId, mustChangePw: false },
+      update: { mustChangePw: false } });
     await prisma.userSession.deleteMany({
       where: { userId: session.userId, NOT: { id: session.sessionId } } });
     logSecurityEvent({ request, userId: session.userId, eventType: 'security.password_changed', details: { method: 'password' } }).catch(() => {});
@@ -538,7 +579,7 @@ export async function notificationsHandler(request: NextRequest) {
               SELECT
                 COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE is_read = false)::int AS unread
-              FROM "user"."notifications"
+              FROM "public"."notifications"
               WHERE user_id = ${session.userId}
             `,
             trackQuery('notifications_by_user_created', () => prisma.notification.findMany({
@@ -639,12 +680,17 @@ function prefsEndpoint(
       const problem = options.validate?.(patch);
       if (problem) return NextResponse.json({ error: problem }, { status: 400 });
 
-      const saved = await saveNotificationPrefs(session.userId, patch);
+      let finalPatch: Record<string, unknown> = patch;
       // Re-enabling mail is also the moment the one-click unsubscribe from an
       // earlier email stops applying.
       if (patch.email === true) {
-        await prisma.$executeRaw`UPDATE "user"."users" SET "email_unsubscribed" = '{}'::jsonb WHERE "id" = ${session.userId}`.catch(() => {});
+        const current = await loadNotificationPrefs(session.userId);
+        const eu: any = (current.unsubscribed && typeof current.unsubscribed === 'object' && !Array.isArray(current.unsubscribed)) ? current.unsubscribed : {};
+        if (eu.all || eu.product || eu.forms || eu.support) {
+          finalPatch = { ...patch, unsubscribed: { ...eu, all: false, product: false, forms: false, support: false } };
+        }
       }
+      const saved = await saveNotificationPrefs(session.userId, finalPatch);
       return NextResponse.json(shape(saved));
     } catch (err: any) {
       console.error('[NOTIFICATION_PREFS]', err?.message || err);
@@ -735,8 +781,8 @@ export async function integrationsHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    // The read is the union of misc.oauth + the legacy columns, with the link
-    // date the OAuth callback filed as an `oauth.<provider>.connected` event.
+    // The read is preferences.misc.oauth, with the link date the OAuth callback
+    // filed as an `oauth.<provider>.connected` event.
     const readConnections = () => listConnections(session.userId);
 
     if (request.method === 'GET') {
@@ -840,12 +886,11 @@ export async function mergeAccountsHandler(request: NextRequest) {
     }
 
     // Link the provider to the signed-in account. The link is written to the
-    // authoritative store (preferences.misc.oauth) AND the legacy column, so
-    // the connection shows up in "Connected apps" and login options reflect it
-    // without a reload trick.
+    // authoritative store (preferences.misc.oauth), so the connection shows up
+    // in "Connected apps" and login options reflect it without a reload trick.
     const currentUser = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { id: true, name: true, photoUrl: true } });
+      select: { id: true, profile: { select: { name: true, photoUrl: true } } } });
     if (!currentUser) {
       return NextResponse.json({ error: 'Current account not found' }, { status: 404 });
     }
@@ -854,12 +899,18 @@ export async function mergeAccountsHandler(request: NextRequest) {
 
     // Never overwrite an existing name/photo — those are managed from the
     // dashboard profile; provider values only fill EMPTY fields.
-    if (!currentUser.photoUrl || !currentUser.name) {
-      await prisma.user.update({
-        where: { id: session.userId },
-        data: {
-          ...(currentUser.photoUrl ? {} : { photoUrl: photoUrl || undefined }),
-          ...(currentUser.name ? {} : { name: name || undefined }) } });
+    const currentName = currentUser.profile?.name ?? null;
+    const currentPhoto = currentUser.profile?.photoUrl ?? null;
+    if (!currentPhoto || !currentName) {
+      await prisma.userProfile.upsert({
+        where: { userId: session.userId },
+        create: {
+          userId: session.userId,
+          ...(currentPhoto ? {} : { photoUrl: photoUrl || null }),
+          ...(currentName ? {} : { name: name || null }) },
+        update: {
+          ...(currentPhoto ? {} : { photoUrl: photoUrl || null }),
+          ...(currentName ? {} : { name: name || null }) } });
     }
     bustProfileCache(session.userId);
 
@@ -1003,14 +1054,14 @@ export async function userDailyActivityHandler(request: NextRequest) {
       prisma.$queryRaw<{ day: string; kind: string; count: number }[]>`
         select to_char(created_at at time zone ${tz}::text, 'YYYY-MM-DD') as day,
                kind, count(*)::int as count
-        from "activity".activity_events
+        from "public".activity_events
         where user_id = ${session.userId} and created_at >= ${since}
         group by 1, 2
         order by 1`,
       prisma.$queryRaw<{ day: string; kind: string; count: number }[]>`
         select to_char(created_at at time zone ${tz}::text, 'YYYY-MM-DD') as day,
                method as kind, count(*)::int as count
-        from "security".user_logins
+        from "public".user_logins
         where user_id = ${session.userId} and created_at >= ${since} and success = true
         group by 1, 2
         order by 1`,
@@ -1038,7 +1089,6 @@ const CHANGE_ANSWER_KIND = 'account.change_answered';
 const NOT_A_CHANGE = {
   NOT: [
     { kind: { startsWith: 'auth.' } },
-    { kind: { startsWith: 'captcha.' } },
     { kind: { startsWith: 'request.' } },
     { kind: { startsWith: 'device.' } },
     { kind: { contains: 'login' } },
@@ -1237,15 +1287,16 @@ export async function userAppsHandler(request: NextRequest) {
     ] = await Promise.all([
       trackQuery('apps_notif_unread', () => prisma.notification.count({ where: { userId, isRead: false } })),
       trackQuery('apps_sessions_active', () => prisma.userSession.count({ where: { userId, status: 'active' } })),
-      trackQuery('apps_integrations', () => prisma.user.findUnique({
-        where: { id: userId },
-        select: { googleId: true, githubId: true, discordId: true } })),
+      trackQuery('apps_integrations', () => prisma.userPreferences.findUnique({
+        where: { userId },
+        select: { misc: true } })),
     ]);
 
     const formCount = 0;
     const openTickets = 0;
     const storageBytes = 0;
-    const connectedIntegrations = ['google', 'github', 'discord'].filter((p) => !!(integrations as any)?.[`${p}Id`]).length;
+    const oauthLinks = ((integrations as any)?.misc?.oauth ?? {}) as Record<string, string>;
+    const connectedIntegrations = ['google', 'github', 'discord'].filter((p) => !!oauthLinks[p]).length;
 
     const formsUrl = process.env.NEXT_PUBLIC_FORMS_URL || 'https://forms.tirbeo.com';
     const apps = [
@@ -1356,29 +1407,30 @@ export async function preferencesHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
-    if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    const account = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true } });
+    if (!account) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-    // preferences.user_preferences is the source of truth. A handful of
-    // handlers still read the legacy user.users columns (theme/language/
-    // timezone/consents), so a write mirrors those until they move over.
+    // user_preferences is the single source of truth: theme/language/timezone in
+    // `appearance`, and the consent switches in `misc.consents` (where the old
+    // users.consents column moved to).
     const prefsRow = await prisma.userPreferences.findUnique({
       where: { userId: session.userId },
-      select: { appearance: true, privacy: true } });
+      select: { appearance: true, privacy: true, misc: true } });
     const appearance = (prefsRow?.appearance && typeof prefsRow.appearance === 'object' ? prefsRow.appearance : {}) as Record<string, any>;
     const privacy = (prefsRow?.privacy && typeof prefsRow.privacy === 'object' ? prefsRow.privacy : {}) as Record<string, any>;
-    const legacyConsents = ((user as any).consents ?? {}) as Record<string, any>;
+    const misc = (prefsRow?.misc && typeof prefsRow.misc === 'object' ? prefsRow.misc : {}) as Record<string, any>;
+    const miscConsents = (misc.consents && typeof misc.consents === 'object' ? misc.consents : {}) as Record<string, any>;
     const currentPrivacy = {
-      allowAnalytics: privacy.allowAnalytics ?? legacyConsents.allowAnalytics ?? false,
-      allowCrashReports: privacy.allowCrashReports ?? legacyConsents.allowCrashReports ?? true };
+      allowAnalytics: privacy.allowAnalytics ?? miscConsents.allowAnalytics ?? false,
+      allowCrashReports: privacy.allowCrashReports ?? miscConsents.allowCrashReports ?? true };
 
     if (request.method === 'GET') {
       return NextResponse.json({
         ok: true,
         preferences: {
-          theme: appearance.theme ?? user.theme ?? 'system',
-          language: appearance.language ?? user.language ?? 'en',
-          timezone: appearance.timezone ?? user.timezone ?? 'UTC',
+          theme: appearance.theme ?? 'system',
+          language: appearance.language ?? 'en',
+          timezone: appearance.timezone ?? 'UTC',
           privacy: currentPrivacy } });
     }
 
@@ -1398,28 +1450,25 @@ export async function preferencesHandler(request: NextRequest) {
         if (typeof body.privacy.allowCrashReports === 'boolean') { nextPrivacy.allowCrashReports = body.privacy.allowCrashReports; privacyChanged = true; }
       }
 
+      // The consent switches are canonically stored in misc.consents (what
+      // features/users/consent.ts reads); mirror them there on every change so
+      // the store stays the one answer.
+      const nextMisc = privacyChanged
+        ? { ...misc, consents: { ...miscConsents, ...nextPrivacy, updatedAt: new Date().toISOString() } }
+        : null;
+
       if (appearanceChanged || privacyChanged) {
         await prisma.userPreferences.upsert({
           where: { userId: session.userId },
           create: {
             userId: session.userId,
             appearance: nextAppearance as any,
-            privacy: nextPrivacy as any },
+            privacy: nextPrivacy as any,
+            ...(nextMisc ? { misc: nextMisc as any } : {}) },
           update: {
             ...(appearanceChanged ? { appearance: nextAppearance as any } : {}),
-            ...(privacyChanged ? { privacy: nextPrivacy as any } : {}) } });
-      }
-
-      // Mirror the legacy columns so the other readers stay in step.
-      const mirror: Record<string, unknown> = {};
-      if (body.theme !== undefined) mirror.theme = body.theme;
-      if (body.language !== undefined) mirror.language = body.language;
-      if (body.timezone !== undefined) mirror.timezone = body.timezone;
-      if (privacyChanged) {
-        mirror.consents = { ...legacyConsents, ...nextPrivacy, updatedAt: new Date().toISOString() };
-      }
-      if (Object.keys(mirror).length > 0) {
-        await prisma.user.update({ where: { id: session.userId }, data: mirror });
+            ...(privacyChanged ? { privacy: nextPrivacy as any } : {}),
+            ...(nextMisc ? { misc: nextMisc as any } : {}) } });
       }
 
       // Record consent changes in the audit log with full details.
@@ -1620,7 +1669,11 @@ export async function setPasswordHandler(request: NextRequest) {
     }
 
     const hash = await hashPassword(password);
-    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash, mustChangePassword: false } });
+    await prisma.user.update({ where: { id: session.userId }, data: { passwordHash: hash } });
+    await prisma.userSecurity.upsert({
+      where: { userId: session.userId },
+      create: { userId: session.userId, mustChangePw: false },
+      update: { mustChangePw: false } });
 
     return NextResponse.json({ ok: true, message: 'Password updated' });
   } catch (err: any) {
@@ -1749,7 +1802,10 @@ export async function avatarUploadHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Avatar URL scheme not allowed' }, { status: 400 });
     }
 
-    await prisma.user.update({ where: { id: session.userId }, data: { photoUrl } });
+    await prisma.userProfile.upsert({
+      where: { userId: session.userId },
+      create: { userId: session.userId, photoUrl },
+      update: { photoUrl } });
     bustProfileCache(session.userId);
 
     createAuditEvent({
@@ -1838,7 +1894,6 @@ const EXPORT_MODELS: Record<string, string> = {
   appeals: 'userAppeal',
   deactivation: 'userDeactivation',
   deletionRequest: 'userDeletionRequest',
-  apiKeys: 'apiKey',
   pushSubscriptions: 'pushSubscription' };
 
 const EXPORT_SECTIONS: ExportSection[] = [
@@ -1928,11 +1983,6 @@ const EXPORT_SECTIONS: ExportSection[] = [
     key: 'deletionRequest',
     read: (id, take) => prisma.userDeletionRequest.findMany({ where: { userId: id }, take }) },
   {
-    key: 'apiKeys',
-    read: (id, take) => prisma.apiKey.findMany({
-      where: { userId: id }, orderBy: { createdAt: 'asc' }, take,
-      select: { name: true, keyPrefix: true, permissions: true, isActive: true, lastUsedAt: true, expiresAt: true, createdAt: true, revokedAt: true } }) },
-  {
     // Which browsers were given a push channel, and when. The endpoint URL and
     // its keys can push to the device, so they are not part of a downloadable
     // file.
@@ -1944,20 +1994,116 @@ const EXPORT_SECTIONS: ExportSection[] = [
 
 /** The security settings of an account, with the secrets left out on purpose. */
 async function readSecuritySummary(userId: string) {
-  const [security, user] = await Promise.all([
+  const [security, links] = await Promise.all([
     prisma.userSecurity.findUnique({ where: { userId }, select: { totpEnabled: true, backupCodes: true, mustChangePw: true, updatedAt: true } }),
-    prisma.user.findUnique({ where: { id: userId }, select: { is2FAEnabled: true, googleId: true, githubId: true, discordId: true } }),
+    readOauthLinks(userId),
   ]);
   return {
-  twoFactorEnabled: !!(security?.totpEnabled ?? user?.is2FAEnabled),
+  twoFactorEnabled: !!security?.totpEnabled,
   backupCodesRemaining: Array.isArray(security?.backupCodes) ? (security!.backupCodes as any[]).length : 0,
   mustChangePassword: !!security?.mustChangePw,
   updatedAt: security?.updatedAt ?? null,
   connectedAccounts: [
-    user?.googleId && 'Google',
-    user?.githubId && 'GitHub',
-    user?.discordId && 'Discord',
+    links.google && 'Google',
+    links.github && 'GitHub',
+    links.discord && 'Discord',
   ].filter(Boolean) as string[] };
+}
+
+const json = (raw: unknown): Record<string, any> =>
+  raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, any>) : {};
+
+/**
+ * The most recent enforcement facts for an account, read from the tables that
+ * replaced the old ban/suspend columns: a live restriction carries the reason and
+ * the until date, and the status-event history carries the reference codes (with
+ * a deterministic fallback so a legacy account still shows one).
+ */
+async function latestEnforcement(userId: string) {
+  const [restriction, banEvent, suspendEvent] = await Promise.all([
+    prisma.userRestriction.findFirst({
+      where: { userId }, orderBy: { startedAt: 'desc' },
+      select: { detail: true, endsAt: true } }).catch(() => null),
+    prisma.userStatusEvent.findFirst({
+      where: { userId, toStatus: 'banned' }, orderBy: { createdAt: 'desc' },
+      select: { metadata: true } }).catch(() => null),
+    prisma.userStatusEvent.findFirst({
+      where: { userId, toStatus: 'suspended' }, orderBy: { createdAt: 'desc' },
+      select: { metadata: true } }).catch(() => null),
+  ]);
+  const banMeta = json(banEvent?.metadata);
+  const suspMeta = json(suspendEvent?.metadata);
+  return {
+    reason: restriction?.detail ?? suspMeta.reason ?? banMeta.reason ?? null,
+    until: restriction?.endsAt
+      ?? (suspMeta.until ? new Date(suspMeta.until) : null)
+      ?? (banMeta.until ? new Date(banMeta.until) : null),
+    banRefCode: (banMeta.refCode as string | undefined) ?? eventIdFor(userId, 'ban'),
+    suspendRefCode: (suspMeta.refCode as string | undefined) ?? eventIdFor(userId, 'suspend'),
+  };
+}
+
+/**
+ * The `account` block of the export, assembled from every table the old single
+ * users row was split across. The response keeps the exact same keys — a caller
+ * that downloaded an export before the split reads the same field names.
+ */
+async function accountExportSnapshot(userId: string): Promise<Record<string, unknown>> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true, username: true, email: true, status: true, isAdmin: true,
+      lastActiveAt: true, lastLoginAt: true, createdAt: true, updatedAt: true,
+      profile: { select: { name: true, photoUrl: true } },
+      preferences: { select: { appearance: true, notif: true, misc: true } },
+      security: { select: { totpEnabled: true } },
+      emails: { select: { address: true, kind: true, isDefault: true, verifiedAt: true } } },
+  });
+  if (!user) return {};
+
+  const appearance = json(user.preferences?.appearance);
+  const notif = json(user.preferences?.notif);
+  const misc = json(user.preferences?.misc);
+  const emailRow = user.emails.find((e) => e.address === user.email)
+    || user.emails.find((e) => e.isDefault)
+    || user.emails.find((e) => e.kind === 'primary');
+
+  const [deletion, enforce] = await Promise.all([
+    prisma.userDeletionRequest.findUnique({
+      where: { userId }, select: { reason: true, finalAt: true, cancelledAt: true, executedAt: true } }).catch(() => null),
+    latestEnforcement(userId),
+  ]);
+  const deletionActive = user.status === 'deletion_pending' && !!deletion && !deletion.cancelledAt && !deletion.executedAt;
+
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    emailVerified: emailRow?.verifiedAt != null,
+    name: user.profile?.name ?? null,
+    photoUrl: user.profile?.photoUrl ?? null,
+    status: user.status,
+    isAdmin: user.isAdmin,
+    theme: appearance.theme ?? 'system',
+    language: appearance.language ?? 'en',
+    timezone: appearance.timezone ?? null,
+    consents: json(misc.consents),
+    notificationPreferences: notif,
+    emailUnsubscribed: json(notif.unsubscribed),
+    is2FAEnabled: !!user.security?.totpEnabled,
+    isBanned: user.status === 'banned',
+    isSuspended: user.status === 'suspended',
+    suspendReason: enforce.reason,
+    suspendedUntil: enforce.until,
+    banRefCode: enforce.banRefCode,
+    suspendRefCode: enforce.suspendRefCode,
+    deletedAt: user.status === 'deleted' ? user.updatedAt : null,
+    scheduledDeletionAt: deletionActive ? deletion!.finalAt : null,
+    deletionReason: deletionActive ? (deletion!.reason ?? null) : null,
+    lastActiveAt: user.lastActiveAt,
+    lastLoginAt: user.lastLoginAt,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt };
 }
 
 /**
@@ -1985,7 +2131,9 @@ export async function exportDataHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const user = await prisma.user.findUnique({ where: { id: session.userId } });
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      select: { id: true, username: true, email: true, status: true, profile: { select: { name: true } } } });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const exportedAt = new Date();
@@ -2038,37 +2186,9 @@ export async function exportDataHandler(request: NextRequest) {
       }
     }
 
-    // The account row itself, field by field, so a column added to the table
-    // cannot quietly join the export.
-    const account: Record<string, unknown> = {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      emailVerified: user.emailVerified,
-      name: user.name,
-      photoUrl: user.photoUrl,
-      status: user.status,
-      isAdmin: user.isAdmin,
-      theme: user.theme,
-      language: user.language,
-      timezone: user.timezone,
-      consents: user.consents,
-      notificationPreferences: user.notificationPreferences,
-      emailUnsubscribed: user.emailUnsubscribed,
-      is2FAEnabled: user.is2FAEnabled,
-      isBanned: user.isBanned,
-      isSuspended: user.isSuspended,
-      suspendReason: user.suspendReason,
-      suspendedUntil: user.suspendedUntil,
-      banRefCode: user.banRefCode,
-      suspendRefCode: user.suspendRefCode,
-      deletedAt: user.deletedAt,
-      scheduledDeletionAt: user.scheduledDeletionAt,
-      deletionReason: user.deletionReason,
-      lastActiveAt: user.lastActiveAt,
-      lastLoginAt: user.lastLoginAt,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt };
+    // The account row itself, gathered from the tables the old single row was
+    // split across — same field names the export has always carried.
+    const account = await accountExportSnapshot(session.userId);
 
     const [sections, security] = await Promise.all([
       Promise.all(EXPORT_SECTIONS.map(async (section) => {
@@ -2166,7 +2286,7 @@ export async function exportDataHandler(request: NextRequest) {
     try {
       const { sendTemplateEmail } = await import('@/features/email/email');
       await sendTemplateEmail(user.email, 'export_ready', {
-        name: user.name || user.email,
+        name: user.profile?.name || user.email,
         exportedAt: exportedAt.toLocaleString() });
     } catch (err: any) {
       console.error('[EXPORT NOTICE]', err?.message || err);
@@ -2248,10 +2368,10 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
       // `name` and `lifetimeMinutes` are not decoration: a variable the render
       // step never sees stays in the mail as its literal `{{name}}`, and the
       // code's real life is the core's TTL, not a number typed into the copy.
-      const row = await prisma.user.findUnique({ where: { id: session.userId }, select: { name: true } });
+      const row = await prisma.user.findUnique({ where: { id: session.userId }, select: { profile: { select: { name: true } } } });
       const sent = await sendTemplateEmail(email, 'delete_account_otp', {
         otp: issued.code,
-        name: (row?.name || '').trim() || email.split('@')[0],
+        name: (row?.profile?.name || '').trim() || email.split('@')[0],
         lifetimeMinutes: String(OTP_TTL_MINUTES),
       }).catch((e: any) => ({ success: false, error: e?.message || 'mail send failed' }));
       if (!sent.success) {
@@ -2345,10 +2465,17 @@ export async function publicProfileHandler(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, name: true, username: true, photoUrl: true, createdAt: true } });
+      select: {
+        id: true, username: true, createdAt: true,
+        profile: { select: { name: true, photoUrl: true } } } });
 
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    return NextResponse.json({ ok: true, profile: user });
+    return NextResponse.json({ ok: true, profile: {
+      id: user.id,
+      name: user.profile?.name ?? null,
+      username: user.username,
+      photoUrl: user.profile?.photoUrl ?? null,
+      createdAt: user.createdAt } });
   } catch (err: any) {
     console.error('[PUBLIC PROFILE]', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch profile' }, { status: 500 });

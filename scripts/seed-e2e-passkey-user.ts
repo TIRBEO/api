@@ -25,16 +25,24 @@ async function main() {
   });
   const user = await prisma.user.upsert({
     where: { email: EMAIL },
-    update: { passwordHash, emailVerified: true, isBanned: false, isSuspended: false, deletedAt: null },
-    create: {
-      email: EMAIL,
-      passwordHash,
-      name: 'E2E Passkey Test',
-      emailVerified: true,
-      adminRole: 'admin',
-      language: 'en',
-    },
-    select: { id: true, email: true, adminRole: true },
+    update: { passwordHash, status: 'active', isAdmin: true },
+    create: { email: EMAIL, passwordHash, isAdmin: true },
+    select: { id: true, email: true, isAdmin: true },
+  });
+  await prisma.userEmail.upsert({
+    where: { userId_address: { userId: user.id, address: EMAIL } },
+    create: { userId: user.id, address: EMAIL, kind: 'primary', isDefault: true, verifiedAt: new Date() },
+    update: { kind: 'primary', isDefault: true, verifiedAt: new Date() },
+  });
+  await prisma.userProfile.upsert({
+    where: { userId: user.id },
+    create: { userId: user.id, name: 'E2E Passkey Test' },
+    update: { name: 'E2E Passkey Test' },
+  });
+  await prisma.userPreferences.upsert({
+    where: { userId: user.id },
+    create: { userId: user.id, appearance: { language: 'en', theme: 'system' } },
+    update: { appearance: { language: 'en', theme: 'system' } },
   });
   console.log(`SEEDED: ${JSON.stringify(user)}`);
 }

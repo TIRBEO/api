@@ -9,17 +9,17 @@ export async function GET(request: NextRequest) {
 
   const user = await prisma.user.findUnique({
     where: { id: session.userId },
-    select: { id: true, email: true, name: true, adminRole: true },
+    select: { id: true, email: true, isAdmin: true, profile: { select: { name: true } } },
   });
-  if (!user || !user.adminRole) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  if (!user || !user.isAdmin) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
 
   const permissions = await getEffectivePermissions(user.id);
 
   return NextResponse.json({
     id: user.id,
     email: user.email,
-    name: user.name,
-    adminRole: user.adminRole,
+    name: user.profile?.name ?? null,
+    adminRole: user.isAdmin ? 'admin' : null,
     permissions,
     roles: [],
   }, { headers: { 'Cache-Control': 'private, no-store' } });

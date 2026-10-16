@@ -3,6 +3,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { getBranding } from '@/features/branding/branding';
 import { getApiBaseUrl } from '@/config/app-urls';
 import { createTtlCache } from '@/infrastructure/cache';
+import { unsubscribeSection } from '@/features/email/email-fragments';
 
 interface EmailResult { success: boolean; error?: string; messageId?: string; }
 
@@ -30,16 +31,20 @@ async function recipientIdentity(address: string): Promise<{ name: string; email
   const link = await prisma.userEmail
     .findFirst({ where: { address: key }, select: { userId: true, address: true } })
     .catch(() => null);
+  // A User row has no name column — the display name lives on user_profile, so
+  // it comes through the relation. Asking for `name` here threw on every mail
+  // and the .catch turned that into a silent fallback to the address prefix.
+  const select = { email: true, profile: { select: { name: true } } } as const;
   const user = link?.userId
     ? await prisma.user
-        .findUnique({ where: { id: link.userId }, select: { name: true, email: true } })
+        .findUnique({ where: { id: link.userId }, select })
         .catch(() => null)
     : await prisma.user
-        .findUnique({ where: { email: key }, select: { name: true, email: true } })
+        .findUnique({ where: { email: key }, select })
         .catch(() => null);
 
   const resolved = {
-    name: (user?.name || '').trim() || key.split('@')[0] || 'there',
+    name: (user?.profile?.name || '').trim() || key.split('@')[0] || 'there',
     email: user?.email || link?.address || address,
   };
   recipients.set(key, resolved);
@@ -80,14 +85,19 @@ export async function logEmail(input: {
     const eventKey = input.template ? `legacy.${input.template}` : 'legacy.ad_hoc';
     const row = await prisma.email_jobs.create({
       data: {
+        // Both recipient columns exist and the recipient-time index is on
+        // `to_email`, so writing only `to_address` left every job row with an
+        // empty recipient and an index nothing could be looked up through.
+        toEmail: input.toEmail,
         toAddress: input.toEmail,
+        eventKey,
+        category: jobKindFor(input.template),
         kind: jobKindFor(input.template),
         templateSlug: input.template || null,
         subject: input.subject,
         status: input.status || 'sent',
         payload: {
           ...(input.metadata || {}),
-          eventKey,
           fromEmail: input.fromEmail,
           threadId: input.threadId || null,
           replyTo: input.replyTo || null,
@@ -103,8 +113,13 @@ export async function logEmail(input: {
 }
 
 /** Finalize a previously created EmailJob after the provider responds. */
-async function finalizeEmailLog(logId: string | null, result: EmailResult) {
+async function finalizeEmailLog(
+  logId: string | null,
+  result: EmailResult,
+  ctx: { provider: string; toEmail: string; subject: string; category: string; eventKey: string },
+) {
   if (!logId) return;
+  const { provider, toEmail, subject, category, eventKey } = ctx;
   try {
     if (result.success) {
       // select: the live email_jobs/email_deliveries tables are narrower than
@@ -115,13 +130,41 @@ async function finalizeEmailLog(logId: string | null, result: EmailResult) {
         select: { id: true },
       });
       await prisma.email_deliveries.create({
-        data: { jobId: logId, event: 'sent', provider: 'resend', providerId: result.messageId || null },
+        data: {
+          jobId: logId,
+          toEmail,
+          subject,
+          category,
+          eventKey,
+          event: 'sent',
+          status: 'sent',
+          provider,
+          providerId: result.messageId || null,
+          messageId: result.messageId || null,
+        },
         select: { id: true },
       });
     } else {
       await prisma.email_jobs.update({
         where: { id: logId },
         data: { status: 'failed', lastError: result.error || null },
+        select: { id: true },
+      });
+      // A send the provider rejected used to leave no trace at all in the
+      // delivery history — the table only ever held rows with the column
+      // default `sent`, so the one question ops asks ("did it go out?") read
+      // back as yes. Failures are rows now.
+      await prisma.email_deliveries.create({
+        data: {
+          jobId: logId,
+          toEmail,
+          subject,
+          category,
+          eventKey,
+          event: 'failed',
+          status: 'failed',
+          provider,
+        },
         select: { id: true },
       });
     }
@@ -136,6 +179,31 @@ function deriveThreadId(to: string, subject: string, explicit?: string): string 
   return crypto.createHash('sha1').update(`${to.toLowerCase()}|${subject}`).digest('hex').slice(0, 24);
 }
 
+// Mailcow's postfix pins MAIL FROM to the authenticated mailbox (rejects
+// mismatched senders with 553), so in SMTP mode every fallback sender must
+// be an address we actually own on tirbeo.app.
+function emailIsSmtp(): boolean {
+  return (process.env.EMAIL_PROVIDER || '').toLowerCase() === 'smtp';
+}
+function fallbackSender(): string {
+  return emailIsSmtp() ? (process.env.SMTP_USER || 'support@tirbeo.app') : 'noreply@tirbeo.com';
+}
+
+// Resend refuses to send from any domain that has not completed DNS
+// verification (403), and tirbeo.com is the only one that has. Callers and the
+// admin config both carry addresses from other hosts — `support@tirbeo.app`
+// from the self-hosted Mailcow setup is one of them — so the sender is checked
+// at the one place every send passes through rather than at each call site.
+function verifiedSender(address: string): string {
+  const domain = (address.split('@')[1] || '').toLowerCase();
+  const verified = (process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com').toLowerCase();
+  if (domain && domain !== verified && !domain.endsWith(`.${verified}`)) {
+    console.warn(`[EMAIL] Sender domain "${domain}" is not verified on Resend — sending as "${verified}"`);
+    return fallbackSender();
+  }
+  return address;
+}
+
 // The emailConfig table is gone in the consolidated schema — config now lives
 // in the AppConfig row `email.config` (JSON), with env vars as the fallback.
 export async function getEmailConfig() {
@@ -144,11 +212,15 @@ export async function getEmailConfig() {
     enabled: true,
     resendDomain: process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com',
     apiKey: process.env.RESEND_API_KEY || '',
-    fromEmail: process.env.EMAIL_FROM || 'noreply@tirbeo.com',
+    smtpHost: process.env.SMTP_HOST || '',
+    smtpPort: parseInt(process.env.SMTP_PORT || '', 10) || 587,
+    smtpUser: process.env.SMTP_USER || '',
+    smtpPass: process.env.SMTP_PASS || '',
+    fromEmail: process.env.EMAIL_FROM || fallbackSender(),
     fromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
-    defaultFromEmail: process.env.EMAIL_FROM || 'noreply@tirbeo.com',
+    defaultFromEmail: process.env.EMAIL_FROM || fallbackSender(),
     defaultFromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
-    alertFromEmail: process.env.EMAIL_ALERT_FROM || 'noreply@tirbeo.com',
+    alertFromEmail: process.env.EMAIL_ALERT_FROM || fallbackSender(),
     alertFromName: process.env.EMAIL_FROM_NAME || 'Tirbeo',
     welcomeFromEmail: null,
     welcomeFromName: null,
@@ -178,10 +250,9 @@ export async function getEmailTemplate(slug: string) {
   return prisma.emailTemplate.findUnique({ where: { slug } });
 }
 
-// Vendored locally (packages/ui/src/emails/index.ts) so new templates (e.g. form_flagged)
-// ship without an @tirbeo/ui npm publish. Keep in sync with packages/ui/src/emails/index.ts.
+// The built-in catalogue is plain string templates beside this file — no
+// component library, so a new template ships without a dependency or a publish.
 import {
-  buildTemplates,
   getTemplate,
   renderTemplate,
 } from '@/features/email/email-templates';
@@ -192,7 +263,7 @@ export function escapeHtml(str: string): string {
   return str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
 }
 
-// `renderTemplate` is imported from email-templates.tsx and re-exported so the
+// `renderTemplate` is imported from email-templates.ts and re-exported so the
 // preview endpoint's existing import path keeps working. It used to be defined
 // here as a second copy carrying its own raw-var list, and the two drifted:
 // jobs.ts sent `statRows` without listing it, so the weekly summary shipped to
@@ -227,7 +298,7 @@ export async function sendEmail(
   to: string,
   subject: string,
   htmlBody: string,
-  options?: { fromEmail?: string; fromName?: string; replyTo?: string; threadId?: string; templateName?: string; metadata?: Record<string, unknown>; categoryOverride?: string; userId?: string }
+  options?: { fromEmail?: string; fromName?: string; replyTo?: string; threadId?: string; templateName?: string; metadata?: Record<string, unknown>; categoryOverride?: string; userId?: string; headers?: Record<string, string> }
 ): Promise<EmailResult> {
   // ─── Email suppression check (lowest level) ───
   // If the user disabled email or unsubscribed from this category, block non-essential sends.
@@ -241,9 +312,10 @@ export async function sendEmail(
     try {
       const { shouldSuppressEmail } = await import('@/features/email/emailPrefs');
       if (await shouldSuppressEmail(to, options.templateName, options.categoryOverride, options.userId)) {
-        if (process.env.NODE_ENV === 'production') {
-          console.log(`[EMAIL] Suppressed '${options.templateName}' to ${to} (user prefs)`);
-        }
+        // Logged in every environment: this branch reports success to its
+        // caller, so a suppression that prints nothing is indistinguishable
+        // from a delivered mail — in exactly the environment people debug in.
+        console.log(`[EMAIL] Suppressed '${options.templateName}' to ${to} (user prefs)`);
         return { success: true };
       }
     } catch { /* best-effort */ }
@@ -281,19 +353,40 @@ export async function sendEmail(
 
   const dbApiKey = config?.apiKey || '';
   const apiKey = dbApiKey || process.env.RESEND_API_KEY || '';
-  const provider = config?.provider || 'resend';
+  const provider = String(config?.provider || 'resend').toLowerCase();
   const enabled = config?.enabled !== false;
 
-  if (!apiKey) {
+  if (!enabled && dbApiKey) {
+    console.warn(`[EMAIL] DB config disabled — not sending to ${to}: ${subject}`);
+    return { success: false, error: 'Email sending disabled in admin config' };
+  }
+
+  // SMTP credentials resolve from the DB config with env as fallback — the
+  // admin panel's PATCH /api/admin/email/config must actually change where
+  // mail goes, not just what the panel displays.
+  const smtpHost = config?.smtpHost || process.env.SMTP_HOST || '';
+  const smtpPort = parseInt(String(config?.smtpPort || process.env.SMTP_PORT || ''), 10) || 587;
+  const smtpUser = config?.smtpUser || process.env.SMTP_USER || '';
+  const smtpPass = config?.smtpPass || process.env.SMTP_PASS || '';
+  const smtpTlsServername = process.env.SMTP_TLS_SERVERNAME || '';
+
+  if (!apiKey && provider !== 'smtp') {
     console.error(`[EMAIL] No API key configured (DB: ${dbApiKey ? 'set' : 'empty'}, ENV: ${process.env.RESEND_API_KEY ? 'set' : 'missing'}). Cannot send to ${to}: ${subject}`);
     return { success: false, error: 'No email API key configured' };
   }
-
-  if (!enabled && dbApiKey) {
-    console.warn(`[EMAIL] DB config disabled but API key present. Falling through to env var. Sending to ${to}: ${subject}`);
+  if (provider === 'smtp' && !(smtpHost && smtpUser && smtpPass)) {
+    console.error(`[EMAIL] provider=smtp but SMTP host/user/pass incomplete. Cannot send to ${to}: ${subject}`);
+    return { success: false, error: 'SMTP not configured' };
   }
 
-  const fromEmail = options?.fromEmail || config?.fromEmail || 'noreply@tirbeo.com';
+  let fromEmail = options?.fromEmail || config?.fromEmail || fallbackSender();
+  // Mailcow's postfix pins MAIL FROM to the authenticated mailbox (553 on any
+  // mismatch), so in SMTP mode every sender identity collapses onto smtpUser.
+  // Display names survive; only the address is rewritten.
+  if (provider === 'smtp' && smtpUser && fromEmail.toLowerCase() !== smtpUser.toLowerCase()) {
+    fromEmail = smtpUser;
+  }
+  if (provider !== 'smtp') fromEmail = verifiedSender(fromEmail);
   const fromName = options?.fromName || config?.fromName || 'Tirbeo';
   const threadId = deriveThreadId(to, subject, options?.threadId);
 
@@ -313,29 +406,57 @@ export async function sendEmail(
   } catch { /* logging is best-effort */ }
 
   let result: EmailResult = { success: false };
-  // Resend is the only provider (SMTP was removed by design).
   if (provider !== 'resend' && provider !== 'smtp') {
     console.error(`[EMAIL] Unknown provider "${provider}" — defaulting to resend.`);
   }
   if (provider === 'smtp') {
-    // Legacy DB rows may still say 'smtp'; route through Resend so sends keep working.
-    console.warn(`[EMAIL] DB config provider is 'smtp' — SMTP is discontinued, using Resend for ${to}.`);
+    result = await sendViaSmtp(
+      { host: smtpHost, port: smtpPort, user: smtpUser, pass: smtpPass, tlsServername: smtpTlsServername },
+      to, fromEmail, fromName, subject, htmlBody, options?.replyTo, options?.headers,
+    );
+  } else {
+    result = await sendViaResend(apiKey, to, fromEmail, fromName, subject, htmlBody, options?.replyTo, options?.headers);
   }
-  result = await sendViaResend(apiKey, to, fromEmail, fromName, subject, htmlBody, options?.replyTo);
 
-  await finalizeEmailLog(logId, result);
+  await finalizeEmailLog(logId, result, {
+    provider,
+    toEmail: to,
+    subject,
+    category: jobKindFor(options?.templateName),
+    eventKey: options?.templateName ? `legacy.${options.templateName}` : 'legacy.ad_hoc',
+  });
 
   return result;
 }
 
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: ' ',
+  middot: '·',
+  copy: '©',
+  reg: '®',
+  trade: '™',
+  mdash: '—',
+  ndash: '–',
+  hellip: '…',
+  lsquo: '‘',
+  rsquo: '’',
+  ldquo: '“',
+  rdquo: '”',
+  bull: '•',
+  rarr: '→',
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+};
+
 /**
  * HTML to plain text.
  *
- * Resend sends the HTML part alone today, which means every one of these emails
- * has no fallback: a client with images or CSS disabled, a screen reader
- * reading the markup, and anyone reading in a terminal all get the tag soup or
- * nothing at all. The multipart/alternative text part is what those clients
- * actually use, so it is worth the ~30 lines.
+ * Both providers take a `text` part, and this is what a client with images or
+ * CSS disabled, a screen reader, and anyone reading in a terminal actually get.
+ * Without it they get the tag soup or nothing at all, so it is worth the ~30
+ * lines.
  *
  * Deliberately dependency-free and lossy — this is a fallback, not a second
  * rendering pass. Block-level elements become blank lines, links become
@@ -351,10 +472,15 @@ export function htmlToText(html: string): string {
   out = out.replace(/<!--[\s\S]*?-->/g, '');
   out = out.replace(/<img\b[^>]*>/gi, '');
 
-  // react-email pads <Preview> with a run of zero-width characters so the
-  // preheader is invisible in the HTML body but still shows in the inbox.
-  // In a text part those characters are not invisible — they arrive as a wall
-  // of noise several thousand characters long, ahead of the actual message.
+  // The preheader is hidden in the HTML (display:none) precisely because the
+  // inbox already shows it beside the subject — repeating it as the first line
+  // of the text part would duplicate the heading two lines later. The shell
+  // marks that block `data-skip-in-text` for exactly this.
+  out = out.replace(/<div[^>]*data-skip-in-text="true"[\s\S]*?<\/div>/i, '');
+
+  // Padding runs of zero-width characters keep the preheader from swallowing the
+  // text after it in the inbox. In a text part they are not invisible — they
+  // arrive as noise ahead of the actual message.
   out = out.replace(/[\u200B-\u200F\u2060\uFEFF]/g, '');
 
   // Links: keep the URL, because in an email the link IS the content.
@@ -371,10 +497,9 @@ export function htmlToText(html: string): string {
     },
   );
 
-  // Structural breaks. A </span> is treated as a line break because react-email
-  // uses display:block spans for every stacked pair — "Your code" above the
-  // digits, a label above a value — and without this those run together as
-  // "Your code482913".
+  // Structural breaks. A </span> is treated as a line break because the detail
+  // rows stack a label in one span above its value, and without this they run
+  // together as "Your code482913".
   out = out.replace(/<\s*br\s*\/?\s*>/gi, '\n');
   out = out.replace(/<\/(p|div|tr|h1|h2|h3|h4|li|table|section)\s*>/gi, '\n\n');
   out = out.replace(/<\/(span)\s*>/gi, '\n');
@@ -383,15 +508,13 @@ export function htmlToText(html: string): string {
   // Strip every remaining tag.
   out = out.replace(/<[^>]+>/g, '');
 
-  // Unescape the handful of entities react-email can emit.
+  // Unescape the entities the templates and the runtime fragments can emit.
+  // `&middot;` separates a list heading from its count and `&copy;` opens the
+  // legal bar, so missing them put literal ampersand-code in the reader's inbox.
   out = out
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&#(\d+);/g, (_m, d) => String.fromCharCode(Number(d)));
+    .replace(/&([a-z]+);/gi, (m, name) => NAMED_ENTITIES[name.toLowerCase()] ?? m)
+    .replace(/&#(\d+);/g, (_m, d) => String.fromCharCode(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)));
 
   // Collapse the runs of blank space the table layout leaves behind, and trim
   // each line: the <Preview> block is padded with a long unbroken run of
@@ -404,7 +527,46 @@ export function htmlToText(html: string): string {
   return out.trim();
 }
 
-async function sendViaResend(apiKey: string, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string): Promise<EmailResult> {
+interface SmtpSettings {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  tlsServername?: string;
+}
+
+async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string, headers?: Record<string, string>): Promise<EmailResult> {
+  // Self-hosted delivery via Mailcow submission (STARTTLS, verified cert).
+  // Mailcow pins MAIL FROM to the authenticated mailbox, so the caller has
+  // already collapsed fromEmail onto smtp.user. Single-recipient only,
+  // mirroring the Resend privacy rule.
+  const { createTransport } = await import('nodemailer');
+  const transporter = createTransport({
+    host: smtp.host,
+    port: smtp.port,
+    secure: smtp.port === 465,
+    ...(smtp.tlsServername ? { tls: { servername: smtp.tlsServername } } : {}),
+    auth: { user: smtp.user, pass: smtp.pass },
+  });
+  try {
+    const info = await transporter.sendMail({
+      from: fromName ? `${fromName} <${fromEmail}>` : fromEmail,
+      to,
+      subject,
+      html,
+      text: htmlToText(html),
+      ...(replyTo ? { replyTo } : {}),
+      ...(headers && Object.keys(headers).length ? { headers } : {}),
+    });
+    return { success: true, messageId: info.messageId || undefined };
+  } catch (err: unknown) {
+    return { success: false, error: `SMTP error: ${String(err)}` };
+  } finally {
+    transporter.close();
+  }
+}
+
+async function sendViaResend(apiKey: string, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string, headers?: Record<string, string>): Promise<EmailResult> {
   // PRIVACY: single-recipient only — never add cc/bcc. Each email is sent
   // individually to one address (no bulk, no secondary recipients).
   const body: Record<string, any> = {
@@ -419,6 +581,7 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
   delete (body as any).cc;
   delete (body as any).bcc;
   if (replyTo) body.replyTo = replyTo;
+  if (headers && Object.keys(headers).length) body.headers = headers;
 
   // Retry up to 2 times on transient network errors
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -451,12 +614,6 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
     }
   }
   return { success: false, error: 'Email delivery failed after retries' };
-}
-
-// ─── Fallback templates using @tirbeo/ui ───
-
-async function buildFallbackTemplates(): Promise<Record<string, { subject: string; html: string }>> {
-  return buildTemplates((await getBranding()).logoUrl);
 }
 
 
@@ -521,10 +678,7 @@ export async function sendTemplateEmail(
       const unsubUrl = (await buildUnsubscribeUrl(to)) || `${apiBase}/api/emails/unsubscribe`;
       mergedVars['unsubscribeUrl'] = unsubUrl;
       mergedVars['managePreferencesUrl'] = unsubUrl;
-      /* #8a7462 on the #000 canvas stays legible — an unsubscribe link is
-         legally required to be readable, and a control nobody can read is not
-         one they can act on. Matches the template's faint footer tone. */
-      mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="${unsubUrl}" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
+      mergedVars['unsubscribeSection'] = unsubscribeSection(unsubUrl);
     } else {
       mergedVars['unsubscribeUrl'] = '';
       mergedVars['unsubscribeSection'] = '';
@@ -532,8 +686,9 @@ export async function sendTemplateEmail(
     }
   } catch {
     const apiBase = getApiBaseUrl();
-    mergedVars['unsubscribeUrl'] = `${apiBase}/api/emails/unsubscribe`;
-    mergedVars['unsubscribeSection'] = `<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="${apiBase}/api/emails/unsubscribe" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>`;
+    const unsubUrl = `${apiBase}/api/emails/unsubscribe`;
+    mergedVars['unsubscribeUrl'] = unsubUrl;
+    mergedVars['unsubscribeSection'] = unsubscribeSection(unsubUrl);
     mergedVars['managePreferencesUrl'] = '';
   }
 
@@ -544,18 +699,19 @@ export async function sendTemplateEmail(
   // but every address must live on the verified domain until the subdomains
   // are actually verified there.
   const SECURITY_TEMPLATES = new Set([
-    'signup_otp', 'login_otp', 'verify_email', 'password_reset_otp', 'password_reset_link',
-    'magic_link', 'account_recovery', 'delete_account_otp', 'password_changed', 'reauth_otp',
-    'suspicious_login', 'two_factor_disabled', 'login_alert', 'account_suspended', 'account_deleted', 'export_ready',
+    'signup_otp', 'login_otp', 'verify_email', 'password_reset_otp', 'password_reset_otp_recovery',
+    'password_reset_link', 'magic_link', 'account_recovery', 'delete_account_otp', 'password_changed',
+    'reauth_otp', 'suspicious_login', 'two_factor_disabled', 'login_alert', 'account_suspended',
+    'account_deleted', 'export_ready',
   ]);
-  const ADMIN_TEMPLATES = new Set(['admin_alert', 'system_alert', 'admin_crash_report', 'admin_test']);
+  const ADMIN_TEMPLATES = new Set(['admin_alert', 'admin_test']);
   const humanMailboxTemplates = ['welcome'];
 
-  const adminFrom = process.env.ADMIN_FROM_EMAIL || 'admin@tirbeo.com';
+  const adminFrom = process.env.ADMIN_FROM_EMAIL || fallbackSender();
 
   const DOMAIN_FROM = {
-    casual: { email: 'noreply@tirbeo.com', name: branding.brandName || 'Tirbeo' },
-    security: { email: 'noreply@tirbeo.com', name: 'Tirbeo Security' },
+    casual: { email: fallbackSender(), name: branding.brandName || 'Tirbeo' },
+    security: { email: fallbackSender(), name: 'Tirbeo Security' },
     admin: { email: adminFrom, name: 'Tirbeo Admin' },
   };
   const category = ADMIN_TEMPLATES.has(templateName) ? 'admin'
@@ -571,7 +727,7 @@ export async function sendTemplateEmail(
   if (config && category === 'security') {
     // Explicit DB overrides still win when set (per-type sender customization)
     const otpSet = ['signup_otp', 'login_otp', 'verify_email'];
-    const resetSet = ['password_reset_otp', 'password_reset_link'];
+    const resetSet = ['password_reset_otp', 'password_reset_otp_recovery', 'password_reset_link'];
     if (otpSet.includes(templateName) && config.otpFromEmail) {
       defaultFromEmail = config.otpFromEmail;
       defaultFromName = config.otpFromName || defaultFromName;
@@ -581,6 +737,11 @@ export async function sendTemplateEmail(
     }
   }
 
+  // RFC 8058 one-click unsubscribe. Gmail and Yahoo require it of bulk senders,
+  // and it is what lets a reader stop mail without hunting for the link: only
+  // mail that actually carries an unsubscribe URL gets the header, so the
+  // essential/security templates stay header-free by construction.
+  const unsubHeader = mergedVars['unsubscribeUrl'];
   const finalOptions = {
     fromEmail: options?.fromEmail || defaultFromEmail,
     fromName: options?.fromName || defaultFromName,
@@ -588,18 +749,37 @@ export async function sendTemplateEmail(
     threadId: options?.threadId,
     categoryOverride: options?.categoryOverride,
     userId: options?.userId,
+    ...(unsubHeader
+      ? {
+          headers: {
+            'List-Unsubscribe': `<${unsubHeader}>`,
+            'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+          },
+        }
+      : {}),
   };
 
-  // Built-in templates win over DB rows. Asked for by name rather than by
-  // building the whole catalogue: this is the one template this send needs.
-  const fallback = await getTemplate(templateName, branding.logoUrl);
-  if (fallback) {
-    if (!fallbackLoggedTemplates.has(templateName)) {
+  // An admin-edited DB row wins; the code template is the default. A row only
+  // exists once someone has authored that slug in the admin, so nothing is
+  // overridden by accident — and deleting the row hands the template back to
+  // the code, which keeps shipping fixes.
+  //
+  // Read failure falls through to the built-in template rather than dropping
+  // the mail: a database hiccup must not cost somebody their sign-in code.
+  let override: { subject: string; html: string } | null = null;
+  try {
+    override = await getEmailTemplate(templateName);
+  } catch {
+    override = null;
+  }
+  const chosen = override || getTemplate(templateName, branding.logoUrl) || null;
+  if (chosen) {
+    if (!override && !fallbackLoggedTemplates.has(templateName)) {
       fallbackLoggedTemplates.add(templateName);
       console.log(`[EMAIL] Using built-in template: '${templateName}'`);
     }
-    const subject = renderTemplate(fallback.subject, mergedVars, rawKeys);
-    const htmlBody = renderTemplate(fallback.html, mergedVars, rawKeys);
+    const subject = renderTemplate(chosen.subject, mergedVars, rawKeys);
+    const htmlBody = renderTemplate(chosen.html, mergedVars, rawKeys);
     const missing = findUnresolvedVars(subject + htmlBody, rawKeys);
     if (missing.length) {
       /* Log loudly and still send: a support email with one blank line beats
@@ -611,20 +791,5 @@ export async function sendTemplateEmail(
     return sendEmail(to, subject, htmlBody, { ...finalOptions, templateName });
   }
 
-  // Fall back to DB-stored templates only if no built-in exists
-  const template = await getEmailTemplate(templateName);
-  if (template) {
-    const subject = renderTemplate(template.subject, mergedVars, rawKeys);
-    const htmlBody = renderTemplate(template.html, mergedVars, rawKeys);
-    return sendEmail(to, subject, htmlBody, {
-      ...finalOptions,
-      templateName,
-    });
-  }
-
   return { success: false, error: `Template '${templateName}' not found` };
-}
-
-export async function getFallbackTemplates(): Promise<Record<string, { subject: string; html: string }>> {
-  return buildFallbackTemplates();
 }

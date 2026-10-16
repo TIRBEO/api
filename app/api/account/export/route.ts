@@ -14,6 +14,7 @@ export async function GET(req: NextRequest) {
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
       include: {
+        profile: { select: { name: true, photoUrl: true } },
         notifications: { select: { id: true, type: true, title: true, body: true, createdAt: true } },
         sessions: { select: { id: true, createdAt: true, lastUsedAt: true } },
         passkeys: { select: { id: true } },
@@ -29,9 +30,9 @@ export async function GET(req: NextRequest) {
       profile: {
         id: user.id,
         email: user.email,
-        name: user.name,
+        name: user.profile?.name ?? null,
         username: user.username,
-        photoUrl: user.photoUrl,
+        photoUrl: user.profile?.photoUrl ?? null,
         createdAt: user.createdAt,
       },
       notifications: user.notifications.map((n: any) => ({

@@ -120,10 +120,6 @@ import {
   sessionRevokeHandler } from '@/features/security/securityHandlers';
 
 import {
-  apiKeysHandler,
-  apiKeyDeleteHandler } from '@/features/admin/developerHandlers';
-
-import {
   chatHandler } from '@/features/auth/authHandlers';
 
 // oauthAdminHandlers removed — OAuth2 server models deleted
@@ -240,7 +236,6 @@ const INTERNAL_ROUTES = [
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
   'emails', 'emails/unsubscribe', 'emails/preferences', 'pushes',
   'districts',
-  'developer/api-keys',
   'user/activity', 'user/apps', 'user/overview', 'user/account-status', 'user/account-checks',
   'admin/reserved-addresses',
   'admin/groups',
@@ -273,10 +268,10 @@ const INTERNAL_ROUTES = [
 // The blocklist table is gone. IP blocks are Redis-backed now (isIpBlocked in
 // features/security/security.ts — same stale-tolerant contract, never throws),
 // and user blocks are derived from the consolidated account status:
-// suspended | deletion_pending | deleted are the blocking states.
+// banned | suspended | deletion_pending | deleted are the blocking states.
 const USER_BLOCK_CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
 const USER_BLOCK_STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
-const BLOCKED_USER_STATUSES = new Set(['suspended', 'deletion_pending', 'deleted', 'restricted']);
+const BLOCKED_USER_STATUSES = new Set(['banned', 'suspended', 'deletion_pending', 'deleted', 'restricted']);
 const userBlockCache = new Map<string, { blocked: boolean; ts: number }>();
 
 async function isUserBlocked(userId?: string) {
@@ -329,13 +324,6 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
     }
   }
 
-  // Handle developer/api-keys/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'developer' && slug[1] === 'api-keys') {
-    const keyId = slug[2];
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'developer/api-keys/[id]', method, internal: true, allowedRoles: ['guest'], meta: { keyId } };
-    }
-  }
 
   // Handle admin/reserved-addresses/{id} dynamic route
   if (slug.length === 3 && slug[0] === 'admin' && slug[1] === 'reserved-addresses') {
@@ -482,7 +470,6 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'emails/unsubscribe': ['GET', 'POST'],
       'pushes': ['GET'],
       'districts': ['GET'],
-      'developer/api-keys': ['GET', 'POST'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'user/overview': ['GET'],
       'user/account-status': ['GET'],
@@ -573,18 +560,13 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   const authHeader = request.headers.get('authorization') || '';
   const pathStr = slug.join('/');
   let session: any = null;
-  let authMethod: 'cookie' | 'api-key' | 'none' = 'none';
+  let authMethod: 'cookie' | 'none' = 'none';
 
 
   try {
     session = await getSession(request);
     if (session) {
-      if (session.sessionId?.startsWith('apikey:')) {
-        authMethod = 'api-key';
-        console.log(`[AUTH] API key auth success — user: ${session.userId}, path: ${pathStr}, method: ${method}`);
-      } else {
-        authMethod = 'cookie';
-      }
+    authMethod = 'cookie';
     } else if (authHeader) {
       // Only actual API keys (tb_…) can resolve via the API-key path. A Bearer
       // JWT (eyJ…) is handled by cookie/session auth above — do NOT log it as an
@@ -988,22 +970,29 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         if (!admUser?.isAdmin) { resp = jsonForbidden('Admin only'); break; }
         const epUrl = new URL(request.url);
         const epTemplate = epUrl.searchParams.get('template') || 'welcome';
-        const { getFallbackTemplates } = await import('@/features/email/email');
-        const templates = await getFallbackTemplates();
-        const tmpl = templates[epTemplate];
+        // Preview what a send would actually deliver: the admin-edited row if
+        // one exists, the code template otherwise — same precedence as
+        // `sendTemplateEmail`. Previewing only the built-in would show an admin
+        // a mail they are no longer sending.
+        const override = await prisma.emailTemplate
+          .findUnique({ where: { slug: epTemplate.trim().toLowerCase() } })
+          .catch(() => null);
+        const { getTemplate } = await import('@/features/email/email-templates');
+        const { getBranding } = await import('@/features/branding/branding');
+        const branding = await getBranding();
+        const tmpl = override || getTemplate(epTemplate, branding.logoUrl);
         if (tmpl) {
           const { renderTemplate } = await import('@/features/email/email');
           // One shared manifest — see features/email/sample-vars.ts. This
           // block used to carry its own 44-name list that had drifted out of
-          // sync with the catalogue: 60 of 91 real placeholders were missing,
-          // so previews rendered literal {{submissionId}} to the admin.
-          const { sampleVars: buildSampleVars } = await import(
+          // sync with the catalogue, so most previews rendered the raw
+          // `{{token}}` to the admin instead of a value.
+          const { previewVars } = await import(
             '@/features/email/sample-vars'
           );
-          const sampleVars = buildSampleVars({
+          const sampleVars = previewVars(epTemplate, {
             accountsUrl: getAccountsBaseUrl(),
-            dashboardUrl: getDashboardBaseUrl(),
-            adminUrl: getAdminBaseUrl() });
+            dashboardUrl: getDashboardBaseUrl() });
           const html = renderTemplate(tmpl.html, sampleVars);
           resp = NextResponse.json({ html });
         } else {
@@ -1094,6 +1083,15 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
               if (tm) euTokenIn = euTokenIn || decodeURIComponent(tm[1]).trim();
             }
 
+            if (!euAddr) {
+              // RFC 8058 one-click: Gmail POSTs `List-Unsubscribe=One-Click` with
+              // no email field. The signed URL already carries both the token and
+              // the address in its query string, so read them from there. The
+              // token is still the ownership proof — nothing about the security
+              // changes, only where the address is read from.
+              euAddr = euPrefill.trim().toLowerCase();
+            }
+
             if (!euTokenIn) {
               resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+link+is+missing+its+authorization+token.+Please+use+the+link+from+your+email.`, 302);
             } else {
@@ -1149,12 +1147,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'districts':
         resp = NextResponse.json({ districts: [] });
-        break;
-      case 'developer/api-keys':
-        resp = await apiKeysHandler(request);
-        break;
-      case 'developer/api-keys/[id]':
-        resp = await apiKeyDeleteHandler(request, (route as any).meta.keyId);
         break;
       case 'admin/reserved-addresses/[id]':
         resp = NextResponse.json({ error: 'Not implemented' }, { status: 501 });

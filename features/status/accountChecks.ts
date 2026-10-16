@@ -16,7 +16,7 @@ import { loadAccountStatus } from '@/features/status/accountStatus';
      • Account standing ......... user.status + the admin's status level
      • Sign-ins we stopped ...... security.user_logins (failed attempts
                                   that were never followed by a success)
-                                  + security.captcha_blocks still active
+                                  + active automated-protection blocks
      • What's limited now ....... status.user_restrictions, severity
                                   warning/strike, still in force
      • Checks waiting on you .... status.user_restrictions, severity
@@ -100,12 +100,7 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     }),
-    prisma.captchaBlock.findMany({
-      where: { userId, unblockedAt: null },
-      orderBy: { blockedAt: 'desc' },
-      take: 20,
-      select: { id: true, ipAddress: true, reason: true, blockedAt: true },
-    }),
+    Promise.resolve([] as { id: string; ipAddress: string | null; reason: string; blockedAt: Date }[]),
     prisma.userRestriction.findMany({
       where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: now } }] },
       orderBy: { startedAt: 'desc' },
@@ -121,7 +116,7 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
   // ── Account standing: the account's own status, plus the admin's number ──
   const standingItems: CheckItem[] = [];
   const accountStatus = user?.status ?? 'active';
-  if (accountStatus === 'restricted' || accountStatus === 'suspended') {
+  if (accountStatus === 'restricted' || accountStatus === 'suspended' || accountStatus === 'banned') {
     const event = await prisma.userStatusEvent.findFirst({
       where: { userId, toStatus: accountStatus as any },
       orderBy: { createdAt: 'desc' },
@@ -131,7 +126,9 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
       id: `standing-${accountStatus}`,
       title: accountStatus === 'suspended'
         ? 'The account is suspended'
-        : 'The account is under restriction',
+        : accountStatus === 'banned'
+          ? 'The account is banned'
+          : 'The account is under restriction',
       sub: event?.reason
         ? `Reason kept on the decision: ${event.reason}.`
         : 'The account itself is not in normal use while this stands.',
@@ -164,17 +161,6 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
       sub: `A failed ${row.method} attempt from ${describeIp(row.ipAddress, row.location)} that never got into the account.`,
       guideline: 'Sign-in — failed attempt',
       at: iso(row.createdAt),
-      appealable: false,
-      ask: '',
-    });
-  }
-  for (const block of activeBlocks) {
-    signInItems.push({
-      id: `block-${block.id}`,
-      title: 'A sign-in was held back',
-      sub: `Automated protection stopped a sign-in from ${describeIp(block.ipAddress, null)} (${block.reason}).`,
-      guideline: 'Automated protection — blocked attempt',
-      at: iso(block.blockedAt),
       appealable: false,
       ask: '',
     });

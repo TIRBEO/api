@@ -3,47 +3,58 @@
  *
  * Exists because the admin preview endpoint and the offline render script both
  * need to fill every placeholder in the catalogue, and each had its own list.
- * The endpoint's list had drifted badly — 12 names no template used, and 60 of
- * the 91 real placeholders missing outright, so most previews on the admin page
- * were showing the literal text `{{submissionId}}` where a value should be.
+ * The endpoint's list had drifted badly — 12 names no template used, and most
+ * of the real placeholders missing outright, so most previews on the admin page
+ * were showing literal `{{token}}` text where a value should be.
  * One list, checked by a test, is the only way to keep the preview honest.
  *
- * Real URLs are resolved from the environment at call time so a preview points
- * at whichever deployment is being looked at.
+ * The section slots are built by the same helpers the real senders use
+ * (`features/email/email-fragments.ts`), so a preview cannot look nothing like
+ * the mail it is standing in for.
  */
 
 export type SampleVarResolver = () => {
   accountsUrl: string;
   dashboardUrl: string;
-  adminUrl: string;
 };
+
+import {
+  attentionPanel,
+  cardItem,
+  listGroup,
+  listPlate,
+  listRow,
+  moreRow,
+  unsubscribeSection,
+} from '@/features/email/email-fragments';
+import { ESSENTIAL_TEMPLATES } from '@/features/email/email-classification';
+
+const URL = 'https://tirbeo.com';
 
 /** Plausible values for every section slot the templates expose. */
 const SECTION_VALUES: Record<string, string> = {
-  unsubscribeSection: '<p style="margin:16px 0 0;font-size:13px;line-height:20px;color:#8a7462"><a href="https://tirbeo.com/u" style="color:#8a7462;text-decoration:underline;">Unsubscribe from these emails</a></p>',
+  unsubscribeSection: unsubscribeSection(`${URL}/u`),
   digestItems:
-    '<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="font-size:14px;font-weight:600;line-height:22px;color:#ffffff;">New submission on Contact Form</div><div style="font-size:13px;line-height:20px;color:#bd9d8a;padding-top:2px;">Someone filled in your contact form.</div></div>',
-  activitySection:
-    '<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="font-size:14px;font-weight:600;line-height:22px;color:#ffffff;">3 sign-ins this week</div><div style="font-size:13px;line-height:20px;color:#bd9d8a;padding-top:2px;">Last one from Chrome on Linux.</div></div>',
-  activitySummary: '<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;font-size:14px;line-height:22px;color:#ffffff;">You signed in 4 times and created 2 projects this week.</div>',
-  details: '<div style="font-size:14px;line-height:22px;color:#ffffff;">Signed in from a device we have not seen before.</div>',
-  submissionData:
-    '<div style="background:#181008;border:1px solid #38312b;border-radius:12px;"><div style="padding:12px 16px;border-bottom:1px solid #38312b;"><span style="color:#bd9d8a;font-size:13px;">Name:</span> <span style="color:#ffffff;font-size:14px;">Jane Doe</span></div><div style="padding:12px 16px;border-bottom:1px solid #38312b;"><span style="color:#bd9d8a;font-size:13px;">Email:</span> <span style="color:#ffffff;font-size:14px;">jane@example.com</span></div><div style="padding:12px 16px;"><span style="color:#bd9d8a;font-size:13px;">Plan:</span> <span style="color:#ffffff;font-size:14px;">Pro</span></div></div>',
-  answers: '<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="font-size:14px;font-weight:600;line-height:22px;color:#ffffff;">What is your role?</div><div style="font-size:13px;line-height:20px;color:#bd9d8a;padding-top:2px;">Engineer</div></div>',
-  fieldRows: '<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="font-size:14px;font-weight:600;line-height:22px;color:#ffffff;">Role</div><div style="font-size:13px;line-height:20px;color:#bd9d8a;padding-top:2px;">Engineer</div></div>',
-  fieldsRows:
-    '<div style="background:#181008;border:1px solid #38312b;border-radius:12px;"><div style="padding:12px 16px;border-bottom:1px solid #38312b;"><span style="color:#bd9d8a;font-size:13px;">Name:</span> <span style="color:#ffffff;font-size:14px;">Jane</span></div><div style="padding:12px 16px;"><span style="color:#bd9d8a;font-size:13px;">Team size:</span> <span style="color:#ffffff;font-size:14px;">12</span></div></div>',
-  statRows:
-    '<div style="background:#181008;border:1px solid #38312b;border-radius:12px;"><div style="padding:12px 16px;border-bottom:1px solid #38312b;"><span style="color:#bd9d8a;font-size:13px;">Logins:</span> <span style="color:#ffffff;font-size:14px;">12</span></div><div style="padding:12px 16px;"><span style="color:#bd9d8a;font-size:13px;">Submissions:</span> <span style="color:#ffffff;font-size:14px;">47</span></div></div>',
-  suspiciousSection:
-    '<div style="margin:0 0 20px;"><p style="margin:0 0 6px;font-size:14px;font-weight:600;line-height:22px;color:#ffffff;">New sign-in from Berlin, Germany</p><p style="margin:0;font-size:13px;line-height:20px;color:#bd9d8a;">If this was not you, review your sessions.</p></div>',
+    cardItem('New submission on Contact Form', 'Someone filled in your contact form.')
+    + cardItem('A reply landed on your ticket', '“We are looking into this now.”'),
+  activitySection: cardItem('3 sign-ins this week', 'Last one from Chrome on Linux.'),
+  activitySummary: cardItem('You signed in 4 times this week', 'And created 2 projects.'),
+  details: cardItem('Signed in from a device we have not seen before'),
+  statRows: listPlate(
+      listGroup('Sign-ins', 12, listRow('Signed in with Password', '28 Feb 2026, 14:02 · Chrome on macOS'))
+    + listGroup('Changes', 47, listRow('Updated your profile', '27 Feb 2026, 09:15 · myprofile'))
+    + moreRow('22 more in your activity history'),
+  ),
+  suspiciousSection: attentionPanel('2 things to look at', [
+    'Failed sign-in from Berlin on 3 Mar',
+    'Two-step verification was turned off',
+  ]),
 };
 
 /** Every remaining placeholder, in the order the catalogue declares them. */
 const PLAIN_VALUES: Record<string, string> = {
   name: 'John Doe',
   username: 'johndoe',
-  userEmail: 'john@example.com',
   primaryEmail: 'john@example.com',
   recoveryEmail: 'backup@example.com',
 
@@ -51,26 +62,8 @@ const PLAIN_VALUES: Record<string, string> = {
   lifetimeMinutes: '10',
   password: 'correct-horse-battery-staple',
 
-  formTitle: 'Customer feedback',
-  formUrl: 'https://tirbeo.com/f/contact-form',
-  viewUrl: 'https://tirbeo.com/f/contact-form/r/sub_7a3',
-  submissionId: 'sub_7a3c9',
-  responseId: 'res_7a3c9',
-  respondentName: 'Jane Doe',
-  submittedAt: '28 Feb 2026, 14:22 UTC',
-  flaggedAt: '28 Feb 2026, 14:22 UTC',
-  deletedAt: '28 Feb 2026, 15:10 UTC',
-  updatedAt: '28 Feb 2026, 16:00 UTC',
   count: '5',
   reason: 'Possible spam content',
-
-  ticketId: 'TKT-001',
-  ticketUrl: 'https://myprofile.tirbeo.com/support/tickets/TKT-001',
-  ticketSubject: 'Export stuck at 80%',
-  ticketStatus: 'Open',
-  updateMessage: "We've moved this to the engineering team.",
-  replyContent: 'Thanks for the report — we are looking into this now.',
-  replierName: 'Tirbeo Support',
 
   periodLabel: '19–25 Aug 2026',
   daysSince: '21',
@@ -78,17 +71,18 @@ const PLAIN_VALUES: Record<string, string> = {
   title: 'Faster exports',
   message: 'We rebuilt the export pipeline — large projects are now 4x quicker.',
   ctaLabel: 'See what changed',
-  ctaUrl: 'https://tirbeo.com/changelog/42',
+  ctaUrl: `${URL}/changelog/42`,
   actionLabel: 'View account',
-  actionUrl: 'https://myprofile.tirbeo.com/account/security',
-  tipTitle: 'Enable two-factor authentication',
+  actionUrl: `${URL}/account/security`,
+  tipTitle: 'Enable two-step authentication',
   tipBody: 'Add a second step to sign-in and lock out account takeover.',
-  statusType: 'Deactivated',
-  untilLabel: 'Until further notice',
+
+  statusType: 'suspended for 7 days',
+  suspendedUntil: '3 Mar 2026, 09:00 UTC',
+  suspendedNextStep: 'You cannot sign in or use Tirbeo services until then',
   dateLabel: '28 Feb 2026',
   exportedAt: '28 Feb 2026, 16:00 UTC',
   changedAt: '28 Feb 2026, 13:58 UTC',
-  alertTime: '28 Feb 2026, 12:05 UTC',
 
   startTime: '1 Mar 2026, 02:00 UTC',
   estimatedEnd: '1 Mar 2026, 02:30 UTC',
@@ -98,20 +92,11 @@ const PLAIN_VALUES: Record<string, string> = {
   maintenanceMessage: 'Brief downtime is expected while we upgrade.',
   completionMessage: 'The upgrade finished and everything is back to normal.',
 
-  ip: '203.0.113.9',
   ipAddress: '203.0.113.9',
   location: 'Berlin, Germany',
   device: 'Chrome on macOS',
-  userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
   loginTime: '28 Feb 2026, 14:02 UTC',
   twoFactorUrl: 'https://myprofile.tirbeo.com/settings/two-factor',
-
-  service: 'api',
-  severity: 'high',
-  errorType: 'TypeError',
-  stack: 'at exportWorker (app.js:42:9)',
-  source: 'auth.middleware',
-  url: 'https://tirbeo.com/errors/err_1a2b',
 
   sentFor: 'admin preview',
   subject: 'Unhandled error in export worker',
@@ -129,7 +114,7 @@ export const SAMPLE_VAR_NAMES = [
  * stays importable from a plain script without pulling in app config.
  */
 export function sampleVars(
-  urls: { accountsUrl: string; dashboardUrl: string; adminUrl: string },
+  urls: { accountsUrl: string; dashboardUrl: string },
 ): Record<string, string> {
   return {
     ...SECTION_VALUES,
@@ -139,6 +124,21 @@ export function sampleVars(
     recoveryUrl: `${urls.accountsUrl}/recover?token=sample-token`,
     accountsUrl: `${urls.accountsUrl}/onboarding`,
     dashboardUrl: urls.dashboardUrl,
-    adminUrl: urls.adminUrl,
   };
+}
+
+/**
+ * The manifest as this particular mail would actually go out.
+ *
+ * `sendTemplateEmail` blanks the unsubscribe slot on essential mail; a preview
+ * that always filled it showed admins an unsubscribe line their users would
+ * never see, and the one thing worth checking about a code email looked wrong.
+ */
+export function previewVars(
+  templateName: string,
+  urls: { accountsUrl: string; dashboardUrl: string },
+): Record<string, string> {
+  const vars = sampleVars(urls);
+  if (ESSENTIAL_TEMPLATES.has(templateName)) vars.unsubscribeSection = '';
+  return vars;
 }

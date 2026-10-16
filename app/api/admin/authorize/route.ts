@@ -15,13 +15,13 @@ export async function GET(request: NextRequest) {
 
   const user = await prisma.user.findUnique({
     where: { id: session.userId },
-    select: { adminRole: true, isBanned: true, isSuspended: true },
+    select: { isAdmin: true, status: true },
   });
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
   return NextResponse.json({
-    adminRole: user.adminRole || null,
-    isBanned: user.isBanned,
-    isSuspended: user.isSuspended,
+    adminRole: user.isAdmin ? 'admin' : null,
+    isBanned: user.status === 'banned',
+    isSuspended: user.status === 'suspended',
   });
 }

@@ -27,14 +27,12 @@ const DEFAULTS: Record<ConsentType, boolean> = {
  */
 export async function hasConsent(userId: string, type: ConsentType): Promise<boolean> {
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { consents: true },
+    const pref = await prisma.userPreferences.findUnique({
+      where: { userId },
+      select: { misc: true },
     });
 
-    if (!user) return DEFAULTS[type];
-
-    const consents = (user as any).consents as Record<string, unknown> | null;
+    const consents = ((pref?.misc as any)?.consents) as Record<string, unknown> | null;
     const key = CONSENT_MAP[type];
 
     if (consents && typeof consents === 'object' && key in consents) {
@@ -57,12 +55,12 @@ export async function hasConsents(
   const result: Record<string, boolean> = {};
 
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { consents: true },
+    const pref = await prisma.userPreferences.findUnique({
+      where: { userId },
+      select: { misc: true },
     });
 
-    const consents = (user as any)?.consents as Record<string, unknown> | null;
+    const consents = ((pref?.misc as any)?.consents) as Record<string, unknown> | null;
 
     for (const type of types) {
       const key = CONSENT_MAP[type];
@@ -91,8 +89,8 @@ export async function getUsersWithConsent(type: ConsentType): Promise<string[]> 
   try {
     const users = await prisma.user.findMany({
       where: {
-        consents: { path: [key], equals: true },
-        deletedAt: null,
+        preferences: { is: { misc: { path: ['consents', key], equals: true } } },
+        status: { notIn: ['deleted'] },
       },
       select: { id: true },
     });

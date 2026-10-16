@@ -29,6 +29,14 @@ async function countPair(name: string, fn: () => Promise<number>): Promise<[stri
   return [name, await fn().catch(() => 0)];
 }
 
+// OAuth-linked accounts now live in user_preferences.misc.oauth (a jsonb blob),
+// not as columns on users. Count rows whose provider key is present. Provider
+// name is code-controlled, so the `->` path is safe to interpolate as a param.
+async function oauthConnected(provider: 'google' | 'github' | 'discord'): Promise<number> {
+  const rows = await prisma.$queryRaw<[{ c: number }]>`SELECT COUNT(*)::int AS c FROM "public"."user_preferences" WHERE misc -> 'oauth' -> ${provider} IS NOT NULL`;
+  return Number(rows[0]?.c ?? 0);
+}
+
 const g = globalThis as any;
 const CACHE_TTL = 5000; // recompute at most every 5s per process
 if (!g.__adminDashCache) g.__adminDashCache = {};
@@ -57,10 +65,8 @@ export async function GET(request: NextRequest) {
   const tableRows: [string, number][] = await Promise.all([
     countPair('user', () => prisma.user.count()),
     countPair('session', () => prisma.userSession.count()),
-    countPair('deviceAccount', () => prisma.deviceAccount.count()),
     countPair('otp', () => prisma.otp.count()),
     countPair('emailDelivery', () => prisma.email_deliveries.count()),
-    countPair('apiKey', () => prisma.apiKey.count()),
     countPair('passkey', () => prisma.passkey.count()),
     countPair('userTipLog', () => prisma.userTipLog.count()),
     countPair('blocklist', () => prisma.blocklist.count()),
@@ -73,11 +79,6 @@ export async function GET(request: NextRequest) {
     countPair('emailConfig', () => prisma.emailConfig.count()),
     countPair('emailTemplate', () => prisma.emailTemplate.count()),
     countPair('emailDelivery', () => prisma.email_deliveries.count()),
-    countPair('captchaChallenge', () => prisma.captchaChallenge.count()),
-    countPair('captchaAttempt', () => prisma.captchaAttempt.count()),
-    countPair('captchaBlock', () => prisma.captchaBlock.count()),
-    countPair('captchaLog', () => prisma.captchaLog.count()),
-    countPair('captchaSettings', () => prisma.captchaSettings.count()),
     countPair('incidentEvent', () => Promise.resolve(0)),
     countPair('form', () => Promise.resolve(0)),
     countPair('formField', () => Promise.resolve(0)),
@@ -112,20 +113,20 @@ export async function GET(request: NextRequest) {
     safe(prisma.user.count({ where: { createdAt: { gte: todayStart } } })),
     safe(prisma.user.count({ where: { createdAt: { gte: weekAgo } } })),
     safe(prisma.user.count({ where: { createdAt: { gte: monthAgo } } })),
-    safe(prisma.user.count({ where: { emailVerified: true } })),
-    safe(prisma.user.count({ where: { phoneVerified: true } })),
-    safe(prisma.user.count({ where: { isBanned: true } })),
-    safe(prisma.user.count({ where: { isSuspended: true } })),
-    safe(prisma.user.count({ where: { scheduledDeletionAt: { not: null } } })),
-    safe(prisma.user.count({ where: { deletedAt: { not: null } } })),
-    safe(prisma.user.count({ where: { is2FAEnabled: true } })),
-    safe(prisma.user.count({ where: { mustChangePassword: true } })),
+    safe(prisma.userEmail.count({ where: { AND: [{ OR: [{ kind: 'primary' }, { isDefault: true }] }, { verifiedAt: { not: null } }] } })),
+    safe(prisma.userPhone.count({ where: { verifiedAt: { not: null } } })),
+    safe(prisma.user.count({ where: { status: 'banned' } })),
+    safe(prisma.user.count({ where: { status: 'suspended' } })),
+    safe(prisma.user.count({ where: { status: 'deletion_pending' } })),
+    safe(prisma.user.count({ where: { status: 'deleted' } })),
+    safe(prisma.userSecurity.count({ where: { totpEnabled: true } })),
+    safe(prisma.userSecurity.count({ where: { mustChangePw: true } })),
     safe(prisma.notification.count()),
     safe(prisma.notification.count({ where: { isRead: false } })),
     Promise.resolve(0),
     Promise.resolve(0),
     safe(prisma.userSession.count({ where: { expiresAt: { gt: now } } })),
-    safe(prisma.apiKey.count({ where: { isActive: true, revokedAt: null } })),
+    Promise.resolve(0),
     safe(prisma.email_deliveries.count({ where: { createdAt: { gte: todayStart } } })),
     safe(prisma.email_deliveries.count({ where: { createdAt: { gte: hourAgo } } })),
     safe(prisma.email_deliveries.count({ where: { status: 'failed' } })),
@@ -160,14 +161,14 @@ export async function GET(request: NextRequest) {
     ticketMessages, ticketAttachments, formByStatus, submissionByStatus, formFields, formConnections,
     formAnalyticAgg, mediaByMime, incidentBySeverity, incidentBySource,
   ] = await Promise.all([
-    safeMany(prisma.user.groupBy({ by: ['adminRole'], where: { adminRole: { not: null } }, _count: { adminRole: true } })),
+    safeMany(prisma.user.groupBy({ by: ['isAdmin'], where: { isAdmin: true }, _count: { isAdmin: true } })),
     Promise.all([
-      safe(prisma.user.count({ where: { googleId: { not: null } } })),
-      safe(prisma.user.count({ where: { githubId: { not: null } } })),
-      safe(prisma.user.count({ where: { discordId: { not: null } } })),
+      safe(oauthConnected('google')),
+      safe(oauthConnected('github')),
+      safe(oauthConnected('discord')),
     ]),
     safeMany(prisma.userSession.groupBy({ by: ['status'], _count: { status: true } })),
-    safeMany(prisma.apiKey.groupBy({ by: ['isActive'], _count: { isActive: true } })),
+    Promise.resolve([] as any[]),
     safeMany(prisma.notification.groupBy({ by: ['type'], _count: { type: true } })),
     safeMany(prisma.securityEvent.groupBy({ by: ['severity'], _count: { severity: true } })),
     safeMany(prisma.securityEvent.groupBy({ by: ['eventType'], orderBy: { _count: { eventType: 'desc' } }, take: 8, _count: { eventType: true } })),
@@ -228,7 +229,7 @@ export async function GET(request: NextRequest) {
   const [topActions, recentAudit, recentEmails, recentLogins, recentSecurity,
     recentTickets, recentNotifications, recentSubmissions, recentIncidents, recentCaptcha] = await Promise.all([
     safeMany(prisma.activityEvent.groupBy({ by: ['kind'], where: { createdAt: { gte: monthAgo } }, _count: { kind: true }, orderBy: { _count: { kind: 'desc' } }, take: 10 })),
-    safeMany(prisma.activityEvent.findMany({ where: { createdAt: { gte: weekAgo } }, orderBy: { createdAt: 'desc' }, take: 20, include: { user: { select: { id: true, email: true, name: true } } } })),
+    safeMany(prisma.activityEvent.findMany({ where: { createdAt: { gte: weekAgo } }, orderBy: { createdAt: 'desc' }, take: 20, include: { user: { select: { id: true, email: true, profile: { select: { name: true } } } } } })),
     safeMany(prisma.email_deliveries.findMany({ orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, toEmail: true, subject: true, eventKey: true, status: true, openedAt: true, clickedAt: true, createdAt: true } })),
     safeMany(prisma.securityEvent.findMany({ where: { eventType: { in: ['login', 'login_failed'] } }, orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, eventType: true, ipAddress: true, userId: true, createdAt: true } })),
     safeMany(prisma.securityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, eventType: true, severity: true, ipAddress: true, userId: true, createdAt: true } })),
@@ -268,10 +269,7 @@ export async function GET(request: NextRequest) {
 
   const loginsSuccessToday = loginsToday - failedLoginsToday;
 
-  const [revokedKeys, expiredKeys] = await Promise.all([
-    safe(prisma.apiKey.count({ where: { revokedAt: { not: null } } })),
-    safe(prisma.apiKey.count({ where: { expiresAt: { lt: now }, revokedAt: null } })),
-  ]);
+  const [revokedKeys, expiredKeys] = [0, 0];
 
   const body = {
     fetchedAt: now.toISOString(),
@@ -294,7 +292,7 @@ export async function GET(request: NextRequest) {
     users: {
       total: tables.user, active: activeUsers, activeToday: activeUsersToday, newToday, newThisWeek, newThisMonth,
       verifiedEmail, verifiedPhone, banned, suspended, scheduledDeletion, deleted, twoFA, mustChange,
-      admins: adminsByRole.map((r: any) => ({ role: r.adminRole || 'admin', count: r._count.adminRole ?? 0 })),
+      admins: adminsByRole.map((r: any) => ({ role: 'admin', count: r._count?.isAdmin ?? 0 })),
       oauth: { google: oauth[0], github: oauth[1], discord: oauth[2] } },
     sessions: { total: tables.session, active: activeSessions, byStatus: sessionsByStatus.map((s: any) => ({ status: s.status || 'unknown', count: s._count.status ?? 0 })) },
     apiKeys: { total: tables.apiKey, active: activeApiKeys, revoked: revokedKeys, expired: expiredKeys },
@@ -365,7 +363,7 @@ export async function GET(request: NextRequest) {
       media: bucketOf(mediaByDay) },
     topActions: topActions.map((a: any) => ({ action: a.kind, count: a._count.kind })),
     emailStatusBreakdown: emailByStatus,
-    recentAudit: recentAudit.map((l: any) => ({ ...l, actor: l.user })),
+    recentAudit: recentAudit.map((l: any) => ({ ...l, actor: l.user ? { ...l.user, name: l.user.profile?.name ?? null } : l.user })),
     recentEmails,
     recentLogins,
     recentSecurity,

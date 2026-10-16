@@ -23,17 +23,25 @@ interface MaintenanceCompleteOptions {
 
 /** Resolve the recipient list for a maintenance send. */
 async function resolveRecipients(options: { notifyAll?: boolean; userIds?: string[] }): Promise<{ id: string; email: string; name: string | null }[]> {
+  // The display name is on user_profile, not the users row — select `name`
+  // there and Prisma rejects the whole query, so nobody gets the mail.
+  const select = { id: true, email: true, profile: { select: { name: true } } };
+  const flat = (u: { id: string; email: string; profile: { name: string | null } | null }) =>
+    ({ id: u.id, email: u.email, name: u.profile?.name ?? null });
+
   if (options.userIds && options.userIds.length > 0) {
-    return prisma.user.findMany({
+    const rows = await prisma.user.findMany({
       where: { id: { in: options.userIds } },
-      select: { id: true, email: true, name: true },
+      select,
     });
+    return rows.map(flat);
   }
   if (options.notifyAll) {
-    return prisma.user.findMany({
-      select: { id: true, email: true, name: true },
+    const rows = await prisma.user.findMany({
+      select,
       take: 10000, // Safety limit
     });
+    return rows.map(flat);
   }
   return [];
 }

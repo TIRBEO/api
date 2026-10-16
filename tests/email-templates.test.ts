@@ -3,10 +3,11 @@ import {
   buildTemplates,
   clearTemplateCache,
   getTemplate,
+  EMAIL_TEMPLATES,
   RAW_HTML_VARS,
 } from '../features/email/email-templates';
 import { htmlToText, renderTemplate } from '../features/email/email';
-import { sampleVars } from '../features/email/sample-vars';
+import { sampleVars, previewVars } from '../features/email/sample-vars';
 
 const LOGO = 'https://cdn.tirbeo.com/logo-opt.png';
 
@@ -18,15 +19,11 @@ const SECTION_VARS = {
   activitySection: '<div><strong>Recent activity</strong></div>',
   activitySummary: '<div>Signed in 4 times</div>',
   details: '<div>Signed in from a new device.</div>',
-  submissionData: '<div>Field: value</div>',
-  answers: '<div>Q: A</div>',
-  fieldRows: '<div>Answer: Yes</div>',
-  fieldsRows: '<div>Name: Test</div>',
   unsubscribeSection: '<a href="https://tirbeo.com/u">Unsubscribe</a>',
 };
 
 /**
- * All 91 distinct placeholders across the catalogue.
+ * Every distinct placeholder across the catalogue.
  *
  * Kept exhaustive on purpose: the test below renders every template and fails
  * if any placeholder is left unfilled, so a template that grows a new variable
@@ -46,39 +43,11 @@ const VARS: Record<string, string> = {
   recoveryUrl: 'https://accounts.tirbeo.com/recover?token=abc',
   accountsUrl: 'https://accounts.tirbeo.com/onboarding',
   dashboardUrl: 'https://myprofile.tirbeo.com',
-  adminUrl: 'https://tirbeo.com/admin',
-  settingsUrl: 'https://myprofile.tirbeo.com/account/preferences',
-  webhookUrl: 'https://myprofile.tirbeo.com/api/webhooks/hooks_1',
-  formUrl: 'https://tirbeo.com/f/form_1',
-  ticketUrl: 'https://myprofile.tirbeo.com/support/tickets/tk_9f2',
-  ticketId: 'tk_9f2',
-  ticketSubject: 'Export stuck at 80%',
-  ticketStatus: 'Open',
-  updateMessage: 'Moved to In review.',
-  replyContent: 'We are looking into this now.',
-  replierName: 'Tirbeo Support',
-  formTitle: 'Customer feedback',
-  submissionId: 'sub_7a3',
-  responseId: 'res_7a3',
-  submissionData: '<div>Plan: Pro</div>',
-  respondentName: 'Aarav',
-  newResponses: '6',
-  totalResponses: '128',
-  responseCount: '42',
-  count: '5',
-  scheduledAt: '1 Mar 2026, 09:00',
-  flaggedAt: '28 Feb 2026, 14:22',
+  twoFactorUrl: 'https://myprofile.tirbeo.com/settings/two-factor',
   reason: 'Possible spam content',
-  milestone: '100 responses',
-  addedByName: 'Priya',
-  role: 'Editor',
+  count: '5',
   periodLabel: 'Last 7 days',
-  statRows: '<div><strong>Logins:</strong> 12</div>',
-  suspiciousSection: '<div><strong>New device</strong> from Berlin</div>',
-  activitySummary: '<div>Signed in 4 times this week.</div>',
   daysSince: '21',
-  details: '<div>Signed in from a new device.</div>',
-  ip: '203.0.113.9',
   ipAddress: '203.0.113.9',
   location: 'Berlin, Germany',
   device: 'Chrome on macOS',
@@ -86,15 +55,10 @@ const VARS: Record<string, string> = {
   loginTime: '28 Feb 2026, 14:02',
   changedAt: '28 Feb 2026, 13:58',
   password: 'correct-horse-battery-staple',
-  deletedAt: '28 Feb 2026, 15:10',
   dateLabel: '28 Feb 2026',
   exportedAt: '28 Feb 2026, 16:00',
-  updatedAt: '28 Feb 2026, 16:00',
-  submittedAt: '28 Feb 2026, 12:40',
   completedAt: '28 Feb 2026, 17:00',
-  untilLabel: '3 Mar 2026, 09:00',
   alertTime: '28 Feb 2026, 12:05',
-  twoFactorUrl: 'https://myprofile.tirbeo.com/settings/two-factor',
   startTime: '1 Mar 2026, 02:00',
   estimatedEnd: '1 Mar 2026, 02:30',
   duration: '30 minutes',
@@ -109,7 +73,9 @@ const VARS: Record<string, string> = {
   actionUrl: 'https://tirbeo.com/account',
   tipTitle: 'Connect your domain',
   tipBody: 'Point a CNAME at Tirbeo and go live.',
-  statusType: 'Deactivated',
+  statusType: 'suspended for 7 days',
+  suspendedUntil: '3 Mar 2026, 09:00 UTC',
+  suspendedNextStep: 'You cannot sign in until then',
   service: 'api',
   severity: 'high',
   errorType: 'TypeError',
@@ -118,9 +84,7 @@ const VARS: Record<string, string> = {
   source: 'auth.middleware',
   url: 'https://tirbeo.com/errors/err_1',
   sentFor: 'admin test',
-  httpStatus: '500',
   subject: 'Unhandled error in export worker',
-  viewUrl: 'https://tirbeo.com/f/form_1/r/sub_7a3',
 };
 
 describe('renderTemplate escaping', () => {
@@ -187,14 +151,14 @@ describe('template cache', () => {
   it('does not let a single cached template masquerade as the full catalogue', async () => {
     // Regression: getTemplate stored a one-entry bucket under the same cache
     // key buildTemplates uses, so a prior getTemplate() made buildTemplates()
-    // return a single template instead of 55 — intermittently, depending on
-    // which ran first.
+    // return a single template instead of the whole catalogue — intermittently,
+    // depending on which ran first.
     clearTemplateCache();
     await getTemplate('welcome', LOGO);
     const all = await buildTemplates(LOGO);
-    expect(Object.keys(all).length).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(all).length).toBe(Object.keys(EMAIL_TEMPLATES).length);
     expect(all['signup_otp']).toBeDefined();
-    expect(all['ticket_created']).toBeDefined();
+    expect(all['weekly_summary']).toBeDefined();
   });
 
   it('returns undefined for an unknown template instead of throwing', async () => {
@@ -233,7 +197,7 @@ describe('preview manifest parity', () => {
   it('covers every placeholder in the catalogue', async () => {
     // The admin preview and the offline render script both fill templates from
     // this manifest. When each had a private list they drifted: the endpoint's
-    // was missing 60 of 91 names, so previews showed literal {{submissionId}}.
+    // was missing most of the catalogue, so previews showed literal {{otp}}.
     clearTemplateCache();
     const all = await buildTemplates(LOGO);
     const needed = new Set<string>();
@@ -248,7 +212,6 @@ describe('preview manifest parity', () => {
         sampleVars({
           accountsUrl: 'https://accounts.tirbeo.com',
           dashboardUrl: 'https://myprofile.tirbeo.com',
-          adminUrl: 'https://tirbeo.com/admin',
         }),
       ),
     );
@@ -262,15 +225,14 @@ describe('preview manifest parity', () => {
   it('leaves no placeholder when a template is rendered for preview', async () => {
     clearTemplateCache();
     const all = await buildTemplates(LOGO);
-    const vars = sampleVars({
+    const urls = {
       accountsUrl: 'https://accounts.tirbeo.com',
       dashboardUrl: 'https://myprofile.tirbeo.com',
-      adminUrl: 'https://tirbeo.com/admin',
-    });
+    };
     const dirty = Object.entries(all)
       .map(([name, tpl]) => ({
         name,
-        leftover: (renderTemplate(tpl.html, vars).match(/\{\{\s*\w+\s*\}\}/g) || []).length,
+        leftover: (renderTemplate(tpl.html, previewVars(name, urls)).match(/\{\{\s*\w+\s*\}\}/g) || []).length,
       }))
       .filter((x) => x.leftover > 0);
     expect(dirty).toEqual([]);
@@ -278,7 +240,7 @@ describe('preview manifest parity', () => {
 });
 
 describe('htmlToText', () => {
-  it('strips the zero-width padding react-email puts in <Preview>', () => {
+  it('strips the zero-width padding around the preheader', () => {
     const html =
       '<div>‌‏﻿‎‏Hello</div>';
     const text = htmlToText(html);

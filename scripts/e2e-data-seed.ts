@@ -54,13 +54,8 @@ async function seed() {
     data: {
       email: EMAIL,
       username: USERNAME,
-      name: NAME,
       passwordHash,
-      emailVerified: true,
       status: 'active',
-      language: 'en',
-      theme: 'system',
-      githubId: 'gh-e2e-12345', // makes /integrations GET report github connected
     },
     select: { id: true, email: true, username: true },
   });
@@ -68,6 +63,15 @@ async function seed() {
 
   await prisma.userEmail.create({
     data: { userId: uid, address: EMAIL, kind: 'primary', isDefault: true, verifiedAt: new Date() },
+  });
+
+  await prisma.userProfile.create({ data: { userId: uid, name: NAME } });
+  await prisma.userPreferences.create({
+    data: {
+      userId: uid,
+      appearance: { theme: 'system', language: 'en' },
+      misc: { oauth: { github: 'gh-e2e-12345' } }, // makes /integrations GET report github connected
+    },
   });
 
   // Security row starts with 2FA off and no backup codes (regenerate exercises it).

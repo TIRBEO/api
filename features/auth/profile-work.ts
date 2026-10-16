@@ -5,7 +5,7 @@ import { sanitizeInput } from '@/features/security/security';
  *
  * The settings app's "Personal details → Work" sheet and the accounts app's
  * signup wizard ask the same four questions about the same job, and both must
- * land in the same four columns of `"user"."user_profile"`. Two names for one
+ * land in the same four columns of `"public"."user_profile"`. Two names for one
  * fact is how a profile quietly loses an edit (the signup form called the job
  * title "Role" and put "Occupation" in the work-location column, so a person
  * who answered the signup wizard saw their job title in the wrong box forever).
@@ -24,7 +24,7 @@ import { sanitizeInput } from '@/features/security/security';
  * `apps/api/tests/profile-work.test.ts`.
  */
 
-/** Wire key → `"user"."user_profile"` column. Order is the order the forms ask. */
+/** Wire key → `"public"."user_profile"` column. Order is the order the forms ask. */
 export const WORK_COLUMNS = {
   companyRole: 'jobRole',
   companyName: 'jobCompany',

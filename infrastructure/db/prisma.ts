@@ -1,3 +1,4 @@
+import './ipv4-first';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
@@ -9,9 +10,14 @@ const globalForPrisma = globalThis as unknown as { prisma: PrismaClient; pgPool:
 // Supabase free tier allows ~60 concurrent connections; we keep our pool
 // conservative to leave room for migrations and other services.
 // DATABASE_POOL_MAX / DATABASE_POOL_MIN let each process size its pool so a
-// dev server + scripts stay under Supavisor's 20-connection session limit.
-const POOL_MAX = parseInt(process.env.DATABASE_POOL_MAX || '', 10) || (process.env.NODE_ENV === 'production' ? 8 : 12);
-const POOL_MIN = parseInt(process.env.DATABASE_POOL_MIN || '', 10) || (process.env.NODE_ENV === 'production' ? 3 : 4);
+// dev server + scripts stay under Supavisor's connection limit. The dev
+// defaults are deliberately small: the session-mode pooler caps the whole
+// project at ~15 server sessions, and every session-mode client holds one for
+// its lifetime, so a 12-connection dev pool plus a second process (or a
+// `prisma` CLI run) trips EMAXCONNSESSION and stalls requests on the 15s
+// checkout timeout.
+const POOL_MAX = parseInt(process.env.DATABASE_POOL_MAX || '', 10) || (process.env.NODE_ENV === 'production' ? 8 : 6);
+const POOL_MIN = parseInt(process.env.DATABASE_POOL_MIN || '', 10) || (process.env.NODE_ENV === 'production' ? 3 : 2);
 const POOL_CONFIG = {
   // Maximum number of clients in the pool.
   max: POOL_MAX,
@@ -98,7 +104,17 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
   if (now - lastWarmupTime < MIN_WARMUP_INTERVAL && !isColdStart) return;
   isWarming = true;
   lastWarmupTime = now;
+  try {
+    await warmAttempts(pool, isColdStart);
+  } finally {
+    // The success path used to `return` past this reset, leaving isWarming true
+    // for the life of the process — every cold-start re-warm after the first
+    // warm-up was then silently dropped.
+    isWarming = false;
+  }
+}
 
+async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
   const start = performance.now();
   const maxRetries = isColdStart ? 8 : 5; // more retries for cold starts
 
@@ -142,7 +158,9 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
         // Exponential backoff with jitter: 1s, 2s, 4s, 8s... up to 15s for cold starts
         const maxDelay = isColdStart ? 15000 : 8000;
         const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 500, maxDelay);
-        console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed after ${elapsed}ms, retrying in ${Math.round(delay)}ms...`);
+        const reason = err?.code || err?.message || 'unknown';
+        console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed (${reason}), ` +
+          `gave up after ${elapsed}ms, retrying in ${Math.round(delay)}ms...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
         console.error(`[DB-POOL] Warm-up failed after ${elapsed}ms (${maxRetries} attempts):`, err?.message);
@@ -150,7 +168,6 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
     }
   }
   // Don't throw — the pool will lazily connect on first real request
-  isWarming = false;
 }
 
 /** Re-warm pool after cold start detection (called from isDbHealthy) */

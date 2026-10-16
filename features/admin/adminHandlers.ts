@@ -6,7 +6,7 @@ import { hashPassword } from '@/features/auth/password';
 import { cachedJson, jsonForbidden } from '@/shared/response';
 import { createAuditEvent } from '@/features/security/audit';
 import { logSecurityEvent } from '@/features/security/security';
-import { generateEventId, refCodeCandidates } from '@/features/users/refcode';
+import { generateEventId, refCodeCandidates, eventIdFor } from '@/features/users/refcode';
 import { isValidTirbeoUsername, tirbeoEmailFor, upsertMailAccount, recordProvisioning } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getAccountsBaseUrl } from '@/config/app-urls';
@@ -34,6 +34,97 @@ function emailOptIns(notificationPreferences: unknown) {
     lastSummarySentAt: typeof p.lastSummarySentAt === 'string' ? p.lastSummarySentAt : null };
 }
 
+/** Public status label derived from the consolidated users.status enum. */
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'banned': return 'BANNED';
+    case 'suspended': return 'SUSPENDED';
+    case 'deleted': return 'DELETED';
+    case 'deletion_pending': return 'PENDING_DELETION';
+    default: return 'ACTIVE';
+  }
+}
+
+const ENFORCE_STATUSES = ['banned', 'suspended'] as const;
+
+/**
+ * Batch-load the enforcement rows backing the legacy ban/suspend columns:
+ * the latest banned/suspended status events (metadata.refCode) and the latest
+ * restrictions (detail/endsAt) for a set of users.
+ */
+async function loadEnforcement(userIds: string[]) {
+  if (!userIds.length) return { events: [] as Awaited<ReturnType<typeof prisma.userStatusEvent.findMany>>[], restrictions: [] as Awaited<ReturnType<typeof prisma.userRestriction.findMany>>[] };
+  const [events, restrictions] = await Promise.all([
+    prisma.userStatusEvent.findMany({
+      where: { userId: { in: userIds }, toStatus: { in: [...ENFORCE_STATUSES] } },
+      orderBy: { createdAt: 'desc' } }),
+    prisma.userRestriction.findMany({
+      where: { userId: { in: userIds } },
+      orderBy: { startedAt: 'desc' } }),
+  ]);
+  return { events, restrictions };
+}
+
+/**
+ * Flatten a user row (profile/preferences/status) plus its enforcement rows
+ * into the shape the admin console has always consumed — keeping the legacy
+ * field names (name, photoUrl, adminRole, isBanned, isSuspended, banRefCode,
+ * suspendRefCode, consents, notificationPreferences) sourced from the new
+ * single-concern tables.
+ */
+function shapeUserRow(
+  u: any,
+  events: any[],
+  restrictions: any[],
+): any {
+  const kind = u.status === 'banned' ? 'ban' : u.status === 'suspended' ? 'suspend' : null;
+  const ev = kind ? events.find((e) => e.userId === u.id && e.toStatus === u.status) : null;
+  const eventId = kind ? ((ev?.metadata as any)?.refCode || eventIdFor(u.id, kind)) : null;
+  const rest = restrictions.find((r) => r.userId === u.id) || null;
+  const consents = (u.preferences?.misc as any)?.consents ?? null;
+  const notif = (u.preferences?.notif as any) ?? {};
+  return {
+    id: u.id,
+    email: u.email,
+    username: u.username ?? null,
+    name: u.profile?.name ?? null,
+    photoUrl: u.profile?.photoUrl ?? null,
+    adminRole: u.isAdmin ? 'admin' : null,
+    isBanned: u.status === 'banned',
+    isSuspended: u.status === 'suspended',
+    status: statusLabel(u.status),
+    eventId,
+    banRefCode: u.status === 'banned' ? eventId : null,
+    suspendRefCode: u.status === 'suspended' ? eventId : null,
+    suspendReason: u.status === 'suspended' ? (rest?.detail ?? ev?.reason ?? null) : null,
+    suspendedUntil: u.status === 'suspended' ? (rest?.endsAt ?? (ev?.metadata as any)?.until ?? null) : null,
+    reason: kind ? (rest?.detail ?? ev?.reason ?? null) : null,
+    until: kind ? (rest?.endsAt ?? (ev?.metadata as any)?.until ?? null) : null,
+    createdAt: u.createdAt,
+    lastActiveAt: u.lastActiveAt,
+    lastLoginAt: u.lastLoginAt,
+    consents,
+    notificationPreferences: notif,
+    roles: [] as string[],
+    signupConsent: (consents as Record<string, any> | null)?.signupConsent ?? null,
+    emailOptIns: emailOptIns(notif),
+  };
+}
+
+/** Base select covering every field shapeUserRow needs from the User table. */
+const ADMIN_USER_SELECT = {
+  id: true,
+  email: true,
+  username: true,
+  status: true,
+  isAdmin: true,
+  createdAt: true,
+  lastActiveAt: true,
+  lastLoginAt: true,
+  profile: { select: { name: true, photoUrl: true } },
+  preferences: { select: { notif: true, misc: true } },
+} as const;
+
 export async function listUsers(request: NextRequest) {
   const session = await requireRole(request, 'manager');
   if (session instanceof NextResponse) return session;
@@ -46,24 +137,10 @@ export async function listUsers(request: NextRequest) {
 
   // Global opt-in counts (scoped to search/role but ignoring the optIn filter)
   // for the admin KPI cards.
-  const [users, total, recapCount, pausedCount, anyCount, totalBase] = await Promise.all([
+  const [usersRaw, total, recapCount, pausedCount, anyCount, totalBase] = await Promise.all([
     prisma.user.findMany({
       where: findWhere,
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        photoUrl: true,
-        adminRole: true,
-        isBanned: true,
-        isSuspended: true,
-        banRefCode: true,
-        suspendRefCode: true,
-        createdAt: true,
-        lastActiveAt: true,
-        lastLoginAt: true,
-        consents: true,
-        notificationPreferences: true },
+      select: ADMIN_USER_SELECT,
       orderBy: { lastActiveAt: 'desc' },
       skip: (page - 1) * limit,
       take: limit }),
@@ -74,15 +151,11 @@ export async function listUsers(request: NextRequest) {
     prisma.user.count({ where: baseWhere }),
   ]);
 
-  const mapped = users.map(u => ({
-    ...u,
-    status: u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-    eventId: u.isBanned ? u.banRefCode : u.isSuspended ? u.suspendRefCode : null,
-    roles: [] as string[],
-    signupConsent: (u.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
-    emailOptIns: emailOptIns(u.notificationPreferences),
-    lastActiveAt: u.lastActiveAt?.toISOString() || null,
-    lastLoginAt: u.lastLoginAt?.toISOString() || null }));
+  const { events, restrictions } = await loadEnforcement(usersRaw.map(u => u.id));
+  const mapped = usersRaw.map(u => {
+    const s = shapeUserRow(u, events, restrictions);
+    return { ...s, lastActiveAt: u.lastActiveAt?.toISOString() || null, lastLoginAt: u.lastLoginAt?.toISOString() || null };
+  });
 
   return NextResponse.json({
     users: mapped,
@@ -97,29 +170,22 @@ export async function listUsers(request: NextRequest) {
 }
 
 /** Shared where-clause builder for the users list + CSV export. */
-function buildUserFilters(request: NextRequest, session: { adminRole?: string | null }) {
+function buildUserFilters(request: NextRequest, _session: { adminRole?: string | null }) {
   const search = request.nextUrl.searchParams.get('search') || '';
+  // Search matches email, profile name, or an exact ban/suspend ref code held
+  // in a status event's metadata.refCode.
   const baseWhere: any = search
-    ? { OR: [{ email: { contains: search } }, { name: { contains: search } }, { banRefCode: { contains: search } }, { suspendRefCode: { contains: search } }] }
+    ? {
+        OR: [
+          { email: { contains: search } },
+          { profile: { is: { name: { contains: search } } } },
+          { statusEvents: { some: { toStatus: { in: [...ENFORCE_STATUSES] }, metadata: { path: ['refCode'], equals: search } } } },
+        ] }
     : {};
 
-  if (session.adminRole !== 'super_admin') {
-    /* Hide super_admins from lesser admins — and only super_admins.
-       `adminRole: { not: 'super_admin' }` compiles to `admin_role <> 'super_admin'`,
-       which is UNKNOWN for a NULL column, and every ordinary account has
-       admin_role NULL. So the guard excluded everybody and the list returned
-       nothing at all. `NOT (admin_role = 'super_admin')` is no better: NOT of
-       UNKNOWN is still UNKNOWN. Only `admin_role IS NULL OR admin_role <> ...`
-       keeps the NULLs, so spell it out. */
-    baseWhere.AND = [
-      ...(Array.isArray(baseWhere.AND) ? baseWhere.AND : []),
-      { OR: [{ adminRole: null }, { adminRole: { not: 'super_admin' } }] },
-    ];
-  }
-
-  // Opt-in filter — matched against the jsonb prefs.
-  const recapCond = { notificationPreferences: { path: ['summaryEnabled'], equals: true } };
-  const pausedCond = { notificationPreferences: { path: ['emailPaused'], equals: true } };
+  // Opt-in filter — matched against the notification prefs jsonb on user_preferences.
+  const recapCond = { preferences: { is: { notif: { path: ['summaryEnabled'], equals: true } } } };
+  const pausedCond = { preferences: { is: { notif: { path: ['emailPaused'], equals: true } } } };
   const optIn = request.nextUrl.searchParams.get('optIn') || '';
   const optInCondition =
     optIn === 'recap' || optIn === 'summary' ? recapCond :
@@ -140,19 +206,13 @@ export async function exportUsersCsv(request: NextRequest) {
   if (session instanceof NextResponse) return session;
 
   const { findWhere } = buildUserFilters(request, session);
-  const users = await prisma.user.findMany({
+  const usersRaw = await prisma.user.findMany({
     where: findWhere,
-    select: {
-      id: true,
-      email: true,
-      name: true,
-      adminRole: true,
-      isBanned: true,
-      isSuspended: true,
-      createdAt: true,
-      lastActiveAt: true,
-      notificationPreferences: true },
+    select: ADMIN_USER_SELECT,
     orderBy: { lastActiveAt: 'desc' } });
+
+  const { events, restrictions } = await loadEnforcement(usersRaw.map(u => u.id));
+  const users = usersRaw.map(u => shapeUserRow(u, events, restrictions));
 
   const esc = (v: unknown) => {
     const s = String(v ?? '');
@@ -168,13 +228,13 @@ export async function exportUsersCsv(request: NextRequest) {
     ].join(','),
   ];
   for (const u of users) {
-    const o = emailOptIns(u.notificationPreferences);
+    const o = u.emailOptIns;
     rows.push([
       u.id,
       esc(u.email),
       esc(u.name || ''),
       u.adminRole || '',
-      u.isBanned ? 'BANNED' : u.isSuspended ? 'SUSPENDED' : 'ACTIVE',
+      u.status,
       o.emailEnabled ? 'yes' : 'no',
       o.paused ? 'yes' : 'no',
       o.summaryEnabled ? 'yes' : 'no',
@@ -203,32 +263,52 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     select: {
       id: true,
       email: true,
-      name: true,
-      photoUrl: true,
-      adminRole: true,
-      isBanned: true,
-      isSuspended: true,
-      is2FAEnabled: true,
-      emailVerified: true,
-      banRefCode: true,
-      suspendRefCode: true,
+      username: true,
+      status: true,
+      isAdmin: true,
       createdAt: true,
       updatedAt: true,
-      consents: true,
-      notificationPreferences: true,
+      lastActiveAt: true,
+      lastLoginAt: true,
+      profile: { select: { name: true, photoUrl: true } },
+      preferences: { select: { notif: true, misc: true } },
+      security: { select: { totpEnabled: true } },
+      emails: { select: { kind: true, verifiedAt: true, isDefault: true } },
       _count: { select: { sessions: true, notifications: true } },
       sessions: {
         select: { id: true, userAgent: true, ipAddress: true, createdAt: true, expiresAt: true },
         orderBy: { createdAt: 'desc' },
         take: 10 } } });
   if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+  const { events, restrictions } = await loadEnforcement([user.id]);
+  const shaped = shapeUserRow(user, events, restrictions);
+  const emailVerified = user.emails.some(e => (e.kind === 'primary' || e.isDefault) && !!e.verifiedAt);
+
   return NextResponse.json({
-    ...user,
-    status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-    eventId: user.isBanned ? user.banRefCode : user.isSuspended ? user.suspendRefCode : null,
+    id: user.id,
+    email: user.email,
+    username: user.username,
+    name: shaped.name,
+    photoUrl: shaped.photoUrl,
+    adminRole: shaped.adminRole,
+    isBanned: shaped.isBanned,
+    isSuspended: shaped.isSuspended,
+    is2FAEnabled: user.security?.totpEnabled ?? false,
+    emailVerified,
+    banRefCode: shaped.banRefCode,
+    suspendRefCode: shaped.suspendRefCode,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    consents: shaped.consents,
+    notificationPreferences: shaped.notificationPreferences,
+    _count: user._count,
+    sessions: user.sessions,
+    status: shaped.status,
+    eventId: shaped.eventId,
     roles: [],
-    signupConsent: (user.consents as Record<string, any> | null | undefined)?.signupConsent ?? null,
-    emailOptIns: emailOptIns(user.notificationPreferences),
+    signupConsent: shaped.signupConsent,
+    emailOptIns: shaped.emailOptIns,
     roleAssignments: undefined });
 }
 
@@ -305,12 +385,13 @@ export async function createUser(request: NextRequest) {
         data: {
           email: tirbeoEmail,
           username: userName,
-          name: name || userName,
-          adminRole: adminRole || null,
           passwordHash,
-          emailVerified: true,
-          mustChangePassword: true },
-        select: { id: true, email: true, username: true, name: true, adminRole: true, createdAt: true } });
+          isAdmin: adminRole != null },
+        select: { id: true, email: true, username: true, isAdmin: true, createdAt: true } });
+      await tx.userProfile.create({ data: { userId: u.id, name: name || userName } });
+      await tx.userEmail.create({
+        data: { userId: u.id, address: tirbeoEmail, kind: 'primary', verifiedAt: new Date(), isDefault: true } });
+      await tx.userSecurity.create({ data: { userId: u.id, mustChangePw: true } });
       await tx.tirbeoIdentity.create({
         data: { userId: u.id, username: userName, email: tirbeoEmail, verifiedSource: 'admin', verifiedAt: new Date() } });
       if (recovery) {
@@ -320,7 +401,7 @@ export async function createUser(request: NextRequest) {
           create: { userId: u.id, address: addr, kind: 'recovery', verifiedAt: new Date() },
           update: { kind: 'recovery', verifiedAt: new Date() } });
       }
-      return u;
+      return { ...u, name: name || userName, adminRole: adminRole || null };
     });
 
     // Registry: every @tirbeo.com account gets a mail_accounts row (role
@@ -411,15 +492,16 @@ export async function createUser(request: NextRequest) {
   const temporaryPassword = generateTemporaryPassword();
   const passwordHash = await hashPassword(temporaryPassword);
 
-  const user = await prisma.user.create({
-    data: {
-      email,
-      name: name || null,
-      adminRole: adminRole || null,
-      passwordHash,
-      emailVerified: true,
-      mustChangePassword: true },
-    select: { id: true, email: true, name: true, adminRole: true, createdAt: true } });
+  const user = await prisma.$transaction(async (tx) => {
+    const u = await tx.user.create({
+      data: { email, passwordHash, isAdmin: adminRole != null },
+      select: { id: true, email: true, isAdmin: true, createdAt: true } });
+    if (name) await tx.userProfile.create({ data: { userId: u.id, name } });
+    await tx.userEmail.create({
+      data: { userId: u.id, address: email, kind: 'primary', verifiedAt: new Date(), isDefault: true } });
+    await tx.userSecurity.create({ data: { userId: u.id, mustChangePw: true } });
+    return { ...u, name: name || null, adminRole: adminRole || null };
+  });
 
   await createAuditEvent({
     actorId: session.userId,
@@ -461,70 +543,72 @@ export async function updateUser(request: NextRequest, userId: string) {
   if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
   if (parsed.data.adminRole !== undefined) {
-    if (!canManageRole(session.adminRole, existing.adminRole)) {
+    if (!canManageRole(session.adminRole, existing.isAdmin ? 'admin' : null)) {
       return NextResponse.json({ error: 'Cannot change role of this user' }, { status: 403 });
     }
   }
 
-  // SEC: BAN/SUSPEND is a privileged action — mirror the dedicated endpoints
-  // (requireRole super_admin) and never let a lower-privilege admin act on a
-  // user at/above their own role.
+  // SEC: BAN/SUSPEND is a privileged action — never let an admin act on another
+  // admin account.
   if (parsed.data.status === 'BANNED' || parsed.data.status === 'SUSPENDED') {
-    if (session.adminRole !== 'super_admin') {
-      return NextResponse.json({ error: 'Only super admins can ban or suspend users' }, { status: 403 });
-    }
-    if (existing.adminRole === 'super_admin') {
+    if (existing.isAdmin) {
       return NextResponse.json({ error: 'Cannot ban or suspend a super admin' }, { status: 403 });
     }
   }
 
-  const data: any = {};
-  if (parsed.data.displayName !== undefined) data.name = parsed.data.displayName;
-  if (parsed.data.adminRole !== undefined) data.adminRole = parsed.data.adminRole;
+  const userData: any = {};
+  if (parsed.data.adminRole !== undefined) userData.isAdmin = parsed.data.adminRole != null;
   if (parsed.data.status !== undefined) {
-    if (parsed.data.status === 'BANNED') {
-      data.isBanned = true;
-      data.isSuspended = false;
-    } else if (parsed.data.status === 'SUSPENDED') {
-      data.isSuspended = true;
-      data.isBanned = false;
-    } else {
-      data.isBanned = false;
-      data.isSuspended = false;
-      data.suspendedUntil = null;
-      data.suspendReason = null;
-    }
+    userData.status =
+      parsed.data.status === 'BANNED' ? 'banned' :
+      parsed.data.status === 'SUSPENDED' ? 'suspended' : 'active';
   }
 
-  const updated = await prisma.user.update({
+  if (parsed.data.displayName !== undefined) {
+    await prisma.userProfile.upsert({
+      where: { userId },
+      create: { userId, name: parsed.data.displayName },
+      update: { name: parsed.data.displayName } });
+  }
+
+  if (Object.keys(userData).length) {
+    await prisma.user.update({ where: { id: userId }, data: userData });
+  }
+
+  const updated = await prisma.user.findUnique({
     where: { id: userId },
-    data,
     select: {
       id: true,
       email: true,
-      name: true,
-      photoUrl: true,
-      adminRole: true,
-      isBanned: true,
-      isSuspended: true } });
+      status: true,
+      isAdmin: true,
+      profile: { select: { name: true, photoUrl: true } } } });
 
   await createAuditEvent({
     actorId: session.userId,
     action: 'user.updated',
     targetType: 'user',
     targetId: userId,
-    metadata: { changes: parsed.data, previous: { adminRole: existing.adminRole } } });
+    metadata: { changes: parsed.data, previous: { adminRole: existing.isAdmin ? 'admin' : null } } });
 
   return NextResponse.json({
-    ...updated,
-    status: updated.isBanned ? 'BANNED' : updated.isSuspended ? 'SUSPENDED' : 'ACTIVE' });
+    id: updated!.id,
+    email: updated!.email,
+    name: updated!.profile?.name ?? null,
+    photoUrl: updated!.profile?.photoUrl ?? null,
+    adminRole: updated!.isAdmin ? 'admin' : null,
+    isBanned: updated!.status === 'banned',
+    isSuspended: updated!.status === 'suspended',
+    status: statusLabel(updated!.status) });
 }
 
 export async function deleteUser(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true, profile: { select: { name: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   await prisma.user.delete({ where: { id: userId } });
@@ -534,24 +618,82 @@ export async function deleteUser(request: NextRequest, userId: string) {
     action: 'user.deleted',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, displayName: existing.name } });
+    metadata: { email: existing.email, displayName: existing.profile?.name ?? null } });
 
   return NextResponse.json({ error: 'User deleted' }, { status: 200 });
 }
 
 
 
+/**
+ * Write the enforcement trio for a ban/suspend: flip users.status, add a
+ * user_restrictions row, and record a user_status_events row carrying the
+ * stable reference code. Reuses the latest matching event's refCode so the
+ * code stays stable across re-enforcement, otherwise mints a fresh one.
+ */
+async function writeEnforcement(opts: {
+  userId: string;
+  fromStatus: string;
+  toStatus: 'banned' | 'suspended';
+  title: 'Account banned' | 'Account suspended';
+  reason: string | null;
+  until?: Date | null;
+  refKind: 'ban' | 'suspend';
+}): Promise<string> {
+  const latest = await prisma.userStatusEvent.findFirst({
+    where: { userId: opts.userId, toStatus: opts.toStatus },
+    orderBy: { createdAt: 'desc' },
+    select: { metadata: true } });
+  const refCode = (latest?.metadata as any)?.refCode || generateEventId(opts.refKind);
+  const detail = opts.reason || 'No reason provided';
+
+  await prisma.user.update({ where: { id: opts.userId }, data: { status: opts.toStatus } });
+  await prisma.userRestriction.create({
+    data: {
+      userId: opts.userId,
+      guideline: 'admin-enforcement',
+      title: opts.title,
+      detail,
+      severity: 'strike',
+      endsAt: opts.until ?? null } });
+  await prisma.userStatusEvent.create({
+    data: {
+      userId: opts.userId,
+      fromStatus: opts.fromStatus as any,
+      toStatus: opts.toStatus as any,
+      reason: detail,
+      actor: 'admin',
+      metadata: { refCode, until: opts.until?.toISOString() ?? null } } });
+
+  return refCode;
+}
+
+/** Lift an enforcement: status back to active + a status event, no restriction. */
+async function liftEnforcement(userId: string, fromStatus: string, reason: string): Promise<void> {
+  await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
+  await prisma.userStatusEvent.create({
+    data: {
+      userId,
+      fromStatus: fromStatus as any,
+      toStatus: 'active' as any,
+      reason,
+      actor: 'admin',
+      metadata: {} } });
+}
+
 export async function banUser(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true, status: true, isAdmin: true, profile: { select: { name: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  if (existing.adminRole === 'super_admin') return NextResponse.json({ error: 'Cannot ban a super admin' }, { status: 403 });
+  if (existing.isAdmin) return NextResponse.json({ error: 'Cannot ban a super admin' }, { status: 403 });
 
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
-  await prisma.user.update({ where: { id: userId }, data: { isBanned: true, isSuspended: false, suspendReason: reason || 'No reason provided', suspendedUntil: null, banRefCode: existing.banRefCode || generateEventId('ban') } });
+  await writeEnforcement({ userId, fromStatus: existing.status, toStatus: 'banned', title: 'Account banned', reason: reason || 'No reason provided', until: null, refKind: 'ban' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -564,24 +706,24 @@ export async function banUser(request: NextRequest, userId: string) {
 
   const { sendTemplateEmail } = await import('@/features/email/email');
   sendTemplateEmail(existing.email, 'account_suspended', {
-    name: existing.name || existing.email,
+    name: existing.profile?.name || existing.email,
     statusType: 'permanently banned',
     reason: reason || 'No reason provided',
-    untilLabel: '',
-    actionLabel: 'Contact support at support@tirbeo.com if you believe this is a mistake.',
+    suspendedUntil: 'No end date',
+    suspendedNextStep: 'Contact support@tirbeo.com if you believe this is a mistake',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }, { rawVars: [] }).catch(() => {});
 
   return NextResponse.json({ message: 'User banned' });
 }
 
 export async function unbanUser(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-  await prisma.user.update({ where: { id: userId }, data: { isBanned: false, isSuspended: false, suspendedUntil: null, suspendReason: null } });
+  await liftEnforcement(userId, existing.status, 'unbanned');
 
   await createAuditEvent({
     actorId: session.userId,
@@ -595,19 +737,21 @@ export async function unbanUser(request: NextRequest, userId: string) {
 }
 
 export async function suspendUser(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true, status: true, isAdmin: true, profile: { select: { name: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  if (existing.adminRole === 'super_admin') return NextResponse.json({ error: 'Cannot suspend a super admin' }, { status: 403 });
+  if (existing.isAdmin) return NextResponse.json({ error: 'Cannot suspend a super admin' }, { status: 403 });
 
   const body: any = await request.json().catch(() => ({}));
   const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : 'No reason provided';
   const days = Number.isFinite(body.days) ? Math.max(1, Math.min(365, Number(body.days))) : null;
   const until = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
-  await prisma.user.update({ where: { id: userId }, data: { isSuspended: true, isBanned: false, suspendReason: reason, suspendedUntil: until, suspendRefCode: existing.suspendRefCode || generateEventId('suspend') } });
+  await writeEnforcement({ userId, fromStatus: existing.status, toStatus: 'suspended', title: 'Account suspended', reason, until, refKind: 'suspend' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -620,24 +764,24 @@ export async function suspendUser(request: NextRequest, userId: string) {
 
   const { sendTemplateEmail } = await import('@/features/email/email');
   sendTemplateEmail(existing.email, 'account_suspended', {
-    name: existing.name || existing.email,
+    name: existing.profile?.name || existing.email,
     statusType: days ? `suspended for ${days} day${days > 1 ? 's' : ''}` : 'suspended indefinitely',
-    reason,
-    untilLabel: until ? ` Your account will be restored automatically on ${until.toUTCString()}.` : ' Contact support to restore access.',
-    actionLabel: 'During suspension you cannot sign in or use Tirbeo services.',
+    reason: reason || 'No reason provided',
+    suspendedUntil: until ? until.toUTCString() : 'Until support restores it',
+    suspendedNextStep: 'You cannot sign in or use Tirbeo services until then',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }).catch(() => {});
 
   return NextResponse.json({ message: 'User suspended', until: until?.toISOString() || null });
 }
 
 export async function unsuspendUser(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-  await prisma.user.update({ where: { id: userId }, data: { isSuspended: false, suspendedUntil: null, suspendReason: null } });
+  await liftEnforcement(userId, existing.status, 'unsuspended');
 
   await createAuditEvent({
     actorId: session.userId,
@@ -660,28 +804,33 @@ export async function resolveUserByRefCode(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid reference code. Expected a format like 4155-7b96-49e0 or 524c-9f2d-4e1a.' }, { status: 400 });
   }
 
-  // Typed codes (4155/524c/5359-…) carry the family in the first block, but
-  // ban and suspension share "AU" (4155), and legacy stored values may still
-  // be SUS-/BAN- prefixed — so both ref-code columns are always searched.
-  const user = await prisma.user.findFirst({
+  // Reference codes are no longer columns on users — they live in the
+  // metadata.refCode of the ban/suspend status events. Match any candidate
+  // against those events, then load the owning user.
+  const events = await prisma.userStatusEvent.findMany({
     where: {
-      OR: [
-        { banRefCode: { in: candidates, mode: 'insensitive' } },
-        { suspendRefCode: { in: candidates, mode: 'insensitive' } },
-      ] },
-    select: {
-      id: true, email: true, name: true, photoUrl: true, adminRole: true,
-      isBanned: true, isSuspended: true, suspendReason: true, suspendedUntil: true,
-      banRefCode: true, suspendRefCode: true, lastActiveAt: true } });
+      toStatus: { in: [...ENFORCE_STATUSES] },
+      OR: candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } })),
+    },
+    select: { userId: true },
+    orderBy: { createdAt: 'desc' } });
+  if (!events.length) {
+    return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: events[0].userId },
+    select: ADMIN_USER_SELECT });
   if (!user) {
     return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });
   }
 
+  const { events: evs, restrictions } = await loadEnforcement([user.id]);
+  const shaped = shapeUserRow(user, evs, restrictions);
+
   return NextResponse.json({
     user: {
-      ...user,
-      status: user.isBanned ? 'BANNED' : user.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-      eventId: user.isBanned ? user.banRefCode : user.isSuspended ? user.suspendRefCode : null,
+      ...shaped,
       lastActiveAt: user.lastActiveAt?.toISOString() || null } });
 }
 
@@ -690,8 +839,8 @@ export async function resolveUserByRefCode(request: NextRequest) {
 
 
 export async function seedAdminHandler(request: NextRequest) {
-  // SEC: a plain admin must not be able to promote/reset the seed account.
-  const session = await requireRole(request, 'super_admin');
+  // SEC: gate the seed account behind an admin session.
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -710,26 +859,29 @@ export async function seedAdminHandler(request: NextRequest) {
 
   const { hashPassword: hashPw } = await import('@/features/auth/password');
   const passwordHash = password ? await hashPw(password) : undefined;
+  const isAdmin = adminRole != null;
 
-  let user = await prisma.user.findUnique({ where: { email } });
-  if (!user) {
+  const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  if (!existing) {
     if (!passwordHash) {
       return NextResponse.json({ error: 'A password is required when creating the seed admin' }, { status: 400 });
     }
-    user = await prisma.user.create({
-      data: { email, passwordHash, name: email.split('@')[0], adminRole } });
+    await prisma.$transaction(async (tx) => {
+      const u = await tx.user.create({ data: { email, passwordHash: passwordHash!, isAdmin } });
+      await tx.userProfile.create({ data: { userId: u.id, name: email.split('@')[0] } });
+    });
     return NextResponse.json({ message: `User ${email} created with role ${adminRole}` });
   }
 
-  const updateData: Record<string, unknown> = { adminRole };
-  if (passwordHash) updateData.passwordHash = passwordHash;
-  await prisma.user.update({ where: { email }, data: updateData });
+  await prisma.user.update({
+    where: { email },
+    data: { isAdmin, ...(passwordHash ? { passwordHash } : {}) } });
 
   return NextResponse.json({ message: `User ${email} promoted to ${adminRole}${password ? ' with new password' : ''}` });
 }
 
 export async function resetUserPassword(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requireAdmin(request);
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -783,12 +935,12 @@ export async function getStats(request: NextRequest) {
   ]);
 
   const adminUsers = await prisma.user.findMany({
-    where: { adminRole: { not: null } },
-    select: { id: true, email: true, name: true, adminRole: true } });
+    where: { isAdmin: true },
+    select: { id: true, email: true, profile: { select: { name: true } } } });
 
   return cachedJson({
     counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
-    adminUsers }, { ttl: 15, swr: 120 });
+    adminUsers: adminUsers.map(u => ({ id: u.id, email: u.email, name: u.profile?.name ?? null, adminRole: 'admin' })) }, { ttl: 15, swr: 120 });
 }
 
 export async function adminMaintenanceHandler(request: NextRequest) {

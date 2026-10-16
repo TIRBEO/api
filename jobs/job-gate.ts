@@ -40,7 +40,7 @@ const JOB_INTERVALS: Record<JobName, number> = {
 
 async function ensureTable() {
   await prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS "ops"."job_runs" (
+    CREATE TABLE IF NOT EXISTS "public"."job_runs" (
       job_name TEXT PRIMARY KEY,
       last_run TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_duration_ms INT DEFAULT 0,
@@ -54,7 +54,7 @@ async function getLastRun(job: JobName): Promise<number> {
   await ensureTable();
   try {
     const rows = await prisma.$queryRawUnsafe<{ last_run: string }[]>(
-      `SELECT last_run FROM "ops"."job_runs" WHERE job_name = $1`, job
+      `SELECT last_run FROM "public"."job_runs" WHERE job_name = $1`, job
     );
     if (rows.length === 0) return 0;
     return new Date(rows[0].last_run).getTime();
@@ -67,13 +67,13 @@ async function recordRun(job: JobName, durationMs: number, status: string) {
   await ensureTable();
   try {
     await prisma.$executeRawUnsafe(`
-      INSERT INTO "ops"."job_runs" (job_name, last_run, last_duration_ms, last_status, run_count)
+      INSERT INTO "public"."job_runs" (job_name, last_run, last_duration_ms, last_status, run_count)
       VALUES ($1, NOW(), $2, $3, 1)
       ON CONFLICT (job_name) DO UPDATE SET
         last_run = NOW(),
         last_duration_ms = EXCLUDED.last_duration_ms,
         last_status = EXCLUDED.last_status,
-        run_count = "ops"."job_runs".run_count + 1
+        run_count = "public"."job_runs".run_count + 1
     `, job, Math.round(durationMs), status);
   } catch {}
 }

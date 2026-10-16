@@ -32,9 +32,14 @@ export async function knownAccountsHandler(request: NextRequest) {
     if (session) {
       const user = await prisma.user.findUnique({
         where: { id: session.userId },
-        select: { id: true, email: true, name: true, photoUrl: true },
+        select: { id: true, email: true, profile: { select: { name: true, photoUrl: true } } },
       });
-      if (user) current = user;
+      if (user) current = {
+        id: user.id,
+        email: user.email,
+        name: user.profile?.name ?? null,
+        photoUrl: user.profile?.photoUrl ?? null,
+      };
     }
 
     return NextResponse.json({ accounts, current });
@@ -66,17 +71,23 @@ export async function switchAccountHandler(request: NextRequest) {
 
     const target = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, name: true, photoUrl: true, isBanned: true, isSuspended: true },
+      select: { id: true, email: true, status: true, profile: { select: { name: true, photoUrl: true } } },
     });
     if (!target) return jsonUnauthorized();
-    if (target.isBanned || target.isSuspended) {
+    if (target.status === 'banned' || target.status === 'suspended' || target.status === 'deleted') {
       return jsonForbidden('This account is currently unavailable');
     }
+    const targetUser = {
+      id: target.id,
+      email: target.email,
+      name: target.profile?.name ?? null,
+      photoUrl: target.profile?.photoUrl ?? null,
+    };
 
     // Already on this account — no-op.
     if (session.userId === target.id) {
       return NextResponse.json({
-        user: { id: target.id, email: target.email, name: target.name, photoUrl: target.photoUrl },
+        user: targetUser,
         switched: false,
       });
     }
@@ -98,7 +109,7 @@ export async function switchAccountHandler(request: NextRequest) {
 
     const { token, refreshToken, saveLoginInfo } = await createSession(target.id, userAgent, ip);
     const res = NextResponse.json({
-      user: { id: target.id, email: target.email, name: target.name, photoUrl: target.photoUrl },
+      user: targetUser,
       switched: true,
     });
     setSessionCookie(res, token, refreshToken, request, { shortSession: !saveLoginInfo });

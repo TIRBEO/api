@@ -1,7 +1,7 @@
 /**
  * The recovery email as it is shown to somebody who is not signed in.
  *
- * The security hub writes a recovery address as a row in `"email"."user_email"`
+ * The security hub writes a recovery address as a row in `"public"."user_email"`
  * with `kind = 'recovery'`; it only counts once `verified_at` is set, because a
  * typed address is a contact, not a proven mailbox. Password reset may be
  * delivered to it — but only when it is proven, and only ever masked: this is

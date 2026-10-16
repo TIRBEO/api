@@ -89,7 +89,6 @@ export async function POST(request: NextRequest) {
     // ─── Step 3: Delete critical user-owned rows ───
     // Cascade handles most relations, but delete the sensitive ones explicitly.
     const deleteOps = [
-      prisma.apiKey.deleteMany({ where: { userId: session.userId } }),
       prisma.otp.deleteMany({ where: { userId: session.userId } }),
       prisma.passkey.deleteMany({ where: { userId: session.userId } }),
       prisma.notification.deleteMany({ where: { userId: session.userId } }),

@@ -1,24 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
 import { createNotification } from '@/features/notifications/notifications';
 import { sendBroadcastWs } from '@/infrastructure/realtime/ws-deliver';
 
+/**
+ * Who may be mailed a product update, read from the stores that actually
+ * decide it: the account status on users, the person's own switches on
+ * user_preferences.notif (the only place the settings screens write), the
+ * verified login address on user_email, and the display name on user_profile.
+ * These predicates used to name users.notification_preferences,
+ * users.email_verified, users.is_banned and users.name — columns this schema
+ * does not have, so every query here failed and the broadcast sent nothing.
+ */
+const emailedScope = Prisma.sql`
+  FROM "public"."users" u
+  LEFT JOIN "public"."user_profile" prof ON prof."user_id" = u."id"
+  LEFT JOIN "public"."user_preferences" pr ON pr."user_id" = u."id"
+  LEFT JOIN "public"."user_email" e ON e."user_id" = u."id" AND e."is_default" = true
+  WHERE u."status" NOT IN ('deleted', 'banned', 'suspended')
+    AND COALESCE((pr."notif" ->> 'email')::boolean, true)
+    AND COALESCE((pr."notif" ->> 'productEmail')::boolean, false)
+    AND e."verified_at" IS NOT NULL`;
+
 /** Recipient count for the composer preview. */
 export const GET = withAdmin(async () => {
   const rows = await prisma.$queryRaw<Array<{ n: bigint }>>`
-    SELECT COUNT(*)::bigint AS n FROM "user"."users"
-    WHERE "deleted_at" IS NULL AND "is_banned" = false
-      AND ("notification_preferences"->>'email')::boolean = true
-      AND ("notification_preferences"->>'productEmail')::boolean = true
-      AND "email_verified" = true`;
+    SELECT COUNT(*)::bigint AS n ${emailedScope}`;
   return NextResponse.json({ recipients: Number(rows[0]?.n ?? 0) });
 });
 
 /**
  * Product-update broadcast.
- * Sends an email ONLY to users who opted in to product emails
- * (users.notification_preferences.email AND productEmail) and are active.
+ * Sends an email ONLY to users who opted in to product emails and are active.
  */
 export const POST = withAdmin(async (request: NextRequest) => {
   const body: any = await request.json();
@@ -36,11 +51,7 @@ export const POST = withAdmin(async (request: NextRequest) => {
 
   type Row = { id: string; email: string; name: string | null };
   const recipients = await prisma.$queryRaw<Row[]>`
-    SELECT "id", "email", "name" FROM "user"."users"
-    WHERE "deleted_at" IS NULL AND "is_banned" = false
-      AND ("notification_preferences"->>'email')::boolean = true
-      AND ("notification_preferences"->>'productEmail')::boolean = true
-      AND "email_verified" = true
+    SELECT u."id", u."email", prof."name" ${emailedScope}
     LIMIT 10000`;
 
   if (recipients.length === 0) {
@@ -72,12 +83,16 @@ export const POST = withAdmin(async (request: NextRequest) => {
 
   console.log(`[BROADCAST] Product update "${title}" — ${sent} sent, ${failed} failed`);
 
-  // Also create in-app notifications for all opted-in users (not just email recipients)
+  // Also create in-app notifications for everyone who takes product notices —
+  // that channel answers to productPush, not to the email switch.
   const allProductUsers = await prisma.$queryRaw<Array<{ id: string }>>`
-    SELECT "id" FROM "user"."users"
-    WHERE "deleted_at" IS NULL AND "is_banned" = false
-      AND COALESCE(("notification_preferences"->>'product')::boolean, true) = true`;
-  
+    SELECT u."id"
+    FROM "public"."users" u
+    LEFT JOIN "public"."user_preferences" pr ON pr."user_id" = u."id"
+    WHERE u."status" NOT IN ('deleted', 'banned', 'suspended')
+      AND COALESCE((pr."notif" ->> 'productPush')::boolean, true)
+    LIMIT 10000`;
+
   for (const u of allProductUsers) {
     createNotification({
       userId: u.id,

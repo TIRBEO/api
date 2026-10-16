@@ -28,32 +28,8 @@ export function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quie
 // Security emails (login_alert, suspicious_login) are ALSO essential —
 // users cannot unsubscribe from security notifications.
 
-export const ESSENTIAL_TEMPLATES = new Set([
-  // Auth / OTPs
-  'signup_otp',
-  'login_otp',
-  'reauth_otp',
-  'verify_email',
-  'password_reset_otp',
-  'password_reset_link',
-  'magic_link',
-  'password_changed',
-  'welcome',
-  // Security (compulsory — no unsubscribe)
-  'login_alert',
-  'suspicious_login',
-  'two_factor_disabled',
-  // Account
-  'account_recovery',
-  'account_suspended',
-  'account_deleted',
-  'delete_account_otp',
-  // Admin
-  'export_ready',
-  'admin_alert',
-  'system_alert',
-  'admin_crash_report',
-]);
+export { ESSENTIAL_TEMPLATES } from '@/features/email/email-classification';
+import { ESSENTIAL_TEMPLATES } from '@/features/email/email-classification';
 
 // ─── Email Brain mandatory detection ────────────────────────────
 // Brain templates use 'brain:<eventKey>' names. Mandatory security events

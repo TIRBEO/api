@@ -14,9 +14,8 @@ export async function GET(request: NextRequest) {
     const offset = parseInt(url.searchParams.get('offset') || '0', 10);
 
     // For non-admin users, only show emails sent to them.
-    // `role` is gone — the rebuild replaced it with an `isAdmin` flag plus an
-    // optional `adminRole` label, so selecting the old column made this whole
-    // route fail Prisma validation and answer 500 to everyone.
+    // Admin status lives in a single `isAdmin` flag on the consolidated users
+    // table, so select that instead of the old (removed) role column.
     const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true, isAdmin: true } });
     const isAdmin = user?.isAdmin === true;
     const where: any = isAdmin ? {} : { toEmail: user?.email };

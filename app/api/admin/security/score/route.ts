@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
       blockedUsers,
     ] = await Promise.all([
       prisma.user.count(),
-      prisma.user.count({ where: { is2FAEnabled: true } }),
+      prisma.userSecurity.count({ where: { totpEnabled: true } }),
       prisma.userSession.count({ where: { status: 'active' } }),
       prisma.userSession.count({ where: { status: 'revoked' } }),
       prisma.blocklist.count({ where: { targetType: 'ip' } }),
@@ -106,7 +106,9 @@ export async function GET(request: NextRequest) {
           eventType: true,
           createdAt: true,
           ipAddress: true,
-          user: { select: { email: true, name: true } } } })),
+          // A user's name is on user_profile; selecting `name` off the users row
+          // fails the query and this whole endpoint answers 500.
+          user: { select: { email: true, profile: { select: { name: true } } } } } })),
       trackQuery('security_events_group_by_ip', () => prisma.securityEvent.groupBy({
         by: ['ipAddress'],
         where: {
@@ -128,6 +130,11 @@ export async function GET(request: NextRequest) {
       count: ip._count.id,
       lastSeen: new Date().toISOString() }));
 
+    // Flatten the profile relation back into the shape the panel reads.
+    const criticalEvents = recentCritical.map((e: any) => ({
+      ...e,
+      user: e.user ? { email: e.user.email, name: e.user.profile?.name ?? null } : null }));
+
     const topEventTypes = eventTypes.map(et => ({
       type: et.eventType,
       count: et._count.id }));
@@ -136,7 +143,7 @@ export async function GET(request: NextRequest) {
       score: totalScore,
       factors,
       threatLevel,
-      recentCritical,
+      recentCritical: criticalEvents,
       topIPs,
       topEventTypes,
       stats: {

@@ -119,41 +119,34 @@ describe('isCadenceDue', () => {
 // ─── The recap sweep's own gate ────────────────────────────────────
 
 describe('recapChoice', () => {
-  it('needs an explicit yes in one of the two stores', () => {
-    expect(recapChoice({}, {}).summaryEnabled).toBe(false);
-    expect(recapChoice({ summaryEnabled: true }, {}).summaryEnabled).toBe(true);
-    expect(recapChoice({}, { summaryEnabled: true }).summaryEnabled).toBe(true);
-    // An "off" anywhere is off, whichever store the other one says yes in.
-    expect(recapChoice({ summaryEnabled: true }, { summaryEnabled: false }).summaryEnabled).toBe(false);
+  it('needs an explicit yes', () => {
+    expect(recapChoice({}).summaryEnabled).toBe(false);
+    expect(recapChoice({ summaryEnabled: true }).summaryEnabled).toBe(true);
+    expect(recapChoice({ summaryEnabled: false }).summaryEnabled).toBe(false);
   });
 
-  it('takes the cadence the settings screen wrote, not the mirror\'s', () => {
-    expect(recapChoice({ summaryFrequency: 'weekly' }, { summaryFrequency: 'monthly' }).summaryFrequency)
-      .toBe('monthly');
-    expect(recapChoice({}, { summaryFrequency: 'hourly' }).summaryFrequency).toBe('weekly');
+  it('takes the cadence the settings screen wrote', () => {
+    expect(recapChoice({ summaryFrequency: 'weekly' }).summaryFrequency).toBe('weekly');
+    expect(recapChoice({ summaryFrequency: 'monthly' }).summaryFrequency).toBe('monthly');
+    expect(recapChoice({ summaryFrequency: 'hourly' }).summaryFrequency).toBe('weekly');
+    expect(recapChoice({}).summaryFrequency).toBe('weekly');
   });
 
   it('holds a recap back while the account is paused', () => {
-    // The mailer would drop the send and then answer as if it had gone out, so
-    // a sweep that mailed into a pause would move the clock on a letter nobody
-    // read. Blocked here, the clock waits and the recap arrives when the pause
-    // lapses.
     const paused = { summaryEnabled: true, emailPaused: true, emailPausedUntil: null };
-    expect(recapChoice(paused, paused).mailBlocked).toBe(true);
+    expect(recapChoice(paused).mailBlocked).toBe(true);
 
-    // A pause with a date still ahead of us is the same hold.
     const timed = { summaryEnabled: true, emailPaused: true, emailPausedUntil: Date.now() + 3600_000 };
-    expect(recapChoice(timed, {})).toMatchObject({ mailBlocked: true, summaryEnabled: true });
+    expect(recapChoice(timed)).toMatchObject({ mailBlocked: true, summaryEnabled: true });
 
-    // A pause that already lapsed is not a pause.
-    expect(recapChoice({ ...timed, emailPausedUntil: Date.now() - 1000 }, {})).toMatchObject({
+    expect(recapChoice({ ...timed, emailPausedUntil: Date.now() - 1000 })).toMatchObject({
       mailBlocked: false,
     });
 
-    // And the global toggle / a one-click unsubscribe still block it.
-    expect(recapChoice({ summaryEnabled: true, email: false }, {}).mailBlocked).toBe(true);
-    expect(recapChoice({ summaryEnabled: true, unsubscribed: { all: true } }, {}).mailBlocked).toBe(true);
-    expect(recapChoice({ summaryEnabled: true }, {}).mailBlocked).toBe(false);
+    expect(recapChoice({ summaryEnabled: true, email: false }).mailBlocked).toBe(true);
+    expect(recapChoice({ summaryEnabled: true, unsubscribed: { all: true } }).mailBlocked).toBe(true);
+    expect(recapChoice({ summaryEnabled: true, unsubscribed: true }).mailBlocked).toBe(true);
+    expect(recapChoice({ summaryEnabled: true }).mailBlocked).toBe(false);
   });
 });
 

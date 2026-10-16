@@ -2,11 +2,9 @@
  * Render every email template and fail the build if one cannot be built.
  *
  * A template is code that nobody looks at until an email fails to arrive, and
- * the failure surfaces as a 500 in a route nobody was testing at the time —
- * which is exactly how namespaced JSX in the Outlook button kept the whole
- * account service answering 500. `tsc` was happy: the tags were declared as
- * React intrinsics, so only something that actually *built* the templates
- * would have noticed.
+ * the failure surfaces as a 500 in a route nobody was testing at the time.
+ * `tsc` cannot see that: a template that throws only shows up when something
+ * actually builds it.
  *
  * So this does the one thing a type checker cannot: build every template, in
  * the same way `sendEmail` will, and complain if one throws, comes back empty,
@@ -44,7 +42,10 @@ function varsFor(html: string): Record<string, string> {
 
 const problems: string[] = [];
 
-async function check(name: string, build: () => Promise<{ subject: string; html: string }>) {
+async function check(
+  name: string,
+  build: () => { subject: string; html: string } | Promise<{ subject: string; html: string }>,
+) {
   let built: { subject: string; html: string };
   try {
     built = await build();
@@ -76,7 +77,6 @@ async function check(name: string, build: () => Promise<{ subject: string; html:
 
 (async () => {
   const names = Object.keys(EMAIL_TEMPLATES);
-  const formNames: string[] = [];
   if (names.length === 0) problems.push('no templates are registered');
 
   /* First, the path sendEmail actually takes: build them all at once, the way
@@ -91,18 +91,14 @@ async function check(name: string, build: () => Promise<{ subject: string; html:
   for (const name of names) {
     await check(`EMAIL_TEMPLATES.${name}`, () => EMAIL_TEMPLATES[name](LOGO));
   }
-  for (const _name of formNames) {
-// removed: form notification templates not shipped
-  }
 
-  const total = names.length + formNames.length;
   if (problems.length) {
     console.error(`\n✗ ${problems.length} email template problem(s):\n`);
     for (const p of problems) console.error(`   ${p}`);
     console.error('');
     process.exit(1);
   }
-  console.log(`✓ ${total} email templates build and render (${names.length} transactional, ${formNames.length} form notifications)`);
+  console.log(`✓ ${names.length} email templates build and render`);
 })().catch((err) => {
   console.error(err);
   process.exit(1);

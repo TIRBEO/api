@@ -71,11 +71,15 @@ async function main() {
     const password = beforeHash
       ? await prisma.user.update({
           where: { id: user.id },
-          data: {
-            passwordHash: beforeHash,
-            // The real change flips this to false; put back whatever was there.
-            ...(mustChange === 'true' || mustChange === 'false' ? { mustChangePassword: mustChange === 'true' } : {}) } })
+          data: { passwordHash: beforeHash } })
       : null;
+    if (password && (mustChange === 'true' || mustChange === 'false')) {
+      await prisma.userSecurity.upsert({
+        where: { userId: user.id },
+        create: { userId: user.id, mustChangePw: mustChange === 'true' },
+        update: { mustChangePw: mustChange === 'true' },
+      });
+    }
 
     // Re-insert the sessions the password change signed out, ids and all.
     for (const row of sessions) {
@@ -136,7 +140,7 @@ async function main() {
     userId: user.id,
     since: new Date().toISOString(),
     passwordHash: user.passwordHash,
-    mustChangePassword: user.mustChangePassword,
+    mustChangePassword: !!(await prisma.userSecurity.findUnique({ where: { userId: user.id }, select: { mustChangePw: true } }))?.mustChangePw,
     hasPassword: !!user.passwordHash,
     sessions,
     events,

@@ -80,7 +80,7 @@ export async function adminPasskeyOptionsHandler(req: NextRequest) {
 /**
  * POST /api/admin/passkey/verify
  * Body: { credential, challengeNonce }
- * Verifies the WebAuthn assertion, requires the user to hold an adminRole,
+ * Verifies the WebAuthn assertion, requires the user to be an admin,
  * then mints a full session (cookie + bearer token) — exactly like the
  * password admin login.
  */
@@ -103,15 +103,15 @@ export async function adminPasskeyVerifyHandler(req: NextRequest) {
 
     const passkey = await prisma.passkey.findUnique({
       where: { credentialId: credential.id },
-      include: { user: { select: { id: true, email: true, name: true, adminRole: true, isBanned: true, isSuspended: true } } },
+      include: { user: { select: { id: true, email: true, status: true, isAdmin: true, profile: { select: { name: true } } } } },
     });
     if (!passkey) {
       return NextResponse.json({ error: 'Passkey not found' }, { status: 404 });
     }
-    if (passkey.user.isBanned || passkey.user.isSuspended) {
+    if (passkey.user.status === 'banned' || passkey.user.status === 'suspended') {
       return NextResponse.json({ error: 'Account suspended' }, { status: 403 });
     }
-    if (!passkey.user.adminRole) {
+    if (!passkey.user.isAdmin) {
       return NextResponse.json(
         { error: 'This account does not have admin access.' },
         { status: 403 },
@@ -165,7 +165,7 @@ export async function adminPasskeyVerifyHandler(req: NextRequest) {
     const res = NextResponse.json({
       ok: true,
       token,
-      user: { id: passkey.user.id, email: passkey.user.email, name: passkey.user.name, adminRole: passkey.user.adminRole },
+      user: { id: passkey.user.id, email: passkey.user.email, name: passkey.user.profile?.name ?? null, adminRole: passkey.user.isAdmin ? 'admin' : null },
     });
     setSessionCookie(res, token, undefined, req);
     return res;

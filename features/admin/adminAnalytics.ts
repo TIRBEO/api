@@ -35,7 +35,7 @@ export async function adminAnalyticsOverviewHandler(request: NextRequest) {
     prisma.userSession.count().catch(() => 0) as Promise<number>,
     prisma.userSession.count({ where: { expiresAt: { gt: now } } }).catch(() => 0) as Promise<number>,
     prisma.activityEvent.count({ where: { createdAt: { gte: monthAgo } } }).catch(() => 0) as Promise<number>,
-    prisma.apiKey.count({ where: { isActive: true, revokedAt: null } }).catch(() => 0) as Promise<number>,
+    Promise.resolve(0) as Promise<number>,
   ]);
 
   return NextResponse.json({

@@ -5,7 +5,7 @@ import { getSession } from '@/features/auth/http-guards';
 import { getQueryPerformanceStats, resetQueryStats, updateAlertConfig, getAlertConfig } from '@/infrastructure/observability/queryMonitor';
 
 function isAdmin(user: any): boolean {
-  return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
+  return user?.isAdmin === true;
 }
 
 /**

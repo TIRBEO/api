@@ -4,7 +4,6 @@ generator client {
 
 datasource db {
   provider   = "postgresql"
-  schemas = ["user", "preferences", "email", "security", "status", "activity", "ops"]
 }
 
 // ═══ The account ═══════════════════════════════════════════════════
@@ -12,54 +11,29 @@ datasource db {
 enum UserStatusKind {
   active
   restricted
+  banned
   suspended
   deactivated
   deletion_pending
   deleted
 
   @@map("user_status_kind")
-  @@schema("user")
 }
 
+// The account row holds ONLY identity + lifecycle + timestamps. Every other
+// concern has exactly one home: profile → user_profile (+ users.username),
+// preferences → user_preferences, contact addresses → user_email/user_phone,
+// 2FA & password policy → user_security, OAuth links → user_preferences.misc.oauth,
+// enforcement → status + user_restrictions/user_status_events,
+// deletion → status + user_deletion_requests.
 model User {
   id           String         @id @default(dbgenerated("(gen_random_uuid())::text"))
   username     String?        @unique
   email        String         @unique
   passwordHash String         @default("") @map("password_hash")
-  name         String?
-  photoUrl     String?        @map("photo_url")
   status       UserStatusKind @default(active)
   isAdmin      Boolean        @default(false) @map("is_admin")
-  adminRole    String?        @map("admin_role")
 
-  emailVerified Boolean?      @default(false) @map("email_verified")
-  phoneVerified Boolean?      @default(false) @map("phone_verified")
-
-  googleId     String?        @unique @map("google_id")
-  githubId     String?        @unique @map("github_id")
-  discordId    String?        @unique @map("discord_id")
-
-  theme        String?        @default("system")
-  language     String?        @default("en")
-  timezone     String?
-  consents     Json?          @default("{}")
-  notificationPreferences Json? @default("{\"email\":true,\"push\":true,\"security\":true,\"forms\":true,\"product\":false,\"support\":true,\"formsEmail\":true,\"formsPush\":true,\"productEmail\":false,\"productPush\":true,\"supportEmail\":true,\"supportPush\":true,\"digestEnabled\":false,\"digestFrequency\":\"daily\"}") @map("notification_preferences")
-  emailUnsubscribed Json?     @default("{}") @map("email_unsubscribed")
-
-  totpSecret   String?        @map("totp_secret")
-  is2FAEnabled Boolean?       @default(false) @map("is_2fa_enabled")
-  backupCodes  Json?          @default("[]")
-  mustChangePassword Boolean? @default(false) @map("must_change_password")
-
-  isBanned        Boolean?    @default(false) @map("is_banned")
-  isSuspended     Boolean?    @default(false) @map("is_suspended")
-  suspendReason   String?     @map("suspend_reason")
-  suspendedUntil  DateTime?   @map("suspended_until") @db.Timestamptz(6)
-  banRefCode      String?     @map("ban_ref_code")
-  suspendRefCode  String?     @map("suspend_ref_code")
-  deletedAt       DateTime?   @map("deleted_at") @db.Timestamptz(6)
-  scheduledDeletionAt DateTime? @map("scheduled_deletion_at") @db.Timestamptz(6)
-  deletionReason String? @map("deletion_reason")
   lastActiveAt    DateTime?   @map("last_active_at") @db.Timestamptz(6)
   lastLoginAt     DateTime?   @map("last_login_at") @db.Timestamptz(6)
   createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -84,20 +58,16 @@ model User {
   logins          UserLogin[]
   emailJobs       email_jobs[]
   otps            Otp[]
-  apiKeys         ApiKey[]
   blockedRecords  Blocklist[]
   securityEvents     SecurityEvent[]
-  deviceAccounts     deviceAccount[]
-  tipLogs            UserTipLog[]
   pushSubscriptions  PushSubscription[]
+  tipLogs            UserTipLog[]
   tirbeoIdentities   TirbeoIdentity[]
 
   @@index([status], map: "idx_users_status")
   @@index([createdAt], map: "idx_users_created")
   @@index([lastActiveAt], map: "idx_users_last_active")
-  @@index([deletedAt], map: "idx_users_deleted")
   @@map("users")
-  @@schema("user")
 }
 
 // ═══ user.profile ══════════════════════════════════════════════════
@@ -126,7 +96,6 @@ model UserProfile {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_profile")
-  @@schema("user")
 }
 
 // ═══ user.preferences ══════════════════════════════════════════════
@@ -142,7 +111,6 @@ model UserPreferences {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_preferences")
-  @@schema("preferences")
 }
 
 // ═══ user.email ════════════════════════════════════════════════════
@@ -161,7 +129,6 @@ model UserEmail {
   @@unique([userId, address])
   @@index([userId], map: "idx_user_email_user")
   @@map("user_email")
-  @@schema("email")
 }
 
 model UserPhone {
@@ -173,7 +140,6 @@ model UserPhone {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_phone")
-  @@schema("user")
 }
 
 // ═══ user.security ═════════════════════════════════════════════════
@@ -191,7 +157,6 @@ model UserSecurity {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_security")
-  @@schema("security")
 }
 
 model Passkey {
@@ -209,7 +174,6 @@ model Passkey {
 
   @@index([userId], map: "idx_passkeys_user")
   @@map("passkeys")
-  @@schema("security")
 }
 
 model UserSession {
@@ -232,7 +196,6 @@ model UserSession {
   @@index([tokenHash], map: "idx_user_sessions_hash")
   @@index([expiresAt], map: "idx_user_sessions_expires")
   @@map("user_sessions")
-  @@schema("security")
 }
 
 model UserDevice {
@@ -250,7 +213,6 @@ model UserDevice {
 
   @@index([userId], map: "idx_user_devices_user")
   @@map("user_devices")
-  @@schema("security")
 }
 
 model Otp {
@@ -269,7 +231,6 @@ model Otp {
   @@index([userId], map: "idx_otps_user")
   @@index([expiresAt], map: "idx_otps_expires")
   @@map("otps")
-  @@schema("security")
 }
 
 // ═══ user.status ═══════════════════════════════════════════════════
@@ -288,7 +249,6 @@ model UserStatusEvent {
 
   @@index([userId, createdAt(sort: Desc)], map: "idx_user_status_events_user")
   @@map("user_status_events")
-  @@schema("status")
 }
 
 model UserDeletionRequest {
@@ -304,7 +264,6 @@ model UserDeletionRequest {
 
   @@index([finalAt], map: "idx_user_deletion_pending")
   @@map("user_deletion_requests")
-  @@schema("status")
 }
 
 model UserDeactivation {
@@ -316,7 +275,6 @@ model UserDeactivation {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("user_deactivations")
-  @@schema("status")
 }
 
 model UserRestriction {
@@ -335,7 +293,6 @@ model UserRestriction {
 
   @@index([userId], map: "idx_user_restrictions_user")
   @@map("user_restrictions")
-  @@schema("status")
 }
 
 model UserAppeal {
@@ -352,7 +309,6 @@ model UserAppeal {
 
   @@index([restrictionId], map: "idx_user_appeals_restriction")
   @@map("user_appeals")
-  @@schema("status")
 }
 
 // ═══ activity ══════════════════════════════════════════════════════
@@ -364,7 +320,6 @@ enum Severity {
   critical
 
   @@map("severity")
-  @@schema("activity")
 }
 
 model ActivityEvent {
@@ -385,7 +340,6 @@ model ActivityEvent {
   @@index([kind], map: "idx_activity_kind")
   @@index([createdAt(sort: Desc)], map: "idx_activity_created")
   @@map("activity_events")
-  @@schema("activity")
 }
 
 /**
@@ -420,7 +374,6 @@ model DataExportRequest {
   @@index([userId, requestedAt(sort: Desc)], map: "idx_data_export_requests_user")
   @@index([status], map: "idx_data_export_requests_status")
   @@map("data_export_requests")
-  @@schema("activity")
 }
 
 model Notification {
@@ -442,7 +395,6 @@ model Notification {
   @@index([userId, isRead], map: "idx_notifications_user_read")
   @@index([userId, createdAt(sort: Desc)], map: "idx_notifications_user_created")
   @@map("notifications")
-  @@schema("user")
 }
 
 model UserLogin {
@@ -459,7 +411,6 @@ model UserLogin {
 
   @@index([userId, createdAt(sort: Desc)], map: "idx_user_logins_user")
   @@map("user_logins")
-  @@schema("security")
 }
 
 // ═══ email ═════════════════════════════════════════════════════════
@@ -473,7 +424,6 @@ enum EmailJobKind {
   test
 
   @@map("email_job_kind")
-  @@schema("email")
 }
 
 model EmailTemplate {
@@ -487,7 +437,6 @@ model EmailTemplate {
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("email_templates")
-  @@schema("email")
 }
 
 model email_jobs {
@@ -504,8 +453,6 @@ model email_jobs {
   subject     String?
   payload     Json     @default("{}")
   status      String   @default("queued")
-  contentVersionId String? @map("content_version_id")
-  definitionId String? @map("definition_id")
   attempts    Int      @default(0)
   maxAttempts Int      @default(3) @map("max_attempts")
   lastError   String?  @map("last_error")
@@ -523,7 +470,6 @@ model email_jobs {
   @@index([status, createdAt], map: "idx_email_jobs_status")
   @@index([userId], map: "idx_email_jobs_user")
   @@map("email_jobs")
-  @@schema("email")
 }
 
 model email_deliveries {
@@ -539,7 +485,6 @@ model email_deliveries {
   provider   String?
   providerId String?  @map("provider_id")
   messageId  String?  @map("message_id")
-  contentVersionId String? @map("content_version_id")
   openedAt   DateTime? @map("opened_at") @db.Timestamptz(6)
   clickedAt  DateTime? @map("clicked_at") @db.Timestamptz(6)
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
@@ -550,24 +495,8 @@ model email_deliveries {
   @@index([messageId], map: "idx_email_deliveries_message")
   @@index([status, createdAt], map: "idx_email_deliveries_status")
   @@map("email_deliveries")
-  @@schema("email")
 }
 
-model email_suppressions {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String?  @map("user_id")
-  address   String?  @unique
-  toEmail   String   @default("") @map("to_email")
-  eventKey  String   @default("") @map("event_key")
-  reason    String   @default("unsubscribe")
-  dedupeKey String?  @map("dedupe_key")
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([eventKey, createdAt], map: "idx_email_suppressions_event")
-  @@index([userId, createdAt], map: "idx_email_suppressions_user")
-  @@map("email_suppressions")
-  @@schema("email")
-}
 
 // ═══ app_config ════════════════════════════════════════════════════
 
@@ -578,31 +507,10 @@ model AppConfig {
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("app_config")
-  @@schema("ops")
 }
 
 // ═══ Restored feature models (from previous schema) ═════════════════
 
-model ApiKey {
-  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String    @map("user_id")
-  name        String
-  keyHash     String    @unique @map("key_hash")
-  keyPrefix   String    @map("key_prefix")
-  permissions Json?     @default("{}")
-  isActive    Boolean?  @default(true) @map("is_active")
-  lastUsedAt  DateTime? @map("last_used_at") @db.Timestamptz(6)
-  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
-  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  revokedAt   DateTime? @map("revoked_at") @db.Timestamptz(6)
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@index([keyHash], map: "idx_api_keys_hash")
-  @@index([keyPrefix], map: "idx_api_keys_prefix")
-  @@index([userId], map: "idx_api_keys_user")
-  @@map("api_keys")
-  @@schema("ops")
-}
 
 model Blocklist {
   id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -620,110 +528,12 @@ model Blocklist {
   @@index([isActive], map: "idx_blocklist_active")
   @@index([targetType], map: "idx_blocklist_type")
   @@map("blocklist")
-  @@schema("security")
 }
 
-model CaptchaChallenge {
-  id            String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  sessionId     String           @map("session_id")
-  userId        String?          @map("user_id")
-  difficulty    String           @default("easy")
-  challengeType String           @default("image")
-  question      String
-  answerHash    String           @map("answer_hash")
-  options       Json?
-  imageUrl      String?          @map("image_url")
-  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  expiresAt     DateTime         @map("expires_at") @db.Timestamptz(6)
-  attempts      Int              @default(0)
-  solved        Boolean          @default(false)
-  solvedAt      DateTime?        @map("solved_at") @db.Timestamptz(6)
-  ipAddress     String?          @map("ip_address")
-  userAgent     String?          @map("user_agent")
-  rayId         String           @unique @default(dbgenerated("(gen_random_uuid())::text"))
-  attemptLogs   CaptchaAttempt[]
 
-  @@index([sessionId])
-  @@index([userId])
-  @@index([rayId])
-  @@index([difficulty])
-  @@map("captcha_challenges")
-  @@schema("security")
-}
 
-model CaptchaAttempt {
-  id          String           @id @default(dbgenerated("(gen_random_uuid())::text"))
-  challengeId String           @map("challenge_id")
-  userId      String?          @map("user_id")
-  sessionId   String           @map("session_id")
-  answer      String
-  isCorrect   Boolean          @default(false) @map("is_correct")
-  ipAddress   String?          @map("ip_address")
-  userAgent   String?          @map("user_agent")
-  createdAt   DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
-  challenge   CaptchaChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
 
-  @@index([challengeId])
-  @@index([userId])
-  @@index([sessionId])
-  @@map("captcha_attempts")
-  @@schema("security")
-}
 
-model CaptchaBlock {
-  id          String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String?   @map("user_id")
-  sessionId   String    @map("session_id")
-  ipAddress   String    @map("ip_address")
-  reason      String
-  difficulty  String    @default("hard")
-  blockedAt   DateTime  @default(now()) @map("blocked_at") @db.Timestamptz(6)
-  expiresAt   DateTime? @map("expires_at") @db.Timestamptz(6)
-  unblockedAt DateTime? @map("unblocked_at") @db.Timestamptz(6)
-  unblockedBy String?   @map("unblocked_by")
-  rayId       String    @unique @default(dbgenerated("(gen_random_uuid())::text"))
-  metadata    Json?
-
-  @@index([userId])
-  @@index([sessionId])
-  @@index([ipAddress])
-  @@index([rayId])
-  @@map("captcha_blocks")
-  @@schema("security")
-}
-
-model CaptchaLog {
-  id         String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId     String?  @map("user_id")
-  sessionId  String   @map("session_id")
-  ipAddress  String   @map("ip_address")
-  eventType  String   @map("event_type")
-  difficulty String?
-  rayId      String?  @map("ray_id")
-  metadata   Json?
-  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([userId])
-  @@index([sessionId])
-  @@index([ipAddress])
-  @@index([eventType])
-  @@index([rayId])
-  @@map("captcha_logs")
-  @@schema("security")
-}
-
-model CaptchaSettings {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  key         String   @unique
-  value       Json
-  description String?
-  isActive    Boolean  @default(true) @map("is_active")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
-
-  @@map("captcha_settings")
-  @@schema("security")
-}
 
 model VerificationLimit {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -734,56 +544,14 @@ model VerificationLimit {
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("verification_limits")
-  @@schema("ops")
 }
 
-model Cooldown {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  key       String   @unique @map("key")
-  lastSent  DateTime @map("last_sent") @db.Timestamptz(6)
-  count     Int    @default(1)
-  windowStart DateTime @map("window_start") @db.Timestamptz(6)
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  @@index([expiresAt], map: "idx_cooldowns_expires")
-  @@map("cooldowns")
-  @@schema("ops")
-}
-
-model ai_generations {
-  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  task          String // generate | rewrite | translate | subject | digest_summary
-  fingerprint   String?  // sha256 of request — cache lookup
-  eventKey      String?  @map("event_key")
-  model         String
-  tone          String?
-  instruction   String?
-  targetLang    String?  @map("target_lang")
-  inputTokens   Int?     @map("input_tokens")
-  outputTokens  Int?     @map("output_tokens")
-  costEstimate  Float?   @map("cost_estimate")
-  status        String   @default("succeeded") // succeeded | failed
-  error         String?
-  cached        Boolean  @default(false)
-  usedCount     Int      @default(0) @map("used_count")
-  requestedBy   String?  @map("requested_by")
-  resultSubject String?  @map("result_subject")
-  resultBlocks  Json?    @map("result_blocks")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([fingerprint], map: "idx_ai_generations_fingerprint")
-  @@index([task, createdAt], map: "idx_ai_generations_task_time")
-  @@map("ai_generations")
-  @@schema("ops")
-}
 
 enum session_status {
   active
   expired
   revoked
-  @@schema("security")
 }
 
 model SecurityEvent {
@@ -803,22 +571,8 @@ model SecurityEvent {
   @@index([userId, createdAt(sort: Desc)], map: "idx_security_events_user_created")
   @@index([severity, createdAt(sort: Desc)], map: "idx_security_events_severity_created")
   @@map("security_events")
-  @@schema("security")
 }
 
-model deviceAccount {
-  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
-  deviceId   String    @map("device_id")
-  userId     String    @map("user_id")
-  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([deviceId, userId], map: "idx_device_accounts_device_user")
-  @@index([userId], map: "idx_device_accounts_user")
-  @@map("device_accounts")
-  @@schema("security")
-}
 
 model UserTipLog {
   id     String   @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -830,7 +584,6 @@ model UserTipLog {
   @@unique([userId, tipId])
   @@index([userId], map: "idx_tip_logs_user")
   @@map("user_tip_logs")
-  @@schema("activity")
 }
 
 model PushSubscription {
@@ -847,7 +600,6 @@ model PushSubscription {
   @@index([userId], map: "idx_push_subscriptions_user")
   @@index([endpoint], map: "idx_push_subscriptions_endpoint")
   @@map("push_subscriptions")
-  @@schema("user")
 }
 
 model TirbeoIdentity {
@@ -863,7 +615,6 @@ model TirbeoIdentity {
 
   @@index([userId], map: "idx_tirbeo_identities_user")
   @@map("identities")
-  @@schema("user")
 }
 
 model emailConfig {
@@ -896,110 +647,10 @@ model emailConfig {
   updatedAt        DateTime @updatedAt @db.Timestamptz(6)
 
   @@map("email_configs")
-  @@schema("email")
 }
 
-model email_events {
-  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  eventKey     String   @unique @map("event_key")
-  category     String
-  delivery     String   @default("immediate")
-  mandatory    Boolean  @default(false)
-  description  String?
-  defaultVars  Json?    @map("default_vars")
-  enabled      Boolean  @default(true)
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  definitions email_definitions[]
 
-  @@index([category])
-  @@map("email_events")
-  @@schema("email")
-}
 
-model email_definitions {
-  id              String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  eventKey        String   @map("event_key")
-  name            String
-  status          String   @default("draft")
-  activeVersionId String?  @map("active_version_id")
-  createdBy       String?  @map("created_by")
-  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  event    email_events     @relation(fields: [eventKey], references: [eventKey], onDelete: Cascade)
-  versions email_versions[]
 
-  @@unique([eventKey, name], map: "idx_email_definitions_event_name")
-  @@index([status])
-  @@map("email_definitions")
-  @@schema("email")
-}
-
-model email_versions {
-  id           String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  definitionId String   @map("definition_id")
-  version      Int
-  subject      String
-  blocks       Json
-  language     String   @default("en")
-  origin       String   @default("ai")
-  status       String   @default("draft")
-  createdBy    String?  @map("created_by")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  definition email_definitions @relation(fields: [definitionId], references: [id], onDelete: Cascade)
-
-  @@unique([definitionId, language, version], map: "idx_email_versions_def_lang_ver")
-  @@index([definitionId, status], map: "idx_email_versions_def_status")
-  @@map("email_versions")
-  @@schema("email")
-}
-
-model email_preferences {
-  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String   @map("user_id")
-  eventKey  String   @map("event_key")
-  frequency String   @default("default")
-  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  @@unique([userId, eventKey], map: "idx_email_prefs_user_event")
-  @@map("email_preferences")
-  @@schema("email")
-}
-
-model email_digest_items {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String   @map("user_id")
-  category    String
-  entityGroup String   @map("entity_group")
-  title       String
-  body        String?
-  importance  Int      @default(0)
-  dedupeKey   String?  @map("dedupe_key")
-  payload     Json     @default("{}")
-  consumed    Boolean  @default(false)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@unique([userId, dedupeKey], map: "idx_email_digest_items_dedupe")
-  @@index([userId, consumed, createdAt], map: "idx_email_digest_items_poll")
-  @@map("email_digest_items")
-  @@schema("email")
-}
-
-model email_digests {
-  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId      String   @map("user_id")
-  cadence     String
-  itemCount   Int      @default(0) @map("item_count")
-  rangeStart  DateTime @map("range_start") @db.Timestamptz(6)
-  rangeEnd    DateTime @map("range_end") @db.Timestamptz(6)
-  aiEnhanced  Boolean  @default(false) @map("ai_enhanced")
-  contentVersionId String? @map("content_version_id")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([userId, cadence, createdAt], map: "idx_email_digests_user")
-  @@map("email_digests")
-  @@schema("email")
-}

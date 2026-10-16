@@ -46,41 +46,29 @@ async function registerResetFailedAttempt(otpId: string, attempts: number) {
 }
 
 /**
- * Shared send helper — routes through the Email Brain decision engine.
- * Security-critical values (OTP code, reset URL) go into the Redis secure
- * store, never into the DB job payload. Returns false when the value could
- * not be secured (Redis down) — callers then log and fall back to the legacy
- * inline send so the reset request still reaches the user.
+ * Send through the features/email pipeline and WAIT for the result.
+ * Callers turn a false result into a real error response — the old
+ * fire-and-forget pattern reported "reset code sent" even when the
+ * provider rejected the mail outright.
  */
-async function sendViaEmailBrain(_opts: {
-  eventKey: string;
-  toEmail: string;
-  userId: string;
-  name: string;
-  secureVars: Record<string, string>;
-  dedupeKey: string;
-}): Promise<boolean> {
-  // Email Brain is retired. Its queue wrote to a legacy `email_jobs` shape
-  // (dedupe_key / event_key columns) that no longer exists, so it threw and
-  // broke password reset. Always fall through to the caller's inline send,
-  // which delivers via the working features/email pipeline.
-  return false;
-}
-
-/** Legacy inline send (existing delivery layer + suppression rules). */
 async function sendInline(
   to: string,
   templateName: string,
   variables: Record<string, string>,
   logTag: string,
-): Promise<void> {
+): Promise<{ success: boolean; error?: string }> {
   const { sendTemplateEmail } = await import('@/features/email/email');
-  sendTemplateEmail(to, templateName, variables)
-    .then((result) => {
-      if (!result.success) console.error(`[${logTag}] Email send failed: ${result.error}`);
-    })
-    .catch((err) => console.error(`[${logTag}] Email send threw:`, err?.message));
+  try {
+    const result = await sendTemplateEmail(to, templateName, variables);
+    if (!result.success) console.error(`[${logTag}] Email send failed: ${result.error}`);
+    return result;
+  } catch (err: any) {
+    console.error(`[${logTag}] Email send threw:`, err?.message || err);
+    return { success: false, error: String(err?.message || err) };
+  }
 }
+
+const SEND_FAILED = 'Could not send the email. Please try again.';
 
 // Request password reset with OTP only — sends to primary email ONLY
 export async function requestPasswordResetOtp(email: string): Promise<{ success: boolean; error?: string; code?: string }> {
@@ -98,19 +86,8 @@ export async function requestPasswordResetOtp(email: string): Promise<{ success:
     data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
   });
 
-  const requestId = crypto.randomUUID();
-  const sent = await sendViaEmailBrain({
-    eventKey: 'auth.password_reset',
-    toEmail: email,
-    userId: user.id,
-    name: user.name || 'there',
-    secureVars: { otpCode: code, 'reset.code': code },
-    dedupeKey: `otp:${user.id}:${requestId}`,
-  });
-  if (!sent) {
-    console.warn('[PASSWORD RESET] secure store unavailable — falling back to inline send');
-    sendInline(email, 'password_reset_otp', { OTP: code, otp: code, name: user.name || 'there' }, 'PASSWORD RESET OTP');
-  }
+  const send = await sendInline(email, 'password_reset_otp', { OTP: code, otp: code, name: user.name || 'there' }, 'PASSWORD RESET OTP');
+  if (!send.success) return { success: false, error: SEND_FAILED };
 
   return { success: true, code };
 }
@@ -124,20 +101,8 @@ export async function requestPasswordResetMagicLink(email: string): Promise<{ su
 
   const resetToken = await signPasswordResetToken(user.id);
   const resetUrl = `${getAccountsBaseUrl()}/reset-password?token=${resetToken}`;
-  const requestId = crypto.randomUUID();
-
-  const sent = await sendViaEmailBrain({
-    eventKey: 'auth.password_reset',
-    toEmail: email,
-    userId: user.id,
-    name: user.name || 'there',
-    secureVars: { resetUrl },
-    dedupeKey: `link:${user.id}:${requestId}`,
-  });
-  if (!sent) {
-    console.warn('[PASSWORD RESET] secure store unavailable — falling back to inline send');
-    sendInline(email, 'password_reset_link', { resetUrl, name: user.name || 'there' }, 'PASSWORD RESET MAGIC LINK');
-  }
+  const send = await sendInline(email, 'password_reset_link', { resetUrl, name: user.name || 'there' }, 'PASSWORD RESET MAGIC LINK');
+  if (!send.success) return { success: false, error: SEND_FAILED };
 
   return { success: true, resetUrl };
 }
@@ -149,9 +114,9 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
     // Don't reveal if user exists or has recovery email
     return { success: true };
   }
-  // 'banned' is not a UserStatusKind — banning is tracked by users.is_banned, not
-  // by status. Only compare statuses the enum can actually hold.
-  if (user.status === 'suspended' || user.status === 'deleted') {
+  // Banning lives in the status enum now: UserStatusKind includes 'banned'.
+  // Only compare statuses the enum can actually hold.
+  if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
     return { success: true };
   }
   // The login address may itself be the recovery address somebody typed into
@@ -179,27 +144,16 @@ export async function requestPasswordResetRecovery(email: string): Promise<{ suc
     data: { userId: user.id, kind: RESET_OTP_KIND, address: recoveryEmail.toLowerCase(), otpHash, expiresAt },
   });
 
-  const requestId = crypto.randomUUID();
-  const sent = await sendViaEmailBrain({
-    eventKey: 'auth.password_reset',
-    toEmail: recoveryEmail,
-    userId: user.id,
-    name: user.name || 'there',
-    secureVars: { otpCode: code, 'reset.code': code },
-    dedupeKey: `recovery:${user.id}:${requestId}`,
-  });
-  if (!sent) {
-    console.warn('[PASSWORD RESET RECOVERY] secure store unavailable — falling back to inline send');
-    sendInline(
-      recoveryEmail,
-      'password_reset_otp_recovery',
-      {
-        OTP: code, otp: code, name: user.name || 'there',
-        primaryEmail: (user.email || email).toLowerCase(), targetEmail: recoveryEmail, recoveryEmail,
-      },
-      'PASSWORD RESET RECOVERY',
-    );
-  }
+  const send = await sendInline(
+    recoveryEmail,
+    'password_reset_otp_recovery',
+    {
+      OTP: code, otp: code, name: user.name || 'there',
+      primaryEmail: (user.email || email).toLowerCase(), targetEmail: recoveryEmail, recoveryEmail,
+    },
+    'PASSWORD RESET RECOVERY',
+  );
+  if (!send.success) return { success: false, error: SEND_FAILED };
 
   return { success: true, code };
 }
@@ -209,17 +163,6 @@ type ResetMethod = 'otp' | 'magic_link';
 // Request password reset — generates OTP code OR magic link based on method
 // Sends to PRIMARY email ONLY (not secondary/recovery)
 export async function requestPasswordReset(
-  email: string,
-  method: ResetMethod = 'otp'
-): Promise<{ success: boolean; error?: string; resetUrl?: string; code?: string; retryAfterMs?: number }> {
-  try {
-    return await __requestPasswordResetInner(email, method);
-  } catch (e: any) {
-    try { require('fs').appendFileSync('scripts/tmp/err.log', 'REQUEST RESET THREW: ' + (e?.stack || e?.message || String(e)) + '\n'); } catch {}
-    throw e;
-  }
-}
-async function __requestPasswordResetInner(
   email: string,
   method: ResetMethod = 'otp'
 ): Promise<{ success: boolean; error?: string; resetUrl?: string; code?: string; retryAfterMs?: number }> {
@@ -237,20 +180,8 @@ async function __requestPasswordResetInner(
   if (method === 'magic_link') {
     const resetToken = await signPasswordResetToken(user.id);
     const resetUrl = `${getAccountsBaseUrl()}/reset-password?token=${resetToken}`;
-    const requestId = crypto.randomUUID();
-
-    const sent = await sendViaEmailBrain({
-      eventKey: 'auth.password_reset',
-      toEmail: email,
-      userId: user.id,
-      name: user.name || 'there',
-      secureVars: { resetUrl },
-      dedupeKey: `link:${user.id}:${requestId}`,
-    });
-    if (!sent) {
-      console.warn('[PASSWORD RESET] secure store unavailable — falling back to inline send');
-      sendInline(email, 'password_reset_link', { resetUrl, name: user.name || 'there' }, 'PASSWORD RESET');
-    }
+    const send = await sendInline(email, 'password_reset_link', { resetUrl, name: user.name || 'there' }, 'PASSWORD RESET');
+    if (!send.success) return { success: false, error: SEND_FAILED };
 
     return { success: true, resetUrl };
   } else {
@@ -264,19 +195,8 @@ async function __requestPasswordResetInner(
       data: { userId: user.id, kind: RESET_OTP_KIND, address: email.toLowerCase(), otpHash, expiresAt },
     });
 
-    const requestId = crypto.randomUUID();
-    const sent = await sendViaEmailBrain({
-      eventKey: 'auth.password_reset',
-      toEmail: email,
-      userId: user.id,
-      name: user.name || 'there',
-      secureVars: { otpCode: code, 'reset.code': code },
-      dedupeKey: `otp:${user.id}:${requestId}`,
-    });
-    if (!sent) {
-      console.warn('[PASSWORD RESET] secure store unavailable — falling back to inline send');
-      sendInline(email, 'password_reset_otp', { OTP: code, otp: code, name: user.name || 'there' }, 'PASSWORD RESET OTP');
-    }
+    const send = await sendInline(email, 'password_reset_otp', { OTP: code, otp: code, name: user.name || 'there' }, 'PASSWORD RESET OTP');
+    if (!send.success) return { success: false, error: SEND_FAILED };
 
     return { success: true, code };
   }
@@ -291,18 +211,30 @@ export async function verifyPasswordReset(
   if (!user) return { success: false, error: 'Invalid or expired reset request' };
 
   let verified = false;
+  /* Every failure used to answer the same sentence, so a mistyped code, an
+     expired one, one replaced by a newer email, and an attempt-capped one were
+     indistinguishable — and the reader, holding four code emails from a testing
+     afternoon, could not tell which one to type. */
+  let codeError: string | null = null;
 
   // Try code verification
   if (params.code) {
     const otp = await findLiveResetOtp(user.id);
-    if (otp) {
+    if (!otp) {
+      codeError = 'That code has expired, or a newer code replaced it. Please request a new one.';
+    } else {
       const ok = await verifyOtpCode(otp.otpHash, params.code);
       if (ok) {
         verified = true;
         // Delete ALL OTPs for this user (expires the other method)
         await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
       } else {
+        const used = (otp.attempts ?? 0) + 1;
         await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
+        const left = MAX_OTP_ATTEMPTS - used;
+        codeError = left > 0
+          ? `That code is not right. ${left} ${left === 1 ? 'attempt' : 'attempts'} left before it expires.`
+          : 'Too many wrong attempts. Please request a new code.';
       }
     }
   }
@@ -317,7 +249,7 @@ export async function verifyPasswordReset(
     }
   }
 
-  if (!verified) return { success: false, error: 'Invalid or expired reset code/link' };
+  if (!verified) return { success: false, error: codeError || 'Invalid or expired reset code/link' };
 
   // Generate a short-lived token for the password set step
   const { signPasswordResetToken: sign } = await import('@/features/auth/jwt');
@@ -403,10 +335,11 @@ export async function confirmPasswordReset(
     // Non-blocking
   }
 
-  // Notify the user their password changed (non-blocking, inline send).
+  // Notify the user their password changed (non-blocking; the reset itself
+  // already succeeded, so a failed courtesy mail must not fail the request).
   const loginUser = await fetchLoginUserById(user.id).catch(() => null);
   if (loginUser?.email) {
-    sendInline(
+    void sendInline(
       loginUser.email,
       'password_changed',
       { name: loginUser.name || 'there', changedAt: new Date().toISOString(), ipAddress: '' },
@@ -425,6 +358,20 @@ export async function quickLoginWithOtp(
   const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: false, error: 'Invalid or expired code' };
   if (user.status === 'deleted') return { success: false, error: 'This account has been deleted.' };
+  if (user.status === 'banned') {
+    return {
+      success: false,
+      error: 'ACCOUNT_BANNED',
+      banned: true,
+      block: {
+        kind: 'banned',
+        eventId: eventIdFor(user.id, 'ban'),
+        reason: null,
+        until: null,
+        message: 'Your account has been banned.',
+      },
+    } as any;
+  }
   if (user.status === 'suspended') {
     return {
       success: false,

@@ -135,7 +135,7 @@ export async function listDeviceAccounts(request: NextRequest): Promise<DeviceAc
         name: u.profile?.name ?? null,
         email: u.username ? tirbeoEmailFor(u.username) : (u.emails[0]?.address ?? u.id),
         photoUrl: u.profile?.photoUrl ?? null,
-        isBlocked: u.status === 'suspended' || u.status === 'deleted',
+        isBlocked: u.status === 'banned' || u.status === 'suspended' || u.status === 'deleted',
         lastUsedAt: all[u.id] ? new Date(Number(all[u.id])) : null,
       }))
       .sort((a, b) => (b.lastUsedAt?.getTime() ?? 0) - (a.lastUsedAt?.getTime() ?? 0));

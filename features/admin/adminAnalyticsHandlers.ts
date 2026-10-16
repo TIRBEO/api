@@ -22,7 +22,7 @@ export async function analyticsHandler(request: NextRequest) {
     activityByDay,
   ] = await Promise.all([
     prisma.user.count(),
-    prisma.user.count({ where: { adminRole: { not: null } } }),
+    prisma.user.count({ where: { isAdmin: true } }),
     prisma.user.count({ where: { createdAt: { gte: todayStart } } }),
     prisma.notification.count(),
     // Audit events (last 30 days)
@@ -40,7 +40,7 @@ export async function analyticsHandler(request: NextRequest) {
       where: { createdAt: { gte: thirtyDaysAgo } },
       orderBy: { createdAt: 'desc' },
       take: 20,
-      include: { user: { select: { id: true, email: true, name: true } } },
+      include: { user: { select: { id: true, email: true, profile: { select: { name: true } } } } },
     }),
     // Users by day (last 30 days)
     prisma.user.groupBy({
@@ -69,7 +69,7 @@ export async function analyticsHandler(request: NextRequest) {
       total: totalAuditEvents,
     },
     topActions: topActions.map(a => ({ action: a.kind, count: a._count.kind })),
-    recentAudit: recentAudit.map((l: any) => ({ ...l, actor: l.user })),
+    recentAudit: recentAudit.map((l: any) => ({ ...l, actor: l.user ? { ...l.user, name: l.user.profile?.name ?? null } : l.user })),
     usersByDay,
     activityByDay,
   });
@@ -87,21 +87,16 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
   // Find all users with allowAnalytics=true
   const users = await prisma.user.findMany({
     where: {
-      OR: [
-        { consents: { path: ['allowAnalytics'], equals: true } },
-      ],
+      preferences: { is: { misc: { path: ['consents', 'allowAnalytics'], equals: true } } },
     },
     select: {
       id: true,
       email: true,
       username: true,
-      name: true,
       createdAt: true,
       lastLoginAt: true,
-      consents: true,
-      theme: true,
-      language: true,
-      timezone: true,
+      profile: { select: { name: true } },
+      preferences: { select: { misc: true, appearance: true } },
       _count: {
         select: {
           sessions: true,
@@ -116,9 +111,7 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
 
   const total = await prisma.user.count({
     where: {
-      OR: [
-        { consents: { path: ['allowAnalytics'], equals: true } },
-      ],
+      preferences: { is: { misc: { path: ['consents', 'allowAnalytics'], equals: true } } },
     },
   });
 
@@ -132,20 +125,23 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
   }) : [];
   const loginMap = new Map(recentLogins.map(r => [r.userId, r._count.id]));
 
-  const enriched = users.map(u => ({
-    id: u.id,
-    email: u.email,
-    username: u.username,
-    name: u.name,
-    createdAt: u.createdAt,
-    lastLoginAt: u.lastLoginAt,
-    theme: u.theme,
-    language: u.language,
-    timezone: u.timezone,
-    sessionCount: u._count.sessions,
-    notificationCount: u._count.notifications,
-    totalLogins: loginMap.get(u.id) || 0,
-  }));
+  const enriched = users.map(u => {
+    const appearance = (u.preferences?.appearance ?? {}) as Record<string, any>;
+    return {
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      name: u.profile?.name ?? null,
+      createdAt: u.createdAt,
+      lastLoginAt: u.lastLoginAt,
+      theme: appearance.theme ?? null,
+      language: appearance.language ?? null,
+      timezone: appearance.timezone ?? null,
+      sessionCount: u._count.sessions,
+      notificationCount: u._count.notifications,
+      totalLogins: loginMap.get(u.id) || 0,
+    };
+  });
 
   return NextResponse.json({ users: enriched, total });
 }

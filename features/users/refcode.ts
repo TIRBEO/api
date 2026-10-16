@@ -6,8 +6,8 @@
 //   12 hex chars from crypto randomness (or deterministic fallback for legacy).
 //   No type prefix — the kind is inferred from context (ban/suspend/ratelimit/system).
 //
-// Codes are PERSISTED on the user profile (banRefCode / suspendRefCode, set
-// when an admin bans/suspends) so staff can look a user up by event ID from
+// Codes are PERSISTED in user_status_events.metadata.refCode (set when an
+// admin bans/suspends) so staff can look a user up by event ID from
 // the admin console. The deterministic fallback guarantees a usable code for
 // legacy accounts without stored codes.
 

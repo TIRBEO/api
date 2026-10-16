@@ -71,7 +71,6 @@ const SECTION_LABELS: Record<string, string> = {
   appeals: 'Appeals',
   deactivation: 'Deactivation',
   deletionRequest: 'Deletion request',
-  apiKeys: 'API keys',
   pushSubscriptions: 'Push channels',
   security: 'Security',
 };

@@ -27,17 +27,18 @@ export async function POST(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true },
+      select: { id: true, email: true, isAdmin: true, security: { select: { totpSecret: true, totpEnabled: true } } },
     });
-    if (!user || !user.totpSecret || !user.is2FAEnabled) {
+    const totpSecret = user?.security?.totpSecret;
+    if (!user || !totpSecret || !user.security?.totpEnabled) {
       return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
     }
 
-    if (!await verifyTotp(totpCode, user.totpSecret)) {
+    if (!await verifyTotp(totpCode, totpSecret)) {
       return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 });
     }
 
-    const adminRole = user.adminRole || null;
+    const adminRole = user.isAdmin ? 'admin' : null;
     if (!adminRole) {
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',

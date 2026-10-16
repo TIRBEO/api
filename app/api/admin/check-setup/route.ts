@@ -8,7 +8,7 @@ export async function GET(request: NextRequest) {
     if (session instanceof NextResponse) return session;
 
     const adminCount = await prisma.user.count({
-      where: { adminRole: { not: null } },
+      where: { isAdmin: true },
     });
 
     let sessionTableExists = false;

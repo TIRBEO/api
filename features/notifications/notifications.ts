@@ -2,6 +2,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { sendTemplateEmail, escapeHtml } from '@/features/email/email';
 import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
 import { isInQuietHours } from '@/features/email/emailPrefs';
+import { cardItem } from '@/features/email/email-fragments';
 import { tirbeoEmailFor } from '@/features/identity/tirbeo';
 
 export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert' | 'login' | 'forms' | 'product' | 'support' | 'ticket' | 'tips' | 'tip' | 'offers';
@@ -273,7 +274,7 @@ export async function createNotification(input: CreateNotifInput) {
           : `${base}/account/notifications`;
         return sendTemplateEmail(email, 'notification_digest', {
           name: user.profile?.name || email, count: '1',
-          digestItems: `<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;"><div style="color:#ffffff;font-size:14px;font-weight:600;line-height:22px;">${escapeHtml(input.title)}</div><div style="color:#bd9d8a;font-size:13px;line-height:20px;padding-top:2px;">${escapeHtml(input.body || '')}</div></div>`,
+          digestItems: cardItem(escapeHtml(input.title), escapeHtml(input.body || '')),
           activitySection: '',
           dashboardUrl: resolved,
         }, { rawVars: ['digestItems', 'activitySection'], categoryOverride: category, userId: targetUserId }).catch(() => {});
@@ -337,7 +338,8 @@ export const DEFAULT_PREFS: Record<string, unknown> = {
 };
 
 /**
- * What a brand-new account is set to, written to both stores at signup.
+ * What a brand-new account is set to, written to `user_preferences.notif` at
+ * signup.
  *
  * Left unsaid, the column's shipped JSON default would answer instead — a
  * literal that predates this file and turned category mail on. Neither the
@@ -348,19 +350,16 @@ export const NEW_ACCOUNT_PREFS: Record<string, any> = { ...DEFAULT_PREFS, securi
 
 /**
  * The one place a notification preference is read, and the one place it is
- * written.
+ * written: `user_preferences.notif`.
  *
  * Two places used to hold this answer: `users.notification_preferences`, which
- * the settings screens commit to, and `user_preferences.notif`, which the
+ * the settings screens committed to, and `user_preferences.notif`, which the
  * senders read. Nothing kept them in sync, so a person could turn mail off in
  * the app and still be mailed — the choice they made was simply not the one
- * that decided anything.
- *
- * The user row is the choice, because that is what the interface writes.
- * `notif` stays as a mirror, for two reasons: it carries bookkeeping no person
- * edits (when the last digest went out, which push endpoints are registered),
- * and code paths still read it. Every write lands in both, so there is exactly
- * one answer wherever it is looked up from.
+ * that decided anything. The legacy column has since been dropped, so `notif`
+ * is now the single store: it holds both what the interface edits and the
+ * bookkeeping no person touches (when the last digest went out, which push
+ * endpoints are registered).
  */
 const asObj = (raw: unknown): Record<string, any> =>
   raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, any>) : {};
@@ -369,36 +368,35 @@ const asObj = (raw: unknown): Record<string, any> =>
  * Fields the server owns. Nobody edits them in the interface, and a settings
  * write must never carry a stale copy of one back over the live value: that
  * rewinds a send clock and mails someone twice for one period. The `notif`
- * mirror is the only place they are stored, and the digest sweep is the only
+ * store is the only place they are kept, and the digest sweep is the only
  * writer of them.
  */
 const SERVER_OWNED_KEYS = ['lastSummarySentAt', 'lastDigestSentAt', 'lastWeeklySentAt'];
 
 export async function loadNotificationPrefs(userId: string): Promise<Record<string, any>> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { notificationPreferences: true, preferences: { select: { notif: true } } },
+  const prefs = await prisma.userPreferences.findUnique({
+    where: { userId },
+    select: { notif: true },
   });
-  // Later spreads win: chosen over mirrored, mirrored over shipped defaults.
-  return { ...DEFAULT_PREFS, ...asObj(user?.preferences?.notif), ...asObj(user?.notificationPreferences) };
+  return { ...DEFAULT_PREFS, ...asObj(prefs?.notif) };
 }
 
 export async function saveNotificationPrefs(userId: string, patch: Record<string, unknown>): Promise<Record<string, any>> {
   const merged = { ...(await loadNotificationPrefs(userId)), ...patch };
   const chosen: Record<string, unknown> = { ...merged };
   for (const key of SERVER_OWNED_KEYS) delete chosen[key];
-  await prisma.$executeRaw`
-    UPDATE "user"."users" SET "notification_preferences" = ${JSON.stringify(chosen)}::jsonb
-    WHERE "id" = ${userId}`;
-  // Mirror into notif without dropping the machine fields living there.
+  // Keep the machine-owned bookkeeping fields living in notif.
   const row = await prisma.userPreferences.findUnique({ where: { userId }, select: { notif: true } });
-  const mirrored = { ...asObj(row?.notif), ...chosen };
+  const current = asObj(row?.notif);
+  const nextNotif: Record<string, any> = { ...current };
+  for (const key of SERVER_OWNED_KEYS) if (key in current) nextNotif[key] = current[key];
+  Object.assign(nextNotif, chosen);
   await prisma.userPreferences.upsert({
     where: { userId },
-    create: { userId, notif: mirrored as any },
-    update: { notif: mirrored as any },
+    create: { userId, notif: nextNotif as any },
+    update: { notif: nextNotif as any },
   });
-  return { ...mirrored };
+  return { ...nextNotif };
 }
 
 /** Read a user's notification preferences. */

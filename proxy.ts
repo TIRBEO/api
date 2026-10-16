@@ -372,12 +372,13 @@ if (!hasCookie && !hasAuthHeader && !isCredentialAppeal) {
   return jsonResponse(allowedOrigin, { error: 'Not authenticated' }, 401);
 }
 
-// ── Account status enforcement (deleted / deletion-pending / suspended) ──
+// ── Account status enforcement (deleted / deletion-pending / suspended / banned) ──
 // Runs once per authenticated request. The consolidated schema replaced the
 // old isBanned/isSuspended/deletedAt/scheduledDeletionAt columns with a single
-// `status` enum (UserStatusKind): suspended | deletion_pending | deleted are
-// the blocking states. Suspension reason/until come from the newest user
-// restriction; expired suspensions are lifted automatically on first hit.
+// `status` enum (UserStatusKind): banned | suspended | deletion_pending |
+// deleted are the blocking states. Suspension/ban reason/until come from the
+// newest user restriction; expired suspensions are lifted automatically on
+// first hit.
 // /api/support/appeal is exempt: it authenticates with account credentials
 // precisely so blocked users can file an appeal without a session.
 const statusExempt = ['/api/auth/', '/api/health', '/api/users/me/status', '/api/support/appeal'];
@@ -415,7 +416,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         const _seedBanCache: Map<string, { status: string; blocked: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
         _seedBanCache.set(tokenPayload.sub, {
           status: su?.status || 'active',
-          blocked: su?.status === 'deleted' || su?.status === 'suspended',
+          blocked: su?.status === 'deleted' || su?.status === 'suspended' || su?.status === 'banned',
           ts: Date.now(),
         });
         if (_statusCache.size > 2000) {
@@ -467,6 +468,24 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
             message: 'Your account is deactivated. Reactivate it to continue.',
           }, 403);
         }
+      } else if (su?.status === 'banned') {
+        const restriction = su?.restrictions?.[0] || null;
+        const until = restriction?.endsAt ? new Date(restriction.endsAt) : null;
+        if (until && until < new Date()) {
+          // Ban expired — lift it on first hit.
+          await prisma.user.update({
+            where: { id: String(tokenPayload.sub) },
+            data: { status: 'active' },
+          }).catch(() => {});
+        } else {
+          statusResponse = jsonResponse(allowedOrigin, {
+            error: 'ACCOUNT_BANNED', banned: true,
+            eventId: eventIdFor(String(tokenPayload.sub), 'ban'),
+            reason: restriction?.detail || restriction?.title || 'No reason provided',
+            until: until ? until.toISOString() : null,
+            message: `Your account is banned${until ? ` until ${until.toUTCString()}` : ''}.`,
+          }, 403);
+        }
       } else if (su?.status === 'suspended') {
         const restriction = su?.restrictions?.[0] || null;
         const until = restriction?.endsAt ? new Date(restriction.endsAt) : null;
@@ -515,7 +534,7 @@ if (hasAuthHeader) {
   // Use cachedPayload from the early admin check to avoid re-verifying.
   if (hasCookie && STATE_METHODS.has(request.method) && cachedPayload?.sub && !pathname.startsWith('/api/support/appeal')) {
     try {
-      // Check deleted/suspended inline (cached per-user, 60s TTL, max 2000
+      // Check deleted/suspended/banned inline (cached per-user, 60s TTL, max 2000
       // entries). deletion_pending stays out of this set on purpose: the
       // status-enforcement pass above already gates it and keeps the
       // "cancel my deletion" POST reachable.
@@ -525,12 +544,13 @@ if (hasAuthHeader) {
       const statusBlockMessage = (status: string) =>
         status === 'deleted' ? 'Account has been deleted'
           : status === 'suspended' ? 'Account has been suspended'
+          : status === 'banned' ? 'Account has been banned'
           : 'Account is scheduled for deletion';
       if (!_bcHit || Date.now() - _bcHit.ts > 60_000) {
         const { prisma } = await import('@/infrastructure/db/prisma');
         const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { status: true } });
         const status = user?.status || 'active';
-        const blocked = status === 'deleted' || status === 'suspended';
+        const blocked = status === 'deleted' || status === 'suspended' || status === 'banned';
         _banCache.set(_bcKey, { status, blocked, ts: Date.now() });
         if (_banCache.size > 2000) {
           const now = Date.now();
@@ -542,26 +562,6 @@ if (hasAuthHeader) {
       }
     } catch {
       // Block/ban check failed — allow request, handler will re-check
-    }
-  }
-
-  // ── Check banned/suspended/deletion for API key-authed state changes ──
-  if (hasAuthHeader && STATE_METHODS.has(request.method)) {
-    try {
-        const apiKeyModule = await import('@/features/auth/api-key');
-        const apiKeyResult = await apiKeyModule.authenticateApiKey(request);
-      if (apiKeyResult?.userId) {
-        const { prisma } = await import('@/infrastructure/db/prisma');
-        const user = await prisma.user.findUnique({ where: { id: apiKeyResult.userId }, select: { status: true } });
-        // Status enum replaces the old deletedAt/scheduledDeletionAt/isBanned/
-        // isSuspended flags: deleted blocks outright, deletion_pending is a
-        // read-only window with the cancel endpoint exempt, suspended blocks.
-        if (user?.status === 'deleted') return jsonResponse(allowedOrigin, { error: 'ACCOUNT_DELETED', deleted: true, message: 'Your account has been deleted.' }, 403);
-        if (user?.status === 'suspended') return jsonResponse(allowedOrigin, { error: 'Account has been suspended' }, 403);
-        if (user?.status === 'deletion_pending' && !request.url.includes('/api/user/delete-account')) return jsonResponse(allowedOrigin, { error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, message: 'Your account is scheduled for deletion.' }, 403);
-      }
-    } catch {
-      // API key verification failed — that's OK, the handler will re-check
     }
   }
 

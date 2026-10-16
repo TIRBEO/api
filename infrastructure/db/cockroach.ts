@@ -1,3 +1,4 @@
+import './ipv4-first';
 import { Pool } from 'pg';
 import type { QueryResult } from 'pg';
 import { randomUUID } from 'node:crypto';

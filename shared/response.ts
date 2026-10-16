@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { isHostAllowed } from '@/config/app-urls';
 
 function addCorsToResponse(res: NextResponse, request?: NextRequest) {
   if (!request) {
@@ -11,7 +12,9 @@ function addCorsToResponse(res: NextResponse, request?: NextRequest) {
   if (!origin) return res;
   try {
     const u = new URL(origin);
-    if (['localhost', '127.0.0.1'].includes(u.hostname) || u.hostname.endsWith('.tirbeo.com') || u.hostname === 'api-tirbeo.vercel.app') {
+    // Same allowlist proxy.ts uses — the hardcoded list here drifted from it
+    // (missed alternate domains, and let any localhost through in production).
+    if (isHostAllowed(u.hostname)) {
       res.headers.set('Access-Control-Allow-Origin', origin);
       res.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
       res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, x-turnstile-token');

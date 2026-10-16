@@ -19,10 +19,10 @@ export async function POST(request: NextRequest) {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, passwordHash: true, adminRole: true, mustChangePassword: true },
+      select: { id: true, email: true, passwordHash: true, isAdmin: true, security: { select: { mustChangePw: true } } },
     });
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    if (!user.adminRole) {
+    if (!user.isAdmin) {
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
@@ -40,11 +40,16 @@ export async function POST(request: NextRequest) {
     const newHash = await hashPassword(newPassword);
     await prisma.user.update({
       where: { id: user.id },
-      data: { passwordHash: newHash, mustChangePassword: false },
+      data: { passwordHash: newHash },
+    });
+    await prisma.userSecurity.upsert({
+      where: { userId: user.id },
+      create: { userId: user.id, mustChangePw: false },
+      update: { mustChangePw: false },
     });
 
     const ip = request.headers.get('x-forwarded-for') || '';
-    const adminRole = user.adminRole;
+    const adminRole = user.isAdmin ? 'admin' : undefined;
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);

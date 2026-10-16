@@ -23,7 +23,7 @@ async function main() {
 
   if (mode === 'kinds') {
     const rows: { kind: string; events: bigint }[] = await prisma.$queryRawUnsafe(
-      `SELECT kind, count(*)::bigint AS events FROM "activity"."activity_events" GROUP BY kind ORDER BY events DESC`,
+      `SELECT kind, count(*)::bigint AS events FROM "public"."activity_events" GROUP BY kind ORDER BY events DESC`,
     );
     const foreign = await prisma.activityEvent.findFirst({
       where: {

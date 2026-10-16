@@ -18,7 +18,10 @@ async function main() {
   }
   const uid = user.id;
 
-  await prisma.user.update({ where: { id: uid }, data: { githubId: GITHUB_ID } });
+  const pref = await prisma.userPreferences.findUnique({ where: { userId: uid }, select: { misc: true } });
+  const misc: any = { ...((pref?.misc as any) || {}) };
+  misc.oauth = { ...(misc.oauth || {}), github: GITHUB_ID };
+  await prisma.userPreferences.upsert({ where: { userId: uid }, update: { misc }, create: { userId: uid, misc } });
 
   const events = await prisma.activityEvent.deleteMany({
     where: { userId: uid, kind: 'security.app_disconnected' },
@@ -27,12 +30,12 @@ async function main() {
     where: { userId: uid, title: { contains: 'disconnected' } },
   });
 
-  const after = await prisma.user.findUnique({
-    where: { id: uid },
-    select: { googleId: true, githubId: true, discordId: true },
+  const after = await prisma.userPreferences.findUnique({
+    where: { userId: uid },
+    select: { misc: true },
   });
   console.log(`github link restored, ${events.count} event row(s) + ${notes.count} notification(s) removed`);
-  console.log('provider ids:', after);
+  console.log('provider ids:', (after?.misc as any)?.oauth ?? null);
 }
 
 main()

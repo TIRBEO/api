@@ -68,8 +68,8 @@ const key = (rows: Bucket[]) =>
     console.log(`\n=== ${tz} ===`);
     const reply = await fetchJson(`/api/user/activity/daily?days=${DAYS}&tz=${encodeURIComponent(tz)}`);
     const [events, signIns] = await Promise.all([
-      expected(tz, '"activity".activity_events', 'kind', ''),
-      expected(tz, '"security".user_logins', 'method', 'and success = true'),
+      expected(tz, '"public".activity_events', 'kind', ''),
+      expected(tz, '"public".user_logins', 'method', 'and success = true'),
     ]);
     check(`${tz}: feed buckets match the table row for row`, key(reply.events) === key(events), `${JSON.stringify(reply.events)} vs ${JSON.stringify(events)}`);
     check(`${tz}: sign-in buckets match the ledger`, key(reply.signIns) === key(signIns), `${JSON.stringify(reply.signIns)} vs ${JSON.stringify(signIns)}`);

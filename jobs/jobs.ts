@@ -1,5 +1,14 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import { isEmailPaused } from '@/features/email/emailPrefs';
+import {
+  attentionPanel,
+  cardItem,
+  emptyNote,
+  listGroup,
+  listPlate,
+  listRow,
+  moreRow,
+} from '@/features/email/email-fragments';
 
 /** Delete notifications older than 30 days. Runs on startup + hourly. */
 export async function cleanupOldNotifications(olderThanDays = 30) {
@@ -71,41 +80,35 @@ const obj = (raw: unknown): Record<string, any> =>
 const SUMMARY_FREQUENCIES = ['daily', 'weekly', 'monthly'];
 
 /**
- * One person's recap choice, read out of the two stores that both hold part of
- * the answer.
+ * One person's recap choice, read out of `user_preferences.notif` — now the
+ * only store for notification preferences.
  *
- * `off` wins wherever it is found: a preference that only half got cleared must
- * never be read as consent to mail somebody. Opting in has to be an explicit
- * `true` in one of the two, so a column default or a missing field is never a
- * subscription. The cadence comes from the account row first, because that is
- * what the settings screen writes; the send clock lives in the mirror alone and
- * this job is its only writer.
+ * `off` wins: an explicit `false` on the mail switch, an unsubscribed map, or a
+ * pause all hold the letter. Opting in has to be an explicit `true`, so a
+ * column default or a missing field is never a subscription. The send clock
+ * lives in the same object and this job is its only writer.
  */
 /** Exported for the tests: this is the whole decision the sweep makes about one
     account, and it is worth pinning without mailing anybody to prove it. */
-export function recapChoice(mirrorRaw: unknown, accountRaw: unknown): RecapChoice {
-  const mirror = obj(mirrorRaw);
-  const account = obj(accountRaw);
-  const raw = account.summaryFrequency ?? mirror.summaryFrequency;
+export function recapChoice(notifRaw: unknown): RecapChoice {
+  const notif = obj(notifRaw);
+  const raw = notif.summaryFrequency;
   // The unsubscribe map is an object keyed by category; the older literal `true`
   // is still honoured because a store that once held it must keep holding a no.
-  const unsubscribedAll = [mirror, account].some(
-    (p) => p.unsubscribed === true || obj(p.unsubscribed).all === true,
-  );
+  const unsubscribedAll = notif.unsubscribed === true || obj(notif.unsubscribed).all === true;
   return {
-    summaryEnabled: mirror.summaryEnabled !== false && account.summaryEnabled !== false
-      && (mirror.summaryEnabled === true || account.summaryEnabled === true),
+    summaryEnabled: notif.summaryEnabled === true,
     summaryFrequency: SUMMARY_FREQUENCIES.includes(raw) ? raw : 'weekly',
-    lastSummarySentAt: mirror.lastSummarySentAt ?? null,
+    lastSummarySentAt: notif.lastSummarySentAt ?? null,
     /* A paused account is not due for a recap, and saying so here is what saves
        the letter rather than losing it: the mailer answers a suppressed send
        with a plain "success", so a sweep that mailed into a pause would move the
        send clock forward on a mail nobody got — and the person who paused for a
        week would come back to nothing. Held back at the sweep instead, the clock
        stays where it was and the recap arrives when the pause lapses. */
-    mailBlocked: mirror.email === false || account.email === false
+    mailBlocked: notif.email === false
       || unsubscribedAll
-      || isEmailPaused(mirror) || isEmailPaused(account),
+      || isEmailPaused(notif),
   };
 }
 
@@ -161,15 +164,9 @@ async function sendOnceClaimed(
 /** One pass over every account that asked for a recap and is due for one. */
 export async function sendAccountSummaries() {
   try {
-    // Either store can hold the answer, so both are asked. The settings screen
-    // used to write the account row while the senders read the `notif` mirror,
-    // so a person could opt in and never be mailed, or opt out and keep being
-    // mailed.
+    // Notification preferences live only in `user_preferences.notif`.
     const candidates = await prisma.$queryRaw<{ userId: string }[]>`
-      SELECT "id" AS "userId" FROM "user"."users"
-        WHERE COALESCE("notification_preferences" ->> 'summaryEnabled', '') = 'true'
-      UNION
-      SELECT "user_id" FROM "preferences"."user_preferences"
+      SELECT "user_id" AS "userId" FROM "public"."user_preferences"
         WHERE COALESCE("notif" ->> 'summaryEnabled', '') = 'true'
       LIMIT 5000`;
     if (!candidates.length) return;
@@ -179,7 +176,6 @@ export async function sendAccountSummaries() {
       select: {
         id: true,
         status: true,
-        notificationPreferences: true,
         emails: { where: { isDefault: true }, select: { address: true }, take: 1 },
         preferences: { select: { notif: true } },
       },
@@ -188,7 +184,7 @@ export async function sendAccountSummaries() {
     const now = new Date();
     for (const row of rows) {
       if (row.status !== 'active' || !row.emails?.[0]?.address) continue;
-      const choice = recapChoice(row.preferences?.notif, row.notificationPreferences);
+      const choice = recapChoice(row.preferences?.notif);
       if (!choice.summaryEnabled || choice.mailBlocked) continue;
       const periodMs = frequencyToMs(choice.summaryFrequency);
       if (!isCadenceDue(choice.lastSummarySentAt, now, periodMs)) continue;
@@ -270,13 +266,10 @@ function groupFor(kind: string): SummaryGroup {
   return 'other';
 }
 
-const LIST_ROW = 'padding:12px 16px;border-bottom:1px solid #38312b;';
-
 /** One line of the recap: what happened, when, and where it came from. */
 function recapLine(title: string, at: Date, note?: string | null): string {
   const when = at.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-  return `<div style="${LIST_ROW}"><div style="color:#ffffff;font-size:14px;line-height:22px;">${esc(title)}</div>`
-    + `<div style="color:#bd9d8a;font-size:13px;line-height:20px;padding-top:2px;">${esc(when)}${note ? ` · ${esc(note)}` : ''}</div></div>`;
+  return listRow(esc(title), `${esc(when)}${note ? ` · ${esc(note)}` : ''}`);
 }
 
 /** Build & send one account recap. Returns true only when the mail went out. */
@@ -317,19 +310,13 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
       .map((group) => {
         const lines = lists.get(group)!;
         const shown = lines.slice(0, 12);
-        return `<div>`
-          + `<p style="margin:0;padding:14px 16px 4px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${GROUP_LABELS[group]}`
-          + ` <span style="color:#bd9d8a;font-weight:400;">· ${lines.length}</span></p>`
-          + shown.join('')
+        return listGroup(GROUP_LABELS[group], lines.length, shown.join(''))
           + (lines.length > shown.length
-            ? `<div style="padding:10px 16px;font-size:13px;line-height:20px;color:#bd9d8a;">${lines.length - shown.length} more in your activity history</div>`
-            : '')
-          + `</div>`;
+            ? moreRow(`${lines.length - shown.length} more in your activity history`)
+            : '');
       })
       .join('');
-    const listsHtml = groupsHtml
-      ? `<div style="background:#181008;border:1px solid #38312b;border-radius:12px;margin:0 0 20px;">${groupsHtml}</div>`
-      : '';
+    const listsHtml = groupsHtml ? listPlate(groupsHtml) : '';
 
     const attention = [
       ...logins.filter((l) => !l.success)
@@ -339,17 +326,16 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
         .map((e) => e.title),
     ];
     const suspiciousSection = attention.length
-      ? `<div style="margin:0 0 20px;">`
-        + `<p style="margin:0 0 6px;font-size:14px;font-weight:600;color:#ffffff;line-height:22px;">${attention.length} thing${attention.length === 1 ? '' : 's'} to look at</p>`
-        + attention.slice(0, 6).map((line) =>
-            `<p style="margin:0;font-size:13px;line-height:20px;color:#bd9d8a;">· ${esc(line)}</p>`).join('')
-        + `</div>`
+      ? attentionPanel(
+          `${attention.length} thing${attention.length === 1 ? '' : 's'} to look at`,
+          attention.slice(0, 6).map((line) => esc(line)),
+        )
       : '';
 
     const total = events.length + logins.length;
     const statRows = total
       ? listsHtml
-      : `<p style="margin:0;font-size:14px;line-height:22px;color:#bd9d8a;">Nothing was recorded on your account in this period — no sign-ins, no changes, no security events.</p>`;
+      : emptyNote('Nothing was recorded on your account in this period — no sign-ins, no changes, no security events.');
 
     const day = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const periodLabel = `${day(since)} – ${day(until)}`;
@@ -434,14 +420,10 @@ export async function sendReactivationEmails() {
     const cutoff30d = new Date(Date.now() - 30 * 86400_000);
 
     // Find users inactive for 7+ days who are eligible. Reactivation mail is
-    // opt-in: offersEmail must be explicitly true. Either store can hold the
-    // answer — the settings screen writes the account row and mirrors it into
-    // `notif` — so both are asked, the same way the recap sweep asks both.
+    // opt-in: offersEmail must be explicitly true. Notification preferences
+    // live only in `user_preferences.notif`.
     const candidates = await prisma.$queryRaw<{ userId: string }[]>`
-      SELECT "id" AS "userId" FROM "user"."users"
-        WHERE COALESCE("notification_preferences" ->> 'offersEmail', '') = 'true'
-      UNION
-      SELECT "user_id" FROM "preferences"."user_preferences"
+      SELECT "user_id" AS "userId" FROM "public"."user_preferences"
         WHERE COALESCE("notif" ->> 'offersEmail', '') = 'true'
       LIMIT 2000`;
     if (!candidates.length) return;
@@ -493,10 +475,9 @@ export async function sendReactivationEmails() {
       if (!u.email) continue;
       if (alreadySent.has(u.email)) continue;
 
-      // Ask the one function that reads a preference, merged, rather than
-      // whichever store this sweep happened to query: reading only the mirror
-      // is how a person who turned the switch off on the page kept being
-      // mailed. Opt-in still means an explicit true — no stored answer is a no.
+      // Ask the one function that reads a preference so the campaign gate
+      // matches what the settings page actually wrote. Opt-in still means an
+      // explicit true — no stored answer is a no.
       const prefs: any = await loadNotificationPrefs(u.id);
       if (!prefs || prefs.email === false) continue;
       if (prefs.offers === false || prefs.offersEmail !== true) continue;
@@ -511,7 +492,7 @@ export async function sendReactivationEmails() {
       const daysSince = Math.max(1, Math.floor((Date.now() - lastActive) / 86400_000));
 
       // Build a brief activity summary
-      let activitySummary = '<p style="margin:0;font-size:14px;line-height:22px;color:#bd9d8a;">No recent activity recorded. Your workspace is waiting.</p>';
+      let activitySummary = emptyNote('No recent activity recorded. Your workspace is waiting.');
       try {
         const recentNotifs = await prisma.notification.findMany({
           where: { userId: u.id, createdAt: { gte: cutoff7d } },
@@ -519,9 +500,7 @@ export async function sendReactivationEmails() {
           take: 5,
         });
         if (recentNotifs.length > 0) {
-          activitySummary = recentNotifs.map(n =>
-            `<div style="padding:14px 16px;background:#181008;border:1px solid #38312b;border-radius:12px;margin-bottom:8px;font-size:14px;line-height:22px;color:#ffffff;">${esc(n.title)}</div>`
-          ).join('');
+          activitySummary = recentNotifs.map(n => cardItem(esc(n.title))).join('');
         }
       } catch {}
 

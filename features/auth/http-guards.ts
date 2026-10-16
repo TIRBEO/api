@@ -2,8 +2,6 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { createSession, revokeSession, setSessionCookie, clearSessionCookie, getSessionFromToken, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf } from '@/features/auth/session';
 import { COOKIE_NAME } from '@/features/auth/jwt';
-import { authenticateApiKey } from '@/features/auth/api-key';
-import { pathInScope } from '@/features/media/cdnPath';
 import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
 import { isIpBlocked, logSecurityEvent } from '@/features/security/security';
 
@@ -58,43 +56,7 @@ export async function getSession(request: NextRequest) {
     }
   }
 
-  // Fall back to API key auth — also wrapped in try/catch
-  try {
-    const apiKeyAuth = await authenticateApiKey(request);
-    if (apiKeyAuth) {
-      // SECURITY: a CDN key's path scopes are its ONLY boundary. Refuse to
-      // mint a full user session when the key is path-restricted and the
-      // request path isn't covered — otherwise a `/avatars/*` key could hit
-      // user/admin/notification endpoints as a full session.
-      if (apiKeyAuth.pathScopes) {
-        const reqPath = new URL(request.url).pathname;
-        const allowed = apiKeyAuth.pathScopes.some((s) => pathInScope(reqPath, s));
-        if (!allowed) {
-          return null;
-        }
-      }
-      return {
-        userId: apiKeyAuth.userId,
-        email: '',
-        sessionId: `apikey:${apiKeyAuth.keyId}`,
-        keyScope: {
-          keyId: apiKeyAuth.keyId,
-          keyType: apiKeyAuth.keyType,
-          pathScopes: apiKeyAuth.pathScopes,
-          keyPermissions: apiKeyAuth.keyPermissions,
-        },
-      };
-    }
-  } catch (e: any) {
-    console.error('[SESSION] API key auth failed:', e?.message || e);
-  }
-
   return null;
-}
-
-/** API-key sessions must never satisfy admin/role checks — they hold no role. */
-function isApiKeySession(session: any): boolean {
-  return !!session?.sessionId?.startsWith('apikey:');
 }
 
 export async function requireSession(request: NextRequest): Promise<{ userId: string; email: string } | NextResponse> {
@@ -122,7 +84,6 @@ export async function getAdminRole(userId: string): Promise<string | null> {
 export async function isAdmin(request: NextRequest) {
   const session = await getSession(request);
   if (!session) return false;
-  if (isApiKeySession(session)) return false;
   const role = await getAdminRole(session.userId);
   return role != null;
 }
@@ -131,7 +92,7 @@ export async function requireAdmin(request: NextRequest): Promise<{ userId: stri
   const blocked = await checkIpBlock(request);
   if (blocked) return blocked;
   const session = await getSession(request);
-  if (!session || isApiKeySession(session)) return jsonUnauthorized();
+  if (!session) return jsonUnauthorized();
   const role = await getAdminRole(session.userId);
   if (!role) return jsonForbidden();
   return { ...session, adminRole: role };
@@ -147,7 +108,7 @@ export async function requireRole(request: NextRequest, minimumRole: string): Pr
   const blocked = await checkIpBlock(request);
   if (blocked) return blocked;
   const session = await getSession(request);
-  if (!session || isApiKeySession(session)) return jsonUnauthorized();
+  if (!session) return jsonUnauthorized();
   const userRole = await getAdminRole(session.userId);
   if (!userRole || !roleAtLeast(userRole, minimumRole)) {
     return jsonForbidden();

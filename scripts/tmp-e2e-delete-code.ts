@@ -43,7 +43,7 @@ const call = async (jwt: string, body: unknown) => {
 const state = async () => ({
   user: await prisma.user.findUnique({
     where: { id: userId },
-    select: { status: true, scheduledDeletionAt: true, deletionReason: true },
+    select: { status: true },
   }),
   request: await prisma.userDeletionRequest.findUnique({
     where: { userId },
@@ -73,7 +73,7 @@ async function main() {
   const before = await state();
   const otpBefore = await prisma.otp.count({ where: { userId, kind: DELETE_OTP_KIND } });
   const codesBefore = await prisma.activityEvent.count({ where: { userId, kind: 'account.delete-code' } });
-  say(`snapshot: status=${before.user?.status} scheduled=${before.user?.scheduledDeletionAt?.toISOString() ?? 'null'} `
+  say(`snapshot: status=${before.user?.status} scheduled=${before.request?.finalAt?.toISOString() ?? 'null'} `
     + `otp=${otpBefore} codes=${codesBefore}`);
 
   // A code left over from an interrupted run would trip the resend cooldown.
@@ -118,10 +118,10 @@ async function main() {
   const after = await state();
   const otpLeft = await prisma.otp.count({ where: { userId, kind: DELETE_OTP_KIND } });
   const codesLeft = await prisma.activityEvent.count({ where: { userId, kind: 'account.delete-code' } });
-  say(`restored: status=${after.user?.status} scheduled=${after.user?.scheduledDeletionAt?.toISOString() ?? 'null'} `
+  say(`restored: status=${after.user?.status} scheduled=${after.request?.finalAt?.toISOString() ?? 'null'} `
     + `otp=${otpLeft} codes=${codesLeft} (was ${codesBefore}) mailjobs_removed=${jobsRemoved} request=${JSON.stringify(after.request)}`);
   check('code row cleaned', otpLeft === otpBefore, `${otpBefore} -> ${otpLeft}`);
-  check('status unchanged', after.user?.status === before.user?.status && after.user?.scheduledDeletionAt === before.user?.scheduledDeletionAt);
+  check('status unchanged', after.user?.status === before.user?.status && String(after.request?.finalAt) === String(before.request?.finalAt));
 
   say('\n' + results.join('\n'));
   const failed = results.filter((r) => r.startsWith('FAIL')).length;

@@ -33,18 +33,25 @@ export async function GET(request: NextRequest) {
     where: {
       OR: [
         { email: { contains: q, mode: 'insensitive' } },
-        { name: { contains: q, mode: 'insensitive' } },
+        { profile: { is: { name: { contains: q, mode: 'insensitive' } } } },
       ],
     },
-    select: { id: true, email: true, name: true, adminRole: true },
+    select: { id: true, email: true, isAdmin: true, profile: { select: { name: true } } },
     take: 5,
   });
 
   const routes: any[] = []; // Route model removed
 
+  const usersOut = users.map(u => ({
+    id: u.id,
+    email: u.email,
+    name: u.profile?.name ?? null,
+    adminRole: u.isAdmin ? 'admin' : null,
+  }));
+
   const pages = SEARCHABLE_PAGES.filter(p =>
     p.label.toLowerCase().includes(q) || p.url.toLowerCase().includes(q) || p.category.toLowerCase().includes(q)
   );
 
-  return NextResponse.json({ pages, users, routes });
+  return NextResponse.json({ pages, users: usersOut, routes });
 }

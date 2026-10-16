@@ -379,7 +379,7 @@ export async function getSessionFromToken(token: string) {
       const user = await prisma.user.findUnique({
         where: { id: payload.sub },
         select: { id: true, username: true, status: true, isAdmin: true } });
-      if (!user || user.status === 'suspended' || user.status === 'deleted') return null;
+      if (!user || user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') return null;
       const email = await userEmailForSession(user.id, user.username);
       return { userId: user.id, email, sessionId: 'cli', adminRole: user.isAdmin ? 'admin' : null };
     }
@@ -463,7 +463,7 @@ export async function getSessionFromToken(token: string) {
     }
 
     const user = session.user;
-    if (!user || user.status === 'suspended' || user.status === 'deleted') {
+    if (!user || user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
       sessionCache.set(payload.sid, null);
       return null;
     }

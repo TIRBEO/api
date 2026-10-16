@@ -58,11 +58,13 @@ interface RedisConnectionState {
 const REDIS_CONFIG = {
   // Retry strategy: exponential backoff with max 30s delay
   retryStrategy(times: number): number | null {
-    if (times > 20) {
-      console.error('[REDIS-RETRY] Max retries (20) exceeded, giving up');
-      return null;
-    }
     const delay = Math.min(times * 100, 30000); // 100ms, 200ms, ... up to 30s
+    if (times > 20) {
+      // Never give up: a transient Upstash hiccup used to wedge the client in
+      // "end" state, where keep-alive recovery could not revive it.
+      throttledLog('redis:retry-long', 60_000, () => console.warn(`[REDIS-RETRY] Still down after ${times} attempts — retrying every 30s`));
+      return 30000;
+    }
     throttledLog('redis:retry', 30_000, () => console.warn(`[REDIS-RETRY] Reconnecting in ${delay}ms (attempt ${times})`));
     return delay;
   },
@@ -76,10 +78,7 @@ const REDIS_CONFIG = {
   // Enable lazy connect to avoid connection storms on startup
   lazyConnect: true,
 
-  // TLS for Upstash (self-signed cert)
-  tls: { rejectUnauthorized: false },
-
-  // Keep-alive interval (30s — Upstash closes idle connections after ~30-60s)
+  // Keep-alive interval (Upstash closes idle connections after ~30-60s)
   keepAliveInterval: 25_000,
 
   // Reconnect on error codes that indicate connection loss
@@ -142,7 +141,12 @@ function startKeepAlive(name: string, client: any): void {
         if (state.keepAliveFailures >= 3) {
           console.warn(`[REDIS-KEEPALIVE] ${name}: Too many failures, triggering reconnect...`);
           try {
-            await client.disconnect();
+            if (client.status === 'end') {
+              await client.connect();
+            } else {
+              client.disconnect();
+              await client.connect();
+            }
           } catch {}
           state.keepAliveFailures = 0;
         }
@@ -212,7 +216,7 @@ export function createRedisClient(options: CreateRedisOptions): any {
     connectTimeout: config.connectTimeout,
     maxRetriesPerRequest: config.maxRetriesPerRequest,
     lazyConnect: config.lazyConnect,
-    tls: config.tls,
+    tls: url.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
     // Enable auto-resend unfulfilled commands after reconnect
     enableOfflineQueue: true,
   });

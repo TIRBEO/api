@@ -25,20 +25,27 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
-      emailVerified: true,
-      is2FAEnabled: true,
-      security: { select: { mustChangePw: true, backupCodes: true } },
+      email: true,
+      security: { select: { mustChangePw: true, backupCodes: true, totpEnabled: true } },
       phone: { select: { number: true } },
+      emails: { select: { address: true, kind: true, isDefault: true, verifiedAt: true } },
       _count: { select: { passkeys: true } },
     },
   });
   if (!user) return [];
 
+  const is2FAEnabled = !!user.security?.totpEnabled;
+  const emailRow =
+    user.emails.find((e) => e.address === user.email) ||
+    user.emails.find((e) => e.isDefault) ||
+    user.emails.find((e) => e.kind === 'primary');
+  const emailVerified = !!emailRow?.verifiedAt;
+
   const backupCodes = Array.isArray((user.security as any)?.backupCodes)
     ? (user.security as any).backupCodes.length : 0;
   const tips: AccountTip[] = [];
 
-  if (!user.is2FAEnabled) {
+  if (!is2FAEnabled) {
     tips.push({
       id: 'enable-2fa',
       title: 'A second step at sign-in',
@@ -58,7 +65,7 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
     });
   }
 
-  if (user.is2FAEnabled && backupCodes === 0) {
+  if (is2FAEnabled && backupCodes === 0) {
     tips.push({
       id: 'backup-codes',
       title: 'Keep backup codes for when your phone is gone',
@@ -89,7 +96,7 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
     });
   }
 
-  if (!user.emailVerified) {
+  if (!emailVerified) {
     tips.push({
       id: 'verify-email',
       title: 'Confirm your email address',
@@ -182,11 +189,12 @@ function nextTipDueAt(userId: string, lastSentAt: number, createdAt: Date | null
  */
 async function eligibleUserIds(): Promise<Array<{ id: string; createdAt: Date | null }>> {
   return prisma.$queryRaw<{ id: string; createdAt: Date | null }[]>`
-    SELECT "id", "created_at" AS "createdAt"
-    FROM "user"."users"
-    WHERE "deleted_at" IS NULL AND "is_banned" = false AND "is_suspended" = false
-      AND COALESCE(("notification_preferences" ->> 'tipsEmail')::boolean, false)
-      AND COALESCE(("notification_preferences" ->> 'email')::boolean, true)
+    SELECT u."id", u."created_at" AS "createdAt"
+    FROM "public"."users" u
+    LEFT JOIN "public"."user_preferences" p ON p."user_id" = u."id"
+    WHERE u."status" NOT IN ('deleted', 'banned', 'suspended')
+      AND COALESCE((p."notif" ->> 'tipsEmail')::boolean, false)
+      AND COALESCE((p."notif" ->> 'email')::boolean, true)
     LIMIT 2000`;
 }
 
@@ -212,13 +220,13 @@ export async function sendNextTipForUser(userId: string): Promise<boolean> {
     const tip = await nextUnsentTip(userId);
     if (!tip) return false;
 
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, profile: { select: { name: true } } } });
     if (!user?.email) return false;
 
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { getDashboardBaseUrl } = await import('@/config/app-urls');
     const result = await sendTemplateEmail(user.email, 'security_tip', {
-      name: user.name || user.email,
+      name: user.profile?.name || user.email,
       tipTitle: tip.title,
       tipBody: tip.body,
       actionUrl: `${getDashboardBaseUrl()}${tip.path}`,
@@ -254,7 +262,7 @@ export async function runAutoTipsSweep() {
     const ids = eligible.map((u) => u.id);
     const lastSentRows = await prisma.$queryRaw<Array<{ userId: string; lastSentAt: Date }>>`
       SELECT "user_id" AS "userId", MAX("sent_at") AS "lastSentAt"
-      FROM "activity"."user_tip_logs"
+      FROM "public"."user_tip_logs"
       WHERE "user_id" = ANY(${ids})
       GROUP BY "user_id"`;
     const lastSent = new Map(lastSentRows.map((row) => [row.userId, new Date(row.lastSentAt).getTime()]));

@@ -15,8 +15,8 @@ import { prisma } from '@/infrastructure/db/prisma';
  * After deleting we stamp `executedAt` so the account is never double-processed
  * (and so the "already handled" case is explicit, not incidental).
  *
- * The lifecycle lives on `user.status` + `user_deletion_requests`; the legacy
- * scheduledDeletionAt column is only a mirror and is not what the sweep reads.
+ * The lifecycle lives entirely on `user.status` + `user_deletion_requests`;
+ * the old `scheduledDeletionAt` column has been dropped.
  */
 
 /** Hard cap on how many accounts one sweep run may permanently delete. */
@@ -84,7 +84,6 @@ async function permanentlyDeleteUser(userId: string, now: Date) {
   // securityEvent / auditEvent merged into activityEvent (which cascades on the
   // user row); the old `session` table became user_sessions.
   const deleteOps = [
-    prisma.apiKey.deleteMany({ where: { userId } }),
     prisma.otp.deleteMany({ where: { userId } }),
     prisma.passkey.deleteMany({ where: { userId } }),
     prisma.notification.deleteMany({ where: { userId } }),

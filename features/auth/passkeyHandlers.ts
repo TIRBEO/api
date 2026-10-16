@@ -412,14 +412,15 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
 
     const passkey = await prisma.passkey.findUnique({
       where: { credentialId: credential.id },
-      // Consolidated schema: isBanned/isSuspended/email columns gone — gate on
-      // status and read the primary email from user_email.
-      include: { user: { select: { id: true, name: true, status: true, emails: { where: { isDefault: true }, select: { address: true } } } } } });
+      // Consolidated schema: name/email/ban+suspend flags are gone from users —
+      // gate on status and read the display name from user_profile, the primary
+      // email from user_email.
+      include: { user: { select: { id: true, status: true, profile: { select: { name: true } }, emails: { where: { isDefault: true }, select: { address: true } } } } } });
 
     if (!passkey) return jsonError('Passkey not found. It may have been deleted.', 404, request);
     const passkeyUser = passkey.user;
     const primaryEmail = passkeyUser.emails[0]?.address || '';
-    if (passkeyUser.status === 'deleted' || passkeyUser.status === 'deletion_pending') {
+    if (passkeyUser.status === 'banned' || passkeyUser.status === 'deleted' || passkeyUser.status === 'deletion_pending') {
       const { eventIdFor } = await import('@/features/users/refcode');
       return NextResponse.json({
         error: 'ACCOUNT_BANNED',
@@ -477,7 +478,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
     notifySuspiciousLogin({
       userId: passkey.user.id,
       email: primaryEmail,
-      name: passkeyUser.name,
+      name: passkeyUser.profile?.name,
       ip: clientIp || 'unknown',
       userAgent: request.headers.get('user-agent'),
       fingerprint: request.cookies.get('__dfp')?.value || request.headers.get('x-device-fingerprint') || null,

@@ -83,23 +83,20 @@ export async function PUT(request: NextRequest) {
       if (data.supportEmail === undefined) data.supportEmail = true;
     }
 
-    const prefs = await saveNotificationPrefs(session.userId, data);
-
+    let clearUnsub: Record<string, any> | null = null;
     if (data.email === true) {
-      try {
-        const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { emailUnsubscribed: true } });
-        const eu: any = (user as any)?.emailUnsubscribed || {};
-        if (eu.all || eu.product || eu.forms || eu.support) {
-          eu.all = false;
-          eu.product = false;
-          eu.forms = false;
-          eu.support = false;
-          await prisma.$executeRaw`
-            UPDATE "user"."users" SET "email_unsubscribed" = ${JSON.stringify(eu)}::jsonb
-            WHERE "id" = ${session.userId}`;
-          console.log(`[NOTIFICATIONS] Cleared emailUnsub flags for user ${session.userId} (email re-enabled)`);
-        }
-      } catch { /* non-fatal */ }
+      const row = await prisma.userPreferences.findUnique({ where: { userId: session.userId }, select: { notif: true } });
+      const notif: any = (row?.notif && typeof row.notif === 'object' && !Array.isArray(row.notif)) ? row.notif : {};
+      const eu: any = (notif.unsubscribed && typeof notif.unsubscribed === 'object' && !Array.isArray(notif.unsubscribed)) ? notif.unsubscribed : {};
+      if (eu.all || eu.product || eu.forms || eu.support) {
+        clearUnsub = { ...eu, all: false, product: false, forms: false, support: false };
+      }
+    }
+
+    const prefs = await saveNotificationPrefs(session.userId, clearUnsub ? { ...data, unsubscribed: clearUnsub } : data);
+
+    if (clearUnsub) {
+      console.log(`[NOTIFICATIONS] Cleared emailUnsub flags for user ${session.userId} (email re-enabled)`);
     }
 
     return NextResponse.json(prefs);

@@ -5,7 +5,6 @@ import { adminLoginHandler } from '@/features/auth/authHandlers';
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  captchaRayId: z.string().optional(),
   fingerprint: z.string().optional(),
 });
 
@@ -16,7 +15,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
     }
 
-    const { email, password, captchaRayId, fingerprint } = parsed.data;
+    const { email, password, fingerprint } = parsed.data;
     return adminLoginHandler(request, parsed.data);
   } catch (err: any) {
     console.error('[ADMIN LOGIN] Authentication error:', err?.message || err);
@@ -46,18 +45,19 @@ async function handleVerify(request: NextRequest) {
     const { prisma } = await import('@/infrastructure/db/prisma');
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { id: true, email: true, totpSecret: true, is2FAEnabled: true, adminRole: true, mustChangePassword: true },
+      select: { id: true, email: true, isAdmin: true, security: { select: { totpSecret: true, totpEnabled: true, mustChangePw: true } } },
     });
-    if (!user || !user.totpSecret || !user.is2FAEnabled) {
+    const totpSecret = user?.security?.totpSecret;
+    if (!user || !totpSecret || !user.security?.totpEnabled) {
       return NextResponse.json({ error: '2FA not enabled' }, { status: 400 });
     }
 
     const { verifyTotp } = await import('@/features/auth/totp');
-    if (!await verifyTotp(totpCode, user.totpSecret)) {
+    if (!await verifyTotp(totpCode, totpSecret)) {
       return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 });
     }
 
-    if (!user.adminRole) {
+    if (!user.isAdmin) {
       const { sendTemplateEmail } = await import('@/features/email/email');
       sendTemplateEmail(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',
@@ -70,7 +70,7 @@ async function handleVerify(request: NextRequest) {
 
     // 2FA satisfied but the account was provisioned with a temporary password —
     // force a password change before issuing any admin session.
-    if (user.mustChangePassword) {
+    if (user.security?.mustChangePw) {
       const { signTempPasswordChangeToken } = await import('@/features/auth/jwt');
       const pwToken = await signTempPasswordChangeToken(user.id);
       return NextResponse.json({ needsPasswordChange: true, tempToken: pwToken });
@@ -78,7 +78,7 @@ async function handleVerify(request: NextRequest) {
 
     const ip = request.headers.get('x-forwarded-for') || '';
     const { createSession, setSessionCookie } = await import('@/features/auth/http-guards');
-    const adminRole = user.adminRole;
+    const adminRole = user.isAdmin ? 'admin' : undefined;
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);
