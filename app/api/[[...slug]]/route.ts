@@ -1300,10 +1300,17 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
       // it match what staff see) and it is findable in admin by that code.
       const syEventId = await systemFaultRef(`${method} ${route.path} ${err?.name || 'Error'}: ${err?.message || ''}`);
       console.error(`[HANDLER] System event ID for ${method} ${pathStr}: ${syEventId}`);
-      resp = NextResponse.json(
-        { error: 'Internal server error', eventId: syEventId },
-        { status: 500, headers: { 'X-Event-Id': syEventId } },
-      );
+      if (/callback$/.test(route.path) && (request.headers.get('accept') || '').includes('text/html')) {
+        // OAuth callbacks are browser navigations; a JSON 500 is a dead-end
+        // page. Land the user back on the login screen with the same ref.
+        const { getAccountsBaseUrl } = await import('@/config/app-urls');
+        resp = NextResponse.redirect(`${getAccountsBaseUrl()}/login?error=oauth_callback_failed&ref=${encodeURIComponent(syEventId)}`);
+      } else {
+        resp = NextResponse.json(
+          { error: 'Internal server error', eventId: syEventId },
+          { status: 500, headers: { 'X-Event-Id': syEventId } },
+        );
+      }
     }
     // A handler that caught its own failure still returns a 5xx without an
     // ID ("Could not check email" style); attach the same deterministic,

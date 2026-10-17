@@ -28,7 +28,7 @@ import { logAuthJson, logOtpJson, logLinkJson } from '@/features/auth/auth-log';
 import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
-import { ensureRefCode } from '@/features/users/refcode';
+import { ensureRefCode, systemFaultRef } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
@@ -1016,6 +1016,21 @@ function logOauthFailure(request: NextRequest, provider: string, reason: string,
     eventType: 'auth.oauth_failed',
     severity: 'warning',
     details: { provider, reason, ...(detail ? { detail: detail.slice(0, 200) } : {}) } }).catch(() => {});
+}
+
+/** OAuth start/callback pages are browser navigations — a JSON error there
+    is a dead-end white page. Send the user back to the login screen with a
+    reason and a stable event id instead: the same failure always shows the
+    same id, and that id is recorded in the admin event ledger. */
+async function oauthFail(request: NextRequest, reason: string, detail?: string): Promise<NextResponse> {
+  const provider = (request.nextUrl.pathname.match(/auth\/(google|github|discord)/) || [, 'oauth'])[1];
+  let ref = '';
+  try { ref = await systemFaultRef(`oauth ${provider} ${reason} ${detail || ''}`); } catch { /* no id beats no redirect */ }
+  const base = (prodSafeEnvUrl(process.env.ACCOUNTS_URL) || getAccountsBaseUrl()).replace(/\/$/, '');
+  const url = new URL(`${base}/login`);
+  url.searchParams.set('error', `oauth_${provider}_${reason}`);
+  if (ref) url.searchParams.set('ref', ref);
+  return NextResponse.redirect(url.toString());
 }
 
 const loginSchema = z.object({
@@ -2964,7 +2979,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
     console.info(`[OAUTH:google] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GOOGLE_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const sp = request.nextUrl.searchParams;
     const safeRedirect = normalizeOAuthRedirect(sp.get('redirect_to') || sp.get('redirect'));
@@ -3002,18 +3017,18 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/google/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return NextResponse.json({ error: 'Google OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'google');
     if ('error' in validated) {
       logOauthFailure(request, 'google', 'state_validation', validated.error);
-      return NextResponse.json({ error: validated.error }, { status: 400 });
+      return await oauthFail(request, 'state_validation', validated.error);
     }
     const { state } = validated;
     if (!code) {
       logOauthFailure(request, 'google', 'missing_code');
-      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+      return await oauthFail(request, 'missing_code');
     }
 
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -3029,7 +3044,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       const errBody = await tokenRes.text();
       console.error('[GOOGLE TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri, 'client_id:', clientId?.slice(0, 20));
       logOauthFailure(request, 'google', 'token_exchange_failed', errBody);
-      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+      return await oauthFail(request, 'exchange_failed');
     }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -3038,7 +3053,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       headers: { Authorization: `Bearer ${accessToken}` } });
     if (!userInfoRes.ok) {
       logOauthFailure(request, 'google', 'userinfo_fetch_failed');
-      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+      return await oauthFail(request, 'userinfo_failed');
     }
     const profile: any = await userInfoRes.json();
 
@@ -3050,7 +3065,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[GOOGLE CALLBACK]', err?.message || err);
     logOauthFailure(request, 'google', 'callback_exception', err?.message);
-    return NextResponse.json({ error: 'Google OAuth callback failed' }, { status: 500 });
+    return await oauthFail(request, 'callback_failed', err?.message);
   }
 }
 
@@ -3062,7 +3077,7 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
     console.info(`[OAUTH:github] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.GITHUB_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const sp = request.nextUrl.searchParams;
     const safeRedirect = normalizeOAuthRedirect(sp.get('redirect_to') || sp.get('redirect'));
@@ -3096,18 +3111,18 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/github/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return NextResponse.json({ error: 'GitHub OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'github');
     if ('error' in validated) {
       logOauthFailure(request, 'github', 'state_validation', validated.error);
-      return NextResponse.json({ error: validated.error }, { status: 400 });
+      return await oauthFail(request, 'state_validation', validated.error);
     }
     const { state } = validated;
     if (!code) {
       logOauthFailure(request, 'github', 'missing_code');
-      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+      return await oauthFail(request, 'missing_code');
     }
 
     const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
@@ -3118,7 +3133,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       const errBody = await tokenRes.text();
       console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
       logOauthFailure(request, 'github', 'token_exchange_failed', errBody);
-      return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+      return await oauthFail(request, 'exchange_failed');
     }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -3130,7 +3145,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (!userInfoRes.ok) {
       console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
       logOauthFailure(request, 'github', 'userinfo_fetch_failed', String(userInfoRes.status));
-      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+      return await oauthFail(request, 'userinfo_failed');
     }
     const profile: any = await userInfoRes.json();
     let email = profile.email as string | undefined;
@@ -3176,7 +3191,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[GITHUB CALLBACK]', err?.message || err);
     logOauthFailure(request, 'github', 'callback_exception', err?.message);
-    return NextResponse.json({ error: 'GitHub OAuth callback failed' }, { status: 500 });
+    return await oauthFail(request, 'callback_failed', err?.message);
   }
 }
 
@@ -3188,7 +3203,7 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
     console.info(`[OAUTH:discord] redirect_uri → ${redirectUri} [source: ${cfg.redirectUri ? 'DB site_configs — OVERRIDES ENV' : process.env.DISCORD_REDIRECT_URI ? 'env' : 'derived from request'}]`);
     if (!cfg.enabled || !clientId || !redirectUri) {
-      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const sp = request.nextUrl.searchParams;
     const safeRedirect = normalizeOAuthRedirect(sp.get('redirect_to') || sp.get('redirect'));
@@ -3223,18 +3238,18 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     const clientSecret = cfg.clientSecret;
     const redirectUri = cfg.redirectUri || getDynamicRedirectUri(request, '/auth/discord/callback');
     if (!cfg.enabled || !clientId || !clientSecret || !redirectUri) {
-      return NextResponse.json({ error: 'Discord OAuth not configured' }, { status: 500 });
+      return await oauthFail(request, 'not_configured');
     }
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'discord');
     if ('error' in validated) {
       logOauthFailure(request, 'discord', 'state_validation', validated.error);
-      return NextResponse.json({ error: validated.error }, { status: 400 });
+      return await oauthFail(request, 'state_validation', validated.error);
     }
     const { state } = validated;
     if (!code) {
       logOauthFailure(request, 'discord', 'missing_code');
-      return NextResponse.json({ error: 'Missing code' }, { status: 400 });
+      return await oauthFail(request, 'missing_code');
     }
 
     const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
@@ -3250,7 +3265,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
        const errBody = await tokenRes.text();
        console.error('[DISCORD TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
        logOauthFailure(request, 'discord', 'token_exchange_failed', errBody);
-       return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
+       return await oauthFail(request, 'exchange_failed');
      }
     const tokenData: any = await tokenRes.json();
     const accessToken = tokenData.access_token;
@@ -3259,7 +3274,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
       headers: { Authorization: `Bearer ${accessToken}` } });
     if (!userInfoRes.ok) {
       logOauthFailure(request, 'discord', 'userinfo_fetch_failed');
-      return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
+      return await oauthFail(request, 'userinfo_failed');
     }
     const profile: any = await userInfoRes.json();
     const discordId = profile.id as string;
@@ -3277,7 +3292,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
   } catch (err: any) {
     console.error('[DISCORD CALLBACK]', err?.message || err);
     logOauthFailure(request, 'discord', 'callback_exception', err?.message);
-    return NextResponse.json({ error: 'Discord OAuth callback failed' }, { status: 500 });
+    return await oauthFail(request, 'callback_failed', err?.message);
   }
 }
 
