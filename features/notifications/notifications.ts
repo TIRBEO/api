@@ -115,13 +115,23 @@ export async function checkNotifRateLimit(userId: string, limit = 10, windowSec 
 export async function checkRateLimit(prefix: string, limit = 20, windowSec = 60): Promise<{ allowed: boolean; remaining: number }> {
   // Generic per-prefix rate-limit helper for UI feedback (e.g. prefs:${userId})
   const redis = await getNotifRedis();
-  if (!redis) return { allowed: true, remaining: limit };
-  const key = `${prefix}:${Math.floor(Date.now() / (windowSec*1000))}`;
+  if (redis) {
+    const key = `${prefix}:${Math.floor(Date.now() / (windowSec*1000))}`;
+    try {
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, windowSec);
+      return { allowed: count <= limit, remaining: Math.max(0, limit - count) };
+    } catch { /* Redis error → fall through to Postgres */ }
+  }
+  // Durable fixed window (was fail-open on no Redis). Guarded: if Postgres is
+  // unreachable too we still allow, but only when BOTH stores are down.
   try {
-    const count = await redis.incr(key);
-    if (count === 1) await redis.expire(key, windowSec);
-    return { allowed: count <= limit, remaining: Math.max(0, limit - count) };
-  } catch { return { allowed: true, remaining: limit }; }
+    const { consumeWindow } = await import('@/features/auth/db-windows');
+    const w = await consumeWindow(`notifwin:${prefix}`, limit, windowSec * 1000);
+    return { allowed: w.allowed, remaining: Math.max(0, limit - w.count) };
+  } catch {
+    return { allowed: true, remaining: limit };
+  }
 }
 
 // ─── createNotification ───

@@ -2,7 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 
-// In-memory ring buffer for last 200 client errors (GET requires auth)
+// Client errors are a real event-ledger row (kind 'client.error'), so they
+// survive restarts and are queryable in admin. A small in-memory buffer is kept
+// ONLY as a fallback for the (rare) case where the ledger write fails — it is no
+// longer the source of truth.
 const g = globalThis as any;
 if (!g.__tirbeoClientErrors) g.__tirbeoClientErrors = [] as any[];
 const buf: any[] = g.__tirbeoClientErrors;
@@ -33,8 +36,26 @@ export async function POST(req: NextRequest) {
     if (JSON.stringify(entry).length > 16 * 1024) {
       return NextResponse.json({ ok: true });
     }
-    buf.push(entry);
-    if (buf.length > MAX_ENTRIES) buf.shift();
+    const ip = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim()
+      || req.headers.get('x-real-ip') || req.headers.get('cf-connecting-ip') || null;
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    try {
+      await prisma.activityEvent.create({
+        data: {
+          kind: 'client.error',
+          title: 'Client error (websocket / API)',
+          detail: String(entry.message || '').slice(0, 500) || null,
+          severity: 'warning',
+          ipAddress: ip,
+          userAgent: req.headers.get('user-agent')?.slice(0, 500) ?? null,
+          metadata: entry as any,
+        },
+      });
+    } catch {
+      // Ledger unavailable — keep the volatile buffer so the data isn't lost.
+      buf.push(entry);
+      if (buf.length > MAX_ENTRIES) buf.shift();
+    }
     console.log(`[CLIENT-ERROR] wsCode=${entry.code ?? '?'} retry=${entry.retryCount ?? 0} host=${entry.host} path=${entry.url ?? entry.path ?? ''}`);
     return NextResponse.json({ ok: true });
   } catch {
@@ -45,5 +66,18 @@ export async function POST(req: NextRequest) {
 export async function GET(request: NextRequest) {
   const { isCronAuthorized, cronUnauthorized } = await import('../_guard');
   if (!isCronAuthorized(request)) return cronUnauthorized();
-  return NextResponse.json({ errors: buf.slice(-50).reverse() });
+  try {
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    const rows = await prisma.activityEvent.findMany({
+      where: { kind: 'client.error' },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: { metadata: true },
+    });
+    const errors = rows.map((r: any) => r.metadata ?? {}).reverse();
+    return NextResponse.json({ errors });
+  } catch {
+    // DB read failed — serve the volatile fallback buffer.
+    return NextResponse.json({ errors: buf.slice(-50).reverse() });
+  }
 }

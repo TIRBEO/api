@@ -7,7 +7,7 @@ import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
 import { getAccountsBaseUrl } from '@/config/app-urls';
 import { fetchLoginUserByEmail, fetchLoginUserById } from '@/features/identity/tirbeo';
 import { verifiedRecoveryAddress } from '@/features/auth/recovery-email';
-import { eventIdFor } from '@/features/users/refcode';
+import { ensureRefCode } from '@/features/users/refcode';
 
 const RESET_TTL_MINUTES = 15;
 const MAX_OTP_ATTEMPTS = 5;
@@ -365,7 +365,7 @@ export async function quickLoginWithOtp(
       banned: true,
       block: {
         kind: 'banned',
-        eventId: eventIdFor(user.id, 'ban'),
+        eventId: await ensureRefCode(user.id, 'ban'),
         reason: null,
         until: null,
         message: 'Your account has been banned.',
@@ -379,7 +379,7 @@ export async function quickLoginWithOtp(
       suspended: true,
       block: {
         kind: 'suspended',
-        eventId: eventIdFor(user.id, 'suspend'),
+        eventId: await ensureRefCode(user.id, 'suspend'),
         reason: null,
         until: null,
         message: 'Your account is temporarily suspended.',

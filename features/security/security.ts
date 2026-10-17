@@ -5,6 +5,7 @@ import { sendTemplateEmail } from '@/features/email/email';
 import { getBranding } from '@/features/branding/branding';
 import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { resolveLoginPlace, resolveLoginCoords } from '@/shared/geo';
+import { refCodeCandidates } from '@/features/users/refcode';
 
 export type SecuritySeverity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -230,7 +231,7 @@ export async function logSecurityEvent(input: {
   severity?: SecuritySeverity;
   details?: Record<string, unknown>;
   notifyAdmin?: boolean;
-}): Promise<void> {
+}): Promise<string | null> {
   const ip = input.request ? getClientIp(input.request) : currentRequestOrigin()?.ip ?? undefined;
   const rayId = input.request ? getRayId(input.request) : undefined;
   const userAgent = input.request ? getUserAgent(input.request) : currentRequestOrigin()?.userAgent ?? undefined;
@@ -246,24 +247,28 @@ export async function logSecurityEvent(input: {
   if (place && metadata.location === undefined) metadata.location = place;
   if (coords && metadata.coords === undefined) metadata.coords = coords;
 
+  // The created activity row's id, returned so a caller can surface a
+  // reference (e.g. the "Ref: XXXXXXXX" on a 429 screen). Null when the write
+  // failed — callers must handle the no-id case (most ignore it entirely).
+  let eventId: string | null = null;
   try {
-    // activity_events.user_id has a NOT-NULL FK to users(id). Anonymous events
-    // (no authenticated user) can't satisfy it, so skip the row write; the
-    // admin/critical notification below still fires for them.
-    if (input.userId) {
-      await prisma.activityEvent.create({
-        data: {
-          userId: input.userId,
-          kind: input.eventType,
-          title: humanizeEventType(input.eventType),
-          detail: input.details?.reason ? String(input.details.reason).slice(0, 500) : null,
-          severity: input.severity || 'info',
-          ipAddress: ip,
-          userAgent: userAgent,
-          metadata: (metadata || {}) as Prisma.InputJsonValue,
-        },
-      });
-    }
+    // user_id is nullable since the anonymous-events change, so every security
+    // event lands as a queryable row — pre-account flows (signup OTP, magic
+    // link, telemetry) write with userId null and stay attributable later via
+    // ip/metadata.
+    const row = await prisma.activityEvent.create({
+      data: {
+        userId: input.userId ?? null,
+        kind: input.eventType,
+        title: humanizeEventType(input.eventType),
+        detail: input.details?.reason ? String(input.details.reason).slice(0, 500) : null,
+        severity: input.severity || 'info',
+        ipAddress: ip,
+        userAgent: userAgent,
+        metadata: (metadata || {}) as Prisma.InputJsonValue,
+      },
+    });
+    eventId = row?.id ?? null;
   } catch (e) {
     console.error('[SECURITY] Failed to log event:', e instanceof Error ? e.message : e);
   }
@@ -277,13 +282,60 @@ export async function logSecurityEvent(input: {
       severity: input.severity || 'warning',
     });
   }
+
+  return eventId;
+}
+
+/**
+ * A rate-limit trip becomes a real, queryable activity row. Returns the
+ * created event's id (null if the write failed) so the caller can echo it back
+ * on the 429 as `eventId` — a client shows "Ref: XXXXXXXX" and staff can look
+ * that id up in the security log (listSecurityEvents matches by event id).
+ *
+ * Privacy: the caller passes the email DOMAIN only, never the full address, and
+ * a short "hint" describing which limit bucket tripped (e.g. the key's prefix),
+ * not the raw key with a full email/IP embedded.
+ */
+export async function logRateLimited(input: {
+  request?: Request;
+  userId?: string | null;
+  /** Which endpoint/action tripped the limit, e.g. 'auth/login'. */
+  action: string;
+  /** Email domain only — never the local part or full address. */
+  emailDomain?: string | null;
+  /** Short, non-identifying hint at the limit bucket key shape. */
+  keyHint?: string;
+  /** Epoch ms when the window resets (RateLimitResult.reset seconds → ms). */
+  resetsAt?: number | null;
+}): Promise<string | null> {
+  return logSecurityEvent({
+    request: input.request,
+    userId: input.userId ?? null,
+    eventType: 'security.rate_limited',
+    severity: 'warning',
+    details: {
+      action: input.action,
+      emailDomain: input.emailDomain ?? null,
+      keyHint: input.keyHint ?? null,
+      resetsAt: input.resetsAt ? new Date(input.resetsAt).toISOString() : null,
+      reason: 'rate_limited',
+    },
+  });
+}
+
+/** Extract just the domain of an email — the only part safe to persist on a
+    rate-limit row (the full address stays out of the event log). */
+export function emailDomainOf(email?: string | null): string | null {
+  if (!email) return null;
+  const at = String(email).indexOf('@');
+  return at > 0 ? String(email).slice(at + 1).toLowerCase() : null;
 }
 
 /** Event kinds are written for machines — `security.password_changed`. A
     record a person reads wants the other half of that name: the namespace it
     sits under tells them nothing, and the snake_case is not how anyone
     sentences. */
-function humanizeEventType(type: string): string {
+export function humanizeEventType(type: string): string {
   const leaf = type.includes('.') ? type.slice(type.lastIndexOf('.') + 1) : type;
   return leaf
     .replace(/[_\-]+/g, ' ')
@@ -340,15 +392,55 @@ async function redisBlockLookup(field: string): Promise<BlockEntry | null> {
   }
 }
 
+/** True when a block entry is active now (flag set and not past expiry). */
+function isEntryActive(entry: BlockEntry): boolean {
+  return entry.isActive !== false && (!entry.expiresAt || new Date(entry.expiresAt) >= new Date());
+}
+
+function blockRowToEntry(row: {
+  targetType: string; targetId: string; reason: string | null; blockedBy: string | null;
+  isActive: boolean | null; expiresAt: Date | null; createdAt: Date; updatedAt: Date;
+}): BlockEntry {
+  return {
+    targetType: row.targetType,
+    targetId: row.targetId,
+    reason: row.reason ?? undefined,
+    blockedBy: row.blockedBy ?? null,
+    isActive: row.isActive !== false,
+    expiresAt: row.expiresAt ? row.expiresAt.toISOString() : null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/** DB blocklist lookup. Returns the row, `null` for a definite "no row", or
+ *  `undefined` when the query failed (DB outage) so callers can fall back. */
+async function dbBlockLookup(targetType: string, targetId: string): Promise<BlockEntry | null | undefined> {
+  try {
+    const row = await prisma.blocklist.findUnique({ where: { targetType_targetId: { targetType, targetId } } });
+    return row ? blockRowToEntry(row) : null;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function isIpBlocked(ip: string): Promise<boolean> {
   if (!ip || ip === 'unknown') return false;
   const cached = ipBlockCache.get(ip);
   if (cached && cached.expires > Date.now()) return cached.blocked;
-  const entry = await redisBlockLookup(`ip:${ip}`);
-  // Redis unavailable: serve the (benign) default WITHOUT caching, so the
-  // next request retries instead of locking in a stale verdict for 15s.
-  if (entry === null) return false;
-  const blocked = entry.isActive !== false && (!entry.expiresAt || new Date(entry.expiresAt) >= new Date());
+  const dbRow = await dbBlockLookup('ip', ip);
+  // DB outage: trust the Redis cache, don't poison the in-process cache.
+  if (dbRow === undefined) {
+    const r = await redisBlockLookup(`ip:${ip}`);
+    return r ? isEntryActive(r) : false;
+  }
+  let blocked = dbRow ? isEntryActive(dbRow) : false;
+  // Not blocked per DB: honor a Redis-only entry (legacy ban written before the
+  // DB path existed) so the transition never silently un-blocks someone.
+  if (!blocked) {
+    const r = await redisBlockLookup(`ip:${ip}`);
+    if (r && isEntryActive(r)) blocked = true;
+  }
   ipBlockCache.set(ip, { blocked, expires: Date.now() + IP_BLOCK_CACHE_TTL });
   if (ipBlockCache.size > 1000) {
     const now = Date.now();
@@ -366,27 +458,60 @@ export async function blockTarget(input: {
   blockedBy?: string;
   expiresAt?: Date | null;
 }): Promise<void> {
+  const expiresAt = input.expiresAt ?? null;
+  // Postgres is the source of truth; Redis is only a fast read cache. Blocking
+  // therefore works with no Redis configured (it used to throw).
+  try {
+    await prisma.blocklist.upsert({
+      where: { targetType_targetId: { targetType: input.targetType, targetId: input.targetId } },
+      update: { reason: input.reason, blockedBy: input.blockedBy ?? null, isActive: true, expiresAt },
+      create: {
+        targetType: input.targetType,
+        targetId: input.targetId,
+        reason: input.reason,
+        blockedBy: input.blockedBy ?? null,
+        isActive: true,
+        expiresAt,
+      },
+    });
+  } catch (dbErr) {
+    // DB down: fall back to Redis so a block still lands when it is configured;
+    // with neither store reachable the caller must see the failure.
+    const redis = getRedis();
+    if (!redis) throw dbErr;
+    const now = new Date().toISOString();
+    const entry: BlockEntry = {
+      targetType: input.targetType, targetId: input.targetId, reason: input.reason,
+      blockedBy: input.blockedBy || null, isActive: true,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null, createdAt: now, updatedAt: now,
+    };
+    await redis.hset(BLOCKLIST_REDIS_KEY, `${input.targetType}:${input.targetId}`, JSON.stringify(entry));
+    if (input.targetType === 'ip') ipBlockCache.delete(input.targetId);
+    return;
+  }
+  // Mirror to Redis when configured (best-effort; a cache miss just reads DB).
   const redis = getRedis();
-  if (!redis) throw new Error('Blocklist storage (Redis) unavailable');
-  const now = new Date().toISOString();
-  const entry: BlockEntry = {
-    targetType: input.targetType,
-    targetId: input.targetId,
-    reason: input.reason,
-    blockedBy: input.blockedBy || null,
-    isActive: true,
-    expiresAt: input.expiresAt ? input.expiresAt.toISOString() : null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  await redis.hset(BLOCKLIST_REDIS_KEY, `${input.targetType}:${input.targetId}`, JSON.stringify(entry));
+  if (redis) {
+    const now = new Date().toISOString();
+    const entry: BlockEntry = {
+      targetType: input.targetType, targetId: input.targetId, reason: input.reason,
+      blockedBy: input.blockedBy || null, isActive: true,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null, createdAt: now, updatedAt: now,
+    };
+    await redis.hset(BLOCKLIST_REDIS_KEY, `${input.targetType}:${input.targetId}`, JSON.stringify(entry)).catch(() => {});
+  }
   if (input.targetType === 'ip') ipBlockCache.delete(input.targetId);
 }
 
 export async function unblockTarget(targetType: string, targetId: string): Promise<void> {
+  try {
+    await prisma.blocklist.delete({ where: { targetType_targetId: { targetType, targetId } } });
+  } catch (dbErr) {
+    const redis = getRedis();
+    if (!redis) throw dbErr;
+  }
   const redis = getRedis();
-  if (!redis) return;
-  await redis.hdel(BLOCKLIST_REDIS_KEY, `${targetType}:${targetId}`);
+  if (redis) await redis.hdel(BLOCKLIST_REDIS_KEY, `${targetType}:${targetId}`).catch(() => {});
   if (targetType === 'ip') ipBlockCache.delete(targetId);
 }
 
@@ -404,11 +529,33 @@ export async function listBlocks(options: {
   if (options.activeOnly) where.isActive = true;
   if (options.search) {
     where.OR = [
-      { targetId: { contains: options.search } },
-      { reason: { contains: options.search } },
+      { targetId: { contains: options.search, mode: 'insensitive' } },
+      { reason: { contains: options.search, mode: 'insensitive' } },
     ];
   }
 
+  // Postgres is the source of truth. On a DB outage fall back to the Redis hash
+  // so the admin list still renders.
+  try {
+    const [rows, total] = await Promise.all([
+      prisma.blocklist.findMany({
+        where: where as any,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      prisma.blocklist.count({ where: where as any }),
+    ]);
+    const items = rows.map((r: any) => blockRowToEntry(r));
+    return { items, total, page, limit };
+  } catch {
+    return listBlocksFromRedis(options, page, limit);
+  }
+}
+
+async function listBlocksFromRedis(options: {
+  page?: number; limit?: number; targetType?: string; activeOnly?: boolean; search?: string;
+}, page: number, limit: number) {
   const redis = getRedis();
   if (!redis) return { items: [], total: 0, page, limit };
   const all: Record<string, string> = await redis.hgetall(BLOCKLIST_REDIS_KEY).catch(() => ({}));
@@ -431,11 +578,14 @@ export async function listBlocks(options: {
 
 // ─── Security events query ───
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function listSecurityEvents(options: {
   page?: number;
   limit?: number;
   eventType?: string;
   severity?: string;
+  id?: string;
   ip?: string;
   userId?: string;
   from?: string;
@@ -445,8 +595,30 @@ export async function listSecurityEvents(options: {
   const page = Math.max(1, options.page || 1);
   const limit = Math.min(200, options.limit || 50);
   const where: Record<string, unknown> = {};
+  if (options.id) {
+    // The `id` filter accepts BOTH shapes staff actually paste: the event's
+    // own uuid, and the user-facing reference code (xxxx-xxxx-xxxx) shown on
+    // ban/suspend screens and quoted in security emails — which lives in
+    // metadata.refCode of the activity row (mirrored from
+    // user_status_events.metadata.refCode at enforcement time). A value that
+    // isn't a uuid but parses as a ref code matches the uuid exactly, or any
+    // stored refCode candidate shape (canonical, plain-hex, legacy 8-char and
+    // SUS-/BAN- prefixed forms).
+    const isUuid = UUID_RE.test(options.id);
+    const candidates = isUuid ? [] : refCodeCandidates(options.id);
+    if (candidates.length) {
+      where.OR = [
+        { id: options.id },
+        ...candidates.map((c) => ({ id: c })),
+        ...candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } })),
+      ];
+    } else {
+      where.id = options.id;
+    }
+  }
   if (options.eventType) where.kind = options.eventType;
   if (options.severity) where.severity = options.severity;
+  if (options.ip) where.ipAddress = { contains: options.ip };
   if (options.userId) where.userId = options.userId;
   if (options.from || options.to) {
     const createdAt: Record<string, Date> = {};

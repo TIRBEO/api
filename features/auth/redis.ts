@@ -89,7 +89,24 @@ export async function revokeSessionState(sessionId: string): Promise<boolean> {
 
 export async function markRefreshSpent(hash: string, sessionId: string): Promise<boolean> {
   const redis = getRedis();
-  if (!redis) return false;
+  if (!redis) {
+    // No Redis: persist to Postgres. session.ts calls isRefreshSpent BEFORE
+    // marking, so a genuine replay is caught there; this write just records the
+    // spend. An existing row (same token rotated twice) is the theft signature —
+    // upsert keeps it idempotent. Guarded: a missing table falls back to the
+    // old silent false.
+    try {
+      const { prisma } = await import('@/infrastructure/db/prisma');
+      await prisma.refreshTokenSpent.upsert({
+        where: { tokenHash: hash },
+        update: {},
+        create: { tokenHash: hash, sessionId },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
   try {
     const key = SPENT_KEY(hash);
     await redis.setex(key, Math.ceil(REFRESH_TTL_MS / 1000), sessionId);
@@ -101,7 +118,15 @@ export async function markRefreshSpent(hash: string, sessionId: string): Promise
 
 export async function isRefreshSpent(hash: string): Promise<string | null> {
   const redis = getRedis();
-  if (!redis) return null;
+  if (!redis) {
+    try {
+      const { prisma } = await import('@/infrastructure/db/prisma');
+      const row = await prisma.refreshTokenSpent.findUnique({ where: { tokenHash: hash }, select: { sessionId: true } });
+      return row?.sessionId ?? null;
+    } catch {
+      return null;
+    }
+  }
   try {
     return await redis.get(SPENT_KEY(hash));
   } catch {

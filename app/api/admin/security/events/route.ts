@@ -9,6 +9,7 @@ export async function GET(request: NextRequest) {
   const url = request.nextUrl;
   const page = Math.max(1, Number(url.searchParams.get('page')) || 1);
   const limit = Math.min(200, Number(url.searchParams.get('limit')) || 50);
+  const id = url.searchParams.get('id') || undefined;
   const eventType = url.searchParams.get('eventType') || undefined;
   const severity = url.searchParams.get('severity') || undefined;
   const ip = url.searchParams.get('ip') || undefined;
@@ -18,7 +19,7 @@ export async function GET(request: NextRequest) {
   const includeUser = url.searchParams.get('includeUser') !== 'false';
 
   const [data, stats] = await Promise.all([
-    listSecurityEvents({ page, limit, eventType, severity, ip, userId, from, to, includeUser }),
+    listSecurityEvents({ page, limit, id, eventType, severity, ip, userId, from, to, includeUser }),
     getSecurityStats(),
   ]);
 
@@ -34,6 +35,9 @@ export async function DELETE(request: NextRequest) {
   const olderThanDays = Number(url.searchParams.get('olderThanDays')) || 30;
   const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
 
-  const result = await prisma.securityEvent.deleteMany({ where: { createdAt: { lt: cutoff } } });
+  // One ledger now: the GET above reads activity_events (listSecurityEvents),
+  // so the purge must target the same table. Admin-only endpoint; note the
+  // ledger also carries audit rows — the cutoff default (30d) applies to all.
+  const result = await prisma.activityEvent.deleteMany({ where: { createdAt: { lt: cutoff } } });
   return NextResponse.json({ deleted: result.count });
 }

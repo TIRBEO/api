@@ -7,11 +7,14 @@
 //   No type prefix — the kind is inferred from context (ban/suspend/ratelimit/system).
 //
 // Codes are PERSISTED in user_status_events.metadata.refCode (set when an
-// admin bans/suspends) so staff can look a user up by event ID from
-// the admin console. The deterministic fallback guarantees a usable code for
-// legacy accounts without stored codes.
+// admin bans/suspends, or — for legacy accounts without a stored code — by
+// ensureRefCode() on first display) so staff can look a user up by event ID
+// from the admin console. A code shown to a user must exist in the DB;
+// eventIdFor() remains only as the DB-unreachable fallback.
 
 export type EventKind = 'ban' | 'suspend' | 'ratelimit' | 'system';
+// Codes may also be persisted for deleted accounts; helpers accept the widened kind.
+type DisplayKind = EventKind | 'deleted';
 
 const HEX = '0123456789abcdef';
 
@@ -41,16 +44,24 @@ function randomHex(len: number): string {
 
 // ─── New event IDs (crypto-backed) ───
 // Format: xxxx-xxxx-xxxx (12 hex chars, no type prefix)
-export function generateEventId(_kind: EventKind): string {
+export function generateEventId(_kind: DisplayKind): string {
   const part1 = randomHex(4);
   const part2 = randomHex(4);
   const part3 = randomHex(4);
   return `${part1}-${part2}-${part3}`;
 }
 
-// Deterministic fallback (legacy accounts without a stored code). Stable for
-// a given user+kind so repeated denials always surface the same reference.
-export function eventIdFor(userId: string, _kind: EventKind): string {
+/**
+ * Deterministic fallback (legacy accounts without a stored code). Stable for
+ * a given user+kind so repeated denials always surface the same reference.
+ *
+ * READ-ONLY LEGACY DISPLAY HELPER — never hand a code to a user on a block
+ * screen through this function any more. A code a person sees must exist in
+ * the database so they can quote it and staff can look it up; call
+ * ensureRefCode() instead, which mints once and persists. This stays only as
+ * the last-resort fallback inside ensureRefCode when the DB is unreachable.
+ */
+export function eventIdFor(userId: string, _kind: DisplayKind): string {
   const h1 = fnv1a(`event:v2:${userId}`) & 0xffff;
   const h2 = fnv1a(`event:v2:${userId}:salt`, 0x9e3779b9) & 0xffff;
   const h3 = fnv1a(`event:v2:${userId}:salt2`, 0xdeadbeef) & 0xffff;
@@ -65,6 +76,73 @@ export function eventIdForUser(
 ): string {
   if (stored && stored.trim()) return stored.trim();
   return eventIdFor(userId, kind);
+}
+
+/**
+ * The code a block screen shows for a banned/suspended account — guaranteed
+ * to be PERSISTED. Reads the newest user_status_events row for the user's
+ * current enforcement status; if it (or the whole row) carries no
+ * metadata.refCode, mints a fresh crypto code, writes it back (updating the
+ * existing event, or creating a dedicated enforcement status event when the
+ * legacy row predates codes entirely), and returns that. Every code a user
+ * ever sees is therefore findable in user_status_events — and, for
+ * admin-banned accounts, mirrored into activity_events by the enforcement
+ * write path (security.user_banned / security.user_suspended with
+ * metadata.refCode).
+ *
+ * Falls back to the deterministic legacy code only when the DB itself is
+ * unreachable — refusing to answer a blocked user with any reference at all
+ * is worse than an un-persisted one during an outage.
+ *
+ * The prisma import is lazy so this module stays dependency-free for the
+ * proxy bundle, which imports it statically.
+ */
+export async function ensureRefCode(userId: string, kind: EventKind | 'deleted'): Promise<string> {
+  const toStatus = kind === 'ban' ? 'banned' : kind === 'suspend' ? 'suspended' : kind === 'deleted' ? 'deleted' : null;
+  if (!toStatus) return generateEventId(kind);
+  try {
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    const latest = await prisma.userStatusEvent.findFirst({
+      where: { userId, toStatus },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, metadata: true } });
+    const stored = (latest?.metadata as Record<string, unknown> | null)?.refCode;
+    if (typeof stored === 'string' && stored.trim()) return stored.trim();
+
+    const code = generateEventId(kind);
+    if (latest) {
+      const meta = latest.metadata && typeof latest.metadata === 'object' && !Array.isArray(latest.metadata)
+        ? (latest.metadata as Record<string, unknown>) : {};
+      await prisma.userStatusEvent.update({
+        where: { id: latest.id },
+        data: { metadata: { ...meta, refCode: code } as never } });
+    } else {
+      // No enforcement status event exists at all (legacy ban predating the
+      // status-history tables) — file a dedicated row so the code has a home.
+      await prisma.userStatusEvent.create({
+        data: {
+          userId,
+          fromStatus: toStatus as never,
+          toStatus: toStatus as never,
+          reason: 'Reference code backfilled when first shown to the user',
+          actor: 'system',
+          metadata: { refCode: code, backfilled: true } as never } });
+    }
+    // Mirror the freshly persisted code into activity_events too, so an admin
+    // searching the event log by reference code finds backfilled codes exactly
+    // like codes minted by a ban/suspend (security.user_banned rows).
+    await prisma.activityEvent.create({
+      data: {
+        userId,
+        kind: 'security.ref_code_assigned',
+        title: 'Reference code assigned',
+        detail: `Code ${code} persisted for ${toStatus} account (first display).`,
+        severity: 'info',
+        metadata: { refCode: code, status: toStatus } as never } }).catch(() => {});
+    return code;
+  } catch {
+    return eventIdFor(userId, kind);
+  }
 }
 
 // Canonical display form from a 12-char hex token.

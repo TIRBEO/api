@@ -54,8 +54,14 @@ export async function publicHealthHandler() {
     const dbStart = Date.now();
     await prisma.$queryRaw`SELECT 1`;
     checks.database = { status: 'ok', latencyMs: Date.now() - dbStart };
-  } catch {
-    checks.database = { status: 'error' };
+  } catch (e: any) {
+    // The raw message can carry host/credential fragments, so it stays
+    // server-side; only Prisma's error code is published.
+    console.error('[HEALTH] Database check failed:', e?.code || '', e?.message || e);
+    checks.database = {
+      status: 'error',
+      code: typeof e?.code === 'string' ? e.code : undefined,
+    };
     healthy = false;
   }
 

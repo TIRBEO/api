@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession, validateCsrf } from '@/features/auth/http-guards';
 import { createSession, setSessionCookie } from '@/features/auth/session';
+import { logSecurityEvent } from '@/features/security/security';
 import {
   listDeviceAccounts,
   removeDeviceAccount,
@@ -108,6 +109,14 @@ export async function switchAccountHandler(request: NextRequest) {
     }
 
     const { token, refreshToken, saveLoginInfo } = await createSession(target.id, userAgent, ip);
+    // One row per real switch — which identity gave way to which, from which
+    // address — so the security log can reconstruct who was at the keyboard.
+    logSecurityEvent({
+      request,
+      userId: target.id,
+      eventType: 'auth.account_switch',
+      severity: 'info',
+      details: { fromUserId: session.userId, toUserId: target.id, toEmail: target.email } }).catch(() => {});
     const res = NextResponse.json({
       user: targetUser,
       switched: true,

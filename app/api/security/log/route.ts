@@ -44,7 +44,7 @@ export async function POST(request: NextRequest) {
   }
 
   const rayId = getRayId(request);
-  await logSecurityEvent({
+  const eventId = await logSecurityEvent({
     request,
     userId: body.userId || null,
     eventType: String(body.eventType),
@@ -53,5 +53,7 @@ export async function POST(request: NextRequest) {
     notifyAdmin: body.notifyAdmin !== false,
   });
 
-  return NextResponse.json({ ok: true });
+  // Echo the created row id so a caller (e.g. the proxy's rate-limit screen)
+  // can surface a look-up-able reference to the client.
+  return NextResponse.json({ ok: true, eventId });
 }

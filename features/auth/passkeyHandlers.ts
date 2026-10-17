@@ -15,6 +15,7 @@ import { originFromRequest } from '@/shared/changeOrigin';
 import { getAppDomain } from '@/config/app-urls';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { jsonError, jsonUnauthorized } from '@/shared/response';
+import { logSecurityEvent } from '@/features/security/security';
 import { signReauthToken } from '@/features/auth/jwt';
 import { requireReauth } from '@/features/auth/reauth';
 
@@ -67,6 +68,7 @@ function getOrigin(request: NextRequest): string {
 type ChallengeRow = { challenge: string; type: 'register' | 'auth'; userId?: string; expiresAt: number };
 const challengeCache = new Map<string, ChallengeRow>();
 const CHALLENGE_REDIS_PREFIX = 'pk:chal:';
+const PASSKEY_CHAL_KIND = 'passkey_chal';
 
 async function storeChallenge(nonce: string, challenge: string, type: 'register' | 'auth', userId?: string) {
   const row: ChallengeRow = { challenge, type, userId, expiresAt: Date.now() + CHALLENGE_TTL_MS };
@@ -97,6 +99,22 @@ async function storeChallenge(nonce: string, challenge: string, type: 'register'
     if (v.expiresAt < now) challengeCache.delete(k);
   }
   challengeCache.set(nonce, row);
+
+  // No Redis: persist the one-time challenge so the OPTIONS→VERIFY round trip
+  // survives landing on a different instance / a restart (a per-process Map
+  // answered "Challenge expired" to honest users on serverless). The challenge
+  // is ephemeral public data handed to the initiating browser and the WebAuthn
+  // verifier needs the raw value back, so it is stored (not hashed) under a
+  // distinct Otp kind. Guarded: a DB outage keeps the memory mirror above.
+  try {
+    await prisma.otp.upsert({
+      where: { kind_address: { kind: PASSKEY_CHAL_KIND, address: nonce } },
+      update: { otpHash: `${type}|${challenge}`, userId: userId ?? null, expiresAt: new Date(row.expiresAt) },
+      create: { kind: PASSKEY_CHAL_KIND, address: nonce, otpHash: `${type}|${challenge}`, userId: userId ?? null, expiresAt: new Date(row.expiresAt) },
+    });
+  } catch {
+    /* DB unavailable — memory mirror is the fallback */
+  }
   console.log(`[PASSKEY] Stored ${type} challenge in memory: ${nonce}`);
 }
 
@@ -126,10 +144,29 @@ async function getAndDeleteChallenge(nonce: string): Promise<ChallengeRow | null
   }
 
   const row = challengeCache.get(nonce);
-  if (!row) return null;
-  challengeCache.delete(nonce);
-  if (row.expiresAt < Date.now()) return null;
-  return row;
+  if (row) {
+    challengeCache.delete(nonce);
+    if (row.expiresAt < Date.now()) return null;
+    return row;
+  }
+
+  // No Redis row: read the durable Otp store (guarded), single-use by deleting
+  // the row as it is returned. Covers the OPTIONS→VERIFY cross-instance / restart
+  // case the per-process mirror can't.
+  try {
+    const stored = await prisma.otp.findFirst({ where: { kind: PASSKEY_CHAL_KIND, address: nonce } });
+    if (stored) {
+      await prisma.otp.delete({ where: { id: stored.id } }).catch(() => {});
+      if (stored.expiresAt < new Date()) return null;
+      const sep = stored.otpHash.indexOf('|');
+      const type = (sep > 0 ? stored.otpHash.slice(0, sep) : 'auth') as 'register' | 'auth';
+      const challenge = sep > 0 ? stored.otpHash.slice(sep + 1) : stored.otpHash;
+      return { challenge, type, userId: stored.userId ?? undefined, expiresAt: stored.expiresAt.getTime() };
+    }
+  } catch {
+    /* DB unavailable — memory (if any) already handled above */
+  }
+  return null;
 }
 
 // ─── Registration: generate options ────────────────────────
@@ -407,6 +444,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
 
     const stored = await getAndDeleteChallenge(challengeNonce);
     if (!stored) {
+      logSecurityEvent({ request, eventType: 'auth.passkey_login_failed', severity: 'warning', details: { reason: 'challenge_expired_or_unknown' } }).catch(() => {});
       return jsonError('Challenge expired. Please try again.', 400, request);
     }
 
@@ -417,23 +455,26 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       // email from user_email.
       include: { user: { select: { id: true, status: true, profile: { select: { name: true } }, emails: { where: { isDefault: true }, select: { address: true } } } } } });
 
-    if (!passkey) return jsonError('Passkey not found. It may have been deleted.', 404, request);
+    if (!passkey) {
+      logSecurityEvent({ request, eventType: 'auth.passkey_login_failed', severity: 'warning', details: { reason: 'passkey_not_found', credentialId: credential.id } }).catch(() => {});
+      return jsonError('Passkey not found. It may have been deleted.', 404, request);
+    }
     const passkeyUser = passkey.user;
     const primaryEmail = passkeyUser.emails[0]?.address || '';
     if (passkeyUser.status === 'banned' || passkeyUser.status === 'deleted' || passkeyUser.status === 'deletion_pending') {
-      const { eventIdFor } = await import('@/features/users/refcode');
+      const { ensureRefCode } = await import('@/features/users/refcode');
       return NextResponse.json({
         error: 'ACCOUNT_BANNED',
         banned: true,
-        eventId: eventIdFor(passkeyUser.id, 'ban'),
+        eventId: await ensureRefCode(passkeyUser.id, passkeyUser.status === 'banned' ? 'ban' : 'deleted'),
         message: 'Your account has been permanently banned.' }, { status: 403 });
     }
     if (passkeyUser.status === 'suspended') {
-      const { eventIdFor } = await import('@/features/users/refcode');
+      const { ensureRefCode } = await import('@/features/users/refcode');
       return NextResponse.json({
         error: 'ACCOUNT_SUSPENDED',
         suspended: true,
-        eventId: eventIdFor(passkeyUser.id, 'suspend'),
+        eventId: await ensureRefCode(passkeyUser.id, 'suspend'),
         reason: null,
         until: null,
         message: 'Your account is temporarily suspended.' }, { status: 403 });
@@ -456,6 +497,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
           : undefined } });
 
     if (!verification.verified) {
+      logSecurityEvent({ request, userId: passkeyUser.id, eventType: 'auth.passkey_login_failed', severity: 'warning', details: { reason: 'assertion_not_verified', passkeyId: passkey.id } }).catch(() => {});
       return jsonError('Authentication verification failed', 400, request);
     }
 
@@ -494,6 +536,9 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       severity: 'info',
       origin: originFromRequest(request.headers) });
 
+    // Canonical auth-family row for a passkey sign-in (success).
+    logSecurityEvent({ request, userId: passkey.user.id, eventType: 'auth.passkey_login', severity: 'info', details: { passkeyId: passkey.id, credentialId: passkey.credentialId } }).catch(() => {});
+
     const res = NextResponse.json({
       id: passkey.user.id,
       email: primaryEmail });
@@ -501,6 +546,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
     return res;
   } catch (err: any) {
     console.error('[PASSKEY AUTH VERIFY]', err?.message || err);
+    logSecurityEvent({ request, eventType: 'auth.passkey_login_failed', severity: 'warning', details: { reason: 'verify_exception', detail: String(err?.message || '').slice(0, 200) } }).catch(() => {});
     return jsonError('Failed to verify authentication: ' + (err?.message || 'unknown error'), 500, request);
   }
 }
@@ -614,11 +660,18 @@ export async function passkeyReauthVerifyHandler(request: NextRequest) {
         transports: passkey.transports
           ? (passkey.transports.split(',') as AuthenticatorTransport[])
           : undefined } });
-    if (!verification.verified) return jsonError('Verification failed', 400, request);
+    if (!verification.verified) {
+      logSecurityEvent({ request, userId: session.userId, eventType: 'auth.reauth_failed', severity: 'warning', details: { reason: 'assertion_not_verified', passkeyId: passkey.id } }).catch(() => {});
+      return jsonError('Verification failed', 400, request);
+    }
 
     await prisma.passkey.update({
       where: { id: passkey.id },
       data: { counter: BigInt(verification.authenticationInfo.newCounter) } });
+
+    // Fresh identity proof for a sensitive action — record it against the
+    // account and device that produced it.
+    logSecurityEvent({ request, userId: session.userId, eventType: 'auth.reauth', severity: 'info', details: { method: 'passkey', passkeyId: passkey.id } }).catch(() => {});
 
     const reauthToken = await signReauthToken(session.userId);
     return NextResponse.json({ ok: true, reauthToken });

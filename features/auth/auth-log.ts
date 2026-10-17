@@ -17,11 +17,10 @@ export async function logAuthJson(
       if (v !== undefined && v !== null && v !== '') compact[k] = v;
     }
     compact._t = Date.now();
-    // activity_events.user_id has a NOT-NULL FK to users(id). Pre-account auth
-    // events (signup-otp, login-otp, magic-link) have no user yet, so there is
-    // nothing attributable — skip the DB write instead of violating the FK.
+    // user_id is nullable: pre-account auth events (signup-otp, login-otp,
+    // magic-link) have no user yet, so they land with userId null and stay
+    // queryable by email (kept in `detail`) until an account exists.
     const userId = typeof data.userId === 'string' && data.userId ? data.userId : null;
-    if (!userId) return;
     await prisma.activityEvent.create({
       data: {
         userId,
@@ -37,9 +36,18 @@ export async function logAuthJson(
   } catch {}
 }
 
-// Helper to log OTP generation (hash only, never plain)
-export async function logOtpJson(email: string, method: string, otpHash: string, ip?: string, extra?: Record<string, unknown>) {
-  return logAuthJson('signup_otp', { email: email.toLowerCase(), method, otpHash: otpHash.slice(0, 16) + '…', ip, ...extra });
+// Helper to log OTP generation (hash only, never plain). Defaults to the
+// signup kind; reset/login flows pass their own type so the activity row is
+// filed under the right `auth.log:*` bucket.
+export async function logOtpJson(
+  email: string,
+  method: string,
+  otpHash: string,
+  ip?: string,
+  extra?: Record<string, unknown>,
+  type: 'signup_otp' | 'login_otp' | 'password_reset_otp' | 'password_recovery_otp' = 'signup_otp',
+) {
+  return logAuthJson(type, { email: email.toLowerCase(), method, otpHash: otpHash.slice(0, 16) + '…', ip, ...extra });
 }
 
 export async function logLinkJson(email: string, type: string, tokenJti: string, ip?: string, extra?: Record<string, unknown>) {

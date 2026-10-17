@@ -19,6 +19,8 @@
 // remaining endpoint and the send handlers agree on one source of truth.
 
 import { getRedis } from '@/features/auth/redis';
+import { prisma } from '@/infrastructure/db/prisma';
+import { consumeWindow, peekWindow } from '@/features/auth/db-windows';
 
 export const VERIFY_WINDOW_MS = 15 * 60 * 1000;
 
@@ -44,15 +46,28 @@ export async function getVerifyMax(method: string): Promise<number> {
   const cached = limitCache.get(method);
   if (cached && cached.exp > Date.now()) return cached.max;
   let max = fallback;
+  // The VerificationLimit table is the source of truth — it survives a restart
+  // and is what the admin UI writes. Guarded so a missing row / DB outage keeps
+  // the in-code default.
   try {
-    const redis = redisClient();
-    if (redis) {
-      const v = await redis.get(`vl:max:${method}`);
-      const n = v == null ? NaN : parseInt(String(v), 10);
-      if (Number.isFinite(n) && n > 0) max = n;
-    }
+    const row = await (prisma as any).verificationLimit.findUnique({ where: { method } });
+    if (row && Number.isFinite(row.max) && row.max > 0) max = row.max;
   } catch {
-    // Redis unavailable or bad value → keep the in-code default.
+    // DB unavailable — fall through to the Redis fast path below.
+  }
+  // Redis `vl:max:<method>` remains a cheap override for live tuning without a
+  // DB write; it only wins when it actually holds a value.
+  if (max === fallback) {
+    try {
+      const redis = redisClient();
+      if (redis) {
+        const v = await redis.get(`vl:max:${method}`);
+        const n = v == null ? NaN : parseInt(String(v), 10);
+        if (Number.isFinite(n) && n > 0) max = n;
+      }
+    } catch {
+      // Redis unavailable or bad value → keep the DB value / in-code default.
+    }
   }
   limitCache.set(method, { max, exp: Date.now() + 30_000 });
   return max;
@@ -214,7 +229,22 @@ export async function consumeVerifyAttempt(
     }
   }
 
-  // 3. Redis unavailable → per-instance memory counters.
+  // 3. Redis unavailable → durable Postgres fixed window (guarded), then the
+  //    per-instance memory Map. Same bucket shape as Redis, keyed by the bucket
+  //    key above, so a restart / other instance keeps counting.
+  try {
+    const [mw, gw] = await Promise.all([
+      consumeWindow(mKey, max, VERIFY_WINDOW_MS),
+      consumeWindow(gKey, globalMax, VERIFY_WINDOW_MS),
+    ]);
+    memory.set(mKey, { count: mw.count, reset: mw.resetAt });
+    memory.set(gKey, { count: gw.count, reset: gw.resetAt });
+    return buildResult(method, max, globalMax, mw.count, gw.count, mw.resetAt, gw.resetAt);
+  } catch {
+    // DB unavailable / not migrated → fall through to memory-only.
+  }
+
+  // 4. Memory-only last resort.
   const m2 = memory.get(mKey) || { count: 0, reset: now + VERIFY_WINDOW_MS };
   const g2 = memory.get(gKey) || { count: 0, reset: now + VERIFY_WINDOW_MS };
   if (now > m2.reset) { m2.count = 0; m2.reset = now + VERIFY_WINDOW_MS; }
@@ -264,6 +294,24 @@ export async function getVerifyStatus(
     }
   }
 
+  // Mirror cold and no Redis answer: read the durable window (guarded) so a
+  // status poll after a cold start reflects counts recorded on any instance.
+  if (!mirrorLive) {
+    try {
+      const [mW, gW] = await Promise.all([
+        peekWindow(mKey, VERIFY_WINDOW_MS),
+        peekWindow(gKey, VERIFY_WINDOW_MS),
+      ]);
+      if (mW.count > 0 || gW.count > 0) {
+        memory.set(mKey, { count: mW.count, reset: mW.resetAt });
+        memory.set(gKey, { count: gW.count, reset: gW.resetAt });
+        return buildResult(method, max, globalMax, mW.count, gW.count, mW.resetAt, gW.resetAt);
+      }
+    } catch {
+      // DB unavailable → serve from the mirror below.
+    }
+  }
+
   const mCount = mMem && now <= mMem.reset ? mMem.count : 0;
   const gCount = gMem && now <= gMem.reset ? gMem.count : 0;
   const mReset = mMem && now <= mMem.reset ? mMem.reset : now + VERIFY_WINDOW_MS;
@@ -290,6 +338,15 @@ export async function getGlobalEmailStatus(email: string): Promise<VerifyLimitRe
     } catch {
       // fall through
     }
+  }
+  try {
+    const w = await peekWindow(gKey, VERIFY_WINDOW_MS);
+    if (w.count > 0) {
+      memory.set(gKey, { count: w.count, reset: w.resetAt });
+      return buildResult('global-email', globalMax, globalMax, w.count, w.count, w.resetAt, w.resetAt);
+    }
+  } catch {
+    // DB unavailable → serve the cold default below.
   }
   return buildResult('global-email', globalMax, globalMax, 0, 0, now + VERIFY_WINDOW_MS, now + VERIFY_WINDOW_MS);
 }
@@ -352,6 +409,15 @@ export async function consumeGenericWindow(
     }
   }
 
+  // Redis unavailable → durable Postgres window (guarded), then memory.
+  try {
+    const w = await consumeWindow(rKey, max, windowMs);
+    memory.set(rKey, { count: w.count, reset: w.resetAt });
+    return buildGeneric(key, max, w.count, w.resetAt);
+  } catch {
+    // fall through to memory-only
+  }
+
   const m2 = mem && now <= mem.reset ? mem : { count: 0, reset: now + windowMs };
   if (now > m2.reset) { m2.count = 0; m2.reset = now + windowMs; }
   m2.count += 1;
@@ -381,6 +447,15 @@ export async function peekGenericWindow(
     } catch {
       // fall through
     }
+  }
+  try {
+    const w = await peekWindow(rKey, windowMs);
+    if (w.count > 0) {
+      memory.set(rKey, { count: w.count, reset: w.resetAt });
+      return buildGeneric(key, max, w.count, w.resetAt);
+    }
+  } catch {
+    // fall through
   }
   return buildGeneric(key, max, 0, now + windowMs);
 }

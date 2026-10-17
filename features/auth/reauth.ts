@@ -52,6 +52,30 @@ export type ReauthResult = ReauthOk | ReauthFail;
 const PASSWORD_WINDOW_MS = 15 * 60 * 1000;
 const PASSWORD_MAX_ATTEMPTS = 5;
 
+/**
+ * Fire-and-forget activity row for a consumed re-auth proof:
+ * auth.reauth_verified (info, with the method) when a sensitive action gets
+ * its proof, auth.reauth_failed (warning) when a presented proof is wrong.
+ * Dynamic import keeps this module's static graph light (and the unit tests
+ * hermetic) — a logging failure must never sink the guarded action.
+ */
+function logReauthProof(
+  request: NextRequest,
+  userId: string,
+  outcome: 'verified' | 'failed',
+  method: ReauthMethod,
+  reason?: string,
+): void {
+  import('@/features/security/security')
+    .then(({ logSecurityEvent }) => logSecurityEvent({
+      request,
+      userId,
+      eventType: outcome === 'verified' ? 'auth.reauth_verified' : 'auth.reauth_failed',
+      severity: outcome === 'verified' ? 'info' : 'warning',
+      details: { method, ...(reason ? { reason } : {}) } }))
+    .catch(() => {});
+}
+
 /** What a wrong/spent emailed code answers with. `reauthCode` is the field. */
 const INVALID_REAUTH_CODE = {
   error: 'INVALID_CODE',
@@ -238,7 +262,11 @@ async function checkProof(
   const reauthToken = typeof body?.reauthToken === 'string' ? body.reauthToken : undefined;
   if (reauthToken) {
     const sub = await verifyReauthToken(reauthToken);
-    if (sub === sessionUserId) return { ok: true, method: 'passkey', body };
+    if (sub === sessionUserId) {
+      logReauthProof(request, sessionUserId, 'verified', 'passkey');
+      return { ok: true, method: 'passkey', body };
+    }
+    logReauthProof(request, sessionUserId, 'failed', 'passkey', 'token_invalid_or_mismatched');
     const methods = await availableReauthMethods(sessionUserId);
     return reauthRequired(opts.allowTotp === false ? methods.filter((m) => m !== 'totp') : methods);
   }
@@ -251,8 +279,10 @@ async function checkProof(
       select: { passwordHash: true },
     });
     if (user?.passwordHash && (await verifyPassword(user.passwordHash, password))) {
+      logReauthProof(request, sessionUserId, 'verified', 'password');
       return { ok: true, method: 'password', body };
     }
+    logReauthProof(request, sessionUserId, 'failed', 'password', 'invalid_password');
     // Failed password — rate limit before revealing anything.
     const allowed = await checkWindowLimitDB(`reauth:pw:${sessionUserId}`, PASSWORD_MAX_ATTEMPTS, PASSWORD_WINDOW_MS).catch(() => true);
     if (!allowed) {
@@ -279,11 +309,14 @@ async function checkProof(
     // A wrong shape can't be the code we sent, and must not spend an attempt on
     // the live one.
     if (!/^\d{6}$/.test(reauthCode)) {
+      logReauthProof(request, sessionUserId, 'failed', 'code', 'malformed_code');
       return { ok: false, response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }) };
     }
     if (await consumeReauthCode(sessionUserId, reauthCode).catch(() => false)) {
+      logReauthProof(request, sessionUserId, 'verified', 'code');
       return { ok: true, method: 'code', body };
     }
+    logReauthProof(request, sessionUserId, 'failed', 'code', 'invalid_or_spent_code');
     return {
       ok: false,
       response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }),
@@ -308,8 +341,10 @@ async function checkProof(
       select: { totpSecret: true },
     });
     if (security?.totpSecret && (await verifyTotp(totpCode, security.totpSecret))) {
+      logReauthProof(request, sessionUserId, 'verified', 'totp');
       return { ok: true, method: 'totp', body };
     }
+    logReauthProof(request, sessionUserId, 'failed', 'totp', 'invalid_code');
     return {
       ok: false,
       response: NextResponse.json({ error: 'INVALID_CODE', message: 'Invalid code. Please try again.' }, { status: 400 }),

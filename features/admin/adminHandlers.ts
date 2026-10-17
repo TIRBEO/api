@@ -6,7 +6,7 @@ import { hashPassword } from '@/features/auth/password';
 import { cachedJson, jsonForbidden } from '@/shared/response';
 import { createAuditEvent } from '@/features/security/audit';
 import { logSecurityEvent } from '@/features/security/security';
-import { generateEventId, refCodeCandidates, eventIdFor } from '@/features/users/refcode';
+import { generateEventId, refCodeCandidates, ensureRefCode } from '@/features/users/refcode';
 import { isValidTirbeoUsername, tirbeoEmailFor, upsertMailAccount, recordProvisioning } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getAccountsBaseUrl } from '@/config/app-urls';
@@ -71,15 +71,21 @@ async function loadEnforcement(userIds: string[]) {
  * field names (name, photoUrl, adminRole, isBanned, isSuspended, banRefCode,
  * suspendRefCode, consents, notificationPreferences) sourced from the new
  * single-concern tables.
+ *
+ * ASYNC on purpose: when a blocked user's reference code is not yet persisted
+ * in user_status_events.metadata.refCode (legacy enforcements predating the
+ * code column), shapeUserRow asks ensureRefCode to MINT + PERSIST one rather
+ * than hand back a synthetic deterministic value — every code an admin or a
+ * user ever sees must be findable in the database.
  */
-function shapeUserRow(
+async function shapeUserRow(
   u: any,
   events: any[],
   restrictions: any[],
-): any {
+): Promise<any> {
   const kind = u.status === 'banned' ? 'ban' : u.status === 'suspended' ? 'suspend' : null;
   const ev = kind ? events.find((e) => e.userId === u.id && e.toStatus === u.status) : null;
-  const eventId = kind ? ((ev?.metadata as any)?.refCode || eventIdFor(u.id, kind)) : null;
+  const eventId = kind ? ((ev?.metadata as any)?.refCode || await ensureRefCode(u.id, kind)) : null;
   const rest = restrictions.find((r) => r.userId === u.id) || null;
   const consents = (u.preferences?.misc as any)?.consents ?? null;
   const notif = (u.preferences?.notif as any) ?? {};
@@ -152,10 +158,10 @@ export async function listUsers(request: NextRequest) {
   ]);
 
   const { events, restrictions } = await loadEnforcement(usersRaw.map(u => u.id));
-  const mapped = usersRaw.map(u => {
-    const s = shapeUserRow(u, events, restrictions);
+  const mapped = await Promise.all(usersRaw.map(async u => {
+    const s = await shapeUserRow(u, events, restrictions);
     return { ...s, lastActiveAt: u.lastActiveAt?.toISOString() || null, lastLoginAt: u.lastLoginAt?.toISOString() || null };
-  });
+  }));
 
   return NextResponse.json({
     users: mapped,
@@ -212,7 +218,7 @@ export async function exportUsersCsv(request: NextRequest) {
     orderBy: { lastActiveAt: 'desc' } });
 
   const { events, restrictions } = await loadEnforcement(usersRaw.map(u => u.id));
-  const users = usersRaw.map(u => shapeUserRow(u, events, restrictions));
+  const users = await Promise.all(usersRaw.map(u => shapeUserRow(u, events, restrictions)));
 
   const esc = (v: unknown) => {
     const s = String(v ?? '');
@@ -282,7 +288,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
   if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   const { events, restrictions } = await loadEnforcement([user.id]);
-  const shaped = shapeUserRow(user, events, restrictions);
+  const shaped = await shapeUserRow(user, events, restrictions);
   const emailVerified = user.emails.some(e => (e.kind === 'primary' || e.isDefault) && !!e.verifiedAt);
 
   return NextResponse.json({
@@ -630,8 +636,13 @@ export async function deleteUser(request: NextRequest, userId: string) {
  * user_restrictions row, and record a user_status_events row carrying the
  * stable reference code. Reuses the latest matching event's refCode so the
  * code stays stable across re-enforcement, otherwise mints a fresh one.
+ *
+ * The refCode is ALSO mirrored into activity_events (security.user_banned /
+ * security.user_suspended) via logSecurityEvent, so "find this code in the
+ * events log" answers with the enforcement event, not only the status row.
  */
 async function writeEnforcement(opts: {
+  request?: NextRequest;
   userId: string;
   fromStatus: string;
   toStatus: 'banned' | 'suspended';
@@ -665,6 +676,13 @@ async function writeEnforcement(opts: {
       actor: 'admin',
       metadata: { refCode, until: opts.until?.toISOString() ?? null } } });
 
+  logSecurityEvent({
+    request: opts.request,
+    userId: opts.userId,
+    eventType: opts.refKind === 'ban' ? 'security.user_banned' : 'security.user_suspended',
+    severity: 'warning',
+    details: { refCode, until: opts.until?.toISOString() ?? null, reason: detail } }).catch(() => {});
+
   return refCode;
 }
 
@@ -693,7 +711,7 @@ export async function banUser(request: NextRequest, userId: string) {
 
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
-  await writeEnforcement({ userId, fromStatus: existing.status, toStatus: 'banned', title: 'Account banned', reason: reason || 'No reason provided', until: null, refKind: 'ban' });
+  await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'banned', title: 'Account banned', reason: reason || 'No reason provided', until: null, refKind: 'ban' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -751,7 +769,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
   const days = Number.isFinite(body.days) ? Math.max(1, Math.min(365, Number(body.days))) : null;
   const until = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
-  await writeEnforcement({ userId, fromStatus: existing.status, toStatus: 'suspended', title: 'Account suspended', reason, until, refKind: 'suspend' });
+  await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'suspended', title: 'Account suspended', reason, until, refKind: 'suspend' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -826,7 +844,7 @@ export async function resolveUserByRefCode(request: NextRequest) {
   }
 
   const { events: evs, restrictions } = await loadEnforcement([user.id]);
-  const shaped = shapeUserRow(user, evs, restrictions);
+  const shaped = await shapeUserRow(user, evs, restrictions);
 
   return NextResponse.json({
     user: {

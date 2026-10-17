@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { prisma } from '@/infrastructure/db/prisma';
 import { isIpBlocked } from '@/features/security/security';
-import { isSuspicious } from '@/features/auth/suspicious-activity';
+import { isSuspiciousAsync } from '@/features/auth/suspicious-activity';
 
 export type RiskLevel = 'none' | 'invisible' | 'standard' | 'strong';
 
@@ -163,7 +163,7 @@ export function clearRateLimitsByPattern(pattern: string): void {
 
 /**
  * DB-backed rate limiting — per-user and per-IP, survives incognito.
- * All attempts are saved to SecurityEvent (eventType: auth.attempt) so
+ * All attempts are saved to ActivityEvent (kind: auth.attempt) so
  * counts are per-user in DB, not localStorage. Incognito cannot bypass.
  * Hundreds of attempts → temp IP block (1h), next time → permanent ban.
  */
@@ -410,7 +410,7 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
       (async () => {
         const ok = await recentSuccess;
         if (ok) return; // clear rate-limit suspicion after a successful login
-        if (isSuspicious(input.ip || '')) {
+        if (await isSuspiciousAsync(input.ip || '')) {
           score += 15;
           reasons.push('recent rate-limit hits');
         }

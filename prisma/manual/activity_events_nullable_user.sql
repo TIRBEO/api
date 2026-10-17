@@ -1,0 +1,13 @@
+-- activity_events: allow anonymous (pre-account) events.
+--
+-- This project has no prisma/migrations folder (db-push workflow), so the
+-- schema change in schema.prisma (ActivityEvent.userId String -> String?)
+-- must be applied to the database with this file.
+--
+-- Apply with EITHER:
+--   psql "$DATABASE_URL" -f prisma/manual/activity_events_nullable_user.sql
+-- OR (equivalent, regenerates types too):
+--   npx prisma db push
+--
+-- Safe to re-run: dropping NOT NULL when already nullable is a no-op.
+ALTER TABLE "activity_events" ALTER COLUMN "user_id" DROP NOT NULL;

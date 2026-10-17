@@ -130,7 +130,11 @@ export async function computeTips(userId: string): Promise<AccountTip[]> {
     });
   }
 
-  const concerns = await prisma.securityEvent.count({
+  // SecurityEvent was consolidated into ActivityEvent (eventType → kind, same
+  // severity column), so this reads the single activity log. No kind filter —
+  // every legacy and current security/auth event landed here under
+  // warning/error/critical severity, so historical concerns still count.
+  const concerns = await prisma.activityEvent.count({
     where: { userId, severity: { in: ['warning', 'error', 'critical'] }, createdAt: { gte: new Date(Date.now() - 30 * 86_400_000) } },
   }).catch(() => 0);
 

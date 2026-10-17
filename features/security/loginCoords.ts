@@ -24,6 +24,16 @@ const LOGIN_EVENT_KINDS = [
   'auth.login_recovery_email_success',
   'auth.login_failed',
   'auth.admin_login_success',
+  // Canonical auth-family kinds introduced when the untracked sign-in paths
+  // (OAuth, passkey, reset-OTP quick login, recovery email) gained rows.
+  'auth.oauth_login',
+  'auth.passkey_login',
+  'auth.otp_login',
+  'auth.recovery_login',
+  'auth.oauth_failed',
+  'auth.passkey_login_failed',
+  'auth.otp_login_failed',
+  'auth.recovery_login_failed',
 ];
 
 /** Two real numbers or nothing — a pin at (0,0) would put the map in the sea. */

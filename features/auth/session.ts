@@ -51,6 +51,15 @@ export const SAVE_LOGIN_IDLE_MS = 60 * 60 * 1000;
 
 export const REFRESH_COOKIE_NAME = '__refresh';
 
+/** Activity ledger for session lifecycle. Dynamic import + fire-and-forget:
+ *  the session path must never block on the security module, and tests that
+ *  mock only prisma keep passing. */
+function logSessionEvent(eventType: string, userId: string, details: Record<string, unknown>): void {
+  import('@/features/security/security')
+    .then(({ logSecurityEvent }) => logSecurityEvent({ userId, eventType, severity: 'info', details }))
+    .catch(() => {});
+}
+
 const IS_PROD = process.env.NODE_ENV !== 'development';
 
 // Google-style cookie posture, env-tunable so a deployment can widen sharing
@@ -253,6 +262,10 @@ export async function rotateRefreshToken(refreshToken: string, ipAddress?: strin
   const saveLoginInfo = session.user?.security?.saveLoginInfo ?? true;
 
   if (session.revokedAt || session.expiresAt < now) {
+    // An expired/revoked session is killed here and the caller gets a 401 —
+    // rotation ALWAYS reuses the same session row and no refresh path ever
+    // mints a brand-new session after expiry, which is why there are no
+    // 'auth.session_extended' ledger rows by design.
     await revokeSession(session.id);
     if (isSpent === null) await markRefreshSpent(presentedHash, session.id);
     return null;
@@ -293,11 +306,15 @@ export async function revokeSession(sessionId: string): Promise<void> {
   const owner = await prisma.userSession
     .findUnique({ where: { id: sessionId }, select: { userId: true } })
     .catch(() => null);
-  await prisma.userSession
+  const flipped = await prisma.userSession
     .updateMany({
       where: { id: sessionId, revokedAt: null },
       data: { revokedAt: new Date(), status: 'revoked' } })
-    .catch(() => {});
+    .then((r) => r.count)
+    .catch(() => 0);
+  if (flipped > 0 && owner?.userId) {
+    logSessionEvent('auth.session_revoked', owner.userId, { sessionId, via: 'revokeSession' });
+  }
   try {
     await revokeSessionState(sessionId);
   } catch {}
@@ -323,6 +340,9 @@ export async function revokeLongLivedSessions(userId: string, keepSessionId?: st
     expiresAt: { gt: now },
     ...(keepSessionId ? { id: { not: keepSessionId } } : {}) };
   const toRevoke = await prisma.userSession.findMany({ where: others, select: { id: true } }).catch(() => [] as { id: string }[]);
+  if (toRevoke?.length) {
+    logSessionEvent('auth.session_revoked_all', userId, { count: toRevoke.length, via: 'revokeLongLivedSessions' });
+  }
   await prisma.userSession
     .updateMany({ where: others, data: { revokedAt: now, status: 'revoked' } })
     .catch(() => {});
@@ -348,6 +368,9 @@ export async function revokeLongLivedSessions(userId: string, keepSessionId?: st
 
 export async function revokeSessionFamilyByUser(userId: string): Promise<void> {
   const sessions = await prisma.userSession.findMany({ where: { userId, revokedAt: null }, select: { id: true } });
+  if (sessions.length) {
+    logSessionEvent('auth.session_revoked_all', userId, { count: sessions.length, via: 'revokeSessionFamilyByUser' });
+  }
   await prisma.userSession
     .updateMany({
       where: { userId, revokedAt: null },

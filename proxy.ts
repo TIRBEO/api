@@ -4,7 +4,7 @@ import { isSuspicious } from '@/features/auth/suspicious-activity';
 import { verifyTurnstile, getTurnstileSiteKey, isTurnstileConfigured } from '@/features/auth/turnstile';
 import { detectXss } from '@/features/auth/xss-scan';
 import { getMaintenanceState } from '@/shared/maintenance-state';
-import { eventIdFor, generateEventId } from '@/features/users/refcode';
+import { ensureRefCode, generateEventId } from '@/features/users/refcode';
 import { isHostAllowed } from '@/config/app-urls';
 
 function isAllowedOrigin(origin: string): boolean {
@@ -68,6 +68,51 @@ async function reportBlockedRequest(request: NextRequest, reason: string) {
           method: request.method,
           path: request.nextUrl.pathname,
           query: request.nextUrl.searchParams.toString().slice(0, 500),
+          rayId: request.headers.get('cf-ray') || request.headers.get('x-vercel-id') || '',
+        },
+      }),
+    }).catch(() => {});
+  } catch {
+    // Best-effort logging only
+  }
+}
+
+/**
+ * Turn an edge rate-limit trip into a real, queryable activity row. The proxy
+ * bundle has no direct DB/prisma access, so (like reportBlockedRequest above)
+ * it self-POSTs to /api/security/log, which writes the row via logSecurityEvent.
+ *
+ * The display code handed to the client (`eventId`) is persisted as
+ * metadata.refCode, so staff pasting "Ref: xxxx-xxxx-xxxx" into the security
+ * search finds this exact row (listSecurityEvents matches metadata.refCode
+ * candidates) — the transient RL code is no longer ephemeral. The row is keyed
+ * by ip + action even when a request carries no account.
+ */
+async function reportRateLimit(request: NextRequest, opts: {
+  eventId: string;
+  action: string;
+  ip: string;
+  resetsAt: number;
+}) {
+  const key = process.env.SECURITY_LOG_KEY;
+  if (!key) return;
+  const origin = request.nextUrl.origin;
+  try {
+    await fetch(`${origin}/api/security/log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-security-log-key': key },
+      body: JSON.stringify({
+        eventType: 'security.rate_limited',
+        severity: 'warning',
+        notifyAdmin: false,
+        details: {
+          reason: 'rate_limited',
+          action: opts.action,
+          ip: opts.ip,
+          // Display code, mirrored so the reference the user sees is searchable.
+          refCode: opts.eventId,
+          keyHint: opts.action,
+          resetsAt: new Date(opts.resetsAt).toISOString(),
           rayId: request.headers.get('cf-ray') || request.headers.get('x-vercel-id') || '',
         },
       }),
@@ -276,7 +321,17 @@ if (preHasCookie) {
   if (!rateResult.allowed) {
     // Typed event ID ("RL" family) so the user can reference this exact block.
     const rlEventId = generateEventId('ratelimit');
-    const resp = jsonResponse(allowedOrigin, { error: 'Too many requests. Please try again later.', eventId: rlEventId }, 429);
+    const resetsAt = Date.now() + rateResult.reset * 1000;
+    // Persist a real security.rate_limited row keyed by ip+action (best-effort;
+    // needs SECURITY_LOG_KEY). The display code is stored as metadata.refCode so
+    // "Ref: xxxx-xxxx-xxxx" the client shows is searchable in the security log.
+    await reportRateLimit(request, { eventId: rlEventId, action: pathname, ip, resetsAt });
+    const resp = jsonResponse(allowedOrigin, {
+      error: 'Too many requests. Please try again later.',
+      eventId: rlEventId,
+      reset: rateResult.reset,
+      resetsAt: new Date(resetsAt).toISOString(),
+    }, 429);
     resp.headers.set('X-RateLimit-Limit', String(rateResult.limit));
     resp.headers.set('X-RateLimit-Remaining', '0');
     resp.headers.set('X-RateLimit-Reset', String(rateResult.reset));
@@ -434,7 +489,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         }).catch(() => {});
         statusResponse = jsonResponse(allowedOrigin, {
           error: 'ACCOUNT_DELETED', deleted: true,
-          eventId: eventIdFor(String(tokenPayload.sub), 'ban'),
+          eventId: await ensureRefCode(String(tokenPayload.sub), 'deleted'),
           message: 'Your account has been deleted.',
         }, 403);
       } else if (su?.status === 'deletion_pending') {
@@ -480,7 +535,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         } else {
           statusResponse = jsonResponse(allowedOrigin, {
             error: 'ACCOUNT_BANNED', banned: true,
-            eventId: eventIdFor(String(tokenPayload.sub), 'ban'),
+            eventId: await ensureRefCode(String(tokenPayload.sub), 'ban'),
             reason: restriction?.detail || restriction?.title || 'No reason provided',
             until: until ? until.toISOString() : null,
             message: `Your account is banned${until ? ` until ${until.toUTCString()}` : ''}.`,
@@ -498,7 +553,7 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         } else {
           statusResponse = jsonResponse(allowedOrigin, {
             error: 'ACCOUNT_SUSPENDED', suspended: true,
-            eventId: eventIdFor(String(tokenPayload.sub), 'suspend'),
+            eventId: await ensureRefCode(String(tokenPayload.sub), 'suspend'),
             reason: restriction?.detail || restriction?.title || 'No reason provided',
             until: until ? until.toISOString() : null,
             message: `Your account is suspended${until ? ` until ${until.toUTCString()}` : ''}.`,

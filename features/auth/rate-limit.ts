@@ -1,4 +1,5 @@
 import { recordRateLimitHit } from '@/features/auth/suspicious-activity';
+import { consumeWindow, peekWindow } from '@/features/auth/db-windows';
 import type Redis from 'ioredis';
 
 const WINDOW_MS = 60 * 1000;
@@ -243,6 +244,30 @@ async function checkBlockRateAlert(): Promise<void> {
 
 async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
   try {
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    // Land the alert in the event ledger so it survives a restart and shows up
+    // in admin with a real event id — the in-memory alertState list is only a
+    // live view. Guarded: a DB outage must not block the email fan-out below.
+    try {
+      await prisma.activityEvent.create({
+        data: {
+          kind: 'ops.rate_limit_block_alert',
+          title: 'Rate Limit Block-Rate Alert',
+          detail: alert.message.slice(0, 500),
+          severity: 'warning',
+          metadata: {
+            blockRate: alert.blockRate,
+            threshold: alert.threshold,
+            totalHits: alert.totalHits,
+            totalBlocked: alert.totalBlocked,
+            firedAt: new Date(alert.timestamp).toISOString(),
+          } as any,
+        },
+      });
+    } catch {}
+  } catch { /* prisma import failed — skip ledger write */ }
+
+  try {
     // Send email notification to admins
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { prisma } = await import('@/infrastructure/db/prisma');
@@ -426,10 +451,15 @@ export async function checkRateLimitWithInfo(
         currentCount = await r2.get(redisKey).then(v => parseInt(v || '0', 10));
       } catch {}
     } else {
-      const counters = (globalThis as any).__rateLimitCounters ?? new Map();
-      const entry = counters.get(key);
-      if (entry && Date.now() <= entry.expires) {
-        currentCount = entry.count;
+      // No Redis: peek the durable window (guarded), else the in-memory Map.
+      try {
+        currentCount = (await peekWindow(key, WINDOW_MS)).count;
+      } catch {
+        const counters = (globalThis as any).__rateLimitCounters ?? new Map();
+        const entry = counters.get(key);
+        if (entry && Date.now() <= entry.expires) {
+          currentCount = entry.count;
+        }
       }
     }
 
@@ -455,8 +485,23 @@ export async function checkRateLimitWithInfo(
       recordMetrics(ipFromKey(key), key, false);
       return { allowed: true, limit: max, remaining: Math.max(0, max - count), reset: resetSeconds };
     } catch {
-      // fall through to in-memory
+      // fall through to Postgres
     }
+  }
+
+  // Postgres fixed window (60s bucket, same shape as Redis). Guarded: a missing
+  // table (remote DB not yet migrated) throws and drops to the in-memory Map.
+  try {
+    const w = await consumeWindow(key, max, WINDOW_MS);
+    if (!w.allowed) {
+      recordRateLimitHit(ipFromKey(key));
+      recordMetrics(ipFromKey(key), key, true);
+      return { allowed: false, limit: max, remaining: 0, reset: resetSeconds };
+    }
+    recordMetrics(ipFromKey(key), key, false);
+    return { allowed: true, limit: max, remaining: Math.max(0, max - w.count), reset: resetSeconds };
+  } catch {
+    // fall through to in-memory
   }
 
   const counters = (globalThis as any).__rateLimitCounters ?? new Map<string, { count: number; expires: number }>();

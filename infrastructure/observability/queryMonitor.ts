@@ -112,7 +112,7 @@ export function recordQueryLatency(queryName: string, durationMs: number) {
 
 /**
  * Wrapper that times a query function and records its latency.
- * Usage: const results = await trackQuery('security_events_by_user', () => prisma.securityEvent.findMany(...));
+ * Usage: const results = await trackQuery('activity_events_by_user', () => prisma.activityEvent.findMany(...));
  */
 export async function trackQuery<T>(queryName: string, fn: () => Promise<T>): Promise<T> {
   const start = performance.now();
@@ -167,6 +167,29 @@ function checkAlerts(queryName: string, samples: number[]) {
   if (alertHistory.length > MAX_ALERT_HISTORY) {
     alertHistory.splice(0, alertHistory.length - MAX_ALERT_HISTORY);
   }
+
+  // Land the alert in the event ledger so it survives a restart and is visible
+  // in admin with a real event id. The in-memory array above stays as the live
+  // view; this write is best-effort and must never affect the query path.
+  void (async () => {
+    try {
+      const { prisma } = await import('@/infrastructure/db/prisma');
+      await prisma.activityEvent.create({
+        data: {
+          kind: 'ops.query_latency_alert',
+          title: `Query latency ${alert.severity}: ${alert.queryName}`,
+          detail: alert.message.slice(0, 500),
+          severity: alert.severity === 'critical' ? 'error' : 'warning',
+          metadata: {
+            queryName: alert.queryName,
+            p95Ms: alert.p95Ms,
+            thresholdMs: alert.thresholdMs,
+            alertSeverity: alert.severity,
+          } as any,
+        },
+      });
+    } catch { /* ledger unavailable — keep the in-memory view only */ }
+  })();
 
   // Log
   if (severity === 'critical') {

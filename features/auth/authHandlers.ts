@@ -8,11 +8,11 @@ import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rot
 import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getSession, requireRole } from '@/features/auth/http-guards';
-import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken } from '@/features/auth/jwt';
+import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken, verifyPasswordResetToken } from '@/features/auth/jwt';
 
 import { verifyTotp } from '@/features/auth/totp';
 import { sendTemplateEmail } from '@/features/email/email';
-import { sanitizeInput, logSecurityEvent, recordLoginHistory } from '@/features/security/security';
+import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf } from '@/features/security/security';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from '@/features/auth/password-reset';
 import { createAuditEvent } from '@/features/security/audit';
@@ -24,11 +24,11 @@ import { createTtlCache } from '@/infrastructure/cache';
 import { logPerformance } from '@/infrastructure/observability/perf';
 import { SignJWT } from 'jose';
 import { checkWindowLimit, checkWindowLimitDB, computeRiskScore, recordDeviceSeen, hasRecentLoginSuccess } from '@/features/captcha/risk';
-import { logAuthJson } from '@/features/auth/auth-log';
+import { logAuthJson, logOtpJson, logLinkJson } from '@/features/auth/auth-log';
 import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
-import { eventIdFor } from '@/features/users/refcode';
+import { ensureRefCode } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
@@ -54,6 +54,44 @@ export function bustProfileCache(userId: string) {
 
 function redisSafe(): any {
   try { return getRedis() || null; } catch { return null; }
+}
+
+/**
+ * A rate-limit trip on an auth endpoint becomes a real, queryable
+ * `security.rate_limited` activity row, and its id is echoed back on the 429 as
+ * a top-level `eventId` so the client can render "Ref: XXXXXXXX" and staff can
+ * look that exact event up in the security log. The email never reaches the
+ * log whole — only its domain (see logRateLimited/emailDomainOf).
+ *
+ * `resetsAt` is epoch ms; `retryAfterSec` (seconds) sets the Retry-After header
+ * when the caller knows the window length.
+ */
+async function rateLimited(
+  request: NextRequest,
+  opts: {
+    action: string;
+    message: string;
+    email?: string | null;
+    userId?: string | null;
+    keyHint?: string;
+    resetsAt?: number | null;
+    retryAfterSec?: number | null;
+    extra?: Record<string, unknown>;
+  },
+): Promise<NextResponse> {
+  const eventId = await logRateLimited({
+    request,
+    userId: opts.userId ?? null,
+    action: opts.action,
+    emailDomain: emailDomainOf(opts.email ?? null),
+    keyHint: opts.keyHint,
+    resetsAt: opts.resetsAt ?? null,
+  });
+  const body: Record<string, unknown> = { error: opts.message, ...opts.extra };
+  if (eventId) body.eventId = eventId;
+  const headers: Record<string, string> = {};
+  if (opts.retryAfterSec != null) headers['Retry-After'] = String(Math.ceil(opts.retryAfterSec));
+  return NextResponse.json(body, { status: 429, headers });
 }
 
 /** Device fingerprint the client sends on every auth request (__dfp cookie or
@@ -739,6 +777,7 @@ async function finishProviderSignIn(
     // short-lived signed token; the account (and consent record) is only
     // created when the user explicitly clicks "Create account".
     if (!profile.email) {
+      logOauthFailure(request, provider, 'provider_email_unavailable');
       return NextResponse.json({ error: `${provider[0].toUpperCase()}${provider.slice(1)} email not available` }, { status: 400 });
     }
     const redirect = normalizeOAuthRedirect(state.redirect);
@@ -776,6 +815,12 @@ async function finishProviderSignIn(
         severity: 'info' } }).catch(() => null),
     createSession(account.id, request.headers.get('user-agent') || undefined, ip),
   ]);
+  // The canonical auth-log row for a social sign-in: kind auth.oauth_login so
+  // every login path (password, OTP, passkey, OAuth) is greppable in one
+  // family. isNewUser is false here by construction — brand-new provider
+  // identities are routed to the confirmation screen and logged from
+  // oauthSignupCompleteHandler with isNewUser true.
+  logSecurityEvent({ request, userId: account.id, eventType: 'auth.oauth_login', severity: 'info', details: { provider, isNewUser: false, matchedBy, email: account.email || profile.email || null } }).catch(() => {});
   // Notify user of new sign-in from connected app
   createNotification({
     userId: account.id,
@@ -856,6 +901,10 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
         title: 'Account merged',
         detail: `user:${target.id}`,
         metadata: { provider: data.provider, providerId: data.providerId, email: data.email } } }).catch(() => {});
+    // A completed login-merge IS a social sign-in — log it in the auth family
+    // too, so auth.oauth_login covers every way a provider identity opens a
+    // session.
+    logSecurityEvent({ request, userId: target.id, eventType: 'auth.oauth_login', severity: 'info', details: { provider: data.provider, isNewUser: false, merged: true, email: data.email } }).catch(() => {});
 
     // The ?oauth=merge callback completes a session on an EXISTING account for a
     // just-linked provider identity — a real sign-in, so treat it like the other
@@ -958,6 +1007,17 @@ async function validateOauthState(request: NextRequest, provider: string) {
   return { state };
 }
 
+/** One audit row for a social sign-in that never reached a session — every
+    early return in a provider callback funnels through here so the admin
+    security log shows auth.oauth_failed with the provider and why it died. */
+function logOauthFailure(request: NextRequest, provider: string, reason: string, detail?: string) {
+  logSecurityEvent({
+    request,
+    eventType: 'auth.oauth_failed',
+    severity: 'warning',
+    details: { provider, reason, ...(detail ? { detail: detail.slice(0, 200) } : {}) } }).catch(() => {});
+}
+
 const loginSchema = z.object({
   email: z.string().email().optional(),
   username: z.string().min(1).max(64).optional(),
@@ -1001,7 +1061,12 @@ export async function loginHandler(request: NextRequest) {
       checkWindowLimitDB(`login:ip:${ip}`, 20, 15 * 60 * 1000, ip, idKey),
     ]);
     if (!loginEmailOk || !loginIpOk) {
-      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/login',
+        message: 'Too many sign-in attempts. Please try again later.',
+        email: user?.email,
+        keyHint: 'login:account|login:ip',
+      });
     }
 
     if (!user) {
@@ -1015,7 +1080,7 @@ export async function loginHandler(request: NextRequest) {
       return NextResponse.json({ error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, message: 'Your account is scheduled for deletion.' }, { status: 403 });
     }
     if (user.status === 'banned') {
-      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), message: 'Your account has been permanently banned.' }, { status: 403 });
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: await ensureRefCode(user.id, 'ban'), message: 'Your account has been permanently banned.' }, { status: 403 });
     }
     if (user.status === 'suspended') {
       const until = await suspensionUntil(user.id);
@@ -1023,7 +1088,7 @@ export async function loginHandler(request: NextRequest) {
         await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
         logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: until.toISOString() } }).catch(() => {});
       } else {
-        return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: eventIdFor(user.id, 'suspend'), reason: 'No reason provided', until: until ? until.toISOString() : null, message: `Your account is suspended${until ? ` until ${until.toUTCString()}` : ''}.` }, { status: 403 });
+        return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: await ensureRefCode(user.id, 'suspend'), reason: 'No reason provided', until: until ? until.toISOString() : null, message: `Your account is suspended${until ? ` until ${until.toUTCString()}` : ''}.` }, { status: 403 });
       }
     }
     if (!user.passwordHash) {
@@ -1163,7 +1228,12 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       checkWindowLimitDB(`admin:login:ip:${ip}`, 20, 15 * 60 * 1000, ip, email),
     ]);
     if (!adminEmailOk || !adminIpOk) {
-      return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'admin/login',
+        message: 'Too many sign-in attempts. Please try again later.',
+        email,
+        keyHint: 'admin:login:email|admin:login:ip',
+      });
     }
 
     const user = await fetchLoginUserByEmail(email.toLowerCase());
@@ -1172,7 +1242,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
     if (user.status === 'banned') {
-      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), reason: 'No reason provided', message: 'This admin account is banned.' }, { status: 403 });
+      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: await ensureRefCode(user.id, 'ban'), reason: 'No reason provided', message: 'This admin account is banned.' }, { status: 403 });
     }
     if (user.status === 'suspended' || user.status === 'deleted') {
       return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
@@ -1288,7 +1358,11 @@ export async function verify2faLoginHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`2fa:ip:${clientIp}`, 15, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/verify-2fa',
+        message: 'Too many attempts. Please try again later.',
+        keyHint: '2fa:ip',
+      });
     }
 
     const userId = await verifyTemp2faToken(tempToken);
@@ -1300,7 +1374,13 @@ export async function verify2faLoginHandler(request: NextRequest) {
     }
 
     if (!(await checkWindowLimitDB(`2fa:user:${userId}`, 5, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/verify-2fa',
+        message: 'Too many attempts. Please try again later.',
+        userId,
+        email: user?.email,
+        keyHint: '2fa:user',
+      });
     }
 
     if (!await verifyTotp(totpCode, user.totpSecret)) {
@@ -1351,7 +1431,11 @@ export async function recovery2faLoginHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`2fa-recovery:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/recovery-2fa',
+        message: 'Too many attempts. Please try again later.',
+        keyHint: '2fa-recovery:ip',
+      });
     }
 
     const userId = await verifyTemp2faToken(tempToken);
@@ -1583,10 +1667,20 @@ export async function signupHandler(request: NextRequest) {
 
     // Relaxed rate limits for signup - 20 per hour per IP, 10 per hour per email
     if (!(await checkWindowLimitDB(`signup:ip:${ip}`, 20, 60 * 60 * 1000, ip, email))) {
-      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/signup',
+        message: 'Too many sign-up attempts. Please try again later.',
+        email: accountEmail,
+        keyHint: 'signup:ip',
+      });
     }
     if (!(await checkWindowLimitDB(`signup:email:${accountEmail}`, 10, 60 * 60 * 1000, ip, accountEmail))) {
-      return NextResponse.json({ error: 'Too many sign-up attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/signup',
+        message: 'Too many sign-up attempts. Please try again later.',
+        email: accountEmail,
+        keyHint: 'signup:email',
+      });
     }
 
     // The same lookup the OAuth path uses: an address can be owned through
@@ -1764,7 +1858,16 @@ export async function signupHandler(request: NextRequest) {
       sendTemplateEmail(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] }, {
         fromEmail: 'noreply@tirbeo.com',
         fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
+      // The verification OTP is an auth artifact like every other one — log its
+      // generation (truncated, never the plain code).
+      logOtpJson(accountEmail, 'signup-verify', verifyCode.slice(0, 3) + '***', ip, { userId: user.id }, 'signup_otp').catch(() => {});
     }
+
+    // Account created with a password: land both the auth event and the
+    // creation event in activity_events so the admin log shows who signed up,
+    // from where, and that the account exists — all with queryable ids.
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.signup', severity: 'info', details: { email: accountEmail, method: 'password', preVerifiedEmail: !!preVerifiedEmail } }).catch(() => {});
+    logSecurityEvent({ request, userId: user.id, eventType: 'user.created', severity: 'info', details: { email: accountEmail, username: normalizedUsername } }).catch(() => {});
 
     return res;
   } catch (err: any) {
@@ -1786,24 +1889,29 @@ export async function requestSignupOtpHandler(request: NextRequest) {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
     if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
     if (!(await checkWindowLimitDB(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests. Please try again later.', email, keyHint: 'signup-otp:ip' });
     }
     if (!(await checkWindowLimitDB(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests. Please try again later.', email, keyHint: 'signup-otp:email' });
     }
 
     const cooldown = await enforceResendCooldown(`signup-otp:${email.toLowerCase()}`);
     if (!cooldown.allowed) {
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: 'auth/signup-otp/request',
+        message: 'Please wait before requesting another code.',
+        email,
+        keyHint: 'signup-otp:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+      });
     }
 
     const existing = await userIdForEmail(email.toLowerCase());
@@ -2191,6 +2299,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
 
       const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
       const { token: sessionToken, refreshToken } = await createSession(existingId, request.headers.get('user-agent') || undefined, ip);
+      logSecurityEvent({ request, userId: existingId, eventType: 'auth.oauth_login', severity: 'info', details: { provider: data.provider, isNewUser: false, attached: true, email } }).catch(() => {});
       const res = NextResponse.json({
         ok: true,
         redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
@@ -2280,6 +2389,9 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
 
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
+    // First social sign-in of a freshly created account — the isNewUser:true
+    // half of the auth.oauth_login family.
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.oauth_login', severity: 'info', details: { provider: data.provider, isNewUser: true, email } }).catch(() => {});
     const res = NextResponse.json({
       ok: true,
       redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
@@ -2303,13 +2415,16 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
  * 403 response for banned/suspended accounts carrying the structured block
  * payload (kind, eventId, reason, until, message) so the accounts app can
  * redirect to the signed blocked screen on the dashboard.
+ *
+ * ASYNC because the reference code is PERSISTED on first display
+ * (ensureRefCode) — a code shown to a user must exist in the DB.
  */
-function blockedAccountResponse(user: LoginUser): NextResponse {
+async function blockedAccountResponse(user: LoginUser): Promise<NextResponse> {
   if (user.status === 'banned') {
     return NextResponse.json({
       error: 'ACCOUNT_BANNED',
       banned: true,
-      eventId: eventIdFor(user.id, 'ban'),
+      eventId: await ensureRefCode(user.id, 'ban'),
       reason: null,
       until: null,
       message: 'Your account has been banned.' }, { status: 403 });
@@ -2318,7 +2433,7 @@ function blockedAccountResponse(user: LoginUser): NextResponse {
     return NextResponse.json({
       error: 'ACCOUNT_SUSPENDED',
       suspended: true,
-      eventId: eventIdFor(user.id, 'suspend'),
+      eventId: await ensureRefCode(user.id, 'suspend'),
       reason: null,
       until: null,
       message: 'Your account is temporarily suspended.' }, { status: 403 });
@@ -2326,6 +2441,7 @@ function blockedAccountResponse(user: LoginUser): NextResponse {
   return NextResponse.json({
     error: 'ACCOUNT_DELETED',
     deleted: true,
+    eventId: await ensureRefCode(user.id, 'deleted'),
     message: 'Your account has been deleted.' }, { status: 403 });
 }
 
@@ -2344,10 +2460,14 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     if (ptrGate.state === 'invalid') {
       const guessesOk = await checkWindowLimitDB(`login-otp:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
       if (!guessesOk) {
-        return NextResponse.json(
-          { error: 'Too many invalid attempts from this device. Please try again later.', exceeded: 'global-ip' },
-          { status: 429, headers: { 'Retry-After': '900' } },
-        );
+        return rateLimited(request, {
+          action: 'auth/login-otp/request',
+          message: 'Too many invalid attempts from this device. Please try again later.',
+          email,
+          keyHint: 'login-otp:ptr-guess',
+          retryAfterSec: 900,
+          extra: { exceeded: 'global-ip' },
+        });
       }
       return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
     }
@@ -2367,34 +2487,47 @@ export async function requestLoginOtpHandler(request: NextRequest) {
 
     if (!otp.ok || !globalEmail.ok) {
       const exceeded = !otp.ok ? otp : globalEmail;
-      return NextResponse.json(
-        {
-          error: `Limit reached for code sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+      return rateLimited(request, {
+        action: 'auth/login-otp/request',
+        message: `Limit reached for code sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+        email,
+        keyHint: !otp.ok ? 'login-otp' : 'global-email',
+        resetsAt: exceeded.resetAt,
+        retryAfterSec: Math.max(0, exceeded.resetAt - Date.now()) / 1000,
+        extra: {
           message: `Limit reached — try again after ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
           retryAfterMs: Math.max(0, exceeded.resetAt - Date.now()),
           exceeded: !otp.ok ? 'login-otp' : 'global-email',
           remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, exceeded.resetAt - Date.now()) / 1000)) } },
-      );
+      });
     }
     if (!otpIpWin || !ipWin) {
       const resetAt = windowResetAt(15 * 60 * 1000);
-      return NextResponse.json(
-        {
-          error: 'Too many requests from this device. Please try again later.',
+      return rateLimited(request, {
+        action: 'auth/login-otp/request',
+        message: 'Too many requests from this device. Please try again later.',
+        email,
+        keyHint: !otpIpWin ? 'login-otp:ip' : 'global:ip',
+        resetsAt: resetAt,
+        retryAfterSec: Math.max(0, resetAt - Date.now()) / 1000,
+        extra: {
           retryAfterMs: Math.max(0, resetAt - Date.now()),
           exceeded: 'global-ip',
           remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, resetAt - Date.now()) / 1000)) } },
-      );
+      });
     }
 
     const cooldown = await enforceResendCooldown(`login-otp:${email.toLowerCase()}`);
     if (!cooldown.allowed) {
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs, remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: 'auth/login-otp/request',
+        message: 'Please wait before requesting another code.',
+        email,
+        keyHint: 'login-otp:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs, remaining: remainingInfo },
+      });
     }
 
     /* Resolve the identifier exactly the way the password step does, so a
@@ -2414,8 +2547,8 @@ export async function requestLoginOtpHandler(request: NextRequest) {
       const dr = await prisma.userDeletionRequest.findUnique({ where: { userId: user.id }, select: { finalAt: true } }).catch(() => null);
       return NextResponse.json({ error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true, scheduledAt: dr?.finalAt ?? null, message: 'Your account is scheduled for deletion.' }, { status: 403 });
     }
-    if (user.status === 'banned') return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: eventIdFor(user.id, 'ban'), reason: null, until: await suspensionUntil(user.id), message: 'Your account has been banned.' }, { status: 403 });
-    if (user.status === 'suspended') return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: eventIdFor(user.id, 'suspend'), reason: null, until: await suspensionUntil(user.id), message: 'Your account is temporarily suspended.' }, { status: 403 });
+    if (user.status === 'banned') return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: await ensureRefCode(user.id, 'ban'), reason: null, until: await suspensionUntil(user.id), message: 'Your account has been banned.' }, { status: 403 });
+    if (user.status === 'suspended') return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, eventId: await ensureRefCode(user.id, 'suspend'), reason: null, until: await suspensionUntil(user.id), message: 'Your account is temporarily suspended.' }, { status: 403 });
 
     const code = genSignupOtp();
     // Deliver to (and store under) the account's real address: when somebody
@@ -2462,7 +2595,13 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, {
+        action: 'auth/login-otp/verify',
+        message: 'Too many attempts. Please try again later.',
+        email,
+        userId: user?.id,
+        keyHint: 'login-otp-verify:ip',
+      });
     }
 
     // Same normalization as the request handler — the code was stored under
@@ -2520,6 +2659,9 @@ export async function logoutHandler(request: NextRequest) {
     const session = await getSession(request);
     if (session && session.sessionId !== 'cli') {
       await revokeSession(session.sessionId);
+      // Sign-out is an auth event like sign-in: record it (with the session
+      // that died) so a security timeline shows the full presence window.
+      logSecurityEvent({ request, userId: session.userId, eventType: 'auth.logout', severity: 'info', details: { sessionId: session.sessionId, email: session.email } }).catch(() => {});
     }
     const res = NextResponse.json({ ok: true }, { status: 200 });
     // Pass `request` so cookies are cleared for the SAME domain they were set
@@ -2578,17 +2720,23 @@ export async function requestEmailOtpHandler(request: NextRequest) {
     if (!user || !user.email) return NextResponse.json({ error: 'User email missing' }, { status: 400 });
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`global:email:${user.email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, user.email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/email-otp/request', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
     }
     if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, user.email))) {
-      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/email-otp/request', message: 'Too many requests from this device. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:ip' });
     }
     const cooldown = await enforceResendCooldown(`email-otp:${user.id}`);
     if (!cooldown.allowed) {
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: 'auth/email-otp/request',
+        message: 'Please wait before requesting another code.',
+        email: user.email,
+        userId: user.id,
+        keyHint: 'email-otp:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+      });
     }
     const code = generateOtpCode();
     await storeOtp(session.userId, 'email', code);
@@ -2654,14 +2802,20 @@ export async function changeEmailRequestHandler(request: NextRequest) {
 
     const clientIp2 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp2, email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/change-email/request', message: 'Too many verification attempts. Please try again later.', email, userId: user.id, keyHint: 'global:email' });
     }
     const cooldown = await enforceResendCooldown(`change-email:${user.id}`);
     if (!cooldown.allowed) {
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: 'auth/change-email/request',
+        message: 'Please wait before requesting another code.',
+        email,
+        userId: user.id,
+        keyHint: 'change-email:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+      });
     }
     const code = generateOtpCode();
     await storeOtp(user.id, 'email_verify', code);
@@ -2689,7 +2843,10 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
     const ok = await verifyOtpCode(user.id, 'email_verify', code);
-    if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    if (!ok) {
+      logSecurityEvent({ request, userId: user.id, eventType: 'user.email_verify_failed', severity: 'warning', details: { reason: 'invalid_or_expired_code' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    }
 
     const currentEmail = user.email?.toLowerCase();
     if (currentEmail !== email) {
@@ -2713,6 +2870,13 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       await prisma.userEmail.updateMany({
         where: { userId: user.id, address: email },
         data: { verifiedAt: new Date() } });
+    }
+
+    // A primary email swap is a takeover-detection event — warning severity,
+    // both addresses recorded so the security log answers "where did this old
+    // address go?".
+    if (currentEmail !== email) {
+      logSecurityEvent({ request, userId: user.id, eventType: 'user.email_changed', severity: 'warning', details: { from: currentEmail || null, to: email } }).catch(() => {});
     }
 
     createNotification({
@@ -2749,14 +2913,20 @@ export async function verifySignupEmailHandler(request: NextRequest) {
     if (!code) {
       const clientIp3 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
       if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp3, email))) {
-        return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+        return rateLimited(request, { action: 'auth/verify-email', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
       }
       const cooldown = await enforceResendCooldown(`verify-email:${email.toLowerCase()}`);
       if (!cooldown.allowed) {
-        return NextResponse.json(
-          { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
-          { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-        );
+        return rateLimited(request, {
+          action: 'auth/verify-email',
+          message: 'Please wait before requesting another code.',
+          email: user.email,
+          userId: user.id,
+          keyHint: 'verify-email:resend-cooldown',
+          resetsAt: Date.now() + cooldown.remainingMs,
+          retryAfterSec: cooldown.remainingMs / 1000,
+          extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+        });
       }
       const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
       const otpHash = hashOtpCode(otpCode);
@@ -2825,7 +2995,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/oauth/callback:google', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
     const cfg = await getOauthProviderConfig('google');
     const clientId = cfg.clientId;
@@ -2837,10 +3007,12 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'google');
     if ('error' in validated) {
+      logOauthFailure(request, 'google', 'state_validation', validated.error);
       return NextResponse.json({ error: validated.error }, { status: 400 });
     }
     const { state } = validated;
     if (!code) {
+      logOauthFailure(request, 'google', 'missing_code');
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
@@ -2856,6 +3028,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
       console.error('[GOOGLE TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri, 'client_id:', clientId?.slice(0, 20));
+      logOauthFailure(request, 'google', 'token_exchange_failed', errBody);
       return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
     }
     const tokenData: any = await tokenRes.json();
@@ -2864,6 +3037,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
     const userInfoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` } });
     if (!userInfoRes.ok) {
+      logOauthFailure(request, 'google', 'userinfo_fetch_failed');
       return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
@@ -2875,6 +3049,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
       photoUrl: profile.picture as string | undefined }, state);
   } catch (err: any) {
     console.error('[GOOGLE CALLBACK]', err?.message || err);
+    logOauthFailure(request, 'google', 'callback_exception', err?.message);
     return NextResponse.json({ error: 'Google OAuth callback failed' }, { status: 500 });
   }
 }
@@ -2914,7 +3089,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/oauth/callback:github', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
     const cfg = await getOauthProviderConfig('github');
     const clientId = cfg.clientId;
@@ -2926,10 +3101,12 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'github');
     if ('error' in validated) {
+      logOauthFailure(request, 'github', 'state_validation', validated.error);
       return NextResponse.json({ error: validated.error }, { status: 400 });
     }
     const { state } = validated;
     if (!code) {
+      logOauthFailure(request, 'github', 'missing_code');
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
@@ -2940,6 +3117,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
       console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
+      logOauthFailure(request, 'github', 'token_exchange_failed', errBody);
       return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
     }
     const tokenData: any = await tokenRes.json();
@@ -2951,6 +3129,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       headers: GITHUB_HEADERS });
     if (!userInfoRes.ok) {
       console.error('[GITHUB USER] Fetch failed:', userInfoRes.status);
+      logOauthFailure(request, 'github', 'userinfo_fetch_failed', String(userInfoRes.status));
       return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
@@ -2996,6 +3175,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       photoUrl: profile.avatar_url as string | undefined }, state);
   } catch (err: any) {
     console.error('[GITHUB CALLBACK]', err?.message || err);
+    logOauthFailure(request, 'github', 'callback_exception', err?.message);
     return NextResponse.json({ error: 'GitHub OAuth callback failed' }, { status: 500 });
   }
 }
@@ -3036,7 +3216,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
   try {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/oauth/callback:discord', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
     const cfg = await getOauthProviderConfig('discord');
     const clientId = cfg.clientId;
@@ -3048,10 +3228,12 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     const code = request.nextUrl.searchParams.get('code');
     const validated = await validateOauthState(request, 'discord');
     if ('error' in validated) {
+      logOauthFailure(request, 'discord', 'state_validation', validated.error);
       return NextResponse.json({ error: validated.error }, { status: 400 });
     }
     const { state } = validated;
     if (!code) {
+      logOauthFailure(request, 'discord', 'missing_code');
       return NextResponse.json({ error: 'Missing code' }, { status: 400 });
     }
 
@@ -3067,6 +3249,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
      if (!tokenRes.ok) {
        const errBody = await tokenRes.text();
        console.error('[DISCORD TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
+       logOauthFailure(request, 'discord', 'token_exchange_failed', errBody);
        return NextResponse.json({ error: 'Failed to exchange token' }, { status: 500 });
      }
     const tokenData: any = await tokenRes.json();
@@ -3075,6 +3258,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
     const userInfoRes = await fetch('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${accessToken}` } });
     if (!userInfoRes.ok) {
+      logOauthFailure(request, 'discord', 'userinfo_fetch_failed');
       return NextResponse.json({ error: 'Failed to fetch user info' }, { status: 500 });
     }
     const profile: any = await userInfoRes.json();
@@ -3092,6 +3276,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
         : undefined }, state);
   } catch (err: any) {
     console.error('[DISCORD CALLBACK]', err?.message || err);
+    logOauthFailure(request, 'discord', 'callback_exception', err?.message);
     return NextResponse.json({ error: 'Discord OAuth callback failed' }, { status: 500 });
   }
 }
@@ -3422,14 +3607,14 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {  tr
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
     if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
 
     if (!(await checkWindowLimitDB(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many requests. Please try again later.', email, keyHint: 'pw-reset-otp:ip' });
     }
     const result = await requestPasswordResetOtp(email);
     // An unknown address returns success without sending, so the response stays
@@ -3441,6 +3626,15 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {  tr
         { error: result?.error || 'Could not send the verification code. Please try again.' },
         { status: 502 },
       );
+    }
+    // Tracking: a code was generated (log its truncated hash, never the plain
+    // one) and the reset was requested. A returned code means the account is
+    // real, so the event is attributed to it; unknown addresses stay anonymous.
+    if (result.code) {
+      logOtpJson(email, 'password-reset-otp', result.code.slice(0, 3) + '***', clientIp, undefined, 'password_reset_otp').catch(() => {});
+      fetchLoginUserByEmail(email.toLowerCase())
+        .then((u) => logSecurityEvent({ request, userId: u?.id ?? null, eventType: 'auth.reset_requested', severity: 'info', details: { email: email.toLowerCase(), method: 'otp' } }))
+        .catch(() => {});
     }
     return NextResponse.json({ message: 'If an account exists, a verification code has been sent.' });
   } catch (err: any) {
@@ -3458,14 +3652,14 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
     if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
 
     if (!(await checkWindowLimitDB(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many requests. Please try again later.', email, keyHint: 'pw-reset-link:ip' });
     }
     const result = await requestPasswordResetMagicLink(email);
     // Unknown address returns success without sending, so enumeration protection
@@ -3475,6 +3669,17 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
         { error: result?.error || 'Could not send the reset link. Please try again.' },
         { status: 502 },
       );
+    }
+    // Tracking: reset link generated + requested. The token embedded in the
+    // URL proves the account exists, so its owner attributes the event; the
+    // logLinkJson row keeps only the token's first characters, never a live
+    // credential (it is 15-minute single-purpose anyway).
+    if (result.resetUrl) {
+      const resetToken = (() => { try { return new URL(result.resetUrl!).searchParams.get('token') || ''; } catch { return ''; } })();
+      if (resetToken) logLinkJson(email, 'password_reset_link', resetToken, clientIp).catch(() => {});
+      verifyPasswordResetToken(resetToken)
+        .then((uid) => logSecurityEvent({ request, userId: uid ?? null, eventType: 'auth.reset_requested', severity: 'info', details: { email: email.toLowerCase(), method: 'magic_link' } }))
+        .catch(() => {});
     }
     return NextResponse.json({ message: 'If an account exists, a magic link has been sent.' });
   } catch (err: any) {
@@ -3509,20 +3714,20 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     if (ptrGate.state === 'invalid') {
       const guessesOk = await checkWindowLimitDB(`${ptrMethod}:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
       if (!guessesOk) {
-        return NextResponse.json({ error: 'Too many invalid attempts from this device. Please try again later.' }, { status: 429, headers: { 'Retry-After': '900' } });
+        return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many invalid attempts from this device. Please try again later.', email, keyHint: `${ptrMethod}:ptr-guess`, retryAfterSec: 900 });
       }
       return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
     }
 
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many verification attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
     if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests from this device. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
     const bucket = resetMethod === 'recovery' ? 'pw-reset-recovery' : resetMethod === 'magic_link' ? 'pw-reset-link' : 'pw-reset-otp';
     if (!(await checkWindowLimitDB(`${bucket}:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many requests. Please try again later.', email, keyHint: `${bucket}:ip` });
     }
     const result =
       resetMethod === 'recovery'
@@ -3530,10 +3735,15 @@ export async function requestPasswordResetHandler(request: NextRequest) {
         : await requestPasswordReset(email, resetMethod);
     if (!result.success && result.retryAfterMs) {
       if (ptrGate.state === 'ok') await releasePtr(ptrMethod, email, String(ptr));
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(result.retryAfterMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: `auth/password-reset/request:${resetMethod}`,
+        message: 'Please wait before requesting another code.',
+        email,
+        keyHint: `${bucket}:resend-cooldown`,
+        resetsAt: Date.now() + result.retryAfterMs,
+        retryAfterSec: result.retryAfterMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
+      });
     }
     if (!result.success) {
       // Unknown addresses return success from the helper without sending, so
@@ -3546,6 +3756,26 @@ export async function requestPasswordResetHandler(request: NextRequest) {
         { error: 'We could not reach the email service right now. Please try again in a moment.' },
         { status: 502 },
       );
+    }
+    // Tracking (legacy combined route): OTP code and/or reset link generated,
+    // then the reset_requested event, attributed when the artifact names a
+    // real account (a returned code/resetUrl only exists for one).
+    if (result.code) {
+      logOtpJson(email, `password-reset-${resetMethod}`, result.code.slice(0, 3) + '***', clientIp, undefined, 'password_reset_otp').catch(() => {});
+    }
+    const resetEvent = (userId: string | null) =>
+      logSecurityEvent({ request, userId, eventType: 'auth.reset_requested', severity: 'info', details: { email: email.toLowerCase(), method: resetMethod } });
+    // The union of the two helper results: only the non-recovery branch can
+    // carry a resetUrl, so read it off the wider shape.
+    const legacyResetUrl = (result as { resetUrl?: string }).resetUrl;
+    if (legacyResetUrl) {
+      const legacyToken = (() => { try { return new URL(legacyResetUrl).searchParams.get('token') || ''; } catch { return ''; } })();
+      if (legacyToken) {
+        logLinkJson(email, 'password_reset_link', legacyToken, clientIp).catch(() => {});
+        verifyPasswordResetToken(legacyToken).then((uid) => resetEvent(uid ?? null)).catch(() => {});
+      }
+    } else if (result.code) {
+      fetchLoginUserByEmail(email.toLowerCase()).then((u) => resetEvent(u?.id ?? null)).catch(() => {});
     }
     return NextResponse.json({ message: 'If an account exists, a reset link has been sent.', ptr: issuePtr(ptrMethod, email, ptrDevice) });
   } catch (err: any) {
@@ -3567,12 +3797,17 @@ export async function verifyPasswordResetHandler(request: NextRequest) {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/verify', message: 'Too many attempts. Please try again later.', email, keyHint: 'pw-reset-verify:ip' });
     }
     const result = await verifyPasswordReset(email, { code, token });
     if (!result.success) {
+      // A wrong/expired code or link is a failed auth attempt — warning, kept
+      // anonymous (the address may not belong to anyone; no existence signal in
+      // the row beyond what the response already gives).
+      logSecurityEvent({ request, eventType: 'auth.reset_verify_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'invalid_code_or_token' } }).catch(() => {});
       return NextResponse.json({ error: result.error || 'Verification failed' }, { status: 400 });
     }
+    logSecurityEvent({ request, eventType: 'auth.reset_verified', severity: 'info', details: { email: email.toLowerCase() } }).catch(() => {});
     return NextResponse.json({ resetToken: result.resetToken });
   } catch (err: any) {
     console.error('[PASSWORD RESET VERIFY]', err?.message || err);
@@ -3599,12 +3834,18 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/confirm', message: 'Too many attempts. Please try again later.', keyHint: 'pw-reset-confirm:ip' });
     }
     const result = await confirmPasswordReset(resetToken, newPassword);
     if (!result.success) {
+      logSecurityEvent({ request, eventType: 'auth.reset_confirm_failed', severity: 'warning', details: { reason: result.error || 'invalid_token' } }).catch(() => {});
       return NextResponse.json({ error: result.error || 'Failed to reset password' }, { status: 400 });
     }
+    // The password was set — attribute the completion to the account the
+    // (still-valid) reset token names. Never log the password itself.
+    verifyPasswordResetToken(resetToken)
+      .then((uid) => logSecurityEvent({ request, userId: uid ?? null, eventType: 'auth.reset_completed', severity: 'info', details: { method: 'password_reset' } }))
+      .catch(() => {});
     return NextResponse.json({ message: 'Password updated successfully' });
   } catch (err: any) {
     console.error('[PASSWORD RESET CONFIRM]', err?.message || err);
@@ -3625,7 +3866,7 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!checkWindowLimit(`quick-login:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/password-reset/quick-login', message: 'Too many attempts. Please try again later.', email, keyHint: 'quick-login:ip' });
     }
 
     const { quickLoginWithOtp } = await import('@/features/auth/password-reset');
@@ -3640,15 +3881,18 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
           { status: 403 },
         );
       }
+      logSecurityEvent({ request, eventType: 'auth.otp_login_failed', severity: 'warning', details: { email: String(email).toLowerCase(), reason: result.error || 'invalid_or_expired_code' } }).catch(() => {});
       return NextResponse.json({ error: result.error || 'Invalid or expired code' }, { status: 400 });
     }
 
     // Set session + refresh cookies (same pattern as login)
+    logSecurityEvent({ request, userId: result.userId ?? null, eventType: 'auth.otp_login', severity: 'info', details: { email: String(email).toLowerCase(), method: 'reset_otp_quick_login' } }).catch(() => {});
     const resp = NextResponse.json({ message: 'Logged in successfully', userId: result.userId });
     setSessionCookie(resp, result.sessionToken!, result.refreshToken, request);
     return resp;
   } catch (err: any) {
     console.error('[QUICK LOGIN OTP]', err?.message || err);
+    logSecurityEvent({ request, eventType: 'auth.otp_login_failed', severity: 'warning', details: { reason: 'callback_exception', detail: String(err?.message || '').slice(0, 200) } }).catch(() => {});
     return NextResponse.json({ error: 'Failed to login' }, { status: 500 });
   }
 }
@@ -3675,10 +3919,14 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     if (ptrGate.state === 'invalid') {
       const guessesOk = await checkWindowLimitDB(`magic-link:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
       if (!guessesOk) {
-        return NextResponse.json(
-          { error: 'Too many invalid attempts from this device. Please try again later.', exceeded: 'global-ip' },
-          { status: 429, headers: { 'Retry-After': '900' } },
-        );
+        return rateLimited(request, {
+          action: 'auth/magic-link/request',
+          message: 'Too many invalid attempts from this device. Please try again later.',
+          email,
+          keyHint: 'magic-link:ptr-guess',
+          retryAfterSec: 900,
+          extra: { exceeded: 'global-ip' },
+        });
       }
       return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
     }
@@ -3700,34 +3948,47 @@ export async function requestMagicLinkHandler(request: NextRequest) {
 
     if (!ml.ok || !globalEmail.ok) {
       const exceeded = !ml.ok ? ml : globalEmail;
-      return NextResponse.json(
-        {
-          error: `Limit reached for magic link sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+      return rateLimited(request, {
+        action: 'auth/magic-link/request',
+        message: `Limit reached for magic link sends — resets at ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
+        email,
+        keyHint: !ml.ok ? 'magic-link' : 'global-email',
+        resetsAt: exceeded.resetAt,
+        retryAfterSec: Math.max(0, exceeded.resetAt - Date.now()) / 1000,
+        extra: {
           message: `Limit reached — try again after ${new Date(exceeded.resetAt).toLocaleTimeString()}.`,
           retryAfterMs: Math.max(0, exceeded.resetAt - Date.now()),
           exceeded: !ml.ok ? 'magic-link' : 'global-email',
           remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, exceeded.resetAt - Date.now()) / 1000)) } },
-      );
+      });
     }
     if (!ipBlocked || !ipWin) {
       const resetAt = windowResetAt(15 * 60 * 1000);
-      return NextResponse.json(
-        {
-          error: 'Too many requests from this device. Please try again later.',
+      return rateLimited(request, {
+        action: 'auth/magic-link/request',
+        message: 'Too many requests from this device. Please try again later.',
+        email,
+        keyHint: !ipWin ? 'magic-link:ip' : 'global:ip',
+        resetsAt: resetAt,
+        retryAfterSec: Math.max(0, resetAt - Date.now()) / 1000,
+        extra: {
           retryAfterMs: Math.max(0, resetAt - Date.now()),
           exceeded: 'global-ip',
           remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(Math.max(0, resetAt - Date.now()) / 1000)) } },
-      );
+      });
     }
 
     const mlCooldown = await enforceResendCooldown(`magic-link:${email.toLowerCase()}`);
     if (!mlCooldown.allowed) {
-      return NextResponse.json(
-        { message: `Please wait ${Math.ceil(mlCooldown.remainingMs / 1000)}s before requesting again.`, retryAfterMs: mlCooldown.remainingMs, remaining: remainingInfo },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(mlCooldown.remainingMs / 1000)) } }
-      );
+      return rateLimited(request, {
+        action: 'auth/magic-link/request',
+        message: `Please wait ${Math.ceil(mlCooldown.remainingMs / 1000)}s before requesting again.`,
+        email,
+        keyHint: 'magic-link:resend-cooldown',
+        resetsAt: Date.now() + mlCooldown.remainingMs,
+        retryAfterSec: mlCooldown.remainingMs / 1000,
+        extra: { message: `Please wait ${Math.ceil(mlCooldown.remainingMs / 1000)}s before requesting again.`, retryAfterMs: mlCooldown.remainingMs, remaining: remainingInfo },
+      });
     }
 
     const user = await fetchLoginUserByEmail(email.toLowerCase());
@@ -3768,9 +4029,13 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     if (!send.success) {
       console.error('[MAGIC LINK] send failed:', send.error);
       if (ptrGate.state === 'ok') await releasePtr('magic-link', email, String(ptr));
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.magic_link_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'send_failed' } }).catch(() => {});
       return NextResponse.json({ error: 'Could not send the sign-in link. Please try again.', remaining: remainingInfo }, { status: 502 });
     }
 
+    // The link left the building: record the request as a proper security
+    // event (auth.log:magic_link above only carries the jti breadcrumb).
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.magic_link_requested', severity: 'info', details: { email: email.toLowerCase(), jti: tokenJti?.slice?.(0, 8) } }).catch(() => {});
     const resp: any = {
       message: 'If an account exists, a magic link has been sent.',
       remaining: remainingInfo,
@@ -3809,11 +4074,12 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     if (!(await checkWindowLimitDB(`magic-link-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
-      return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/magic-link/verify', message: 'Too many attempts. Please try again later.', keyHint: 'magic-link-verify:ip' });
     }
 
     const decoded = await verifyMagicLinkToken(token);
     if (!decoded) {
+      logSecurityEvent({ request, eventType: 'auth.magic_link_invalid', severity: 'warning', details: { reason: 'expired_or_invalid_token' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired magic link' }, { status: 401 });
     }
 
@@ -3822,6 +4088,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     if (decoded.jti) {
       const owner = await consumeMagicJti(decoded.jti);
       if (owner !== decoded.userId) {
+        logSecurityEvent({ request, userId: decoded.userId, eventType: 'auth.magic_link_replay', severity: 'warning', details: { reason: 'already_consumed', jti: decoded.jti.slice(0, 8) } }).catch(() => {});
         return NextResponse.json({ error: 'Invalid or expired magic link' }, { status: 401 });
       }
     }
@@ -3855,6 +4122,9 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
     const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
     // Magic link creates a SHORT-TERM session (3 days) — expires after logout or 3 days
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, undefined, true);
+    // The link redeemed: record the verification (both the GET from the email
+    // and the POST from the accounts app land here exactly once).
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.magic_link_verified', severity: 'info', details: { email: user.email, jti: decoded.jti?.slice(0, 8) } }).catch(() => {});
     // Magic-link logins are frequently opened on a different device than the one
     // that requested the link, so this is a genuine first-seen-device signal.
     // Wired once for both the GET (email link) and POST (accounts app) branches.
@@ -3977,18 +4247,23 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
 
     if (!checkWindowLimit(`recovery-login:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/recovery-login', message: 'Too many requests. Please try again later.', email, keyHint: 'recovery-login:ip' });
     }
     if (!checkWindowLimit(`recovery-login:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
-      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+      return rateLimited(request, { action: 'auth/recovery-login', message: 'Too many requests. Please try again later.', email, keyHint: 'recovery-login:email' });
     }
 
     const cooldown = await enforceResendCooldown(`recovery-login:${email.toLowerCase()}`);
     if (!cooldown.allowed) {
-      return NextResponse.json(
-        { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
-        { status: 429, headers: { 'Retry-After': String(Math.ceil(cooldown.remainingMs / 1000)) } },
-      );
+      return rateLimited(request, {
+        action: 'auth/recovery-login',
+        message: 'Please wait before requesting another code.',
+        email,
+        keyHint: 'recovery-login:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
+      });
     }
 
     const user = await fetchLoginUserByEmail(email.toLowerCase());
@@ -4036,7 +4311,10 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     }
 
     const user = await fetchLoginUserByEmail(email.toLowerCase());
-    if (!user) return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
+    if (!user) {
+      logSecurityEvent({ request, eventType: 'auth.recovery_login_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'no_such_user' } }).catch(() => {});
+      return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
+    }
     if (user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') return blockedAccountResponse(user);
     if (!(await isLoginUserEmailVerified(user))) return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
 
@@ -4044,6 +4322,7 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     // with the same bind so reset/recovery codes cannot cross-spend.
     const ok = await verifyOtpCode(user.id, 'email', code, user.recoveryEmail || undefined);
     if (!ok) {
+      logSecurityEvent({ request, userId: user.id, eventType: 'auth.recovery_login_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'invalid_or_expired_code' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
 
@@ -4058,7 +4337,8 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request);
 
-    logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_recovery_email_success' }).catch(() => {});
+    // Canonical auth-family row for this path (recovery-email code login).
+    logSecurityEvent({ request, userId: user.id, eventType: 'auth.recovery_login', severity: 'info', details: { email: user.email || email.toLowerCase(), method: 'recovery_email' } }).catch(() => {});
     const { recordLoginHistory: rlh6 } = await import('@/features/security/security');
     rlh6({ request, userId: user.id, email: user.email || '', success: true, method: 'recovery_email' }).catch(() => {});
     createNotification({

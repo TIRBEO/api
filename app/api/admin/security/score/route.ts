@@ -89,12 +89,16 @@ export async function GET(request: NextRequest) {
 
     // Parallelize the remaining heavy queries
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    // SecurityEvent was consolidated into ActivityEvent (eventType → kind, same
+    // severity/ip/userAgent columns). These three reads now hit the single
+    // activity log; the response still surfaces the kind under `eventType` so
+    // the panel's shape is unchanged.
     const [
       recentCritical,
       ipCounts,
       eventTypes,
     ] = await Promise.all([
-      trackQuery('security_events_by_severity_created', () => prisma.securityEvent.findMany({
+      trackQuery('activity_events_by_severity_created', () => prisma.activityEvent.findMany({
         where: {
           severity: 'critical',
           createdAt: { gte: thirtyDaysAgo } },
@@ -103,13 +107,13 @@ export async function GET(request: NextRequest) {
         select: {
           id: true,
           severity: true,
-          eventType: true,
+          kind: true,
           createdAt: true,
           ipAddress: true,
           // A user's name is on user_profile; selecting `name` off the users row
           // fails the query and this whole endpoint answers 500.
-          user: { select: { email: true, profile: { select: { name: true } } } } } })),
-      trackQuery('security_events_group_by_ip', () => prisma.securityEvent.groupBy({
+          user: { select: { email: true, profile: { select: { name: true } } } } } }).then((rows) => rows.map((r: any) => ({ ...r, eventType: r.kind })))),
+      trackQuery('activity_events_group_by_ip', () => prisma.activityEvent.groupBy({
         by: ['ipAddress'],
         where: {
           createdAt: { gte: thirtyDaysAgo },
@@ -117,8 +121,8 @@ export async function GET(request: NextRequest) {
         _count: { id: true },
         orderBy: { _count: { id: 'desc' } },
         take: 10 })),
-      trackQuery('security_events_group_by_type', () => prisma.securityEvent.groupBy({
-        by: ['eventType'],
+      trackQuery('activity_events_group_by_type', () => prisma.activityEvent.groupBy({
+        by: ['kind'],
         where: { createdAt: { gte: thirtyDaysAgo } },
         _count: { id: true },
         orderBy: { _count: { id: 'desc' } },
@@ -136,7 +140,7 @@ export async function GET(request: NextRequest) {
       user: e.user ? { email: e.user.email, name: e.user.profile?.name ?? null } : null }));
 
     const topEventTypes = eventTypes.map(et => ({
-      type: et.eventType,
+      type: et.kind,
       count: et._count.id }));
 
     return NextResponse.json({

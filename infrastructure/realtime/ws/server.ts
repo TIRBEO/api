@@ -221,10 +221,34 @@ function getRateLimitStatus(ip: string): { connectionLimit: number; connectionRe
 // middleware can import it without pulling Prisma into the bundle.
 // State itself is on globalThis (see maintenance-state.ts), so all bundles
 // share the same object; this module only owns the scheduler + WS broadcast.
-import { getMaintenanceState as _getMaintenanceState, setMaintenanceMode as _setMaintenanceMode, tickMaintenanceSchedule } from '@/shared/maintenance-state';
+import { getMaintenanceState as _getMaintenanceState, setMaintenanceMode as _setMaintenanceMode, syncMaintenanceSchedule, registerMaintenancePersistence } from '@/shared/maintenance-state';
+import { prisma } from '@/infrastructure/db/prisma';
 type MaintenanceState = ReturnType<typeof _getMaintenanceState>;
 const maintenanceState = new Proxy({} as MaintenanceState, {
   get(_t, prop) { return (_getMaintenanceState() as any)[prop]; },
+});
+
+// Maintenance is durable in AppConfig under 'maintenance' (a JSON KV table
+// already in use for 'email.config'). Registering the hooks from here — the
+// Node-side scheduler + the path admin handlers import — hydrates the shared
+// globalThis on boot and persists every change, so any instance converges.
+const MAINTENANCE_CONFIG_KEY = 'maintenance';
+registerMaintenancePersistence({
+  save: (state) => {
+    void prisma.appConfig.upsert({
+      where: { key: MAINTENANCE_CONFIG_KEY },
+      update: { value: state as any },
+      create: { key: MAINTENANCE_CONFIG_KEY, value: state as any, description: 'Maintenance mode state + schedule' },
+    }).catch((e: any) => console.error('[MAINTENANCE] Persist failed:', e?.message));
+  },
+  load: async () => {
+    try {
+      const row = await prisma.appConfig.findUnique({ where: { key: MAINTENANCE_CONFIG_KEY } });
+      return (row?.value as unknown as MaintenanceState) ?? null;
+    } catch {
+      return null;
+    }
+  },
 });
 
 let maintenanceSchedulerTimer: ReturnType<typeof setTimeout> | null = null;
@@ -251,7 +275,7 @@ function startMaintenanceScheduler(): void {
     maintenanceSchedulerTimer = setTimeout(async () => {
       const now = Date.now();
       
-      const tick = tickMaintenanceSchedule();
+      const tick = await syncMaintenanceSchedule();
       if (tick.autoEnabled) {
         console.log('[MAINTENANCE] Auto-enabling maintenance mode (scheduled)');
         broadcastMaintenanceStatus();

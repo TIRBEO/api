@@ -7,6 +7,35 @@ import { publicHealthHandler } from '@/features/observability/health';
 import { getRedisHealthSummary } from '@/infrastructure/db/redis';
 import { isTurnstileConfigured, getTurnstileSiteKey } from '@/features/auth/turnstile';
 
+// One source of truth: every read below goes through activity_events. The
+// legacy SecurityEvent model is no longer queried (its rows are historical,
+// written before the ledger unified). LOGIN kind lists cover BOTH the
+// pre-canonical names old rows carry ('login', 'login_failed') and the
+// canonical auth-family kinds the handlers write today.
+const LOGIN_SUCCESS_KINDS = [
+  'login',
+  'auth.login_success',
+  'auth.login_2fa_success',
+  'auth.login_otp_success',
+  'auth.login_recovery_2fa_success',
+  'auth.login_recovery_email_success',
+  'auth.admin_login_success',
+  'auth.oauth_login',
+  'auth.passkey_login',
+  'auth.otp_login',
+  'auth.recovery_login',
+];
+const LOGIN_FAILED_KINDS = [
+  'login_failed',
+  'auth.log:verify',
+  'auth.login_failed',
+  'auth.oauth_failed',
+  'auth.passkey_login_failed',
+  'auth.otp_login_failed',
+  'auth.recovery_login_failed',
+];
+const ALL_LOGIN_KINDS = [...LOGIN_SUCCESS_KINDS, ...LOGIN_FAILED_KINDS];
+
 /** Captcha gate activity over the last 24h; all kinds, or one specific kind. */
 function captchaGate24h(kind?: 'captcha.blocked' | 'captcha.attempt_failed') {
   return safe(
@@ -70,9 +99,9 @@ export async function GET(request: NextRequest) {
     countPair('passkey', () => prisma.passkey.count()),
     countPair('userTipLog', () => prisma.userTipLog.count()),
     countPair('blocklist', () => prisma.blocklist.count()),
-    countPair('securityEvent', () => prisma.securityEvent.count()),
+    countPair('securityEvent', () => prisma.activityEvent.count()),
     countPair('auditEvent', () => prisma.activityEvent.count()),
-    countPair('loginHistory', () => prisma.securityEvent.count({ where: { eventType: { in: ['login', 'login_failed', 'auth.log:verify'] } } })),
+    countPair('loginHistory', () => prisma.activityEvent.count({ where: { kind: { in: ALL_LOGIN_KINDS } } })),
     countPair('notification', () => prisma.notification.count()),
     countPair('pushSubscription', () => prisma.pushSubscription.count()),
     countPair('media', () => Promise.resolve(0)),
@@ -132,9 +161,9 @@ export async function GET(request: NextRequest) {
     safe(prisma.email_deliveries.count({ where: { status: 'failed' } })),
     safe(prisma.email_deliveries.count({ where: { openedAt: { not: null } } })),
     safe(prisma.email_deliveries.count({ where: { clickedAt: { not: null } } })),
-    safe(prisma.securityEvent.count({ where: { eventType: { in: ['login', 'login_failed'] }, createdAt: { gte: todayStart } } })),
-    safe(prisma.securityEvent.count({ where: { eventType: 'login_failed', createdAt: { gte: todayStart } } })),
-    safe(prisma.securityEvent.count({ where: { createdAt: { gte: todayStart }, severity: { in: ['warning', 'error', 'critical'] } } })),
+    safe(prisma.activityEvent.count({ where: { kind: { in: ALL_LOGIN_KINDS }, createdAt: { gte: todayStart } } })),
+    safe(prisma.activityEvent.count({ where: { kind: { in: LOGIN_FAILED_KINDS }, createdAt: { gte: todayStart } } })),
+    safe(prisma.activityEvent.count({ where: { createdAt: { gte: todayStart }, severity: { in: ['warning', 'error', 'critical'] } } })),
     Promise.resolve(0),
     Promise.resolve(0),
     Promise.resolve(0),
@@ -145,7 +174,7 @@ export async function GET(request: NextRequest) {
     captchaGate24h(),
     captchaGate24h('captcha.blocked'),
     captchaGate24h('captcha.attempt_failed'),
-    safe(prisma.securityEvent.count({ where: { eventType: { startsWith: 'auth.' }, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } })),
+    safe(prisma.activityEvent.count({ where: { kind: { startsWith: 'auth.' }, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } })),
     Promise.resolve(0),
     Promise.resolve(0),
     Promise.resolve(0),
@@ -170,11 +199,11 @@ export async function GET(request: NextRequest) {
     safeMany(prisma.userSession.groupBy({ by: ['status'], _count: { status: true } })),
     Promise.resolve([] as any[]),
     safeMany(prisma.notification.groupBy({ by: ['type'], _count: { type: true } })),
-    safeMany(prisma.securityEvent.groupBy({ by: ['severity'], _count: { severity: true } })),
-    safeMany(prisma.securityEvent.groupBy({ by: ['eventType'], orderBy: { _count: { eventType: 'desc' } }, take: 8, _count: { eventType: true } })),
+    safeMany(prisma.activityEvent.groupBy({ by: ['severity'], _count: { severity: true } })),
+    safeMany(prisma.activityEvent.groupBy({ by: ['kind'], orderBy: { _count: { kind: 'desc' } }, take: 8, _count: { kind: true } })),
     safeMany(prisma.activityEvent.groupBy({ by: ['severity'], _count: { severity: true } })),
     safe(prisma.activityEvent.count({ where: { createdAt: { gte: todayStart } } })),
-    safeMany(prisma.securityEvent.groupBy({ by: ['eventType'], where: { eventType: { in: ['login', 'login_failed', 'login_otp', 'magic_link'] } }, orderBy: { _count: { eventType: 'desc' } }, take: 8, _count: { eventType: true } })),
+    safeMany(prisma.activityEvent.groupBy({ by: ['kind'], where: { kind: { in: ALL_LOGIN_KINDS } }, orderBy: { _count: { kind: 'desc' } }, take: 8, _count: { kind: true } })),
     safeMany(prisma.email_deliveries.groupBy({ by: ['status'], _count: { status: true } })),
     safeMany(prisma.email_deliveries.groupBy({ by: ['eventKey'], orderBy: { _count: { eventKey: 'desc' } }, take: 8, _count: { eventKey: true } })),
     Promise.resolve([] as any[]),
@@ -205,9 +234,9 @@ export async function GET(request: NextRequest) {
   ] = await Promise.all([
     safeMany(prisma.activityEvent.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
     safeMany(prisma.email_deliveries.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
-    safeMany(prisma.securityEvent.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart }, eventType: { in: ['login', 'login_failed'] } }, _count: { createdAt: true } })),
+    safeMany(prisma.activityEvent.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart }, kind: { in: ALL_LOGIN_KINDS } }, _count: { createdAt: true } })),
     safeMany(prisma.user.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
-    safeMany(prisma.securityEvent.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
+    safeMany(prisma.activityEvent.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
     Promise.resolve([] as any[]),
     safeMany(prisma.notification.groupBy({ by: ['createdAt'], where: { createdAt: { gte: seriesStart } }, _count: { createdAt: true } })),
     Promise.resolve([] as any[]),
@@ -231,8 +260,8 @@ export async function GET(request: NextRequest) {
     safeMany(prisma.activityEvent.groupBy({ by: ['kind'], where: { createdAt: { gte: monthAgo } }, _count: { kind: true }, orderBy: { _count: { kind: 'desc' } }, take: 10 })),
     safeMany(prisma.activityEvent.findMany({ where: { createdAt: { gte: weekAgo } }, orderBy: { createdAt: 'desc' }, take: 20, include: { user: { select: { id: true, email: true, profile: { select: { name: true } } } } } })),
     safeMany(prisma.email_deliveries.findMany({ orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, toEmail: true, subject: true, eventKey: true, status: true, openedAt: true, clickedAt: true, createdAt: true } })),
-    safeMany(prisma.securityEvent.findMany({ where: { eventType: { in: ['login', 'login_failed'] } }, orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, eventType: true, ipAddress: true, userId: true, createdAt: true } })),
-    safeMany(prisma.securityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, eventType: true, severity: true, ipAddress: true, userId: true, createdAt: true } })),
+    safeMany(prisma.activityEvent.findMany({ where: { kind: { in: ALL_LOGIN_KINDS } }, orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, kind: true, ipAddress: true, userId: true, createdAt: true } }).then((rows) => rows.map((r) => ({ ...r, eventType: r.kind })))),
+    safeMany(prisma.activityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 15, select: { id: true, kind: true, severity: true, ipAddress: true, userId: true, createdAt: true } }).then((rows) => rows.map((r) => ({ ...r, eventType: r.kind })))),
     Promise.resolve([] as any[]),
     safeMany(prisma.notification.findMany({ orderBy: { createdAt: 'desc' }, take: 10, select: { id: true, type: true, title: true, isRead: true, createdAt: true } })),
     Promise.resolve([] as any[]),
@@ -302,12 +331,12 @@ export async function GET(request: NextRequest) {
     security: {
       total: tables.securityEvent, today: securityEventsToday,
       bySeverity: securityBySeverity.map((s: any) => ({ severity: s.severity ?? 'info', count: s._count.severity ?? 0 })),
-      topTypes: securityTopTypes.map((s: any) => ({ eventType: s.eventType || 'unknown', count: s._count.eventType ?? 0 })) },
+      topTypes: securityTopTypes.map((s: any) => ({ eventType: s.kind || 'unknown', count: s._count.kind ?? 0 })) },
     auditInfo: { total30d: tables.auditEvent, today: auditToday, bySeverity: auditBySeverity.map((s: any) => ({ severity: s.severity ?? 'info', count: s._count.severity ?? 0 })) },
     logins: {
       total: tables.loginHistory, today: loginsToday, successToday: loginsSuccessToday, failedToday: failedLoginsToday,
       successRateToday: loginsToday ? Math.round((loginsSuccessToday / loginsToday) * 100) : 100,
-      byMethod: loginByMethod.map((l: any) => ({ method: l.method || 'unknown', count: l._count.method ?? 0 })) },
+      byMethod: loginByMethod.map((l: any) => ({ method: l.kind || 'unknown', count: l._count.kind ?? 0 })) },
     emails: {
       total: tables.emailLog, today: emailsToday, lastHour: emailsLastHour, failures: emailFailures,
       opened: emailsOpened, clicked: emailsClicked,

@@ -322,9 +322,16 @@ enum Severity {
   @@map("severity")
 }
 
+// Anonymous (pre-account) auth/security events are first-class rows here:
+// user_id is nullable so a signup OTP, a magic-link request or a client
+// telemetry ping lands in the log even when no account exists yet. This is a
+// db-push workflow (no prisma/migrations folder); the matching DB change is
+// kept at prisma/manual/activity_events_nullable_user.sql and must be applied
+// with `psql <DATABASE_URL> -f prisma/manual/activity_events_nullable_user.sql`
+// (or prisma db push) wherever the schema is rebuilt.
 model ActivityEvent {
   id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
-  userId    String   @map("user_id")
+  userId    String?  @map("user_id")
   kind      String
   title     String
   detail    String?
@@ -334,7 +341,7 @@ model ActivityEvent {
   metadata  Json     @default("{}")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt(sort: Desc)], map: "idx_activity_user")
   @@index([kind], map: "idx_activity_kind")
@@ -547,6 +554,37 @@ model VerificationLimit {
 }
 
 
+
+// Fixed-window rate-limit counters, the Postgres fallback for the Redis
+// `ratelimit:*` keys. `bucket` is floor(epochMs / windowMs) so every instance
+// agrees on window boundaries without coordination; a single upsert with an
+// increment is the atomic counter. Guarded reads treat a missing table as
+// "no Postgres" and drop to the in-memory Map.
+model RateLimitWindow {
+  id      String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  key     String
+  bucket  BigInt
+  count   Int      @default(0)
+  resetAt DateTime @map("reset_at") @db.Timestamptz(6)
+
+  @@unique([key, bucket], map: "uq_rate_limit_windows_key_bucket")
+  @@index([resetAt], map: "idx_rate_limit_windows_reset")
+  @@map("rate_limit_windows")
+}
+
+// Spent refresh tokens — the Postgres fallback for the Redis
+// `auth:refresh_spent:*` keys when Redis is not configured. The unique
+// `token_hash` IS the reuse detector: a second spend of the same rotated token
+// violates it. `session_id` is the family to kill when reuse is caught.
+model RefreshTokenSpent {
+  id        String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  tokenHash String   @unique @map("token_hash")
+  sessionId String   @map("session_id")
+  spentAt   DateTime @default(now()) @map("spent_at") @db.Timestamptz(6)
+
+  @@index([spentAt], map: "idx_refresh_token_spent_at")
+  @@map("refresh_token_spent")
+}
 
 enum session_status {
   active

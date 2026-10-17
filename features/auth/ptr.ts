@@ -27,7 +27,18 @@ function redisSafe(): any {
 }
 
 /* Redis-first with process-global mirrors, same convention as verify-limits:
-   dev without Redis still gets working (per-process) enforcement. */
+   dev without Redis still gets working (per-process) enforcement.
+
+   Why the non-Redis fallback is the in-process mirror and NOT the Otp table
+   (unlike the passkey challenge, which fits there): a ptr is an opaque
+   capability that checkPtr compares BY VALUE (bodyPtr === active) and uses to
+   look up a separate flow's record by its raw token to reconcile an
+   email-mismatch guess. Otp.otpHash is a hash column keyed by (kind, address);
+   hashing the ptr makes value-comparison and by-ptr retrieval impossible, and
+   storing the raw ptr there would be strictly worse than the existing Redis
+   store (which already holds it in cleartext). issuePtr is also synchronous by
+   contract. The proof shape can't fit losslessly, so the mirror stays the
+   fallback — ptr only guards resends within a single browser session's flow. */
 const vals = ((globalThis as any).__ptrVals ||= new Map<string, { rec: PtrRec; expiresAt: number }>());
 const idxs = ((globalThis as any).__ptrIdx ||= new Map<string, { ptr: string; expiresAt: number }>());
 

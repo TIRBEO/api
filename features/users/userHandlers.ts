@@ -27,7 +27,7 @@ import {
   listConnections, unlinkProvider, writeOauthLink, readOauthLinks,
   issueDeletionCode, consumeDeletionCode, scheduleDeletion, cancelDeletion,
   activeDeletionFor, OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
-import { eventIdFor } from '@/features/users/refcode';
+import { ensureRefCode } from '@/features/users/refcode';
 import {
   completeExportRequest,
   createExportRequest,
@@ -2016,8 +2016,10 @@ const json = (raw: unknown): Record<string, any> =>
 /**
  * The most recent enforcement facts for an account, read from the tables that
  * replaced the old ban/suspend columns: a live restriction carries the reason and
- * the until date, and the status-event history carries the reference codes (with
- * a deterministic fallback so a legacy account still shows one).
+ * the until date, and the status-event history carries the reference codes. A
+ * legacy account without a stored code gets one minted AND PERSISTED via
+ * ensureRefCode — the export must only ever contain a code that exists in the
+ * database and can be quoted back to staff.
  */
 async function latestEnforcement(userId: string) {
   const [restriction, banEvent, suspendEvent] = await Promise.all([
@@ -2038,8 +2040,8 @@ async function latestEnforcement(userId: string) {
     until: restriction?.endsAt
       ?? (suspMeta.until ? new Date(suspMeta.until) : null)
       ?? (banMeta.until ? new Date(banMeta.until) : null),
-    banRefCode: (banMeta.refCode as string | undefined) ?? eventIdFor(userId, 'ban'),
-    suspendRefCode: (suspMeta.refCode as string | undefined) ?? eventIdFor(userId, 'suspend'),
+    banRefCode: (banMeta.refCode as string | undefined) ?? await ensureRefCode(userId, 'ban'),
+    suspendRefCode: (suspMeta.refCode as string | undefined) ?? await ensureRefCode(userId, 'suspend'),
   };
 }
 

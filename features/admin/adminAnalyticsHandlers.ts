@@ -115,12 +115,24 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
     },
   });
 
-  // Enrich with login history summary for consented users (login_history was
-  // merged into security_events: 'login' / 'login_failed').
+  // Enrich with login history summary for consented users. login_history and
+  // SecurityEvent were both consolidated into ActivityEvent (eventType → kind):
+  // a sign-in is a 'login'/'login_failed' row under the legacy names and an
+  // 'auth.*' row under the current ones, so the filter covers BOTH shapes to
+  // keep historical data counting (mirrors the admin dash's ALL_LOGIN_KINDS).
+  const LOGIN_KINDS = [
+    'login', 'login_failed',
+    'auth.login_success', 'auth.login_2fa_success', 'auth.login_otp_success',
+    'auth.login_recovery_2fa_success', 'auth.login_recovery_email_success',
+    'auth.admin_login_success', 'auth.oauth_login', 'auth.passkey_login',
+    'auth.otp_login', 'auth.recovery_login',
+    'auth.login_failed', 'auth.oauth_failed', 'auth.passkey_login_failed',
+    'auth.otp_login_failed', 'auth.recovery_login_failed', 'auth.admin_login_failed',
+  ];
   const userIds = users.map(u => u.id);
-  const recentLogins = userIds.length ? await prisma.securityEvent.groupBy({
+  const recentLogins = userIds.length ? await prisma.activityEvent.groupBy({
     by: ['userId'],
-    where: { userId: { in: userIds }, eventType: { in: ['login', 'login_failed'] } },
+    where: { userId: { in: userIds }, kind: { in: LOGIN_KINDS } },
     _count: { id: true },
   }) : [];
   const loginMap = new Map(recentLogins.map(r => [r.userId, r._count.id]));

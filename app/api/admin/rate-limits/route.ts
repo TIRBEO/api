@@ -40,21 +40,23 @@ export async function POST(request: NextRequest) {
   let deletedAttempts = 0;
   let unblocked = 0;
   try {
+    // Attempt rows live in the unified ledger (activity_events, kind
+    // 'auth.attempt') — features/captcha/risk.ts writes and counts them there.
     if (clearAll) {
-      const r = await prisma.securityEvent.deleteMany({ where: { eventType: 'auth.attempt' } });
+      const r = await prisma.activityEvent.deleteMany({ where: { kind: 'auth.attempt' } });
       deletedAttempts = r.count;
       await prisma.blocklist.deleteMany({ where: { targetType: 'ip' } });
       unblocked = 1;
     } else {
       if (email) {
-        const r = await prisma.securityEvent.deleteMany({ where: { eventType: 'auth.attempt', metadata: { path: ['email'], equals: email } as any } });
+        const r = await prisma.activityEvent.deleteMany({ where: { kind: 'auth.attempt', metadata: { path: ['email'], equals: email } as any } });
         deletedAttempts += r.count;
         // Also clear by key containing email
-        const r2 = await prisma.securityEvent.deleteMany({ where: { eventType: 'auth.attempt', metadata: { path: ['key'], string_contains: email } as any } });
+        const r2 = await prisma.activityEvent.deleteMany({ where: { kind: 'auth.attempt', metadata: { path: ['key'], string_contains: email } as any } });
         deletedAttempts += r2.count;
       }
       if (ip) {
-        const r = await prisma.securityEvent.deleteMany({ where: { eventType: 'auth.attempt', ipAddress: ip } });
+        const r = await prisma.activityEvent.deleteMany({ where: { kind: 'auth.attempt', ipAddress: ip } });
         deletedAttempts += r.count;
         await unblockTarget('ip', ip).catch(()=>{});
         unblocked++;
