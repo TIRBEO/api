@@ -78,6 +78,62 @@ export function eventIdForUser(
   return eventIdFor(userId, kind);
 }
 
+/** Collapse a raw error into a stable identity: ids, hashes and digits vary
+    per occurrence but the fault does not, so `load failed after 1234ms [uuid]`
+    and `load failed after 99ms [other-uuid]` must share one signature. */
+function faultSignature(raw: string): string {
+  return raw
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id')
+    .replace(/\b[0-9a-f]{16,}\b/gi, ':hex')
+    .replace(/\d+/g, 'N')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+}
+
+/**
+ * Event ID for a server-side fault (the 500 path). Unlike generateEventId,
+ * the code is DETERMINISTIC per error signature and PERSISTED: the first
+ * occurrence of a fault writes an activity_events row with metadata.refCode,
+ * and every occurrence of the same fault within 24h re-reads that row and
+ * shows the same ID. Repeats beyond the window open a new incident, so staff
+ * can tell "same ongoing failure" from "it came back". The code is always
+ * findable in admin — search by event id resolves metadata.refCode.
+ *
+ * If the DB is unreachable the fault can't be recorded; we still return a
+ * stable shape (deterministic group + random tail) rather than nothing.
+ */
+export async function systemFaultRef(rawSignature: string): Promise<string> {
+  const sig = faultSignature(rawSignature);
+  const g1 = (fnv1a(`fault:${sig}`) & 0xffff).toString(16).padStart(4, '0');
+  const g2 = (fnv1a(`fault:${sig}`, 0x9e3779b9) & 0xffff).toString(16).padStart(4, '0');
+  const group = `${g1}-${g2}`;
+  try {
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recent = await prisma.activityEvent.findFirst({
+      where: {
+        kind: 'system.error',
+        createdAt: { gte: since },
+        metadata: { path: ['signature'], equals: sig } },
+      orderBy: { createdAt: 'desc' },
+      select: { metadata: true } });
+    const stored = (recent?.metadata as Record<string, unknown> | null)?.refCode;
+    if (typeof stored === 'string' && stored.trim()) return stored.trim();
+    const code = `${group}-${randomHex(4)}`;
+    await prisma.activityEvent.create({
+      data: {
+        kind: 'system.error',
+        title: `System fault ${code}`,
+        detail: rawSignature.slice(0, 500),
+        severity: 'error',
+        metadata: { refCode: code, signature: sig, group } as never } });
+    return code;
+  } catch {
+    return `${group}-${randomHex(4)}`;
+  }
+}
+
 /**
  * The code a block screen shows for a banned/suspended account — guaranteed
  * to be PERSISTED. Reads the newest user_status_events row for the user's

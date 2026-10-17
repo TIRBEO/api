@@ -5,7 +5,7 @@ import { logRequest } from '@/infrastructure/observability/logger';
 import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { jsonError, jsonForbidden } from '@/shared/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
-import { generateEventId } from '@/features/users/refcode';
+import { systemFaultRef } from '@/features/users/refcode';
 import { isIpBlocked } from '@/features/security/security';
 
 import {
@@ -1295,14 +1295,30 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
     }
     } catch (err: any) {
       console.error(`[HANDLER] Internal route ${route.path} error:`, err?.message || err, err?.stack);
-      // Typed event ID ("SY" — system fault) so users can reference this
-      // exact 500 and staff can correlate it with server logs.
-      const syEventId = generateEventId('system');
+      // Event ID is deterministic per fault signature and recorded in
+      // activity_events — the same error shows the same ID (so users quoting
+      // it match what staff see) and it is findable in admin by that code.
+      const syEventId = await systemFaultRef(`${method} ${route.path} ${err?.name || 'Error'}: ${err?.message || ''}`);
       console.error(`[HANDLER] System event ID for ${method} ${pathStr}: ${syEventId}`);
       resp = NextResponse.json(
         { error: 'Internal server error', eventId: syEventId },
         { status: 500, headers: { 'X-Event-Id': syEventId } },
       );
+    }
+    // A handler that caught its own failure still returns a 5xx without an
+    // ID ("Could not check email" style); attach the same deterministic,
+    // recorded event ID so every server fault is referenceable and findable.
+    if (resp.status >= 500) {
+      try {
+        const body = await resp.clone().json() as Record<string, unknown> | null;
+        if (body && typeof body === 'object' && !body.eventId) {
+          const code = await systemFaultRef(`${method} ${route.path} ${String(body.error || 'server error')}`);
+          resp = NextResponse.json(
+            { ...body, eventId: code },
+            { status: resp.status, headers: { 'X-Event-Id': code } },
+          );
+        }
+      } catch { /* non-JSON 5xx body — leave it untouched */ }
     }
     await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: resp.status });
     return addRateLimitHeaders(resp);

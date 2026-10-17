@@ -388,6 +388,10 @@ if (preHasCookie) {
      '/api/cdn/u/',
      '/api/health',
      '/api/security/log',
+     // Client telemetry lands events for logged-out visitors too (the login
+     // page tracks failures before any session exists); the ingest route
+     // attributes a session when one is attached and rate-limits by IP.
+     '/api/telemetry/',
      '/api/debug/',
      '/api/email/unsubscribe',
      '/api/emails/unsubscribe',

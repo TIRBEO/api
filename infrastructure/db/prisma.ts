@@ -41,15 +41,27 @@ function createPool(): Pool {
   // disables server-side prepared statements for PgBouncer compatibility.
   // Migrations bypass this pool entirely (prisma.config.ts uses the direct
   // session URL, where DDL and long DDL transactions are safe).
-  const base = process.env.DATABASE_URL || process.env.DIRECT_DATABASE_URL || '';
+  // Supabase's SESSION pooler (:5432) pins one server session per pooled
+  // client for the client's whole lifetime. A production pool (min 3 idle,
+  // max 8) across even two warm instances sails past the ~15-session project
+  // cap, and the pooler then rejects every checkout — which surfaces as
+  // P2010 on `SELECT 1` and 500s every endpoint. The TRANSACTION pooler
+  // (:6543) assigns a backend per transaction, so idle clients cost nothing;
+  // runtime always lives there. Migrations use DIRECT_DATABASE_URL and never
+  // come through this function, so DDL is unaffected.
+  let base = process.env.DATABASE_URL || process.env.DIRECT_DATABASE_URL || '';
+  const poolerMatch = base.match(/pooler\.supabase\.com:(\d+)/);
+  if (poolerMatch && poolerMatch[1] === '5432') {
+    base = base.replace('pooler.supabase.com:5432', 'pooler.supabase.com:6543');
+  }
   const sep = base.includes('?') ? '&' : '?';
   // Append pooler-friendly params:
   //   sslmode=require  — encrypted, no CA-chain verification (Supabase self-signed)
   //   uselibpqcompat=true — makes sslmode=require use libpq semantics
   //   pgbouncer=true — only for transaction-mode pooling (port 6543); session
   //     mode (5432) and direct connections keep a real backend per client.
-  const portMatch = base.match(/pooler\.supabase\.com:(\d+)/);
-  const pgbouncer = portMatch && portMatch[1] === '6543' ? '&pgbouncer=true' : '';
+  const isTransactionPooler = /pooler\.supabase\.com:6543/.test(base);
+  const pgbouncer = isTransactionPooler ? '&pgbouncer=true' : '';
   const connectionString = `${base}${sep}uselibpqcompat=true&sslmode=require${pgbouncer}`;
 
   const pool = new Pool({
