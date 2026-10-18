@@ -8,10 +8,11 @@
  *
  * Four rules it is built to keep:
  *
- * 1. **Standalone.** All CSS is inline in the document. No stylesheet, font,
- *    image, script or tracker is fetched, so the report reads the same offline
- *    in ten years as it does now, and opening it cannot tell anyone anything
- *    about the account.
+ * 1. **Standalone.** All CSS is inline in the document, and the only script is
+ *    the inline theme boot (no `src` on it). No stylesheet, font, image,
+ *    fetched script or tracker is requested, so the report reads the same
+ *    offline in ten years as it does now, and opening it cannot tell anyone
+ *    anything about the account.
  * 2. **Nothing new.** It renders the archive object the JSON path already
  *    produces, so it inherits that path's decisions — which columns are read,
  *    which are left out (no password, no authenticator or recovery codes, no
@@ -27,10 +28,12 @@
  *    objects — notification preferences, consents, settings bags — are rendered
  *    as labelled lines, never as a JSON dump.
  *
- * The look follows the Tirbeo account app (apps/myprofile/app/globals.css):
- * a black canvas, solid one-step-above panels, hairline rules, one blue,
- * 14px cards, the system grotesque, and a light palette for people whose
- * browser asks for one.
+ * The look is the Apple theme from the canonical token spec
+ * (docs/design/apple-tokens.css), replicated verbatim into the document: the
+ * grouped iOS canvas (`--bg`) with white plates (`--card`) one step above it,
+ * hairline rules, one blue for anything pressable, 17px cards, the system
+ * stack, and both dark and light schemes — the boot script honours a saved
+ * `tirbeo:theme` choice, then the device preference, exactly like the apps.
  */
 
 /** The archive as `exportDataHandler` assembles it (rows still real Dates). */
@@ -507,91 +510,225 @@ function sectionHtml(key: string, rows: unknown[] | null, counts: Record<string,
   return `<section class="card" id="${anchor}">${heading}<p class="meta">${rows.length.toLocaleString('en-US')} ${plural} in this file.${cap}</p>${tableHtml(rows)}</section>`;
 }
 
-const STYLE = `
-:root {
+/**
+ * The canonical Apple design tokens, replicated VERBATIM from
+ * `docs/design/apple-tokens.css` (the same block every Tirbeo app inlines).
+ * Both schemes travel in the document: `:root` defaults to dark, and the boot
+ * script below resolves `tirbeo:theme` — or the device preference — before the
+ * first paint.
+ */
+const THEME_TOKENS = `
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #000000;
-  --surface: #0e0e10;
-  --surface-2: rgba(255, 255, 255, 0.09);
-  --fg: #f5f5f5;
-  --muted: #a8a8a8;
-  --border: rgba(255, 255, 255, 0.13);
-  --divider: rgba(255, 255, 255, 0.1);
-  --accent: #0095f6;
-  --accent-ink: #5cb4f9;
-  --warn-bg: rgba(255, 178, 36, 0.08);
-  --warn-ink: #ffc45c;
-  --r-card: 14px;
-  --r-control: 8px;
-  --r-pill: 999px;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --bg: #1c1c1e;
+  --card: #2c2c2e;
+  --surface: #2c2c2e;
+  --surface-2: #3a3a3c;
+  --surface-3: #48484a;
+  --fg: #ffffff;
+  --muted: #a1a1a8;
+  --link: #64a5ff;
+  --text-2: #ebeaf0;
+  --text-3: #a1a1a8;
+  --text-4: #8e8e93;
+  --placeholder: #7c7c85;
+  --border: #48484a;
+  --border-strong: #5a5a5e;
+  --divider: #38383a;
+  --hover: #3a3a3c;
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --ig: #0a84ff;
+  --ig-hover: #409cff;
+  --ig-press: #0060c9;
+  --accent-2: #64a5ff;
+  --accent-2-hover: #8ec5ff;
+  --accent-2-press: #0a84ff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --accent-text: #64a5ff;
+  --accent-fg: #ffffff;
+  --danger: #ff453a;
+  --danger-hover: #e0342c;
+  --danger-text: #ff6961;
+  --success: #32d74b;
+  --success-text: #5ce070;
+  --warn: #ffd60a;
+  --warn-text: #e5c209;
+  --stack-sans: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --stack-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --rail: #161618;
+  --scrim: rgb(0 0 0 / 62%);
+  --track: #48484a;
+  --focus-ring: #0a84ff;
+  --autofill-fill: #3a3a3c;
+  --ink: #ffffff;
+  --ink-fg: #000000;
+  --shadow-sheet: 0 -20px 60px -12px rgb(0 0 0 / 68%);
+  --shadow-pop: 0 16px 44px -12px rgb(0 0 0 / 62%);
+  --field: #3a3a3c;
+  --field-hover: #454549;
+  --field-focus: #4b4b4f;
+  --fill: rgba(120, 120, 128, 0.24);
+  --fill-hover: rgba(120, 120, 128, 0.34);
+  --fill-press: rgba(120, 120, 128, 0.42);
+  --hairline: #38383a;
+  --glass: rgba(28, 28, 30, 0.85);
+  --glass-2: rgba(28, 28, 30, 0.94);
+  --glass-3: #1c1c1e;
+  --accent-press: #0060c9;
+  --accent-soft-ring: rgba(10, 132, 255, 0.35);
+  --ambient: rgba(255, 255, 255, 0.05);
+  --faint: rgba(255, 255, 255, 0.06);
+  --ease-enter: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-exit: cubic-bezier(0.32, 0, 0.67, 0);
+  --chart-1: #0a84ff;
+  --chart-2: #32d74b;
+  --chart-3: #ffd60a;
+  --chart-4: #ff453a;
+  --chart-5: #64aaff;
 }
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
-    --bg: #ffffff;
-    --surface: #ffffff;
-    --surface-2: #f4f4f4;
-    --fg: #1a1a1a;
-    --muted: #696969;
-    --border: #dbdbdb;
-    --divider: #dbdbdb;
-    --accent: #0064c8;
-    --accent-ink: #0064c9;
-    --warn-bg: #fdf4ee;
-    --warn-ink: #a45c00;
-  }
-}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f2f7;
+  --card: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f2f2f7;
+  --surface-3: #e8e8ee;
+  --fg: #171717;
+  --muted: #5d5d66;
+  --link: #0068d6;
+  --text-2: #3f3f46;
+  --text-3: #5d5d66;
+  --text-4: #8e8e93;
+  --placeholder: #a1a1aa;
+  --border: #eaeaea;
+  --border-strong: #d1d1d6;
+  --divider: #c6c6c8;
+  --hover: #ececf1;
+  --accent: #007aff;
+  --accent-hover: #0066d6;
+  --ig: #007aff;
+  --ig-hover: #0066d6;
+  --ig-press: #0055b8;
+  --accent-2: #007aff;
+  --accent-2-hover: #0066d6;
+  --accent-2-press: #0055b8;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --accent-text: #0068d6;
+  --accent-fg: #ffffff;
+  --danger: #e0342c;
+  --danger-hover: #c9261f;
+  --danger-text: #c9261f;
+  --success: #1ea64b;
+  --success-text: #188a3e;
+  --warn: #c47b00;
+  --warn-text: #9d6300;
+  --rail: #ffffff;
+  --scrim: rgb(18 19 22 / 45%);
+  --track: #c6c6c8;
+  --focus-ring: #007aff;
+  --autofill-fill: #ececf1;
+  --ink: #171717;
+  --ink-fg: #ffffff;
+  --shadow-sheet: 0 -20px 56px -12px rgb(18 19 22 / 26%), 0 2px 8px rgb(18 19 22 / 12%);
+  --shadow-pop: 0 14px 36px -10px rgb(18 19 22 / 22%), 0 2px 6px rgb(18 19 22 / 10%);
+  --field: #ffffff;
+  --field-hover: #f2f2f7;
+  --field-focus: #ececf1;
+  --fill: rgba(120, 120, 128, 0.16);
+  --fill-hover: rgba(120, 120, 128, 0.24);
+  --fill-press: rgba(120, 120, 128, 0.32);
+  --hairline: #c6c6c8;
+  --glass: rgba(255, 255, 255, 0.86);
+  --glass-2: rgba(255, 255, 255, 0.95);
+  --glass-3: #ffffff;
+  --accent-press: #0062cc;
+  --accent-soft-ring: rgba(0, 122, 255, 0.32);
+  --ambient: rgba(18, 19, 22, 0.04);
+  --faint: rgba(18, 19, 22, 0.05);
+  --chart-1: #0a84ff;
+  --chart-2: #1ea64b;
+  --chart-3: #c47b00;
+  --chart-4: #e0342c;
+  --chart-5: #8b93b0;
+}`;
+
+/**
+ * The theme boot, verbatim from the canonical spec (key: "tirbeo:theme").
+ * Inline, so the document stays standalone — it reads the person's saved choice
+ * or their device preference and sets `data-theme` before the first paint. It
+ * fetches nothing and reports nothing; with scripting off the document simply
+ * renders dark, which is what `:root` says.
+ */
+const THEME_BOOT =
+  '(function(){try{var k="tirbeo:theme";var v=localStorage.getItem(k);' +
+  'var t=(v==="dark"||v==="light"||v==="system")?v:"system";' +
+  'var a=t==="light"||(t==="system"&&window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";' +
+  'document.documentElement.setAttribute("data-theme",a);' +
+  'document.documentElement.style.colorScheme=a;}catch(e){}})();';
+
+const STYLE = `
+${THEME_TOKENS}
+/* Derived surfaces the token blocks do not carry: a tinted ground for the
+   "this part could not be read" notice, and the document's own radii (17 for
+   cards, 12 for controls, pill for chips — the spec's radius ladder). */
+:root, :root[data-theme="dark"] { --warn-bg: rgba(255, 214, 10, 0.13); }
+:root[data-theme="light"] { --warn-bg: rgba(196, 123, 0, 0.10); }
+:root { --r-card: 17px; --r-control: 12px; --r-pill: 999px; }
 * { box-sizing: border-box; }
 body { margin: 0; padding: 2.5rem 1.25rem 5rem; background: var(--bg); color: var(--fg);
-  font: 15px/1.55 var(--sans); }
+  font: 15px/1.55 var(--stack-sans); -webkit-font-smoothing: antialiased; }
 main { max-width: 62rem; margin: 0 auto; }
-.wordmark { font-size: 1.05rem; font-weight: 700; letter-spacing: .02em; color: var(--accent-ink);
+.wordmark { font-size: 17px; font-weight: 700; letter-spacing: -.02em; color: var(--accent-text);
   margin: 0 0 2rem; }
-h1 { font-size: 1.6rem; font-weight: 700; margin: 0 0 .5rem; letter-spacing: -.015em; }
-.intro { color: var(--muted); font-size: .95rem; margin: 0 0 1.75rem; max-width: 46rem; }
+h1 { font-size: 28px; font-weight: 700; margin: 0 0 .5rem; letter-spacing: -.025em; }
+.intro { color: var(--text-3); font-size: 15px; margin: 0 0 1.75rem; max-width: 46rem; }
 .intro strong { color: var(--fg); font-weight: 600; }
 .chips { margin: 0 0 2rem; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: .5rem; }
-.chips li { font-size: .8rem; }
-.chips a { display: inline-block; padding: .3rem .75rem; border: 1px solid var(--border);
-  border-radius: var(--r-pill); background: var(--surface); color: var(--fg); text-decoration: none; }
-.chips a:hover { border-color: var(--accent); color: var(--accent-ink); }
-.chips .n { color: var(--muted); }
+.chips li { font-size: 13px; }
+.chips a { display: inline-block; padding: .35rem .85rem; border: 1px solid var(--border);
+  border-radius: var(--r-pill); background: var(--card); color: var(--fg); text-decoration: none;
+  font-weight: 500; }
+.chips a:hover { border-color: var(--accent); color: var(--accent-text); }
+.chips .n { color: var(--text-3); }
 .note { margin: 0 0 2rem; padding: 1rem 1.25rem; border: 1px solid var(--border); border-radius: var(--r-card);
-  background: var(--surface); color: var(--muted); font-size: .9rem; }
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-card);
+  background: var(--card); color: var(--text-3); font-size: 15px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-card);
   padding: 1.5rem 1.75rem; margin: 0 0 1.25rem; }
-h2 { font-size: 1.1rem; font-weight: 700; margin: 0 0 .75rem; letter-spacing: -.01em; }
-.meta { color: var(--muted); font-size: .85rem; margin: 0 0 1rem; }
+h2 { font-size: 17px; font-weight: 600; margin: 0 0 .75rem; letter-spacing: -.01em; }
+.meta { color: var(--text-3); font-size: 13px; margin: 0 0 1rem; }
 .warn { margin: 0; padding: .85rem 1.1rem; border-radius: var(--r-control); background: var(--warn-bg);
-  color: var(--warn-ink); font-size: .9rem; }
+  color: var(--warn-text); font-size: 15px; }
 .scroll { overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--divider); vertical-align: top; }
 th:last-child, td:last-child { padding-right: 0; }
 th:first-child, td:first-child { padding-left: 0; }
-thead th { position: sticky; top: 0; background: var(--surface); color: var(--muted);
-  font-weight: 600; font-size: .78rem; white-space: nowrap; }
+thead th { position: sticky; top: 0; background: var(--card); color: var(--text-3);
+  font-weight: 600; font-size: 13px; white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
-table.kv th { width: 15rem; font-weight: 600; color: var(--muted); }
-pre, code, .fval .mono { font-family: var(--mono); }
-.none { color: var(--muted); font-style: italic; font-weight: 400; }
-.none-block { color: var(--muted); font-style: italic; margin: 0; }
-.bool { color: var(--accent-ink); }
+table.kv th { width: 15rem; font-weight: 600; color: var(--text-3); }
+pre, code, .fval .mono { font-family: var(--stack-mono); }
+.none { color: var(--text-3); font-style: italic; font-weight: 400; }
+.none-block { color: var(--text-3); font-style: italic; margin: 0; }
+.bool { color: var(--accent-text); }
 .struct { margin: 0; }
 .struct .struct { margin: .2rem 0 .35rem; padding-left: .85rem; border-left: 2px solid var(--divider); }
 .fline { padding: .12rem 0; }
-.fkey { color: var(--muted); font-size: .82rem; }
-.fsep { color: var(--muted); }
-.fval { font-size: .88rem; }
-.sep { color: var(--muted); }
+.fkey { color: var(--text-3); font-size: 13px; }
+.fsep { color: var(--text-3); }
+.fval { font-size: 15px; }
+.sep { color: var(--text-3); }
 ul.flat { margin: 0; padding-left: 1.15rem; }
 time { white-space: nowrap; }
 .foot { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border);
-  color: var(--muted); font-size: .85rem; }
+  color: var(--text-3); font-size: 13px; }
 .foot p { margin: 0 0 .6rem; max-width: 46rem; }
-@media print { body { padding: 0; background: #fff; color: #16181d; } .card { border-color: #d8dbe2; } }
+@media print { body { padding: 0; background: #ffffff; color: #171717; }
+  .card { border-color: #c6c6c8; } }
 `.trim();
 
 /**
@@ -663,6 +800,7 @@ export function renderAccountExportHtml(archive: AccountExportArchive): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Tirbeo account export — ${escapeHtml(who)}</title>
+<script>${THEME_BOOT}</script>
 <style>${STYLE}</style>
 </head>
 <body>

@@ -19,7 +19,7 @@ import { FAINT, LINE, MUTED, TEXT, TEXT_2, WARN } from '@/features/email/email-t
 /** A standalone card — one notification, one recent event. */
 export function cardItem(title: string, body?: string): string {
   return `<div style="padding:13px 0">`
-    + `<div style="color:${TEXT};font-size:14.5px;font-weight:600;line-height:20px">${title}</div>`
+    + `<div style="color:${TEXT};font-size:15px;font-weight:600;line-height:20px">${title}</div>`
     + (body
       ? `<div style="margin-top:3px;color:${MUTED};font-size:13px;line-height:19px">${body}</div>`
       : '')
@@ -29,15 +29,16 @@ export function cardItem(title: string, body?: string): string {
 /** One row inside a grouped list: the thing, and when, on the same line. */
 export function listRow(title: string, meta: string): string {
   return `<div style="padding:11px 0">`
-    + `<div style="color:${TEXT};font-size:14px;line-height:20px">${title}</div>`
-    + `<div style="margin-top:2px;color:${FAINT};font-size:12px;line-height:17px">${meta}</div>`
+    + `<div style="color:${TEXT};font-size:15px;line-height:20px">${title}</div>`
+    + `<div style="margin-top:2px;color:${FAINT};font-size:13px;line-height:17px">${meta}</div>`
     + `</div>`;
 }
 
-/** A group heading above its rows, with the count beside it. */
+/** A group heading above its rows, with the count beside it. Sentence case at
+    13px in the tertiary grey — an iOS section header, not a shout. */
 export function listGroup(label: string, count: number, rows: string): string {
-  return `<div style="margin:20px 0 6px;font-size:11.5px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;line-height:16px;color:${MUTED}">${label}`
-    + ` <span style="color:${FAINT};font-weight:400;letter-spacing:0;text-transform:none">&middot; ${count}</span></div>`
+  return `<div style="margin:20px 0 6px;font-size:13px;font-weight:600;line-height:18px;color:${MUTED}">${label}`
+    + ` <span style="color:${FAINT};font-weight:400">&middot; ${count}</span></div>`
     + rows;
 }
 
@@ -49,7 +50,7 @@ export function listGroup(label: string, count: number, rows: string): string {
  * where one ends and the next begins.
  */
 export function listPlate(groups: string): string {
-  return `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:10px;overflow:hidden">${groups}</div>`;
+  return `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:14px;overflow:hidden">${groups}</div>`;
 }
 
 /** Trailing "n more" line after a list. */

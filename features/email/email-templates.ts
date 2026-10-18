@@ -2,13 +2,14 @@ import { getApiOrigin } from '@/features/branding/branding';
 import { getDashboardBaseUrl, prodSafeEnvUrl } from '@/config/app-urls';
 import {
   BTN,
+  CARD,
   DANGER,
   FAINT,
   FONT_STACK,
-  INK,
   LINE,
   MONO,
   MUTED,
+  PAGE,
   SUCCESS,
   TEXT,
   TEXT_2,
@@ -26,8 +27,9 @@ import {
  * send path used to need a cache: building one of these is a string join.
  *
  * The layout is left-aligned at every width, because a centred mail reads as a
- * flyer and these are notices. One thing per mail is allowed to be blue or
- * black; everything else is ink or grey.
+ * flyer and these are notices. The mail sits on a white 17px card over the
+ * #f2f2f7 grouped canvas. One blue (#007AFF) marks anything pressable;
+ * everything else is ink or grey.
  *
  * Templates declare their values as `{{name}}` and leave substitution to
  * `renderTemplate` at send time, so the rendered text is cacheable per logo and
@@ -76,7 +78,7 @@ const note = (text: string): string =>
  * transcribe must look separable from the prose around it.
  */
 const plate = (inner: string): string =>
-  `<div style="margin:24px 0;padding:20px 22px;background:${WASH};border:1px solid ${LINE};border-radius:10px">${inner}</div>`;
+  `<div style="margin:24px 0;padding:20px 22px;background:${WASH};border:1px solid ${LINE};border-radius:14px">${inner}</div>`;
 
 /** The one-time code — big, monospace, tracking wide enough to read in groups.
     Left-aligned like everything else in the column; the plate is what marks it
@@ -101,10 +103,11 @@ type BtnVariant = 'primary' | 'ghost';
  * The action. Left-aligned, because the mail reads top-to-bottom in one column
  * and a centred button turns a notice into a brochure.
  *
- * Black for the one thing to do, and a bare blue link when the mail is only
- * pointing at a page. There is deliberately no red button: colour in this
- * system marks the *tone of a fact* (a callout rule), not the urgency of a
- * click, and "cancel deletion" is a save rather than a loss.
+ * The Apple blue (#007AFF) with white text, 12px corners and generous padding
+ * for the one thing to do, and a bare blue link when the mail is only pointing
+ * at a page. There is deliberately no red button: colour in this system marks
+ * the *tone of a fact* (a callout rule), not the urgency of a click, and
+ * "cancel deletion" is a save rather than a loss.
  *
  * A mail whose job is to deliver a code gets no `btn`. The reader's action is
  * transcribing digits into our app; a filled button in that mail is decoration
@@ -119,7 +122,7 @@ const button = (url: string, label: string, variant: BtnVariant = 'primary'): st
       + `<a href="${href}" style="color:${BTN};font-size:15px;font-weight:500;text-decoration:none">${text} &rarr;</a></p>`;
   }
   return `<p style="margin:24px 0 0">`
-    + `<a href="${href}" style="display:inline-block;padding:11px 20px;background:${INK};border-radius:6px;color:#ffffff;font-size:14.5px;font-weight:500;line-height:20px;text-decoration:none">${text}</a></p>`;
+    + `<a href="${href}" style="display:inline-block;padding:13px 26px;background:${BTN};border-radius:12px;color:#ffffff;font-size:15px;font-weight:600;line-height:20px;text-decoration:none">${text}</a></p>`;
 };
 
 const btn = (url: string, label: string): string => button(url, label, 'primary');
@@ -133,11 +136,11 @@ const btnGhost = (url: string, label: string): string => button(url, label, 'gho
  * and the hairlines carry the order without a second column of labels.
  */
 const well = (pairs: Array<[string, string]>): string =>
-  `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:10px;overflow:hidden">`
+  `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:14px;overflow:hidden">`
   + pairs.map(([key, value], i) =>
       `<div style="padding:13px 16px;${i ? `border-top:1px solid ${LINE};` : ''}">`
-      + `<div style="font-size:11.5px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:${MUTED};line-height:16px">${key}</div>`
-      + `<div style="margin-top:3px;font-size:14.5px;line-height:20px;color:${TEXT};word-break:break-word">${value}</div>`
+      + `<div style="font-size:13px;font-weight:600;color:${MUTED};line-height:18px">${key}</div>`
+      + `<div style="margin-top:3px;font-size:15px;line-height:20px;color:${TEXT};word-break:break-word">${value}</div>`
       + `</div>`)
     .join('')
   + `</div>`;
@@ -187,10 +190,11 @@ type MailOpts = {
  * and the footer. Templates hand over blocks only, so no template can forget the
  * footer — that is where the unsubscribe link lives.
  *
- * There is no card and no outer panel. The mail IS the page: white ground, one
- * column that stops at 560px so a line stays a readable length on a desktop, a
- * hairline that separates the letterhead from the letter and the letter from the
- * signature. Nothing in it needs to be a box.
+ * The Apple grouped surface: the page ground is #f2f2f7 and the mail itself is
+ * a white card with 17px corners — the same plate radius every other Tirbeo
+ * surface uses — holding one column that stops at 560px so a line stays a
+ * readable length on a desktop. Hairlines inside the card are #c6c6c8 and
+ * separate the letterhead from the letter and the letter from the signature.
  */
 function mail(logo: string, opts: MailOpts): string {
   const { title, sub, blocks, preheader } = opts;
@@ -208,23 +212,24 @@ function mail(logo: string, opts: MailOpts): string {
 <meta name="supported-color-schemes" content="light">
 <title>${esc(title)}</title>
 <style>
-  /* Dark-mode clients invert a white mail into something nobody designed: the
-     plate turns, the black button turns, and the one thing worth pressing
-     disappears. Pinned to light, the mail is what was drawn. */
+  /* Dark-mode clients invert the grey canvas and the blue button into
+     something nobody designed: pinned to light, the mail is what was drawn. */
   :root { color-scheme: light; }
   @media (max-width: 440px) {
-    body { padding: 24px 14px !important; }
+    body { padding: 24px 10px !important; }
     .wrap { padding: 0 !important; }
+    .card { padding: 22px 18px !important; border-radius: 14px !important; }
   }
 </style>
 </head>
-<body style="margin:0;padding:36px 16px;background:#ffffff;color:${TEXT};font-family:${FONT_STACK};font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased">
+<body style="margin:0;padding:36px 16px;background:${PAGE};color:${TEXT};font-family:${FONT_STACK};font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0" data-skip-in-text="true">${pre}&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;</div>
 <div class="wrap" style="max-width:560px;margin:0 auto;padding:0 4px">
+<div class="card" style="background:${CARD};border-radius:17px;padding:28px 30px">
 <div style="padding-bottom:22px;border-bottom:1px solid ${LINE}">
-<a href="${esc(WORKSPACE_URL())}" style="text-decoration:none"><img src="${src}" width="22" height="22" alt="Tirbeo" style="display:inline-block;vertical-align:middle;width:22px;height:22px"> <span style="vertical-align:middle;font-size:15px;font-weight:600;letter-spacing:-0.01em;color:${TEXT}">Tirbeo</span></a>
+<a href="${esc(WORKSPACE_URL())}" style="text-decoration:none"><img src="${src}" width="22" height="22" alt="Tirbeo" style="display:inline-block;vertical-align:middle;width:22px;height:22px"> <span style="vertical-align:middle;font-size:17px;font-weight:600;letter-spacing:-0.02em;color:${TEXT}">Tirbeo</span></a>
 </div>
-<h1 style="margin:26px 0 10px;font-size:20px;line-height:26px;font-weight:600;letter-spacing:-0.02em;color:${TEXT}">${title}</h1>
+<h1 style="margin:26px 0 10px;font-size:22px;line-height:28px;font-weight:600;letter-spacing:-0.025em;color:${TEXT}">${title}</h1>
 ${sub ? `<p style="margin:0 0 22px;font-size:15px;line-height:24px;color:${MUTED}">${sub}</p>` : ''}
 ${blocks.join('\n')}
 <div style="margin:34px 0 0;padding-top:18px;border-top:1px solid ${LINE}">
@@ -232,6 +237,7 @@ ${blocks.join('\n')}
 <p style="margin:0;font-size:12.5px;line-height:18px;color:${FAINT}">Tirbeo Inc. &middot; Kathmandu, Nepal</p>
 <p style="margin:2px 0 0;font-size:12.5px;line-height:18px;color:${FAINT}">&copy; ${new Date().getFullYear()} Tirbeo Inc. All rights reserved.</p>
 <div style="margin:8px 0 0;font-size:12.5px;line-height:18px;color:${FAINT}">{{unsubscribeSection}}</div>
+</div>
 </div>
 </div>
 </body>

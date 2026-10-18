@@ -193,7 +193,10 @@ describe('renderAccountExportHtml', () => {
   it('is a standalone document: inline CSS and nothing fetched', () => {
     expect(html).toContain('<style>');
     expect(html).not.toMatch(/<link\b/i);
-    expect(html).not.toMatch(/<script\b/i);
+    // The only script allowed is the inline theme boot; a script that *fetches*
+    // anything (`src`) would break the standalone promise, so it is forbidden.
+    expect(html).not.toMatch(/<script[^>]+\bsrc\s*=/i);
+    expect(html.match(/<script>/g)).toHaveLength(1);
     expect(html).not.toMatch(/@import/i);
     expect(html).not.toMatch(/\bsrc\s*=/i);
     expect(html).not.toMatch(/url\(\s*['"]?(https?:|\/\/)/i);
