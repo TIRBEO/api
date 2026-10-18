@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
 
