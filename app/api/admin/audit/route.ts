@@ -8,6 +8,7 @@ export const GET = withAdmin(async (request, _session) => {
   const result = await listAuditEvents({
     limit: Number(sp.get('limit')) || 50,
     offset: Number(sp.get('offset')) || 0,
+    id: sp.get('id') || undefined,
     action: sp.get('action') || undefined,
     actorId: sp.get('actorId') || undefined,
     targetType: sp.get('targetType') || undefined,

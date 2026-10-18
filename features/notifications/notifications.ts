@@ -290,7 +290,10 @@ export async function createNotification(input: CreateNotifInput) {
           digestItems: cardItem(escapeHtml(input.title), escapeHtml(input.body || '')),
           activitySection: '',
           dashboardUrl: resolved,
-        }, { rawVars: ['digestItems', 'activitySection'], categoryOverride: category, userId: targetUserId }).catch(() => {});
+        }, { rawVars: ['digestItems', 'activitySection'], categoryOverride: category, userId: targetUserId,
+             // The row metadata (caller event refs like { eventId }) rides into
+             // email_jobs.payload so the admin send log is searchable by them.
+             metadata: { ...(input.metadata || {}), notificationId: notif.id } }).catch(() => {});
       })().catch(() => {});
     }
 

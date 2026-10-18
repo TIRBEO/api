@@ -247,11 +247,22 @@ export async function adminEmailsHandler(request: NextRequest) {
       const status = searchParams.get('status');
       const template = searchParams.get('template');
       const to = searchParams.get('to');
+      const eventKey = searchParams.get('eventKey');
 
       const where: Record<string, any> = {};
       if (status) where.status = status;
       if (template) where.templateSlug = { contains: template };
       if (to) where.toAddress = { contains: to };
+      // Paste any event reference — the tirbeo event id stamped into the
+      // payload ({ eventId } or { metadata: { eventId } } by producers), or
+      // the job's own event key — and get exactly the mail that event caused.
+      if (eventKey) {
+        where.OR = [
+          { eventKey },
+          { payload: { path: ['eventId'], equals: eventKey } },
+          { payload: { path: ['metadata', 'eventId'], equals: eventKey } },
+        ];
+      }
 
       const [jobs, total] = await Promise.all([
         prisma.email_jobs.findMany({
@@ -280,6 +291,7 @@ export async function adminEmailsHandler(request: NextRequest) {
           fromEmail: payload.fromEmail ?? null,
           subject: j.subject,
           eventKey: j.templateSlug,
+          eventId: payload.eventId ?? payload.metadata?.eventId ?? null,
           status: j.status,
           category: j.kind,
           provider: payload.provider ?? null,

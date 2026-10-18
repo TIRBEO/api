@@ -823,8 +823,11 @@ export async function resolveUserByRefCode(request: NextRequest) {
   }
 
   // Reference codes are no longer columns on users — they live in the
-  // metadata.refCode of the ban/suspend status events. Match any candidate
-  // against those events, then load the owning user.
+  // metadata.refCode of the enforcement status events, of every activity row
+  // (stamped at write by the prisma client), and — for sign-in rows, which
+  // have no metadata column — in the first 12 hex digits of the row's own id.
+  // Match any candidate against all three so a code quoted from any screen
+  // finds its user.
   const events = await prisma.userStatusEvent.findMany({
     where: {
       toStatus: { in: [...ENFORCE_STATUSES] },
@@ -832,12 +835,41 @@ export async function resolveUserByRefCode(request: NextRequest) {
     },
     select: { userId: true },
     orderBy: { createdAt: 'desc' } });
+
+  // No enforcement event carries it — fall through to the general ledger.
+  // The compact hex of the typed code also doubles as a uuid prefix: derived
+  // refs (xxxx-xxxx-xxxx from a row id) resolve through it on both tables.
+  let userIdFromLedger: string | null = null;
   if (!events.length) {
-    return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });
+    const hex = code.toLowerCase().replace(/[^0-9a-f]/g, '');
+    const idPrefix = hex.length >= 12 ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-` : null;
+    const [activityHit, loginHit] = await Promise.all([
+      prisma.activityEvent.findFirst({
+        where: {
+          userId: { not: null },
+          OR: [
+            ...candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } })),
+            ...(idPrefix ? [{ id: { startsWith: idPrefix } }] : []),
+          ],
+        },
+        select: { userId: true },
+        orderBy: { createdAt: 'desc' } }),
+      idPrefix
+        ? prisma.userLogin.findFirst({
+            where: { id: { startsWith: idPrefix } },
+            select: { userId: true },
+            orderBy: { createdAt: 'desc' } })
+        : Promise.resolve(null),
+    ]);
+    userIdFromLedger = activityHit?.userId ?? loginHit?.userId ?? null;
+    if (!userIdFromLedger) {
+      return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });
+    }
   }
 
+  const resolvedUserId = events.length ? events[0].userId : userIdFromLedger!;
   const user = await prisma.user.findUnique({
-    where: { id: events[0].userId },
+    where: { id: resolvedUserId },
     select: ADMIN_USER_SELECT });
   if (!user) {
     return NextResponse.json({ error: 'No user found for that reference code' }, { status: 404 });

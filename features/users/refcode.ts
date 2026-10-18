@@ -70,6 +70,30 @@ export function eventIdFor(userId: string, _kind: DisplayKind): string {
   return `${h1.toString(16).padStart(4, '0')}-${h2.toString(16).padStart(4, '0')}-${h3.toString(16).padStart(4, '0')}`;
 }
 
+/**
+ * Short reference for any row whose id is (or contains) a uuid — login-ledger
+ * rows have no metadata column, so their code is derived from the row id
+ * itself: first 12 hex digits, grouped. Stable, unique per row, and nothing
+ * has to be backfilled: every row that ever existed already resolves to the
+ * same code.
+ */
+export function refFromRowId(id: string): string | null {
+  const hex = (id || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (hex.length < 12) return null;
+  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}`;
+}
+
+/** The reference to show for one activity row: its stamped metadata.refCode
+    when it has one (every row written since ref-stamping, and every backfill
+    through ensureRefCode), else the deterministic code derived from its id. */
+export function eventRowRef(row: { id: string; metadata?: unknown }): string {
+  const meta = row.metadata;
+  const stored = meta && typeof meta === 'object' && !Array.isArray(meta)
+    ? (meta as Record<string, unknown>).refCode : null;
+  if (typeof stored === 'string' && stored.trim()) return stored.trim();
+  return refFromRowId(row.id) ?? row.id;
+}
+
 // Best stored-or-generated code for a user row (current status kind).
 export function eventIdForUser(
   userId: string,

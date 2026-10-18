@@ -2,6 +2,9 @@ import './ipv4-first';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
+// Dependency-free (prisma is only ever lazily imported inside it), so this
+// static import creates no cycle while letting the write choke point stamp refs.
+import { generateEventId } from '@/features/users/refcode';
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient; pgPool: Pool };
 
@@ -201,11 +204,76 @@ export async function reWarmAfterColdStart(): Promise<void> {
 }
 
 // ─── Prisma Client Creation ───
+/**
+ * Event-reference stamping (single choke point for the whole app).
+ *
+ * Every activity/security/auth/status event is a row whose human-facing
+ * reference lives in `metadata.refCode` (format xxxx-xxxx-xxxx, from
+ * generateEventId). Staff look events up by that code and users quote it in
+ * support emails, so a code must be PERSISTED, not shown-and-forgotten.
+ *
+ * There are ~25 call sites that create these rows across the app. Rather than
+ * ask each to remember the ref (they won't, and a new event kind would silently
+ * have no code), the write is intercepted once here: a `$extends` create hook
+ * fills `metadata.refCode` on the way in for any `activityEvent` /
+ * `userStatusEvent` row that doesn't already carry one. Enforcement writes
+ * (ban/suspend) and the ensureRefCode backfill set their own code, so this only
+ * fills the gaps — it never overwrites a code already chosen upstream.
+ */
+function withEventRef<T extends Record<string, any>>(data: T | undefined): T | undefined {
+  if (!data || typeof data !== 'object') return data;
+  const existing = (data as { metadata?: unknown }).metadata;
+  // Only enrich a plain object/absent metadata; leave Prisma Json helpers,
+  // arrays, and any pre-set refCode exactly as the caller wrote them.
+  if (existing !== undefined && existing !== null &&
+      (typeof existing !== 'object' || Array.isArray(existing))) {
+    return data;
+  }
+  const meta = (existing ?? {}) as Record<string, unknown>;
+  if (typeof meta.refCode === 'string' && meta.refCode.trim()) return data;
+  return { ...data, metadata: { ...meta, refCode: generateEventId('system') } };
+}
+
+/** Fill the refCode on whichever write payload a query hook is passing
+    through: create/upsert carry `data`/`create`, createMany a `data` array. */
+function stampFromContext(operation: string, args: any): any {
+  if (!args || typeof args !== 'object') return args;
+  if (operation === 'create' && args.data !== undefined) {
+    args.data = withEventRef(args.data);
+  } else if (operation === 'createMany' && args.data !== undefined) {
+    args.data = Array.isArray(args.data) ? args.data.map((d: any) => withEventRef(d)) : withEventRef(args.data);
+  } else if (operation === 'upsert' && args.create !== undefined) {
+    args.create = withEventRef(args.create);
+  }
+  return args;
+}
+
 function createPrismaClient(pool: Pool): PrismaClient {
   const adapter = new PrismaPg(pool);
-  return new PrismaClient({
+  const base = new PrismaClient({
     adapter,
     log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'] });
+
+  // One rule, applied at every write: activity and status events always get a
+  // persisted refCode. See withEventRef above for why this lives here.
+  // (Prisma hands the query hook the PascalCase model name; we key per model
+  // so no string compare is needed.)
+  return base.$extends({
+    query: {
+      activityEvent: {
+        async $allOperations(ctx: any) {
+          ctx.args = stampFromContext(ctx.operation, ctx.args);
+          return ctx.query(ctx.args);
+        },
+      },
+      userStatusEvent: {
+        async $allOperations(ctx: any) {
+          ctx.args = stampFromContext(ctx.operation, ctx.args);
+          return ctx.query(ctx.args);
+        },
+      },
+    },
+  }) as unknown as PrismaClient;
 }
 
 // ─── Singleton Initialization ───

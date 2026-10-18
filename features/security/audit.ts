@@ -4,6 +4,7 @@ import { hasConsent } from '@/features/users/consent';
 import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
 import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { NO_ORIGIN, type ChangeOrigin } from '@/shared/changeOrigin';
+import { eventRowRef, refCodeCandidates } from '@/features/users/refcode';
 
 type Severity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -139,6 +140,7 @@ export async function createAuditEvent(input: AuditInput) {
 export async function listAuditEvents(options: {
   limit?: number;
   offset?: number;
+  id?: string;
   action?: string;
   actorId?: string;
   targetType?: string;
@@ -147,6 +149,26 @@ export async function listAuditEvents(options: {
   to?: string;
 }) {
   const where: Record<string, unknown> = {};
+  if (options.id) {
+    /* The "Event ID" box accepts both shapes staff actually have: the row's
+       own uuid, and the short reference code (xxxx-xxxx-xxxx) shown to users
+       and quoted in support emails — which lives in metadata.refCode (stamped
+       at write) or, on legacy rows, derives from the id. Non-uuid input is
+       tried against every stored refCode candidate shape. */
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(options.id);
+    if (isUuid) {
+      where.id = options.id;
+    } else {
+      const candidates = refCodeCandidates(options.id);
+      const idPrefix = options.id.toLowerCase().replace(/[^0-9a-f]/g, '');
+      const or: Record<string, unknown>[] = candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } }));
+      // A code derived from a row id (first 12 hex) matches a uuid prefix.
+      if (idPrefix.length >= 12) {
+        or.push({ id: { startsWith: `${idPrefix.slice(0, 8)}-${idPrefix.slice(8, 12)}-` } });
+      }
+      where.OR = or;
+    }
+  }
   if (options.action) where.kind = { contains: options.action };
   if (options.actorId) where.userId = options.actorId;
   if (options.severity) where.severity = options.severity;
@@ -173,6 +195,6 @@ export async function listAuditEvents(options: {
 
   return {
     total, limit, offset,
-    events: events.map((e: any) => ({ ...e, action: e.kind, actorId: e.userId })),
+    events: events.map((e: any) => ({ ...e, ref: eventRowRef(e), action: e.kind, actorId: e.userId })),
   };
 }

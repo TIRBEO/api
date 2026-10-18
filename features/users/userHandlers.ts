@@ -31,7 +31,7 @@ import {
   listConnections, unlinkProvider, writeOauthLink, readOauthLinks,
   issueDeletionCode, consumeDeletionCode, scheduleDeletion, cancelDeletion,
   activeDeletionFor, OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
-import { ensureRefCode } from '@/features/users/refcode';
+import { ensureRefCode, eventRowRef, refFromRowId } from '@/features/users/refcode';
 import {
   completeExportRequest,
   createExportRequest,
@@ -999,15 +999,15 @@ export async function userActivityHandler(request: NextRequest) {
     // Merge into a single flat array sorted by date — dashboard expects this format
     const merged = [
       ...auditEvents.map(e => ({
-        id: e.id, source: 'audit', action: e.kind, targetType: (e.metadata as any)?.targetType ?? null,
+        id: e.id, ref: eventRowRef(e), source: 'audit', action: e.kind, targetType: (e.metadata as any)?.targetType ?? null,
         targetId: e.detail, metadata: e.metadata, severity: e.severity,
         createdAt: e.createdAt })),
       ...securityEvents.map(e => ({
-        id: e.id, source: 'security', action: e.kind, targetType: null as string | null,
+        id: e.id, ref: eventRowRef(e), source: 'security', action: e.kind, targetType: null as string | null,
         targetId: null as string | null, metadata: e.metadata, severity: e.severity,
         createdAt: e.createdAt })),
       ...loginHistoryRecords.map(e => ({
-        id: e.id, source: 'login', action: e.kind,
+        id: e.id, ref: eventRowRef(e), source: 'login', action: e.kind,
         targetType: 'session' as string | null, targetId: null as string | null,
         metadata: { ...((e.metadata as Record<string, any>) || {}), ip: e.ipAddress, userAgent: e.userAgent },
         severity: (String(e.kind).includes('failed') ? ('warning' as const) : ('info' as const)),
@@ -1135,6 +1135,13 @@ function changeView(
   const meta = (row.metadata || {}) as Record<string, any>;
   return {
     id: row.id,
+    /* The reference a person quotes to support and staff paste into admin.
+       Written at create time into metadata.refCode; rows older than that
+       resolve to the code derived from their own id, so every row has always
+       had exactly one — including the ones predating the stamp. */
+    ref: typeof meta.refCode === 'string' && meta.refCode.trim()
+      ? meta.refCode.trim()
+      : (refFromRowId(row.id) ?? row.id),
     kind: row.kind,
     /* Rows written before the ledger humanised its own titles carry the
        machine key in the title column. Reading them through the same function

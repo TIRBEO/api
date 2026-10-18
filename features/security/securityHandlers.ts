@@ -20,6 +20,7 @@ import { sendTemplateEmailAfter } from '@/features/email/email';
 import { createNotification, describeDevice, NotifType } from '@/features/notifications/notifications';
 import { bustProfileCache } from '@/features/auth/authHandlers';
 import { fetchLoginUserById, setRecoveryContact, readRecoveryContact } from '@/features/identity/tirbeo';
+import { eventRowRef, refFromRowId } from '@/features/users/refcode';
 
 async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security', skipEmail = false) {
   try {
@@ -128,6 +129,8 @@ export async function securityEventsHandler(request: NextRequest) {
       const meta = (log.metadata as Record<string, any>) || {};
       return {
         id: log.id,
+        /* The reference shown on the event's own page and quoted to support. */
+        ref: eventRowRef(log),
         type,
         description: formatAuditAction(action, meta),
         date: log.createdAt.toISOString(),
@@ -876,7 +879,14 @@ export async function loginHistoryHandler(request: NextRequest) {
     const coords = await coordsByLoginAttempt(
       session.userId,
       rows.map((r) => ({ ip: r.ipAddress, at: r.createdAt })));
-    const logs = rows.map((row, i) => ({ ...row, coords: coords[i], email: session.email }));
+    const logs = rows.map((row, i) => ({
+      ...row,
+      /* Sign-in rows live in a table with no metadata column, so their
+         reference is the short code derived from the row's own id — stable
+         for every row that ever existed, nothing to backfill. */
+      ref: refFromRowId(row.id) ?? row.id,
+      coords: coords[i],
+      email: session.email }));
     return NextResponse.json({ logs });
   } catch (err: any) {
     console.error('[LOGIN HISTORY]', err?.message || err);

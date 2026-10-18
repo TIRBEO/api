@@ -706,7 +706,7 @@ export async function sendTemplateEmail(
   to: string,
   templateName: string,
   variables: Record<string, string>,
-  options?: { fromEmail?: string; fromName?: string; rawVars?: string[]; replyTo?: string; threadId?: string; skipSuppression?: boolean; categoryOverride?: string; userId?: string }
+  options?: { fromEmail?: string; fromName?: string; rawVars?: string[]; replyTo?: string; threadId?: string; skipSuppression?: boolean; categoryOverride?: string; userId?: string; metadata?: Record<string, unknown> }
 ): Promise<EmailResult> {
   // ─── Email suppression check ───
   // THE single enforcement point for user preferences: every templated send is
@@ -834,6 +834,10 @@ export async function sendTemplateEmail(
     threadId: options?.threadId,
     categoryOverride: options?.categoryOverride,
     userId: options?.userId,
+    // Stamps the caller's event reference (e.g. { eventId: '…' }) into the
+    // email_jobs payload, so the admin send log can be filtered by the id of
+    // whatever event caused this mail.
+    ...(options?.metadata ? { metadata: options.metadata } : {}),
     ...(unsubHeader
       ? {
           headers: {

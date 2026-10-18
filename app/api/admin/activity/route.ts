@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
+import { eventRowRef } from '@/features/users/refcode';
 
 export const GET = withAdmin(async (request, _session) => {
 
@@ -41,5 +42,5 @@ export const GET = withAdmin(async (request, _session) => {
     .slice(0, limit)
     .map(s => ({ user: flatUser(s.user) }));
 
-  return NextResponse.json({ logs: logs.map((l: any) => ({ ...l, user: flatUser(l.user), actor: flatUser(l.user) })), onlineUsers }, { headers: { 'Cache-Control': 'private, no-store' } });
+  return NextResponse.json({ logs: logs.map((l: any) => ({ ...l, ref: eventRowRef(l), user: flatUser(l.user), actor: flatUser(l.user) })), onlineUsers }, { headers: { 'Cache-Control': 'private, no-store' } });
 });

@@ -170,6 +170,21 @@ export async function appealFileHandler(request: NextRequest) {
 
     const appeal = filed.appeal;
 
+    // The filing joins the audit trail under the appeal's own id — that id is
+    // the reference an operator pastes into the admin panel to see this whole
+    // story (filing, decision, the emails either side of it). Best-effort:
+    // a consent/DB hiccup must not undo a filed appeal.
+    const { createAuditEvent } = await import('@/features/security/audit');
+    await createAuditEvent({
+      actorId: userId,
+      action: 'appeal.filed',
+      title: 'Appeal filed',
+      targetType: 'appeal',
+      targetId: appeal.id,
+      severity: 'info',
+      metadata: { restrictionId: restrictionIdFinal },
+    }).catch(() => {});
+
     return NextResponse.json({ ok: true, appeal: shape({ ...appeal, restriction: null }) });
   } catch (err: any) {
     console.error('[APPEAL/FILE]', err?.message || err);
