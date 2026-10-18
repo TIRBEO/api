@@ -419,6 +419,10 @@ if (preHasCookie) {
     '/api/auth/refresh',
     '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
     '/api/auth/verify',
+    // Session-free by design: the login screen shows attempt limits (GET) and
+    // remaining-attempts for the typed email (GET) before any session exists.
+    // Keep PUT/POST protected — their handlers enforce admin role themselves.
+    '/api/auth/limits', '/api/auth/remaining',
     '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
   '/api/admin/passkey/options', '/api/admin/passkey/verify',
   '/api/auth/passkey/auth-options', '/api/auth/passkey/verify',
