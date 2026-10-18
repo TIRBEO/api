@@ -1573,7 +1573,22 @@ interface EmailExistsResult {
 
 export async function emailExistsHandler(request: NextRequest) {
   try {
-    const body: any = await request.json();
+    // Hard per-IP budget: this endpoint answers "does this address have an
+    // account", so it is an enumeration oracle first and a UI convenience
+    // second. 10 checks / 10 min / IP — well above anything the sign-in
+    // screen can generate (a 30s result cache absorbs keystroke re-checks)
+    // and far below what a scraper needs. The edge limiter over
+    // `auth/email-exists` (rate-limit.ts) is the outer coarse layer.
+    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    if (!(await checkWindowLimitDB(`email-exists:ip:${clientIp}`, 10, 10 * 60 * 1000, clientIp))) {
+      return rateLimited(request, {
+        action: 'auth/email-exists',
+        message: 'Too many checks from this device. Please try again later.',
+        keyHint: 'email-exists:ip',
+        retryAfterSec: 10 * 60,
+      });
+    }
+    const body: any = await request.json().catch(() => ({}));
     const email = (body?.email || '').toString().toLowerCase().trim();
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return NextResponse.json({ exists: false }, { status: 200 });
@@ -1591,9 +1606,17 @@ export async function emailExistsHandler(request: NextRequest) {
     const row = await prisma.user.findUnique({
       where: { id: userId },
       select: {
+        status: true,
         passwordHash: true,
         profile: { select: { name: true, photoUrl: true } },
         emails: { select: { address: true, kind: true, isDefault: true, verifiedAt: true } } } });
+    // A deleted account is not an account: refuse rather than leak that the
+    // address was ever registered (password reset already does the same).
+    if (!row || row.status === 'deleted') {
+      const result: EmailExistsResult = { exists: false };
+      emailExistsCache.set(email, result);
+      return NextResponse.json(result, { status: 200 });
+    }
     // The login address is the identity; anything else on the row is a contact.
     const primary = row?.emails.find((e) => e.kind === 'primary' || e.isDefault) || row?.emails[0] || null;
     const result: EmailExistsResult = {

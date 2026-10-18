@@ -1,7 +1,7 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { checkRateLimitWithInfo } from '@/features/auth/rate-limit';
 import { isSuspicious } from '@/features/auth/suspicious-activity';
-import { verifyTurnstile, getTurnstileSiteKey, isTurnstileConfigured } from '@/features/auth/turnstile';
+import { verifyTurnstile, isTurnstileConfigured } from '@/features/auth/turnstile';
 import { detectXss } from '@/features/auth/xss-scan';
 import { getMaintenanceState } from '@/shared/maintenance-state';
 import { ensureRefCode, generateEventId } from '@/features/users/refcode';
@@ -123,6 +123,32 @@ async function reportRateLimit(request: NextRequest, opts: {
 }
 
 const isDev = process.env.NODE_ENV === 'development';
+
+// ─── Turnstile fallback budget (suspicious-IP gate) ───────────────────────
+// 5 tokenless passes per hour per IP. The durable window lives in
+// `security.rate_limit_windows` (consumed via db-windows, dynamically
+// imported so Prisma stays out of this bundle — same contract as
+// suspicious-activity.ts); if the DB is unreachable we degrade to a
+// per-process memory window rather than failing open or 500-ing the edge.
+const TURNSTILE_FALLBACK_MAX = 5;
+const TURNSTILE_FALLBACK_WINDOW_MS = 60 * 60 * 1000;
+const turnstileFallbackMemory = new Map<string, { count: number; reset: number }>();
+
+async function turnstileFallbackBudget(ip: string): Promise<{ allowed: boolean; resetAt: number }> {
+  const key = `turnstile-fallback:${ip}`;
+  try {
+    const m = await import('@/features/auth/db-windows');
+    const w = await m.consumeWindow(key, TURNSTILE_FALLBACK_MAX, TURNSTILE_FALLBACK_WINDOW_MS);
+    return { allowed: w.allowed, resetAt: w.resetAt };
+  } catch {
+    const now = Date.now();
+    let w = turnstileFallbackMemory.get(key);
+    if (!w || now > w.reset) w = { count: 0, reset: now + TURNSTILE_FALLBACK_WINDOW_MS };
+    w.count++;
+    turnstileFallbackMemory.set(key, w);
+    return { allowed: w.count <= TURNSTILE_FALLBACK_MAX, resetAt: w.reset };
+  }
+}
 
 const securityHeaders = {
   'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
@@ -340,18 +366,31 @@ if (preHasCookie) {
   }
 
   // ── Turnstile captcha for suspicious IPs ──
+  // Graceful fallback: a hard 403 on a missing token dead-ends every real user
+  // whenever the widget itself cannot load (challenges.cloudflare.com blocked
+  // by the visitor's network, an ad-blocker, an outage) — password resets and
+  // OTP sends become unreachable. Instead of trapping them, requests without a
+  // passed token ride a stricter secondary budget: 5 per hour per IP, durable
+  // across instances via the DB window (dynamic import keeps Prisma out of the
+  // static middleware bundle, same contract as suspicious-activity.ts). The
+  // only error left on this path is a clear 429 once the budget is spent.
   if (!isDev && isAuth && isTurnstileConfigured() && isSuspicious(ip)) {
     const turnstileToken = request.headers.get('x-turnstile-token') || '';
-    if (!turnstileToken) {
-      return jsonResponse(allowedOrigin, {
-        error: 'Captcha verification required',
-        turnstileRequired: true,
-        siteKey: getTurnstileSiteKey(),
-      }, 403);
-    }
-    const valid = await verifyTurnstile(turnstileToken, ip);
+    const valid = turnstileToken ? await verifyTurnstile(turnstileToken, ip) : false;
     if (!valid) {
-      return jsonResponse(allowedOrigin, { error: 'Captcha verification failed' }, 403);
+      const budget = await turnstileFallbackBudget(ip);
+      if (!budget.allowed) {
+        const eventId = generateEventId('ratelimit');
+        const retryAfterSec = Math.max(1, Math.ceil((budget.resetAt - Date.now()) / 1000));
+        await reportRateLimit(request, { eventId, action: 'turnstile-fallback', ip, resetsAt: budget.resetAt });
+        const resp = jsonResponse(allowedOrigin, {
+          error: 'Too many attempts without a passed security check. Please try again in about an hour.',
+          eventId,
+          reset: retryAfterSec,
+        }, 429);
+        resp.headers.set('Retry-After', String(retryAfterSec));
+        return resp;
+      }
     }
   }
 
