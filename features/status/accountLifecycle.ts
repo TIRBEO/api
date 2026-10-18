@@ -536,6 +536,10 @@ export interface AccountState {
   deletionPending: boolean;
   deletionFinalAt: string | null;
   deletionDaysRemaining: number | null;
+  /** The persisted event reference for the current enforcement state, so the
+      in-app lock screens can show/attach it the same way the /blocked
+      hand-off does. Null when nothing was ever decided. */
+  refCode: string | null;
   signInMethods: SignInMethods;
   connections: ConnectionRow[];
 }
@@ -553,8 +557,19 @@ export async function readAccountState(userId: string): Promise<AccountState> {
   const deactivated = status === 'deactivated' && !!deactivation && !deactivation.resumedAt;
   const deletionPending = status === 'deletion_pending' && !!active;
 
+  const refKind =
+    status === 'banned' ? 'ban' : status === 'suspended' ? 'suspend' :
+    status === 'deletion_pending' ? 'delete' : status === 'deactivated' ? 'deactivate' :
+    status === 'deleted' ? 'deleted' : null;
+  let refCode: string | null = null;
+  if (refKind) {
+    const { ensureRefCode } = await import('@/features/users/refcode');
+    refCode = await ensureRefCode(userId, refKind).catch(() => null);
+  }
+
   return {
     status,
+    refCode,
     deactivated,
     deactivatedAt: deactivated ? deactivation!.pausedAt.toISOString() : null,
     deactivatedReason: deactivated ? deactivation!.reason ?? null : null,
