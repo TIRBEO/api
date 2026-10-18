@@ -125,12 +125,15 @@ async function reportRateLimit(request: NextRequest, opts: {
 const isDev = process.env.NODE_ENV === 'development';
 
 // ─── Turnstile fallback budget (suspicious-IP gate) ───────────────────────
-// 5 tokenless passes per hour per IP. The durable window lives in
+// 30 tokenless passes per hour per IP. This budget is only ever consumed by an
+// IP that already reached the suspicious-IP gate below (`isSuspicious(ip)`), so
+// a normal visitor never touches it — the tightened number is a ceiling for
+// scripters, not a wall for people. The durable window lives in
 // `security.rate_limit_windows` (consumed via db-windows, dynamically
 // imported so Prisma stays out of this bundle — same contract as
 // suspicious-activity.ts); if the DB is unreachable we degrade to a
 // per-process memory window rather than failing open or 500-ing the edge.
-const TURNSTILE_FALLBACK_MAX = 5;
+const TURNSTILE_FALLBACK_MAX = 30;
 const TURNSTILE_FALLBACK_WINDOW_MS = 60 * 60 * 1000;
 const turnstileFallbackMemory = new Map<string, { count: number; reset: number }>();
 
@@ -369,11 +372,14 @@ if (preHasCookie) {
   // Graceful fallback: a hard 403 on a missing token dead-ends every real user
   // whenever the widget itself cannot load (challenges.cloudflare.com blocked
   // by the visitor's network, an ad-blocker, an outage) — password resets and
-  // OTP sends become unreachable. Instead of trapping them, requests without a
-  // passed token ride a stricter secondary budget: 5 per hour per IP, durable
-  // across instances via the DB window (dynamic import keeps Prisma out of the
-  // static middleware bundle, same contract as suspicious-activity.ts). The
-  // only error left on this path is a clear 429 once the budget is spent.
+  // OTP sends become unreachable. This block only runs for an IP already
+  // flagged `isSuspicious(ip)`, so a normal visitor never enters it. Instead of
+  // trapping even a suspicious one, requests without a passed token ride a
+  // secondary budget: 30 per hour per IP (a ceiling for scripters, never a wall
+  // for people), durable across instances via the DB window (dynamic import
+  // keeps Prisma out of the static middleware bundle, same contract as
+  // suspicious-activity.ts). The only error left on this path is a clear 429
+  // once that budget is spent.
   if (!isDev && isAuth && isTurnstileConfigured() && isSuspicious(ip)) {
     const turnstileToken = request.headers.get('x-turnstile-token') || '';
     const valid = turnstileToken ? await verifyTurnstile(turnstileToken, ip) : false;

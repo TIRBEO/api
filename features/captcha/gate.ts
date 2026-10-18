@@ -1,6 +1,7 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import { verifyTurnstile, isTurnstileConfigured } from '@/features/auth/turnstile';
 import { checkWindowLimitDB } from '@/features/captcha/risk';
+import { isSuspiciousAsync } from '@/features/auth/suspicious-activity';
 
 const WARNING_CACHE_TTL = 5 * 60 * 1000;
 const warningCountCache = new Map<string, { count: number; recentBlocks: number; at: number }>();
@@ -12,16 +13,25 @@ const warningCountCache = new Map<string, { count: number; recentBlocks: number;
 // Real users were permanently locked out of password resets, login OTPs and
 // magic links — no client-side retry can ever succeed.
 //
-// So a request without a *valid* token is not rejected outright; it rides a
-// stricter secondary gate instead: 5 attempts per hour per IP (vs. the
-// standard per-endpoint windows on the tokened path), an audited
-// `captcha.fallback_bypassed` activity event per use, and the same
-// blocklist/abuse machinery `checkWindowLimitDB` applies everywhere else.
-// Abuse stays bounded — the tightened budget IS the control — and the only
-// error a client still sees for the no-token path is a clear rate-limit once
-// the budget is spent. When Turnstile is not fully configured the whole gate
-// remains a no-op (env kill-switch, unchanged).
-const FALLBACK_MAX = 5;
+// So a request without a *valid* token is not rejected outright. It is
+// suspicion-aware: only an IP that already looks abusive rides the tightened
+// secondary budget; a normal / anonymous tokenless request is NOT metered here
+// at all and simply proceeds under the standard per-endpoint per-IP limits the
+// caller already enforces (those endpoint windows are the real control, and a
+// human doing a couple of legit sends never comes close to them). An IP is
+// treated as suspicious when it carries a recent `captcha.blocked` /
+// `captcha.attempt_failed` audit trail OR the shared suspicious-IP tracker
+// (`isSuspiciousAsync`) has it flagged — both signals already exist in the
+// repo, nothing new is invented.
+//
+// When an IP *is* suspicious, the tightened budget is 30 attempts per hour per
+// IP — high enough that no real user can trip it by accident (the whole point:
+// only scripters should ever see a wall), low enough to bound abuse, and every
+// bypass is audited as `captcha.fallback_bypassed`. The durable-window
+// machinery and blocklist/abuse handling in `checkWindowLimitDB` are unchanged.
+// When Turnstile is not fully configured the whole gate remains a no-op (env
+// kill-switch, unchanged).
+const FALLBACK_MAX = 30;
 const FALLBACK_WINDOW_MS = 60 * 60 * 1000;
 
 /**
@@ -119,11 +129,58 @@ async function captchaFallbackAllowed(ipAddress: string | undefined): Promise<bo
 }
 
 /**
+ * Recent `captcha.blocked` / `captcha.attempt_failed` audit trail for an IP.
+ * Reuses the very events `getUserWarningCount` and `computeRiskScore` already
+ * read as their escalation signal — an IP whose last day shows failed captcha
+ * challenges is a candidate for the tightened fallback budget; a fresh, normal
+ * IP is not. Best-effort: any DB error means "not suspicious" so a benign
+ * request is never metered by accident.
+ */
+async function hasRecentCaptchaFailureTrail(ip: string): Promise<boolean> {
+  if (!ip || ip === 'unknown') return false;
+  try {
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const count = await prisma.activityEvent.count({
+      where: {
+        ipAddress: ip,
+        kind: { in: ['captcha.blocked', 'captcha.attempt_failed'] },
+        createdAt: { gte: dayAgo },
+      },
+    });
+    return count > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Should this IP be metered by the tightened tokenless fallback budget at all?
+ * Only a genuinely suspicious IP is: one flagged by the shared suspicious-IP
+ * tracker (`isSuspiciousAsync` — recent rate-limit hits) or carrying a recent
+ * captcha-failure trail. A normal / anonymous tokenless request returns false
+ * so the caller lets it through under the endpoint's own standard per-IP
+ * limits — the real, human-safe control. This keeps the fallback from ever
+ * trapping a legitimate user whose widget simply could not load.
+ */
+async function shouldMeterTokenlessFallback(ipAddress: string | undefined): Promise<boolean> {
+  const ip = ipAddress || 'unknown';
+  if (await hasRecentCaptchaFailureTrail(ip)) return true;
+  try {
+    return await isSuspiciousAsync(ip);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Turnstile-only CAPTCHA gate — replaces the removed custom challenge
  * engine (features/captcha/service.ts). Verifies one Cloudflare Turnstile
  * token. A valid token passes with the standard limits untouched; a missing
- * or invalid token does NOT hard-fail — it rides the tightened per-IP
- * fallback gate documented above, and only errors once that budget is spent.
+ * or invalid token does NOT hard-fail. It is suspicion-aware: a normal /
+ * anonymous tokenless request proceeds under the endpoint's own standard
+ * per-IP limits, while only an already-suspicious IP is metered by the
+ * tightened per-IP fallback budget documented above (and only errors once
+ * that budget is spent).
  *
  * A no-op when Turnstile isn't fully configured, so the gate can never reject
  * a request no client could satisfy.
@@ -139,7 +196,21 @@ export async function requireCaptchaGate(opts: {
   const verified = token ? await verifyTurnstile(token, opts.ipAddress) : false;
   if (verified) return { ok: true };
 
+  // Decide metering BEFORE recording this request's failure, so a single
+  // benign tokenless hit never manufactures its own "suspicious" trail.
+  const suspicious = await shouldMeterTokenlessFallback(opts.ipAddress);
+
+  // Record the miss so a genuine repeat offender accumulates the trail that
+  // eventually trips the tightened budget. Anonymous hits (no userId) can't
+  // write the user-keyed event, so they never self-escalate — exactly the
+  // pre-login flows (magic link / login OTP / password reset) we must keep
+  // reachable.
   recordGateFailure(opts.userId || '', opts.ipAddress, !token);
+
+  // Normal / anonymous tokenless request: not this IP's business to be
+  // tightened. Proceed; the endpoint's standard per-IP limits govern volume.
+  if (!suspicious) return { ok: true };
+
   if (await captchaFallbackAllowed(opts.ipAddress)) {
     recordFallbackBypass(opts.userId, opts.ipAddress, Boolean(token));
     return { ok: true };
