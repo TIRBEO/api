@@ -101,6 +101,47 @@ function createPool(): Pool {
   return pool;
 }
 
+// ─── Hard connection deadline ───
+// pg's connectionTimeoutMillis only bounds the TCP handshake. A pooler that
+// accepts the socket and then queues the login (Supavisor under load) therefore
+// hangs well past it — production logs showed warm-up attempts giving up after
+// 594s and 1024s. Everything a caller waits on is wrapped in withDeadline() so
+// neither a request nor a background warm-up can be held open by a half-dead
+// socket.
+const CONNECT_DEADLINE_MS = parseInt(process.env.DB_CONNECT_DEADLINE_MS || '', 10) || 8_000;
+
+/**
+ * Reject if `work` has not settled within `ms`. The loser is deliberately not
+ * cancelled — an aborted handshake leaks its socket, which pg's own
+ * idleTimeoutMillis reaps. What this guarantees is only that the caller is
+ * released on time.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
+/** One usable connection: checkout + handshake + login + probe. */
+function warmOne(pool: Pool): Promise<void> {
+  return withDeadline(
+    pool
+      .connect()
+      .then((client) =>
+        withDeadline(client.query('SELECT 1').then(() => client.release()), CONNECT_DEADLINE_MS, 'warm-up query').catch(
+          (err) => {
+            client.release(err);
+            throw err;
+          },
+        ),
+      ),
+    CONNECT_DEADLINE_MS,
+    'warm-up checkout',
+  );
+}
+
 // ─── Re-warm Lock ───
 // Prevents concurrent re-warm attempts that could create connection storms.
 let isRewarming = false;
@@ -134,22 +175,11 @@ async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
   const maxRetries = isColdStart ? 8 : 5; // more retries for cold starts
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const attemptStart = performance.now();
     try {
       // Force the pool to create `min` clients by checking out and releasing them
-      const warmupPromises: Promise<void>[] = [];
       const connectionsToCreate = isColdStart ? 2 : (POOL_CONFIG.min || 2); // start small on cold start
-
-      for (let i = 0; i < connectionsToCreate; i++) {
-        warmupPromises.push(
-          pool.connect().then((client) => {
-            // Run a lightweight query to ensure the connection is fully initialized
-            return client.query('SELECT 1').then(() => {
-              client.release();
-            });
-          })
-        );
-      }
-      await Promise.all(warmupPromises);
+      await Promise.all(Array.from({ length: connectionsToCreate }, () => warmOne(pool)));
 
       // On cold start, after initial connections succeed, warm up the rest
       if (isColdStart && connectionsToCreate < (POOL_CONFIG.min || 2)) {
@@ -168,17 +198,20 @@ async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
       console.log(`[DB-POOL] Warmed up ${POOL_CONFIG.min} connections in ${elapsed}ms (attempt ${attempt}${isColdStart ? ', cold start' : ''})`);
       return;
     } catch (err: any) {
-      const elapsed = (performance.now() - start).toFixed(0);
+      // Per attempt, not since the loop began — the old figure summed the two
+      // and made one hung connect look like a 17-minute retry.
+      const tookMs = (performance.now() - attemptStart).toFixed(0);
+      const totalMs = (performance.now() - start).toFixed(0);
       if (attempt < maxRetries) {
         // Exponential backoff with jitter: 1s, 2s, 4s, 8s... up to 15s for cold starts
         const maxDelay = isColdStart ? 15000 : 8000;
         const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 500, maxDelay);
         const reason = err?.code || err?.message || 'unknown';
-        console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed (${reason}), ` +
-          `gave up after ${elapsed}ms, retrying in ${Math.round(delay)}ms...`);
+        console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed after ${tookMs}ms (${reason}), ` +
+          `retrying in ${Math.round(delay)}ms...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
-        console.error(`[DB-POOL] Warm-up failed after ${elapsed}ms (${maxRetries} attempts):`, err?.message);
+        console.error(`[DB-POOL] Warm-up failed after ${totalMs}ms (${maxRetries} attempts):`, err?.message);
       }
     }
   }
@@ -801,15 +834,13 @@ export async function isDbHealthy(): Promise<boolean> {
   }
 
   try {
-    // Use the raw pg pool instead of Prisma to avoid adapter-slot contention
+    // Use the raw pg pool instead of Prisma to avoid adapter-slot contention.
+    // This runs inline in the request path, so it gets the same hard deadline
+    // as the warm-up: without it one half-open socket stalls every request
+    // behind this health gate instead of failing fast.
     const pool = globalForPrisma.pgPool;
     if (pool) {
-      const client = await pool.connect();
-      try {
-        await client.query('SELECT 1');
-      } finally {
-        client.release();
-      }
+      await withDeadline(warmOne(pool), CONNECT_DEADLINE_MS + 2_000, 'DB health probe');
     } else {
       await withRetry(() => prisma.$queryRaw`SELECT 1`, 1, 100);
     }
