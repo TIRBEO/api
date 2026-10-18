@@ -184,7 +184,7 @@ export async function GET(request: NextRequest) {
 
   /* ─────────────── Group-by breakdowns ─────────────── */
   const [
-    adminsByRole, oauth, sessionsByStatus, apiKeysByState, notificationsByType,
+    adminsByRole, oauth, sessionsByStatus, notificationsByType,
     securityBySeverity, securityTopTypes, auditBySeverity, auditToday, loginByMethod,
     emailByStatus, emailTopTemplates, ticketByStatus, ticketByPriority, ticketByCategory,
     ticketMessages, ticketAttachments, formByStatus, submissionByStatus, formFields, formConnections,
@@ -197,7 +197,6 @@ export async function GET(request: NextRequest) {
       safe(oauthConnected('discord')),
     ]),
     safeMany(prisma.userSession.groupBy({ by: ['status'], _count: { status: true } })),
-    Promise.resolve([] as any[]),
     safeMany(prisma.notification.groupBy({ by: ['type'], _count: { type: true } })),
     safeMany(prisma.activityEvent.groupBy({ by: ['severity'], _count: { severity: true } })),
     safeMany(prisma.activityEvent.groupBy({ by: ['kind'], orderBy: { _count: { kind: 'desc' } }, take: 8, _count: { kind: true } })),

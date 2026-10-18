@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildTemplates,
   clearTemplateCache,
@@ -274,5 +277,121 @@ describe('htmlToText', () => {
     expect(text).toContain('482913');
     expect(text).not.toContain('<');
     expect(text.length).toBeGreaterThan(50);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   Every link a mail sends to the dashboard names a page that exists
+
+   Six CTAs pointed at `/account/sessions` and `/account/security`, which the
+   settings app has never had, and they stayed broken for as long as anything
+   else did because nothing joins the two: the addresses are strings inside
+   template functions in one app and the pages are directories in another. A
+   type check cannot see across that, and neither can a person reviewing a
+   diff of one app.
+
+   So the catalogue is rendered here and every address on the dashboard host
+   is looked up in the app's own tree — the directories that hold a page file,
+   the record shapes its one catch-all route answers for, and the redirects
+   its config says it answers. The lists are read from the source rather than
+   written down again, because a list kept here is a second thing to forget to
+   update.
+   ═══════════════════════════════════════════════════════════════════ */
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, '../../..'); // apps/api/tests -> repo root
+const read = (rel: string) => readFileSync(path.join(repoRoot, rel), 'utf8');
+
+/** Both hosts the settings app answers on: the current one and the dashboard
+    address it is still allowed to be reached through. */
+const DASHBOARD_HOSTS = ['myprofile.tirbeo.com', 'dashboard.tirbeo.com'];
+
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** A route the app can serve, as a matcher. `[slug]` is one segment; a
+    `:param` from a redirect source is one segment, and `:path*` is any
+    number of them. */
+function routeMatcher(route: string): RegExp {
+  const src = route
+    .split('/')
+    .filter(Boolean)
+    .map((seg) =>
+      seg.startsWith(':') ? (seg.endsWith('*') ? '(?:/[^/]+)+' : '[^/]+') : esc(seg),
+    )
+    .join('/');
+  // `route === "/"` leaves nothing here, and the app's root address is the
+  // root redirect — so an address with no path at all is the same page.
+  return new RegExp(src ? `^/${src}/?$` : '^/?$');
+}
+
+function realDashboardRoutes(): RegExp[] {
+  const out: RegExp[] = [];
+
+  /* 1. Every directory under app/ that holds a page. `app/**` is walked rather
+        than the route manifest read, because the manifest is build output and
+        a test that runs before a build would be checking a stale answer. */
+  const walk = (dir: string, base: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('(')) continue;
+      const rel = `${base}/${entry.name}`;
+      // The record catch-all is added below from its own table, so a path under
+      // it isn't allowed just for being under /settings.
+      if (entry.name === '[...path]') continue;
+      if (readdirSync(path.join(dir, entry.name)).includes('page.tsx')) out.push(routeMatcher(rel));
+      walk(path.join(dir, entry.name), rel);
+    }
+  };
+  walk(path.join(repoRoot, 'apps/myprofile/app'), '');
+
+  /* 2. The shapes /settings/[...path] answers for: the six record screens and
+        the account-status section/item paths. Read from the table the route
+        itself reads, so the two can't drift. */
+  const table = read('apps/myprofile/lib/record-routes.ts');
+  const ids = /const ID_SCREENS = new Set\(\[([\s\S]*?)\] as const/.exec(table);
+  expect(ids, 'ID_SCREENS not found in lib/record-routes.ts').not.toBeNull();
+  for (const screen of [...ids![1].matchAll(/"([^"]+)"/g)].map((m) => m[1])) {
+    out.push(new RegExp(`^/settings/${esc(screen!)}/[^/]+/?$`));
+  }
+  out.push(new RegExp('^/settings/account-status/[^/]+(?:/[^/]+)?/?$'));
+
+  /* 3. Redirect sources — an address the app answers by moving you, which a
+        mail link is allowed to use. */
+  for (const m of read('apps/myprofile/next.config.ts').matchAll(/source:\s*"([^"]+)"/g)) {
+    out.push(routeMatcher(m[1]!));
+  }
+
+  return out;
+}
+
+function dashboardPaths(html: string): string[] {
+  const found: string[] = [];
+  for (const m of html.matchAll(/href="https?:\/\/([^/"]+)([^"]*)"/g)) {
+    if (!DASHBOARD_HOSTS.includes(m[1]!.toLowerCase())) continue;
+    // &amp; is what an href carrying a query actually looks like in markup.
+    found.push(decodeURIComponent(m[2]!).replace(/&amp;/g, '&').split('?')[0]!);
+  }
+  return found;
+}
+
+describe('links a mail sends to the dashboard', () => {
+  it('resolve to a page, a record shape, or a redirect in the settings app', async () => {
+    clearTemplateCache();
+    const all = await buildTemplates(LOGO);
+    const routes = realDashboardRoutes();
+
+    const bad: { template: string; path: string }[] = [];
+    let checked = 0;
+    for (const [name, tpl] of Object.entries(all)) {
+      const html = renderTemplate(tpl.html, VARS, new Set());
+      for (const p of dashboardPaths(html)) {
+        checked++;
+        if (!routes.some((re) => re.test(p))) bad.push({ template: name, path: p });
+      }
+    }
+
+    // A guard that checked nothing must not report success — if the host the
+    // templates build for ever changes, this fails instead of going quiet.
+    expect(checked, 'no dashboard links found in the catalogue').toBeGreaterThan(4);
+    expect(bad).toEqual([]);
   });
 });

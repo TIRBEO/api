@@ -1,19 +1,27 @@
-// ═══ RESEND COOLDOWN (Redis-only) ═══
+// ═══ RESEND COOLDOWN (Redis-first) ═══
 // The 30s "please wait between sends" gate + 5-per-15min attempt window is
 // one atomic Redis Lua script (single round-trip, ~1-3ms). The durable DB
-// mirror was dropped with the consolidated schema (no cooldowns table); when
-// Redis is unavailable the gate fails open — the per-flow verify-limits and
-// risk checks still apply.
+// mirror was dropped with the consolidated schema (no cooldowns table), so
+// when Redis is unavailable the attempt window falls back to the Postgres
+// fixed window in features/auth/db-windows.ts — same ceiling, still shared
+// across instances. Only a Redis *and* Postgres outage lets a send through
+// ungated, and the per-flow verify-limits and risk checks still apply.
 //
 // All keys are email-scoped, so the cooldown holds across incognito, other
 // browsers, and other devices.
 
 import { getRedis } from '@/features/auth/redis';
+import { consumeWindow } from '@/features/auth/db-windows';
 
 const DEFAULT_COOLDOWN_MS = 30_000;
 const MAX_ATTEMPTS_PER_WINDOW = 5;
 const ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
 const TTL_HOURS = 24;
+
+/** The "please wait between sends" window every OTP/link flow applies, in ms.
+    Exported so a successful send can honestly quote when the next one is
+    allowed (`retryAfterMs`) instead of the client guessing 30s. */
+export const RESEND_COOLDOWN_MS = DEFAULT_COOLDOWN_MS;
 
 // ─── Redis Lua: one round-trip for the whole decision ───
 // KEYS[1] = state hash, ARGV: nowMs, cooldownMs, windowMs, maxAttempts, ttlMs
@@ -88,11 +96,27 @@ export async function enforceResendCooldown(
       if (!allowed) return { allowed: false, remainingMs };
       return { allowed: true, remainingMs: 0 };
     } catch {
-      // Redis error → fail open.
+      // Redis error → the durable window below, not a free pass.
     }
   }
 
-  return { allowed: true, remainingMs: 0 };
+  // 2. No Redis. The Postgres fixed window is the same counter every other
+  //    limiter in this app falls back to, so it holds across instances. It
+  //    cannot express "30s since the last send" — a fixed window has no
+  //    lastSent — but the 5-per-15-min ceiling is the part that stops a mail
+  //    loop, and it is the part worth keeping when Redis is the thing broken.
+  try {
+    const win = await consumeWindow(rKey, MAX_ATTEMPTS_PER_WINDOW, ATTEMPT_WINDOW_MS);
+    return win.allowed
+      ? { allowed: true, remainingMs: 0 }
+      : { allowed: false, remainingMs: Math.max(0, win.resetAt - now) };
+  } catch {
+    // Redis and Postgres both unreachable. Failing closed would deny a
+    // verification code to every account at once — and with the database down
+    // there is no session to abuse either, so the outage costs mail volume, not
+    // security. This is the only place the gate lets a send through ungated.
+    return { allowed: true, remainingMs: 0 };
+  }
 }
 
 export async function getRemainingAttempts(key: string): Promise<{ remaining: number; resetsInMs: number }> {

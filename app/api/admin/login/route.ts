@@ -15,7 +15,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 400 });
     }
 
-    const { email, password, fingerprint } = parsed.data;
     return adminLoginHandler(request, parsed.data);
   } catch (err: any) {
     console.error('[ADMIN LOGIN] Authentication error:', err?.message || err);
@@ -98,7 +97,7 @@ async function handleVerify(request: NextRequest) {
       type: 'login',
       title: 'Signed in to admin panel with 2FA',
       body: `Admin login from IP: ${ip || 'unknown'}`,
-      link: '/account/security',
+      link: '/settings/security',
       skipEmail: true,
     }).catch(() => {});
 

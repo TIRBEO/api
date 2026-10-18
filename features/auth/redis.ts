@@ -41,6 +41,11 @@ export async function checkAuthRedisHealth(): Promise<{ ok: boolean; latencyMs: 
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_KEY = (sid: string) => `auth:session:${sid}`;
 const SPENT_KEY = (hash: string) => `auth:refresh_spent:${hash}`;
+/** Set when a session is revoked, and read by anyone holding a cache entry for
+    that session. Must outlive the identity cache below, or the entry it exists
+    to veto could outlive it. */
+const REVOKED_KEY = (sid: string) => `auth:revoked:${sid}`;
+const REVOKED_MARK_TTL_MS = 15 * 60 * 1000;
 
 export async function getSessionState(sessionId: string): Promise<SessionState | null> {
   const redis = getRedis();
@@ -73,7 +78,16 @@ export async function revokeSessionState(sessionId: string): Promise<boolean> {
     return false;
   }
   try {
-    await redis.del(SESSION_KEY(sessionId));
+    // The marker is the durable half of this call. Deleting `auth:session:*`
+    // leaves nothing behind to point at, so a reader that cached the identity
+    // before the revoke has no way to learn it happened if the second delete
+    // (session:cache, fire-and-forget on the auth path) never lands. One
+    // positive key that outlives the identity cache's TTL makes the revocation
+    // readable instead of merely remembered.
+    const multi = redis.multi();
+    multi.del(SESSION_KEY(sessionId));
+    multi.set(REVOKED_KEY(sessionId), '1', 'EX', Math.ceil(REVOKED_MARK_TTL_MS / 1000));
+    await multi.exec();
   } catch {
     /* fall through to fallback */
   }
@@ -146,12 +160,19 @@ const SESSION_CACHE_KEY = (sid: string) => `session:cache:${sid}`;
 
 type SessionIdentity = { userId: string; email: string; sessionId: string; adminRole: string | null };
 
-export async function getCachedSessionIdentity(sid: string): Promise<SessionIdentity | null> {
+/** The identity cache plus the revocation veto, in one round trip.
+ *
+ *  Returning `null` means "learn nothing here, ask the database", which is what
+ *  every failure mode wants: no Redis, a stalled Redis, an expired entry, a
+ *  malformed value. Only a `{ identity, revoked: false }` is an answer. */
+export async function readCachedSessionIdentity(sid: string):
+  Promise<{ identity: SessionIdentity; revoked: boolean } | null> {
   const redis = getRedis();
-  if (!redis) return undefined as unknown as null; // signal "no redis"
+  if (!redis) return null;
   try {
-    const raw = await redis.get(SESSION_CACHE_KEY(sid));
-    return raw ? (JSON.parse(raw) as SessionIdentity) : null;
+    const [cached, mark] = await redis.mget(SESSION_CACHE_KEY(sid), REVOKED_KEY(sid));
+    if (!cached) return null;
+    return { identity: JSON.parse(cached) as SessionIdentity, revoked: mark === '1' };
   } catch {
     return null;
   }

@@ -161,6 +161,9 @@ vi.mock('@/features/auth/signup-otp', () => ({
 }));
 vi.mock('@/features/email/email', () => ({
   sendTemplateEmail: vi.fn(async () => ({ success: true })),
+  // Signup mails the welcome note and the verification code through the
+  // deferred helper; nothing here asserts on them, it only has to exist.
+  sendTemplateEmailAfter: vi.fn(),
   logEmail: vi.fn(async () => {}),
 }));
 vi.mock('@/features/notifications/notifications', () => ({

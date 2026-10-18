@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
 
-export const GET = withAdmin(async (request, session) => {
+export const GET = withAdmin(async (request, _session) => {
 
   const limit = Number(request.nextUrl.searchParams.get('limit')) || 20;
 

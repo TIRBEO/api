@@ -11,10 +11,12 @@ import { coordsByLoginAttempt, coordsFromMeta } from '@/features/security/loginC
 import { createAuditEvent } from '@/features/security/audit';
 import { requireReauth } from '@/features/auth/reauth';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes, normalizeTotpCode } from '@/features/auth/totp';
-import { hashRecoveryCode } from '@/features/auth/password';
+import { hashRecoveryCode, verifyPassword } from '@/features/auth/password';
+import { checkPasswordBreach } from '@/features/auth/breach';
+import { scorePassword, strengthLabel } from '@/features/security/password-strength';
 import { generateOtpCode, storeOtp, verifyOtpCode } from '@/features/auth/otp';
 import { checkWindowLimitDB } from '@/features/captcha/risk';
-import { sendTemplateEmail } from '@/features/email/email';
+import { sendTemplateEmailAfter } from '@/features/email/email';
 import { createNotification, describeDevice, NotifType } from '@/features/notifications/notifications';
 import { bustProfileCache } from '@/features/auth/authHandlers';
 import { fetchLoginUserById, setRecoveryContact, readRecoveryContact } from '@/features/identity/tirbeo';
@@ -26,7 +28,7 @@ async function notify(userId: string, title: string, body?: string, link?: strin
       type,
       title,
       body: body || undefined,
-      link: link || '/account/notifications',
+      link: link || '/settings/notifications',
       ...(skipEmail ? { skipEmail: true } : {}) });
   } catch (e) {
     console.error('[NOTIFICATION CREATE]', (e as Error)?.message || e);
@@ -258,11 +260,11 @@ export async function totpVerifyHandler(request: NextRequest) {
     await notify(session.userId, 'Two-step verification enabled', 'Authenticator app two-factor is now active on your account.', undefined, 'security', true).catch(() => {});
 
     if (session.email) {
-      sendTemplateEmail(session.email, 'login_alert', {
+      sendTemplateEmailAfter(session.email, 'login_alert', {
         name: session.email.split('@')[0],
         location: 'Security Settings',
         device: request.headers.get('user-agent') || 'Unknown device',
-        loginTime: new Date().toLocaleString() }).catch(() => {});
+        loginTime: new Date().toLocaleString() });
     }
 
     return NextResponse.json({ ok: true, backupCodes: recoveryCodes });
@@ -355,11 +357,12 @@ export async function totpDisableHandler(request: NextRequest) {
       // setting from a session they were already in. Telling somebody a stranger
       // reached their account when that is not what happened is worse than
       // staying quiet about it.
-      sendTemplateEmail(loginUser.email, 'two_factor_disabled', {
+      const { getDashboardBaseUrl } = await import('@/config/app-urls');
+      sendTemplateEmailAfter(loginUser.email, 'two_factor_disabled', {
         name: loginUser.name || loginUser.email.split('@')[0],
         device: describeDevice(request.headers.get('user-agent')),
         loginTime: new Date().toLocaleString(),
-        twoFactorUrl: `${(await import('@/config/app-urls')).getDashboardBaseUrl()}/settings/two-factor` }).catch(() => {});
+        twoFactorUrl: `${getDashboardBaseUrl()}/settings/two-factor` });
     }
 
     return NextResponse.json({ ok: true });
@@ -615,22 +618,135 @@ export async function recoveryEmailVerifyHandler(request: NextRequest) {
 }
 
 // ─── POST /api/security/password-check ───────────────────────
+/**
+ * Analyse a candidate password.
+ *
+ * This endpoint used to answer `weak: 0, reused: 0, feedback: []` for every
+ * caller — a strength check that ran no check. It now measures what it claims:
+ * length against the charset actually used, common roots, repetition,
+ * sequences, date shapes, the account's own name/email/username, the HIBP
+ * range the password already appears in, and whether it is the password this
+ * account is using right now.
+ *
+ * `reused` is honest about its own reach: the consolidated schema records NO
+ * password history (there is no history column in `user_security`, so nothing
+ * to compare against), so the field means "is this the current password" and
+ * `historyAvailable: false` says the wider claim was never testable. When the
+ * account has no password on record it is `null` — not checked — rather than a
+ * reassuring 0.
+ *
+ * Nothing is logged beyond the band: no password, no hash, no prefix.
+ */
 export async function passwordCheckHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const user = await prisma.user.findUnique({
       where: { id: session.userId },
-      select: { passwordHash: true } });
+      select: {
+        passwordHash: true, email: true, username: true,
+        profile: { select: { name: true } } } });
     const hasPassword = !!user?.passwordHash && user.passwordHash.length > 0;
+
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    // Bounded: analysis is O(length) and the policy caps at 128 anyway.
+    const candidate = typeof body.password === 'string' ? body.password.slice(0, 256) : '';
+
+    if (!candidate) {
+      // No candidate, no claim. The old shape implied a checked-and-fine
+      // password; `checked: false` is the truthful version of the same reply.
+      return NextResponse.json({
+        hasPassword,
+        checked: false,
+        weak: null,
+        reused: null,
+        total: 1,
+        score: hasPassword ? 'unchecked' : 'no_password',
+        label: hasPassword
+          ? 'Send { password } to check a candidate against this account.'
+          : 'This account has no password set.',
+        feedback: [hasPassword
+          ? 'Nothing was checked — no password was sent. Pass one in the body to analyse it.'
+          : 'This account signs in another way, so there is no password to grade.'],
+        strength: null,
+        meetsPolicy: null,
+        valid: null,
+        breached: null,
+        historyAvailable: false });
+    }
+
+    const assessment = scorePassword({
+      password: candidate,
+      context: [user?.email, user?.username, user?.profile?.name],
+    });
+
+    // Reuse, against what is actually on record: this account's current hash.
+    const reusedNow = hasPassword ? await verifyPassword(user!.passwordHash!, candidate) : null;
+
+    // Breach lookup is k-anonymised (first 5 SHA-1 chars) and fails open — the
+    // same helper the reset and signup paths use, so a check here agrees with
+    // what would happen if this password were actually set.
+    let breached: boolean | null = null;
+    let breachCount = 0;
+    if (body.checkBreach !== false) {
+      try {
+        const b = await checkPasswordBreach(candidate);
+        breached = b.breached;
+        breachCount = b.count;
+        if (b.breached) {
+          assessment.weak = true;
+          assessment.score = Math.min(assessment.score, 1);
+          if (assessment.band === 'fair' || assessment.band === 'good' || assessment.band === 'strong') assessment.band = 'weak';
+          assessment.feedback.unshift(
+            `This exact password has appeared in ${b.count.toLocaleString()} published breaches — it is already in guess lists. Choose one never used anywhere else.`);
+        }
+      } catch { /* HIBP down: the local analysis still stands */ }
+    }
+    if (reusedNow) {
+      assessment.feedback.unshift('This is the password this account already uses.');
+    }
+
+    // The ledger learns that a check ran and what band it landed in. Never the
+    // password, never a hash, never a length (lengths leak the shape of it).
+    createAuditEvent({
+      actorId: session.userId,
+      action: 'security.password_check',
+      targetType: 'user',
+      targetId: session.userId,
+      severity: assessment.weak ? 'warning' : 'info',
+      metadata: {
+        score: assessment.band,
+        weak: assessment.weak,
+        reused: reusedNow,
+        breached,
+        breachCount: breached ? breachCount : undefined,
+      } }).catch(() => {});
+
     return NextResponse.json({
       hasPassword,
-      weak: !hasPassword ? 0 : 0,
-      reused: 0,
+      checked: true,
+      weak: assessment.weak ? 1 : 0,
+      reused: reusedNow === null ? null : reusedNow ? 1 : 0,
       total: 1,
-      score: hasPassword ? 'good' : 'no_password',
-      label: hasPassword ? 'Password is set' : 'No password set',
-      feedback: [] });
+      score: assessment.band,
+      label: strengthLabel(assessment),
+      feedback: assessment.feedback,
+      policyErrors: assessment.policyErrors,
+      // Guessability (`weak`) and saveability (`meetsPolicy`) are different
+      // answers; the screen needs both, and `valid` is what a save would do.
+      meetsPolicy: assessment.meetsPolicy,
+      valid: assessment.weak ? false : assessment.meetsPolicy,
+      strength: {
+        score: assessment.score,
+        band: assessment.band,
+        entropyBits: assessment.entropyBits,
+        length: assessment.length,
+        classes: assessment.classes },
+      breached,
+      breachCount: breached ? breachCount : 0,
+      // Honest scope marker: `reused` compares with the CURRENT password only,
+      // because the schema keeps no previous hashes to compare with.
+      historyAvailable: false });
   } catch (err: any) {
     console.error('[PASSWORD CHECK]', err?.message || err);
     return NextResponse.json({ error: 'Failed to check password' }, { status: 500 });

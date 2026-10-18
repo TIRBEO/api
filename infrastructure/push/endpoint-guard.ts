@@ -1,20 +1,20 @@
 import { lookup } from 'node:dns/promises';
 
-const PRIVATE_RANGES = [
-  { name: '10/8', test: (a: number, b: number, c: number, d: number) => a === 10 },
-  { name: '172.16/12', test: (a: number, b: number) => a === 172 && b >= 16 && b <= 31 },
-  { name: '192.168/16', test: (a: number, b: number) => a === 192 && b === 168 },
-  { name: '127/8', test: (a: number) => a === 127 },
-  { name: '169.254/16', test: (a: number, b: number) => a === 169 && b === 254 },
-  { name: '0/8', test: (a: number) => a === 0 },
-  { name: '100.64/10 (CGNAT)', test: (a: number, b: number) => a === 100 && b >= 64 && b <= 127 },
-  { name: '224/4 multicast', test: (a: number) => a >= 224 },
+const PRIVATE_RANGES: { name: string; test: (o: number[]) => boolean }[] = [
+  { name: '10/8', test: (o) => o[0] === 10 },
+  { name: '172.16/12', test: (o) => o[0] === 172 && o[1] >= 16 && o[1] <= 31 },
+  { name: '192.168/16', test: (o) => o[0] === 192 && o[1] === 168 },
+  { name: '127/8', test: (o) => o[0] === 127 },
+  { name: '169.254/16', test: (o) => o[0] === 169 && o[1] === 254 },
+  { name: '0/8', test: (o) => o[0] === 0 },
+  { name: '100.64/10 (CGNAT)', test: (o) => o[0] === 100 && o[1] >= 64 && o[1] <= 127 },
+  { name: '224/4 multicast', test: (o) => o[0] >= 224 },
 ];
 
 function isPrivateV4(ip: string): boolean {
-  const parts = ip.split('.').map((n) => Number(n));
+  const parts = ip.split('.').map(Number);
   if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
-  return PRIVATE_RANGES.some((r) => r.test(parts[0], parts[1], parts[2], parts[3]));
+  return PRIVATE_RANGES.some((r) => r.test(parts));
 }
 
 function isPrivateV6(ip: string): boolean {

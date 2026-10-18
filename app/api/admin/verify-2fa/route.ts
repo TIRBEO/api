@@ -60,7 +60,7 @@ export async function POST(request: NextRequest) {
       type: 'login',
       title: 'Signed in to admin panel with 2FA',
       body: `Admin login from IP: ${ip || 'unknown'}`,
-      link: '/account/security',
+      link: '/settings/security',
     }).catch(() => {});
 
     return res;

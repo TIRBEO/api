@@ -11,7 +11,7 @@ import {
   saveSessionState,
   getSessionState,
   revokeSessionState,
-  getCachedSessionIdentity,
+  readCachedSessionIdentity,
   setCachedSessionIdentity,
   deleteCachedSessionIdentity } from '@/features/auth/redis';
 import { createTtlCache } from '@/infrastructure/cache';
@@ -235,7 +235,12 @@ export async function seedSessionState(sessionId: string, userId: string, ip: st
     deviceInfo: ua || null }).catch(() => {});
 }
 
-export async function rotateRefreshToken(refreshToken: string, ipAddress?: string, userAgent?: string) {
+/**
+ * Refreshing reuses the existing session row, so `ipAddress`/`userAgent` on it
+ * mean "signed in from" — the new-IP checks in authHandlers compare against
+ * exactly that. They are deliberately not overwritten here.
+ */
+export async function rotateRefreshToken(refreshToken: string) {
   const presentedHash = await hashRefreshToken(refreshToken);
   const now = new Date();
 
@@ -412,10 +417,18 @@ export async function getSessionFromToken(token: string) {
       const cached = sessionCache.get(sid);
       if (cached !== undefined) return cached;
       // Distributed cache (survives cold starts) — consult before hitting the DB.
-      const distributed = await withDeadline(getCachedSessionIdentity(sid), SESSION_CACHE_DEADLINE_MS);
-      if (distributed) {
-        sessionCache.set(sid, distributed);
-        return distributed;
+      // Carries its own revocation veto: this entry is the one place a revoke
+      // could be missed outright, since the cache clear below it is
+      // fire-and-forget and the revocation marker is the durable half.
+      const distributed = await withDeadline(readCachedSessionIdentity(sid), SESSION_CACHE_DEADLINE_MS);
+      if (distributed?.revoked) {
+        sessionCache.set(sid, null);
+        void deleteCachedSessionIdentity(sid);
+        return null;
+      }
+      if (distributed?.identity) {
+        sessionCache.set(sid, distributed.identity);
+        return distributed.identity;
       }
     }
 

@@ -338,7 +338,7 @@ export function emailDomainOf(email?: string | null): string | null {
 export function humanizeEventType(type: string): string {
   const leaf = type.includes('.') ? type.slice(type.lastIndexOf('.') + 1) : type;
   return leaf
-    .replace(/[_\-]+/g, ' ')
+    .replace(/[_-]+/g, ' ')
     .replace(/\b2fa\b/gi, 'two-factor')
     .replace(/^\w/, (c) => c.toUpperCase());
 }

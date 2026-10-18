@@ -80,7 +80,7 @@ function describeIp(ip: string | null, location: string | null): string {
 export async function buildAccountChecks(userId: string): Promise<AccountChecks> {
   const now = new Date();
 
-  const [status, user, failures, lastSuccess, activeBlocks, restrictions, appeals] = await Promise.all([
+  const [status, user, failures, lastSuccess, restrictions, appeals] = await Promise.all([
     loadAccountStatus(userId),
     prisma.user.findUnique({
       where: { id: userId },
@@ -100,7 +100,6 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     }),
-    Promise.resolve([] as { id: string; ipAddress: string | null; reason: string; blockedAt: Date }[]),
     prisma.userRestriction.findMany({
       where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: now } }] },
       orderBy: { startedAt: 'desc' },

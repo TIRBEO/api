@@ -1,9 +1,17 @@
 import crypto from 'crypto';
+import { after } from 'next/server';
+import type { Transporter } from 'nodemailer';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getBranding } from '@/features/branding/branding';
 import { getApiBaseUrl } from '@/config/app-urls';
 import { createTtlCache } from '@/infrastructure/cache';
 import { unsubscribeSection } from '@/features/email/email-fragments';
+import {
+  EMAIL_CACHE_KEYS,
+  EMAIL_CACHE_TTL,
+  cachedConfigRead,
+  cachedEmailRead,
+} from '@/features/email/emailCache';
 
 interface EmailResult { success: boolean; error?: string; messageId?: string; }
 
@@ -233,21 +241,30 @@ export async function getEmailConfig() {
     formsFromEmail: null,
     formsFromName: null,
   };
-  try {
-    const row = await prisma.appConfig.findUnique({ where: { key: 'email.config' } });
-    const value = row?.value as Record<string, any> | null;
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      Object.assign(config, value);
+  const stored = await cachedConfigRead(EMAIL_CACHE_KEYS.config, async () => {
+    try {
+      const row = await prisma.appConfig.findUnique({ where: { key: 'email.config' } });
+      const value = row?.value as Record<string, any> | null;
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    } catch (e: any) {
+      console.warn('[EMAIL] Failed to load config from AppConfig:', e?.message);
+      return null;
     }
-  } catch (e: any) {
-    console.warn('[EMAIL] Failed to load config from AppConfig:', e?.message);
-  }
+  });
+  if (stored) Object.assign(config, stored);
   if (!config.apiKey) config.apiKey = process.env.RESEND_API_KEY || '';
   return config;
 }
 
+/** An admin override for one template. Cached per slug: a broadcast re-reads
+    the same row once per mail without this, and a missing row is a real answer
+    rather than a miss (see emailCache). */
 export async function getEmailTemplate(slug: string) {
-  return prisma.emailTemplate.findUnique({ where: { slug } });
+  return cachedEmailRead(
+    EMAIL_CACHE_KEYS.template(slug),
+    EMAIL_CACHE_TTL.template,
+    () => prisma.emailTemplate.findUnique({ where: { slug } }),
+  );
 }
 
 // The built-in catalogue is plain string templates beside this file — no
@@ -535,11 +552,24 @@ interface SmtpSettings {
   tlsServername?: string;
 }
 
-async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string, headers?: Record<string, string>): Promise<EmailResult> {
-  // Self-hosted delivery via Mailcow submission (STARTTLS, verified cert).
-  // Mailcow pins MAIL FROM to the authenticated mailbox, so the caller has
-  // already collapsed fromEmail onto smtp.user. Single-recipient only,
-  // mirroring the Resend privacy rule.
+// One pooled transport per SMTP endpoint, kept for the life of the process.
+// Building a transport per message means a fresh TCP connect, STARTTLS
+// handshake and AUTH login for every email — and the sender awaits all of it,
+// which is why a mail that takes 300ms to accept can take 3s to send here.
+// The key carries a digest of the password rather than the password itself, so
+// rotating the credential in AppConfig retires the old transport instead of
+// every send continuing to authenticate with a stale one.
+const smtpTransports = new Map<string, Transporter>();
+
+function transportKey(smtp: SmtpSettings): string {
+  const passDigest = crypto.createHash('sha256').update(smtp.pass).digest('hex').slice(0, 16);
+  return `${smtp.host}|${smtp.port}|${smtp.user}|${smtp.tlsServername ?? ''}|${passDigest}`;
+}
+
+async function transportFor(smtp: SmtpSettings): Promise<Transporter> {
+  const key = transportKey(smtp);
+  const existing = smtpTransports.get(key);
+  if (existing) return existing;
   const { createTransport } = await import('nodemailer');
   const transporter = createTransport({
     host: smtp.host,
@@ -547,7 +577,33 @@ async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fr
     secure: smtp.port === 465,
     ...(smtp.tlsServername ? { tls: { servername: smtp.tlsServername } } : {}),
     auth: { user: smtp.user, pass: smtp.pass },
+    pool: true,
+    // Two sockets is the whole of the concurrency this needs; an idle one is
+    // kept for nodemailer's default and a frozen function drops it anyway.
+    maxConnections: 2,
   });
+  // A credential rotation leaves the retired transport with nothing to send on;
+  // close it once its in-flight messages have had a moment to finish.
+  const stale = [...smtpTransports.entries()].filter(([k]) => k.startsWith(`${smtp.host}|${smtp.port}|${smtp.user}|`) && k !== key);
+  for (const [k, t] of stale) {
+    smtpTransports.delete(k);
+    setTimeout(() => { try { t.close(); } catch {} }, 70_000).unref();
+  }
+  smtpTransports.set(key, transporter);
+  return transporter;
+}
+
+async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string, headers?: Record<string, string>): Promise<EmailResult> {
+  // Self-hosted delivery via Mailcow submission (STARTTLS, verified cert).
+  // Mailcow pins MAIL FROM to the authenticated mailbox, so the caller has
+  // already collapsed fromEmail onto smtp.user. Single-recipient only,
+  // mirroring the Resend privacy rule.
+  let transporter: Transporter;
+  try {
+    transporter = await transportFor(smtp);
+  } catch (err: unknown) {
+    return { success: false, error: `SMTP error: ${String(err)}` };
+  }
   try {
     const info = await transporter.sendMail({
       from: fromName ? `${fromName} <${fromEmail}>` : fromEmail,
@@ -561,8 +617,6 @@ async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fr
     return { success: true, messageId: info.messageId || undefined };
   } catch (err: unknown) {
     return { success: false, error: `SMTP error: ${String(err)}` };
-  } finally {
-    transporter.close();
   }
 }
 
@@ -616,6 +670,37 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
   return { success: false, error: 'Email delivery failed after retries' };
 }
 
+
+/**
+ * Mail the caller's answer does not depend on — a login alert, a welcome note,
+ * an "export is ready" notice — goes out after the response is already sent.
+ *
+ * Two problems solved at once. The request stops paying the provider's round
+ * trip (hundreds of milliseconds to seconds) on the user's side, and the send is
+ * *scheduled* instead of merely started: an un-awaited promise here is free to
+ * be cut off when a serverless function freezes at the end of the response,
+ * which means the mail silently never happens. `after` is the platform's
+ * guarantee that it does.
+ *
+ * Outside a request — the cron jobs, the standalone server — there is no
+ * response to be after: `after` throws, and the send runs inline instead and is
+ * handed back so a job that wants to can await it.
+ */
+export function sendTemplateEmailAfter(
+  to: string,
+  templateName: string,
+  variables: Record<string, string>,
+  options?: Parameters<typeof sendTemplateEmail>[3]
+): Promise<void> | void {
+  const run = () => sendTemplateEmail(to, templateName, variables, options)
+    .then((r) => { if (!r.success) console.error(`[EMAIL/AFTER] ${templateName} to ${to} failed: ${r.error}`); })
+    .catch((e: any) => console.error(`[EMAIL/AFTER] ${templateName} threw: ${e?.message || e}`));
+  try {
+    after(run);
+  } catch {
+    return run();
+  }
+}
 
 export async function sendTemplateEmail(
   to: string,

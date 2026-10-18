@@ -18,10 +18,39 @@ const wsPort = process.env.WS_PORT !== undefined
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
+// This process is the long-lived one: on a self-host box it also hosts the
+// periodic jobs and the WebSocket server, so a stray rejection must not be
+// allowed to take all of that down. Node >=15 exits on an unhandled rejection,
+// and the floating promises here are deliberate — fire-and-forget logging,
+// cache busts, `.catch()`-ed writes that occasionally reject after their guard
+// was attached. Surfacing them loudly is the right response; killing realtime
+// and the deletion sweep for one is not.
+process.on('unhandledRejection', (reason: any) => {
+  console.error('[PROCESS] unhandled rejection:', reason?.message || reason);
+});
+process.on('uncaughtException', (e: any) => {
+  console.error('[PROCESS] uncaught exception:', e?.stack || e?.message || e);
+});
+
 app.prepare().then(() => {
   const server = createServer((req, res) => {
     const parsedUrl = parse(req.url!, true);
-    handle(req, res, parsedUrl);
+    // A handler that rejects must close the socket, not unwind into the
+    // process — an uncaught throw here used to take the whole server with it.
+    Promise.resolve(handle(req, res, parsedUrl)).catch((e: any) => {
+      console.error('[SERVER] request failed:', e?.message || e);
+      if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+      res.end('{"error":"Internal server error"}');
+    });
+  });
+
+  server.on('error', (e: any) => {
+    if (e?.code === 'EADDRINUSE') {
+      console.error(`> Port ${port} is already in use — stop whatever holds it, or start with PORT=<other port>`);
+    } else {
+      console.error('[SERVER] listen failed:', e?.message || e);
+    }
+    process.exit(1);
   });
 
   server.listen(port, () => {
@@ -77,4 +106,9 @@ app.prepare().then(() => {
       }
     }
   });
+}).catch((e: any) => {
+  // Nothing listens if Next never prepared, so staying up would only hide the
+  // failure behind a port that answers nothing.
+  console.error('[SERVER] failed to prepare Next app:', e?.stack || e?.message || e);
+  process.exit(1);
 });

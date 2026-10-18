@@ -112,20 +112,36 @@ export async function appealFileHandler(request: NextRequest) {
       );
     }
 
-    const existing = await prisma.userAppeal.findFirst({
-      where: { restrictionId, userId },
-      select: { id: true },
+    // One appeal per decision — and that promise needs something to make it
+    // atomic. The read-then-write had nothing: no unique on (restrictionId,
+    // userId), so two filings that overlap both saw no existing row and both
+    // inserted, which means two reviews of the same decision and two answers
+    // for one person to read. A Postgres advisory lock taken for the length of
+    // the transaction makes the second filing wait for the first and then see
+    // its row. It is named after the decision, so filings about other
+    // decisions never queue behind each other, and it releases on commit or
+    // crash, so nothing can strand it.
+    const filed = await prisma.$transaction(async (tx: any) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${restrictionId}))`;
+      const already = await tx.userAppeal.findFirst({
+        where: { restrictionId, userId },
+        select: { id: true },
+      });
+      if (already) return { appeal: null };
+      return {
+        appeal: await tx.userAppeal.create({
+          data: { restrictionId, userId, note, decision: 'pending' } }),
+      };
     });
-    if (existing) {
+
+    if (!filed.appeal) {
       return NextResponse.json(
         { error: 'A review is already filed for this decision.', code: 'appeal_exists' },
         { status: 409 },
       );
     }
 
-    const appeal = await prisma.userAppeal.create({
-      data: { restrictionId, userId, note, decision: 'pending' },
-    });
+    const appeal = filed.appeal;
 
     return NextResponse.json({ ok: true, appeal: shape({ ...appeal, restriction: null }) });
   } catch (err: any) {

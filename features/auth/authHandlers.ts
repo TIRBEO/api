@@ -11,12 +11,12 @@ import { getSession, requireRole } from '@/features/auth/http-guards';
 import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken, verifyPasswordResetToken } from '@/features/auth/jwt';
 
 import { verifyTotp } from '@/features/auth/totp';
-import { sendTemplateEmail } from '@/features/email/email';
+import { sendTemplateEmail, sendTemplateEmailAfter } from '@/features/email/email';
 import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf } from '@/features/security/security';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from '@/features/auth/password-reset';
 import { createAuditEvent } from '@/features/security/audit';
-import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
+import { enforceResendCooldown, RESEND_COOLDOWN_MS } from '@/features/auth/resend-cooldown';
 import { checkPasswordBreach } from '@/features/auth/breach';
 import { jsonUnauthorized } from '@/shared/response';
 import { createNotification, describeDevice, NEW_ACCOUNT_PREFS } from '@/features/notifications/notifications';
@@ -26,10 +26,11 @@ import { SignJWT } from 'jose';
 import { checkWindowLimit, checkWindowLimitDB, computeRiskScore, recordDeviceSeen, hasRecentLoginSuccess } from '@/features/captcha/risk';
 import { logAuthJson, logOtpJson, logLinkJson } from '@/features/auth/auth-log';
 import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate';
+import { getTurnstileSiteKey } from '@/features/auth/turnstile';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
 import { ensureRefCode, systemFaultRef } from '@/features/users/refcode';
-import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
+import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, getVerifyMax, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
 import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
@@ -54,6 +55,28 @@ export function bustProfileCache(userId: string) {
 
 function redisSafe(): any {
   try { return getRedis() || null; } catch { return null; }
+}
+
+/**
+ * A captcha 403 the client can actually act on.
+ *
+ * `requireCaptchaGate` used to answer `{ error }` alone, and the browser had no
+ * way to tell "mount a widget and retry" from "your request was refused":
+ * only the edge (`proxy.ts:348`) carried the mountable contract. Both layers
+ * now speak the same one — `turnstileRequired: true` plus the `siteKey` the
+ * widget needs, with the original `error` text preserved for the copy.
+ *
+ * `captchaState` separates the two reasons a gate trips (no token yet vs a
+ * token that failed verification) so a client can show the right message; it
+ * is additive and nothing existing reads it.
+ */
+function captchaChallengeResponse(captchaToken: string, error?: string) {
+  return NextResponse.json({
+    error: error || 'CAPTCHA verification required. Please complete the challenge.',
+    turnstileRequired: true,
+    siteKey: getTurnstileSiteKey(),
+    captchaState: captchaToken ? 'failed' : 'required',
+  }, { status: 403 });
 }
 
 /**
@@ -293,8 +316,6 @@ export async function sessionHandler(request: NextRequest) {
 
 export async function refreshHandler(request: NextRequest) {
   const startTime = performance.now();
-  const ip = getIp(request);
-  const userAgent = request.headers.get('user-agent') || undefined;
 
   try {
     const refreshToken = request.cookies.get(REFRESH_COOKIE_NAME)?.value;
@@ -313,7 +334,7 @@ export async function refreshHandler(request: NextRequest) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         result = await withTimeout(
-          rotateRefreshToken(refreshToken, ip, userAgent),
+          rotateRefreshToken(refreshToken),
           REFRESH_ATTEMPT_TIMEOUT_MS,
           'refresh rotation',
         );
@@ -551,17 +572,6 @@ interface OauthProviderConfig {
   redirectUri?: string;
 }
 
-/** Structured UA breakdown stored on every login_history row. */
-function parseLoginMetadata(ua?: string | null): Record<string, string> {
-  const d = describeDevice(ua);
-  const [browser, ...osParts] = d.split(' on ');
-  return {
-    os: osParts.join(' on ') || 'Unknown',
-    browser: browser || 'Unknown',
-    deviceType: /mobile|android|iphone|ipad/i.test(ua || '') ? 'mobile'
-      : /tablet|ipad/i.test(ua || '') ? 'tablet' : 'desktop' };
-}
-
 const OAUTH_ENV_KEYS: Record<string, { id: string; secret: string; uri: string }> = {
   google: { id: 'GOOGLE_CLIENT_ID', secret: 'GOOGLE_CLIENT_SECRET', uri: 'GOOGLE_REDIRECT_URI' },
   github: { id: 'GITHUB_CLIENT_ID', secret: 'GITHUB_CLIENT_SECRET', uri: 'GITHUB_REDIRECT_URI' },
@@ -743,8 +753,8 @@ async function finishProviderSignIn(
         type: 'security',
         title: `${provider.charAt(0).toUpperCase() + provider.slice(1)} connected`,
         body: `Your ${provider.charAt(0).toUpperCase() + provider.slice(1)} account was linked to Tirbeo. You can now sign in with it.`,
-        link: '/account/connected-apps' }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
-      const res = NextResponse.redirect(`${dashboardBase}/account/connected-apps?connected=${provider}`);
+        link: '/settings/connected-apps' }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+      const res = NextResponse.redirect(`${dashboardBase}/settings/connected-apps?connected=${provider}`);
       clearOauthStateCookie(res, request);
       return res;
     }
@@ -827,7 +837,7 @@ async function finishProviderSignIn(
     type: 'login',
     title: `Signed in with ${provider.charAt(0).toUpperCase() + provider.slice(1)}`,
     body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
-    link: '/account/security',
+    link: '/settings/security',
     metadata: { provider, ip, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
   // Record login history
   recordLoginHistory({ request, userId: account.id, email: account.email || '', success: true, method: provider }).catch(() => {});
@@ -1023,7 +1033,7 @@ function logOauthFailure(request: NextRequest, provider: string, reason: string,
     reason and a stable event id instead: the same failure always shows the
     same id, and that id is recorded in the admin event ledger. */
 async function oauthFail(request: NextRequest, reason: string, detail?: string): Promise<NextResponse> {
-  const provider = (request.nextUrl.pathname.match(/auth\/(google|github|discord)/) || [, 'oauth'])[1];
+  const provider = request.nextUrl.pathname.match(/auth\/(google|github|discord)/)?.[1] ?? 'oauth';
   let ref = '';
   try { ref = await systemFaultRef(`oauth ${provider} ${reason} ${detail || ''}`); } catch { /* no id beats no redirect */ }
   const base = (prodSafeEnvUrl(process.env.ACCOUNTS_URL) || getAccountsBaseUrl()).replace(/\/$/, '');
@@ -1072,8 +1082,8 @@ export async function loginHandler(request: NextRequest) {
 
     // Independent counters — checked concurrently to halve the DB wait.
     const [loginEmailOk, loginIpOk] = await Promise.all([
-      checkWindowLimitDB(`login:account:${idKey}`, 5, 15 * 60 * 1000, ip, idKey),
-      checkWindowLimitDB(`login:ip:${ip}`, 20, 15 * 60 * 1000, ip, idKey),
+      checkWindowLimitDB(`login:account:${idKey}`, 5, 15 * 60 * 1000, ip),
+      checkWindowLimitDB(`login:ip:${ip}`, 20, 15 * 60 * 1000, ip),
     ]);
     if (!loginEmailOk || !loginIpOk) {
       return rateLimited(request, {
@@ -1127,7 +1137,7 @@ export async function loginHandler(request: NextRequest) {
     if (forceCaptcha) {
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
-        return NextResponse.json({ error: check.error }, { status: 403 });
+        return captchaChallengeResponse(captchaToken, check.error);
       }
     }
 
@@ -1143,7 +1153,7 @@ export async function loginHandler(request: NextRequest) {
     if (risk?.requireCaptcha) {
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
-        return NextResponse.json({ error: check.error }, { status: 403 });
+        return captchaChallengeResponse(captchaToken, check.error);
       }
     }
 
@@ -1188,7 +1198,7 @@ export async function loginHandler(request: NextRequest) {
         type: 'security',
         title: 'New sign-in to your account',
         body: `Signed in with your password from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}). If this wasn't you, review your sessions immediately.`,
-        link: '/account/sessions',
+        link: '/settings/devices',
         metadata: { ip, device: describeDevice(userAgent), method: 'Password' },
         skipEmail: true })),
       Promise.resolve(recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId })),
@@ -1239,8 +1249,8 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     // Independent counters — checked concurrently to halve the DB wait.
     const [adminEmailOk, adminIpOk] = await Promise.all([
-      checkWindowLimitDB(`admin:login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, ip, email),
-      checkWindowLimitDB(`admin:login:ip:${ip}`, 20, 15 * 60 * 1000, ip, email),
+      checkWindowLimitDB(`admin:login:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, ip),
+      checkWindowLimitDB(`admin:login:ip:${ip}`, 20, 15 * 60 * 1000, ip),
     ]);
     if (!adminEmailOk || !adminIpOk) {
       return rateLimited(request, {
@@ -1277,7 +1287,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     if (forceCaptcha) {
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
-        return NextResponse.json({ error: check.error }, { status: 403 });
+        return captchaChallengeResponse(captchaToken, check.error);
       }
     }
 
@@ -1289,11 +1299,11 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     if (!user.isAdmin) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'not_admin' } }).catch(() => {});
-      if (user.email) sendTemplateEmail(user.email, 'admin_alert', {
+      if (user.email) sendTemplateEmailAfter(user.email, 'admin_alert', {
         subject: 'Unauthorized Admin Access Attempt',
         message: 'A user without admin privileges attempted to access the admin panel.',
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
-        dashboardUrl: getAdminBaseUrl() }).catch(() => {});
+        dashboardUrl: getAdminBaseUrl() });
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
@@ -1301,7 +1311,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     if (risk?.requireCaptcha) {
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip, userId: user.id });
       if (!check.ok) {
-        return NextResponse.json({ error: check.error }, { status: 403 });
+        return captchaChallengeResponse(captchaToken, check.error);
       }
     }
 
@@ -1331,7 +1341,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       type: 'login',
       title: 'Signed in to admin panel',
       body: `Signed in from ${describeDevice(userAgent)} (IP ${ip || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'admin_password', ip, device: describeDevice(userAgent) },
       skipEmail: true }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
 
@@ -1348,12 +1358,12 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
     const isNewIp = !!alertEmail && (!lastSession || lastSession.ipAddress !== ip);
     if (isNewIp && alertEmail) {
       const appDomain = getAppDomain();
-      sendTemplateEmail(alertEmail, 'login_alert', {
+      sendTemplateEmailAfter(alertEmail, 'login_alert', {
         name: alertEmail.split('@')[0],
         location: 'Admin Panel',
         device: userAgent || 'Unknown device',
         loginTime: new Date().toLocaleString(),
-        revokeUrl: `https://myprofile.${appDomain}/settings/sessions` }).catch(() => {});
+        revokeUrl: `https://myprofile.${appDomain}/settings/devices` });
     }
 
     return res;
@@ -1416,7 +1426,7 @@ export async function verify2faLoginHandler(request: NextRequest) {
       type: 'login',
       title: 'Signed in with authenticator',
       body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'totp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     // A 2FA login that completes on a first-seen device is worth a "was that
     // you?" mail even though the authenticator code passed — a phished password
@@ -1493,7 +1503,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       type: 'login',
       title: 'Signed in with backup code',
       body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'backup_code', ip, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch {
@@ -1681,7 +1691,7 @@ export async function signupHandler(request: NextRequest) {
     }
 
     // Relaxed rate limits for signup - 20 per hour per IP, 10 per hour per email
-    if (!(await checkWindowLimitDB(`signup:ip:${ip}`, 20, 60 * 60 * 1000, ip, email))) {
+    if (!(await checkWindowLimitDB(`signup:ip:${ip}`, 20, 60 * 60 * 1000, ip))) {
       return rateLimited(request, {
         action: 'auth/signup',
         message: 'Too many sign-up attempts. Please try again later.',
@@ -1689,7 +1699,7 @@ export async function signupHandler(request: NextRequest) {
         keyHint: 'signup:ip',
       });
     }
-    if (!(await checkWindowLimitDB(`signup:email:${accountEmail}`, 10, 60 * 60 * 1000, ip, accountEmail))) {
+    if (!(await checkWindowLimitDB(`signup:email:${accountEmail}`, 10, 60 * 60 * 1000, ip))) {
       return rateLimited(request, {
         action: 'auth/signup',
         message: 'Too many sign-up attempts. Please try again later.',
@@ -1721,7 +1731,7 @@ export async function signupHandler(request: NextRequest) {
       // activity write when userId is empty.
       const check = await requireCaptchaGate({ token: captchaToken, ipAddress: ip });
       if (!check.ok) {
-        return NextResponse.json({ error: check.error }, { status: 403 });
+        return captchaChallengeResponse(captchaToken, check.error);
       }
     }
 
@@ -1843,10 +1853,12 @@ export async function signupHandler(request: NextRequest) {
 
     recordDeviceSeen({ fingerprint, userId: user.id, ip, ua: userAgent, sessionId: captchaSession }).catch(() => {});
 
-    // Send welcome email (non-blocking)
-    sendTemplateEmail(accountEmail, 'welcome', { name: name || accountEmail.split('@')[0] }, {
+    // Send welcome email — scheduled after the response, so the signup answer
+    // does not wait on the mail provider and the send still runs if this
+    // function is frozen the moment the response is out.
+    sendTemplateEmailAfter(accountEmail, 'welcome', { name: name || accountEmail.split('@')[0] }, {
       fromEmail: 'noreply@tirbeo.com',
-      fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Welcome email failed:', err?.message));
+      fromName: 'Tirbeo' });
 
     // Create welcome notification — STRICTLY per-user, no broadcast, no CC.
     // This notification must ONLY be visible to the newly created account
@@ -1870,9 +1882,9 @@ export async function signupHandler(request: NextRequest) {
       await prisma.otp.deleteMany({ where: { kind: 'email', address: accountEmail } });
       await prisma.otp.create({
         data: { userId: user.id, kind: 'email', address: accountEmail, otpHash, expiresAt } });
-      sendTemplateEmail(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] }, {
+      sendTemplateEmailAfter(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] }, {
         fromEmail: 'noreply@tirbeo.com',
-        fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Verification email failed:', err?.message));
+        fromName: 'Tirbeo' });
       // The verification OTP is an auth artifact like every other one — log its
       // generation (truncated, never the plain code).
       logOtpJson(accountEmail, 'signup-verify', verifyCode.slice(0, 3) + '***', ip, { userId: user.id }, 'signup_otp').catch(() => {});
@@ -1903,16 +1915,16 @@ export async function requestSignupOtpHandler(request: NextRequest) {
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
     // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
-    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
-    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
-    if (!(await checkWindowLimitDB(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`signup-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests. Please try again later.', email, keyHint: 'signup-otp:ip' });
     }
-    if (!(await checkWindowLimitDB(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`signup-otp:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many requests. Please try again later.', email, keyHint: 'signup-otp:email' });
     }
 
@@ -2206,10 +2218,10 @@ export async function oauthAttachHandler(request: NextRequest) {
       type: 'security',
       title: `${label} connected`,
       body: `Your ${label} account was linked to Tirbeo. You can now sign in with it.`,
-      link: '/account/connected-apps' }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
+      link: '/settings/connected-apps' }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
 
     const dashboardBase = getDashboardBase();
-    return NextResponse.json({ ok: true, redirect_to: `${dashboardBase}/account/connected-apps?connected=${data.provider}` });
+    return NextResponse.json({ ok: true, redirect_to: `${dashboardBase}/settings/connected-apps?connected=${data.provider}` });
   } catch (err: any) {
     console.error('[OAUTH ATTACH]', err?.message || err);
     return NextResponse.json({ error: 'Could not connect that account. Please try again.' }, { status: 500 });
@@ -2412,9 +2424,9 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
     setSessionCookie(res, sessionToken, refreshToken, request);
 
-    sendTemplateEmail(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
+    sendTemplateEmailAfter(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
       fromEmail: 'noreply@tirbeo.com',
-      fromName: 'Tirbeo' }).catch(err => console.error('[OAUTH COMPLETE] Welcome email failed:', err?.message));
+      fromName: 'Tirbeo' });
 
     return res;
   } catch (err: any) {
@@ -2473,7 +2485,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
     const ptrGate = await checkPtr('login-otp', email, ptr, ptrDevice);
     if (ptrGate.state === 'invalid') {
-      const guessesOk = await checkWindowLimitDB(`login-otp:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      const guessesOk = await checkWindowLimitDB(`login-otp:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp);
       if (!guessesOk) {
         return rateLimited(request, {
           action: 'auth/login-otp/request',
@@ -2492,8 +2504,8 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     const [otp, globalEmail, otpIpWin, ipWin] = await Promise.all([
       consumeVerifyAttempt('login-otp', email.toLowerCase(), clientIp),
       getVerifyStatus('global-email', email.toLowerCase()),
-      checkWindowLimitDB(`login-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email),
-      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email),
+      checkWindowLimitDB(`login-otp:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp),
+      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp),
     ]);
 
     const remainingInfo = {
@@ -2609,7 +2621,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     }
 
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    if (!(await checkWindowLimitDB(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, {
         action: 'auth/login-otp/verify',
         message: 'Too many attempts. Please try again later.',
@@ -2646,7 +2658,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
       type: 'login',
       title: 'Signed in with email code',
       body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${clientIp || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'otp', ip: clientIp, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     const { recordLoginHistory } = await import('@/features/security/security');
     recordLoginHistory({ request, userId: user.id, email: user.email || '', success: true, method: 'otp' }).catch(() => {});
@@ -2734,10 +2746,10 @@ export async function requestEmailOtpHandler(request: NextRequest) {
     const user = await fetchLoginUserById(session.userId);
     if (!user || !user.email) return NextResponse.json({ error: 'User email missing' }, { status: 400 });
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    if (!(await checkWindowLimitDB(`global:email:${user.email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, user.email))) {
+    if (!(await checkWindowLimitDB(`global:email:${user.email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/email-otp/request', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
     }
-    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, user.email))) {
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/email-otp/request', message: 'Too many requests from this device. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:ip' });
     }
     const cooldown = await enforceResendCooldown(`email-otp:${user.id}`);
@@ -2816,7 +2828,7 @@ export async function changeEmailRequestHandler(request: NextRequest) {
     }
 
     const clientIp2 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp2, email))) {
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp2))) {
       return rateLimited(request, { action: 'auth/change-email/request', message: 'Too many verification attempts. Please try again later.', email, userId: user.id, keyHint: 'global:email' });
     }
     const cooldown = await enforceResendCooldown(`change-email:${user.id}`);
@@ -2901,7 +2913,7 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       body: currentEmail === email
         ? `Your email (${email}) was verified.`
         : `Your email was changed to ${email}. If this wasn't you, contact support immediately.`,
-      link: '/account/profile' }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
+      link: '/settings/edit-profile' }).catch((e: Error) => console.error('[NOTIFICATION]', e?.message));
 
     return NextResponse.json({ error: 'Email verified' }, { status: 200 });
   } catch (err: any) {
@@ -2927,7 +2939,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
     // Resend request — generate a new OTP and email it again
     if (!code) {
       const clientIp3 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-      if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp3, email))) {
+      if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp3))) {
         return rateLimited(request, { action: 'auth/verify-email', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
       }
       const cooldown = await enforceResendCooldown(`verify-email:${email.toLowerCase()}`);
@@ -2950,9 +2962,9 @@ export async function verifySignupEmailHandler(request: NextRequest) {
         where: { kind_address: { kind: 'email', address: email.toLowerCase() } },
         create: { userId: user.id, kind: 'email', address: email.toLowerCase(), otpHash, expiresAt },
         update: { userId: user.id, otpHash, expiresAt, attempts: 0 } });
-      sendTemplateEmail(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] }, {
+      sendTemplateEmailAfter(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] }, {
         fromEmail: 'noreply@tirbeo.com',
-        fromName: 'Tirbeo' }).catch(err => console.error('[SIGNUP] Resend verification email failed:', err?.message));
+        fromName: 'Tirbeo' });
       return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
     }
 
@@ -3621,14 +3633,14 @@ export async function requestPasswordResetOtpHandler(request: NextRequest) {  tr
       }
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
-    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
 
-    if (!(await checkWindowLimitDB(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`pw-reset-otp:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:otp', message: 'Too many requests. Please try again later.', email, keyHint: 'pw-reset-otp:ip' });
     }
     const result = await requestPasswordResetOtp(email);
@@ -3666,14 +3678,14 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
-    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
-    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
 
-    if (!(await checkWindowLimitDB(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`pw-reset-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/password-reset/request:magic_link', message: 'Too many requests. Please try again later.', email, keyHint: 'pw-reset-link:ip' });
     }
     const result = await requestPasswordResetMagicLink(email);
@@ -3703,6 +3715,53 @@ export async function requestPasswordResetMagicLinkHandler(request: NextRequest)
   }
 }
 
+/**
+ * The server's authoritative send counts for a password-reset request, in the
+ * SAME `{ [method]: { used, remaining, max, resetAt } }` shape the OTP sends
+ * carry (login-otp/request, signup-otp/request and their 429s).
+ *
+ * A success that returns only `{ message, ptr }` leaves the client's display
+ * cache on its own optimistic bump, so the counters drift upward on every
+ * failed send and the screen ends up quoting sends the server never charged.
+ * Read-only peeks here — the request already consumed its slot.
+ *
+ * The per-IP bucket is published under BOTH names the client keys it by: the
+ * server's window name (`pw-reset-otp` / `pw-reset-link` / `pw-reset-recovery`)
+ * and the flow key the client holds (`pw-reset-otp` / `pw-reset-magic_link` /
+ * `pw-reset-recovery`).
+ */
+async function passwordResetRemaining(
+  resetMethod: 'otp' | 'magic_link' | 'recovery',
+  email: string,
+  clientIp: string,
+): Promise<Record<string, { used: number; remaining: number; max: number; resetAt: number }>> {
+  const serverBucket =
+    resetMethod === 'recovery' ? 'pw-reset-recovery'
+      : resetMethod === 'magic_link' ? 'pw-reset-link'
+        : 'pw-reset-otp';
+  const clientBucket = `pw-reset-${resetMethod}`;
+  const [globalEmailMax, globalIpMax, ipMax] = await Promise.all([
+    getVerifyMax('global-email'),
+    getVerifyMax('global-ip'),
+    getVerifyMax(serverBucket).catch(() => 5),
+  ]);
+  const bucketMax = Number.isFinite(ipMax) && ipMax > 0 ? Math.min(ipMax, 5) : 5;
+  const [globalEmailWin, globalIpWin, bucketWin] = await Promise.all([
+    peekGenericWindow(`global:email:${email.toLowerCase()}`, globalEmailMax, VERIFY_WINDOW_MS),
+    peekGenericWindow(`global:ip:${clientIp}`, globalIpMax, VERIFY_WINDOW_MS),
+    peekGenericWindow(`${serverBucket}:ip:${clientIp}`, bucketMax, VERIFY_WINDOW_MS),
+  ]);
+  const entry = (w: typeof globalEmailWin) => ({
+    used: w.used, remaining: w.remaining, max: w.max, resetAt: w.resetAt });
+  const out: Record<string, { used: number; remaining: number; max: number; resetAt: number }> = {
+    'global-email': entry(globalEmailWin),
+    'global-ip': entry(globalIpWin),
+    [clientBucket]: entry(bucketWin),
+  };
+  if (clientBucket !== serverBucket) out[serverBucket] = entry(bucketWin);
+  return out;
+}
+
 // Password reset — request (legacy — sends both OTP and link for backward compatibility)
 export async function requestPasswordResetHandler(request: NextRequest) {
   try {
@@ -3727,21 +3786,21 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     const ptrMethod = `pw-reset-${resetMethod}`;
     const ptrGate = await checkPtr(ptrMethod, email, ptr, ptrDevice);
     if (ptrGate.state === 'invalid') {
-      const guessesOk = await checkWindowLimitDB(`${ptrMethod}:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      const guessesOk = await checkWindowLimitDB(`${ptrMethod}:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp);
       if (!guessesOk) {
         return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many invalid attempts from this device. Please try again later.', email, keyHint: `${ptrMethod}:ptr-guess`, retryAfterSec: 900 });
       }
       return NextResponse.json(ptrErrorBody(ptrGate.reason), { status: 403 });
     }
 
-    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
     }
-    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many requests from this device. Please try again later.', email, keyHint: 'global:ip' });
     }
     const bucket = resetMethod === 'recovery' ? 'pw-reset-recovery' : resetMethod === 'magic_link' ? 'pw-reset-link' : 'pw-reset-otp';
-    if (!(await checkWindowLimitDB(`${bucket}:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email))) {
+    if (!(await checkWindowLimitDB(`${bucket}:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: `auth/password-reset/request:${resetMethod}`, message: 'Too many requests. Please try again later.', email, keyHint: `${bucket}:ip` });
     }
     const result =
@@ -3757,7 +3816,10 @@ export async function requestPasswordResetHandler(request: NextRequest) {
         keyHint: `${bucket}:resend-cooldown`,
         resetsAt: Date.now() + result.retryAfterMs,
         retryAfterSec: result.retryAfterMs / 1000,
-        extra: { message: 'Please wait before requesting another code.', retryAfterMs: result.retryAfterMs },
+        extra: {
+          message: 'Please wait before requesting another code.',
+          retryAfterMs: result.retryAfterMs,
+          remaining: await passwordResetRemaining(resetMethod, email, clientIp) },
       });
     }
     if (!result.success) {
@@ -3768,7 +3830,10 @@ export async function requestPasswordResetHandler(request: NextRequest) {
       // failed send looked like a delivered one.
       console.error(`[PASSWORD RESET REQUEST] send failed for ${email}: ${result.error || 'unknown'}`);
       return NextResponse.json(
-        { error: 'We could not reach the email service right now. Please try again in a moment.' },
+        {
+          error: 'We could not reach the email service right now. Please try again in a moment.',
+          remaining: await passwordResetRemaining(resetMethod, email, clientIp),
+        },
         { status: 502 },
       );
     }
@@ -3792,7 +3857,16 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     } else if (result.code) {
       fetchLoginUserByEmail(email.toLowerCase()).then((u) => resetEvent(u?.id ?? null)).catch(() => {});
     }
-    return NextResponse.json({ message: 'If an account exists, a reset link has been sent.', ptr: issuePtr(ptrMethod, email, ptrDevice) });
+    // The counters travel with the send, not just with the 429: without them
+    // the client keeps its own optimistic bump and drifts. `retryAfterMs` is
+    // the resend cooldown the helper just started, quoted honestly rather than
+    // guessed at 30s by the UI.
+    const remaining = await passwordResetRemaining(resetMethod, email, clientIp);
+    return NextResponse.json({
+      message: 'If an account exists, a reset link has been sent.',
+      remaining,
+      retryAfterMs: RESEND_COOLDOWN_MS,
+      ptr: issuePtr(ptrMethod, email, ptrDevice) });
   } catch (err: any) {
     console.error('[PASSWORD RESET REQUEST]', err?.message || err);
     return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
@@ -3932,7 +4006,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
     const ptrGate = await checkPtr('magic-link', email, ptr, ptrDevice);
     if (ptrGate.state === 'invalid') {
-      const guessesOk = await checkWindowLimitDB(`magic-link:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp, email);
+      const guessesOk = await checkWindowLimitDB(`magic-link:ptr-guess:${clientIp}`, 10, 15 * 60 * 1000, clientIp);
       if (!guessesOk) {
         return rateLimited(request, {
           action: 'auth/magic-link/request',
@@ -3953,8 +4027,8 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     const [ml, globalEmail, ipWin, ipBlocked] = await Promise.all([
       consumeVerifyAttempt('magic-link', email.toLowerCase(), clientIp),
       getVerifyStatus('global-email', email.toLowerCase()),
-      checkWindowLimitDB(`magic-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp, email),
-      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp, email),
+      checkWindowLimitDB(`magic-link:ip:${clientIp}`, 5, 15 * 60 * 1000, clientIp),
+      checkWindowLimitDB(`global:ip:${clientIp}`, 20, 15 * 60 * 1000, clientIp),
     ]);
 
     const remainingInfo = {
@@ -4170,7 +4244,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
         type: 'login',
         title: 'Signed in with magic link',
 body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
-        link: '/account/security',
+        link: '/settings/security',
         metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
       const { recordLoginHistory: rlh3 } = await import('@/features/security/security');
       rlh3({ request, userId: user.id, email: user.email || '', success: true, method: 'magic_link' }).catch(() => {});
@@ -4193,7 +4267,7 @@ body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP $
       type: 'login',
       title: 'Signed in with magic link',
       body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'magic_link', ip, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     const { recordLoginHistory: rlh3 } = await import('@/features/security/security');
     rlh3({ request, userId: user.id, email: user.email || '', success: true, method: 'magic_link' }).catch(() => {});
@@ -4361,7 +4435,7 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
       type: 'login',
       title: 'Signed in with recovery email',
       body: `Signed in from ${describeDevice(request.headers.get('user-agent'))} (IP ${ip || 'unknown'}).`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { method: 'recovery_email', ip, device: describeDevice(request.headers.get('user-agent')) } }).catch((e: any) => console.error('[NOTIFICATION]', e?.message));
     return res;
   } catch (err: any) {
@@ -4516,7 +4590,7 @@ const DEFAULT_HELP_ARTICLES = [
   { id: "60", title: "Custom SMTP", content: "Configure custom SMTP in Settings → Email → SMTP. Supports SendGrid, Mailgun, AWS SES.", category: "Integrations", icon: "link" },
 ];
 
-export async function helpConfigHandler(request: NextRequest) {
+export async function helpConfigHandler(_request: NextRequest) {
   return NextResponse.json({
     articles: DEFAULT_HELP_ARTICLES,
     contactEmail: "support@tirbeo.com",

@@ -32,7 +32,7 @@ export async function GET(request: NextRequest) {
       sessionTableExists,
       setupRequired: adminCount === 0,
     });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json({ error: 'Internal error' }, { status: 500 });
   }
 }

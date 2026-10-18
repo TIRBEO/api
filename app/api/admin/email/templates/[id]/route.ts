@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin } from '@/features/auth/http-guards';
+import { invalidateEmailTemplate } from '@/features/email/emailCache';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireAdmin(request);
@@ -27,6 +28,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
       ...(body.variables !== undefined && { variables: body.variables }),
     },
   });
+  await invalidateEmailTemplate(tpl.slug);
   return NextResponse.json(tpl);
 }
 
@@ -35,6 +37,10 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
   if (sess instanceof NextResponse) return sess;
 
   const { id } = await params;
-  await prisma.emailTemplate.delete({ where: { id } });
+  // `delete` returns the row it removed, which is the slug the send path
+  // caches under — dropping it here is why an edited template shows up on the
+  // next mail rather than up to five minutes later.
+  const gone = await prisma.emailTemplate.delete({ where: { id } });
+  await invalidateEmailTemplate(gone.slug);
   return NextResponse.json({ ok: true });
 }

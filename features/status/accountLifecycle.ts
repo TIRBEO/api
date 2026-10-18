@@ -367,16 +367,24 @@ export async function consumeSensitiveCode(kind: string, email: string, code: st
 
   const ok = await verifyOtpHash(otp.otpHash, `${code}|${bind}`);
   if (ok) {
-    await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
-  } else {
-    const next = (otp.attempts ?? 0) + 1;
-    if (next >= MAX_OTP_ATTEMPTS) {
-      await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
-    } else {
-      await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
-    }
+    // The delete is the spend. Asking how many rows it removed turns two
+    // concurrent verifies of one code into one success — the loser sees 0 and
+    // is refused — instead of both reading the live row and both returning
+    // true. A failed delete (the database is the problem, not the code) is
+    // also a refusal: the row stays live for a retry.
+    const spent = await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => ({ count: 0 }));
+    return spent.count === 1;
   }
-  return ok;
+
+  // A miss costs an attempt, and the row self-destructs at the limit, so a
+  // brute force dies with the code it is hunting.
+  const next = (otp.attempts ?? 0) + 1;
+  if (next >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
+  } else {
+    await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
+  }
+  return false;
 }
 
 /** Resolve the account that signs in with this email (primary address or the

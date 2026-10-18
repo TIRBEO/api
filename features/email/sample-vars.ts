@@ -73,7 +73,7 @@ const PLAIN_VALUES: Record<string, string> = {
   ctaLabel: 'See what changed',
   ctaUrl: `${URL}/changelog/42`,
   actionLabel: 'View account',
-  actionUrl: `${URL}/account/security`,
+  actionUrl: `${URL}/settings/security`,
   tipTitle: 'Enable two-step authentication',
   tipBody: 'Add a second step to sign-in and lock out account takeover.',
 

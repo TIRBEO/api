@@ -16,7 +16,7 @@ const mocks = vi.hoisted(() => ({
   deviceSeenCount: 0,
   alertCount: 0,
   activityCreate: vi.fn(async () => ({})),
-  sendTemplateEmail: vi.fn(async () => ({ success: true })),
+  sendTemplateEmail: vi.fn(async (..._args: unknown[]) => ({ success: true })),
   recordDeviceSeen: vi.fn(async () => {}),
 }));
 
@@ -34,7 +34,14 @@ vi.mock('@/infrastructure/db/prisma', () => ({
   },
 }));
 
-vi.mock('@/features/email/email', () => ({ sendTemplateEmail: mocks.sendTemplateEmail }));
+vi.mock('@/features/email/email', () => ({
+  sendTemplateEmail: mocks.sendTemplateEmail,
+  // The alert mails through the deferred helper now, so delegate: the
+  // assertions below stay pointed at the send itself — who got what, how many
+  // times.
+  sendTemplateEmailAfter: (to: string, template: string, vars: Record<string, string>) =>
+    mocks.sendTemplateEmail(to, template, vars),
+}));
 vi.mock('@/features/captcha/risk', () => ({ recordDeviceSeen: mocks.recordDeviceSeen }));
 // Real describeDevice lives in a module with Prisma/branding side effects; keep
 // the suite hermetic with a faithful-but-trivial stub.

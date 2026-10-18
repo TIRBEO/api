@@ -170,7 +170,7 @@ export async function PUT(request: NextRequest) {
       notifications: notificationResult,
       isScheduled,
     });
-  } catch (error) {
+  } catch {
     return NextResponse.json(
       { error: 'Invalid request body' },
       { status: 400 }

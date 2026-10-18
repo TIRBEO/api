@@ -1,7 +1,6 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
 import { getSession, requireSession } from '@/features/auth/http-guards';
-import { logRequest } from '@/infrastructure/observability/logger';
 import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { jsonError, jsonForbidden } from '@/shared/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
@@ -87,6 +86,7 @@ import { internalProfileHandler } from '@/features/users/internalProfileHandlers
 
 import { accountStatusHandler, adminAccountStatusHandler } from '@/features/status/accountStatus';
 import { dataUsageHandler } from '@/features/preferences/dataUsage';
+import { feedbackHandler, adminFeedbackHandler } from '@/features/feedback/feedbackHandlers';
 
 import {
   emailConfigHandler,
@@ -560,14 +560,10 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   const authHeader = request.headers.get('authorization') || '';
   const pathStr = slug.join('/');
   let session: any = null;
-  let authMethod: 'cookie' | 'none' = 'none';
-
 
   try {
     session = await getSession(request);
-    if (session) {
-    authMethod = 'cookie';
-    } else if (authHeader) {
+    if (!session && authHeader) {
       // Only actual API keys (tb_…) can resolve via the API-key path. A Bearer
       // JWT (eyJ…) is handled by cookie/session auth above — do NOT log it as an
       // API-key failure, or every dashboard request spams 401-noise even on 200s.
@@ -581,10 +577,11 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   }
 
   // ── Vercel serverless: trigger due background jobs on first request ──
-  // Fire-and-forget — does not block the response.
+  // Fire-and-forget — does not block the response, and gated per instance so a
+  // busy request stream does not turn a daily job check into a pool contest.
   if (process.env.VERCEL && pathStr !== 'cron') {
-    import('@/jobs/job-gate').then(({ runDueJobs }) => {
-      runDueJobs().catch(() => {});
+    import('@/jobs/job-gate').then(({ runDueJobsFromRequest }) => {
+      runDueJobsFromRequest().catch(() => {});
     }).catch(() => {});
   }
 
@@ -598,7 +595,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
 
   if (blocked) {
     console.warn(`[AUTH] Blocked request — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
-    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
     return jsonForbidden('Your IP or account has been blocked');
   }
 
@@ -626,7 +622,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   const route = matchRoute(slug, method);
   if (!route) {
     console.warn(`[ROUTE] Not found — path: ${pathStr}, method: ${method}`);
-    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 404 });
     return jsonError(`Route not configured: ${method} ${pathStr}`, 404);
   }
 
@@ -636,7 +631,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   rateLimitInfo = await checkRateLimitWithInfo(`${pathStr}:${ip}`, isAuth, routeLimit);
   if (!rateLimitInfo.allowed) {
     console.warn(`[RATE LIMIT] Exceeded — path: ${pathStr}, ip: ${ip}`);
-    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 429 });
     return NextResponse.json({ error: 'Too many requests. Please slow down.' }, { status: 429, headers: { 'Retry-After': String(rateLimitInfo.reset), 'X-RateLimit-Limit': String(rateLimitInfo.limit), 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': String(rateLimitInfo.reset) } });
   }
 
@@ -1208,10 +1202,10 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         resp = NextResponse.json({ ok: true, message: 'Waitlist feature coming soon' });
         break;
       case 'feedback':
-        resp = NextResponse.json({ ok: true, message: 'Feedback received' });
+        resp = await feedbackHandler(request);
         break;
       case 'admin/feedback':
-        resp = NextResponse.json({ feedback: [] });
+        resp = await adminFeedbackHandler(request);
         break;
       case 'admin/subscribers':
         resp = NextResponse.json({ subscribers: [] });
@@ -1327,7 +1321,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         }
       } catch { /* non-JSON 5xx body — leave it untouched */ }
     }
-    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: resp.status });
     return addRateLimitHeaders(resp);
   }
 
@@ -1345,7 +1338,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
     }
   }
   if (!route.allowedRoles.includes(userRole)) {
-    await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
     return jsonForbidden(`Your role '${userRole}' does not have access to this resource`);
   }
 
@@ -1358,7 +1350,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
     const isTrustedTarget = trustedInternalOrigins().has(parsedTarget.origin);
     if (!isTrustedTarget) {
       if (blockedHosts.includes(hostname) || blockedIpRanges.some(r => r.test(hostname))) {
-        await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
         return jsonForbidden('Proxy target not allowed');
       }
       if (/^[a-z0-9.-]+$/i.test(hostname) && !/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
@@ -1370,11 +1361,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
             blockedIpRanges.some(r => r.test(address))
           );
           if (isPrivate) {
-            await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 403 });
             return jsonForbidden('Proxy target not allowed');
           }
-        } catch (e: any) {
-          await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 400 });
+        } catch {
           return jsonError('Proxy target could not be resolved', 400);
         }
       }
@@ -1400,7 +1389,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   } catch (e: any) {
     clearTimeout(timeout);
     if (e?.name === 'AbortError') {
-      await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: 504 });
       return NextResponse.json({ error: 'Gateway timeout — upstream server did not respond in time' }, { status: 504 });
     }
     throw e;
@@ -1411,6 +1399,5 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
     status: upstreamResponse.status,
     headers: responseHeaders });
 
-  await logRequest({ ip, method, path: pathStr, userId: session?.userId, status: upstreamResponse.status });
   return addRateLimitHeaders(response);
 }

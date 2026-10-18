@@ -1,8 +1,5 @@
 {
   "compilerOptions": {
-    "types": [
-      "@cloudflare/workers-types"
-    ],
     "target": "ES2017",
     "lib": [
       "dom",
@@ -39,7 +36,6 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules",
-    "scripts/tmp-*"
+    "node_modules"
   ]
 }

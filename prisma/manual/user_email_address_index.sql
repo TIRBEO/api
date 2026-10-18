@@ -1,0 +1,28 @@
+-- user_email: an index on `address` alone.
+--
+-- This project has no prisma/migrations folder (db-push workflow), so the
+-- schema change in schema.prisma (`@@index([address], map:
+-- "idx_user_email_address")` on UserEmail) must be applied to the database
+-- with this file.
+--
+-- Apply with EITHER:
+--   psql "$DIRECT_DATABASE_URL" -f prisma/manual/user_email_address_index.sql
+-- OR (equivalent, regenerates types too):
+--   npx prisma db push
+--
+-- Safe to re-run.
+--
+-- Why: `address` is the key the mailer turns into an account, and it is read
+-- on the send path for every message — recipientIdentity() and
+-- userIdForAddress() resolve an address to a userId before anything is
+-- composed, and the password-reset / deletion / reauth / signup code lookups
+-- all find the owner the same way. The only indexes on this table start with
+-- `user_id` (`@@unique([userId, address])` and idx_user_email_user), and
+-- Postgres cannot use a composite index whose leading column is missing from
+-- the predicate. So every one of those reads has been scanning the table.
+--
+-- Exact match, not `ILIKE`: every writer stores the address lowercased
+-- (`address.toLowerCase()` on insert, in the OTP rows and in `user_email`) and
+-- every reader lowercases before looking up, which is what makes a plain btree
+-- on the column sufficient.
+CREATE INDEX IF NOT EXISTS "idx_user_email_address" ON "email"."user_email"("address");

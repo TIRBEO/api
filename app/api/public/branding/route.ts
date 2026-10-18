@@ -1,4 +1,4 @@
-import { getBranding, type Branding } from '@/features/branding/branding';
+import { getBranding } from '@/features/branding/branding';
 import { cachedJson } from '@/shared/response';
 
 export const dynamic = 'force-dynamic';

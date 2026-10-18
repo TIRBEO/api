@@ -131,7 +131,7 @@ export async function sendPushNotification(userIdOrSubscription: string | { endp
         body: payload?.body || '',
         icon: payload?.icon || getAppUrl('/icons/notification.png'),
         badge: getAppUrl('/icons/badge.png'),
-        url: payload?.url ? getAppUrl(payload.url) : getAppUrl('/account/notifications'),
+        url: payload?.url ? getAppUrl(payload.url) : getAppUrl('/settings/notifications'),
         tag: payload?.tag || 'tirbeo-notification',
         timestamp: Date.now(),
       }), { TTL: 3600 });

@@ -40,14 +40,15 @@ export async function verifyOtpCode(userId: string, type: 'email' | 'email_verif
     return false;
   }
   if (otp.expiresAt < new Date()) {
-    await prisma.otp.delete({ where: { id: otp.id } });
+    await prisma.otp.deleteMany({ where: { id: otp.id } });
     return false;
   }
   const ok = await verifyOtpHash(otp.otpHash, bindTo(code, bind));
-  if (ok) {
-    await prisma.otp.delete({ where: { id: otp.id } });
-  }
-  return ok;
+  if (!ok) return false;
+  // The delete is the spend: counting what it removed means two concurrent
+  // verifies of one code produce one success, not two.
+  const spent = await prisma.otp.deleteMany({ where: { id: otp.id } });
+  return spent.count === 1;
 }
 
 /** Send OTP via configured email provider (Resend) */

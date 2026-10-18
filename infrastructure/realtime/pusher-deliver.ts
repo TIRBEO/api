@@ -150,7 +150,7 @@ export function beamsNotifyUser(
 }
 
 // Beams validates `web.notification.deep_link` as a full URI — a relative app
-// path like `/account/inbox` is rejected with a 422. Resolve app links (which
+// path like `/settings/notifications` is rejected with a 422. Resolve app links (which
 // the codebase stores as bare paths) to an absolute dashboard URL before send.
 function resolveAppLink(link: string): string {
   if (/^https?:\/\//i.test(link)) return link;

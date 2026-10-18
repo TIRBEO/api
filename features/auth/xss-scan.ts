@@ -5,7 +5,7 @@
 const XSS_PATTERNS: { regex: RegExp; label: string }[] = [
   // HTML injection — require word-boundary after tag name to avoid
   // false positives on <formula>, <form>, <metadata>, etc.
-  { regex: /<\s*\/?\s*(script|iframe|object|embed|svg|math)\b[\s>\/]/i, label: 'dangerous_tag' },
+  { regex: /<\s*\/?\s*(script|iframe|object|embed|svg|math)\b[\s>/]/i, label: 'dangerous_tag' },
 
   // Dangerous protocol handlers
   { regex: /javascript\s*:/i, label: 'javascript_proto' },

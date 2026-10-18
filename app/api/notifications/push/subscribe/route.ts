@@ -12,7 +12,7 @@ export async function GET() {
       configured: isPushConfigured(),
       publicKey: getVapidPublicKey(),
     });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json({ error: 'Failed to check push config' }, { status: 500 });
   }
 }

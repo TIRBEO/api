@@ -423,6 +423,32 @@ describe('REAUTH_REQUIRED lists the methods the account can actually use', () =>
     mocks.primaryEmail = null;
     expect(await availableReauthMethods('u1')).toEqual(['password', 'code']);
   });
+
+  it('an account whose ONLY door is the emailed code is still asked for proof', async () => {
+    // The bypass this test exists for: the fallback used to key on
+    // password/TOTP/passkey alone, so a Google-or-GitHub account with no
+    // password cleared every sensitive action with nothing but its cookie —
+    // even though the code it was being offered was the proof it could give.
+    mocks.prismaUser = { passwordHash: null, totpSecret: null, email: 'frank@gmail.com', _count: { passkeys: 0 } };
+    mocks.primaryEmail = 'frank@gmail.com';
+    expect(await availableReauthMethods('u1')).toEqual(['code']);
+    const r = await requireReauth(fakeRequest({}), 'u1');
+    expect(r.ok).toBe(false);
+    if ('response' in r) {
+      expect(r.response.status).toBe(403);
+      const payload: any = await r.response.json();
+      expect(payload.methods).toEqual(['code']);
+    }
+  });
+
+  it('an account with no door at all is still waved through, not locked out', async () => {
+    mocks.prismaUser = { passwordHash: null, totpSecret: null, email: null, _count: { passkeys: 0 } };
+    mocks.primaryEmail = null;
+    expect(await availableReauthMethods('u1')).toEqual([]);
+    const r = await requireReauth(fakeRequest({}), 'u1');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.method).toBe('none');
+  });
 });
 
 // ─── Pre-validating a proof without performing the action ───────────

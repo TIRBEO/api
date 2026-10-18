@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin } from '@/features/auth/http-guards';
+import { invalidateEmailTemplate } from '@/features/email/emailCache';
 
 export async function GET(request: NextRequest) {
   const session = await requireAdmin(request);
@@ -23,5 +24,6 @@ export async function POST(request: NextRequest) {
 
   const tpl = await prisma.emailTemplate.create({
     data: { slug: name, label, subject, html: htmlBody, variables: variables || [] } });
+  await invalidateEmailTemplate(tpl.slug);
   return NextResponse.json(tpl, { status: 201 });
 }

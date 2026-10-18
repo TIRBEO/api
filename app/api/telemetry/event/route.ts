@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { checkRateLimit } from '@/features/auth/rate-limit';
+import { analyticsConsentAllowed, isAnalyticsCategoryEvent, stripClientConsentFields } from '@/features/preferences/dataUsage';
 import { getClientIp, getUserAgent, humanizeEventType } from '@/features/security/security';
 
 export const runtime = 'nodejs';
@@ -28,6 +29,11 @@ interface TelemetryBody {
  * Deliberately forgiving: bad-but-parseable payloads are dropped field by
  * field rather than rejected, and ANY internal failure answers 200 { ok: false }
  * — telemetry must never leak internals or break the client that sent it.
+ *
+ * Analytics/cookie-dependent event categories are gated on the ACCOUNT's
+ * stored `analyticsCookies` consent (features/preferences/dataUsage.ts) — never
+ * on anything the request claims. Operational events and accounts that never
+ * answered are unaffected.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -79,6 +85,10 @@ export async function POST(request: NextRequest) {
         /* unserializable → drop */
       }
     }
+    // The consent answers are the account's, read from the account below. A
+    // client posting its own `consent` field would be writing a fake answer
+    // into the ledger admins read, so those keys never get stored.
+    metadata = stripClientConsentFields(metadata);
 
     // ── Attribute to the signed-in user when a session cookie is present ──
     // Same resolution path as every authenticated API route (getSession reads
@@ -89,6 +99,15 @@ export async function POST(request: NextRequest) {
       userId = session?.userId ?? null;
     } catch {
       userId = null;
+    }
+
+    // ── Consent gate (server-side, authoritative) ──
+    // Analytics/cookie-dependent categories are dropped for accounts that
+    // turned analytics cookies OFF. Anonymous events and accounts that never
+    // answered keep flowing — an absent consent is not a refusal, and a
+    // classifier or DB problem must not silently kill production telemetry.
+    if (isAnalyticsCategoryEvent(rawKind) && !(await analyticsConsentAllowed(userId))) {
+      return NextResponse.json({ ok: true, id: null, stored: false, reason: 'consent' });
     }
 
     const row = await prisma.activityEvent.create({

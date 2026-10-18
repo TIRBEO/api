@@ -356,6 +356,10 @@ const ROUTE_LIMITS: Record<string, number> = {
      proves the caller with a shared token, which is the actual control here. */
   'internal/profile': 600,
   'feedback': 5,
+  // Staff read-back of the rows `feedback` writes. A list, so it is polled a
+  // lot more than it is posted to; the authorization inside the handler is the
+  // actual control, this only stops a runaway admin screen hammering the DB.
+  'admin/feedback': 30,
   'waitlist': 5 };
 
 import { getCachedRedisClient } from '@/infrastructure/db/redis';
@@ -474,8 +478,15 @@ export async function checkRateLimitWithInfo(
     try {
       const window = Math.floor(Date.now() / WINDOW_MS);
       const redisKey = `ratelimit:${key}:${window}`;
-      const count = await r.incr(redisKey);
-      if (count === 1) await r.pexpire(redisKey, WINDOW_MS);
+      // The increment and its expiry go out as one queue. Two separate commands
+      // leave a window in which the process can die after the INCR and before
+      // the PEXPIRE — and a counter key with no TTL never rolls over, so that
+      // caller is rate limited for good. Renewing the TTL on every hit is
+      // harmless: the key names its own window, so a fresh expiry only delays
+      // the eviction of a bucket that is already out of use.
+      const reply = await r.multi().incr(redisKey).pexpire(redisKey, WINDOW_MS).exec();
+      const count = Number(reply?.[0]?.[1]);
+      if (reply?.[0]?.[0] || !Number.isFinite(count)) throw reply?.[0]?.[0] || new Error('bad INCR reply');
       if (count > max) {
         recordRateLimitHit(ipFromKey(key));
         recordMetrics(ipFromKey(key), key, true);

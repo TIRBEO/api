@@ -118,8 +118,11 @@ export async function checkRateLimit(prefix: string, limit = 20, windowSec = 60)
   if (redis) {
     const key = `${prefix}:${Math.floor(Date.now() / (windowSec*1000))}`;
     try {
-      const count = await redis.incr(key);
-      if (count === 1) await redis.expire(key, windowSec);
+      // One queue, so a death between the two commands cannot leave a bucket
+      // with no TTL — that counter would never roll over.
+      const reply = await redis.multi().incr(key).pexpire(key, windowSec * 1000).exec();
+      const count = Number(reply?.[0]?.[1]);
+      if (reply?.[0]?.[0] || !Number.isFinite(count)) throw reply?.[0]?.[0] || new Error('bad INCR reply');
       return { allowed: count <= limit, remaining: Math.max(0, limit - count) };
     } catch { /* Redis error → fall through to Postgres */ }
   }
@@ -253,13 +256,13 @@ export async function createNotification(input: CreateNotifInput) {
         targetUserId,
         input.title,
         input.body || '',
-        input.link || '/account/notifications',
+        input.link || '/settings/notifications',
         input.icon || undefined,
       );
     } catch { /* beams not configured */ }
 
     void import('@/infrastructure/push/push-notifications').then(m=> m.sendPushNotification(targetUserId, {
-      title: input.title, body: input.body || '', icon: input.icon || undefined, url: input.link || '/account/notifications', tag: input.type,
+      title: input.title, body: input.body || '', icon: input.icon || undefined, url: input.link || '/settings/notifications', tag: input.type,
     }).catch(()=>{})).catch(()=>{});
   }
 // Per-notification mail is decided by the category toggles alone: the batched
@@ -281,7 +284,7 @@ export async function createNotification(input: CreateNotifInput) {
         // link itself is usually a dashboard path (e.g. /support/tickets/x).
         const resolved = input.link
           ? (/^https?:\/\//i.test(input.link) ? input.link : `${base}${input.link}`)
-          : `${base}/account/notifications`;
+          : `${base}/settings/notifications`;
         return sendTemplateEmail(email, 'notification_digest', {
           name: user.profile?.name || email, count: '1',
           digestItems: cardItem(escapeHtml(input.title), escapeHtml(input.body || '')),

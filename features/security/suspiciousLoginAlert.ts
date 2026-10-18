@@ -1,5 +1,5 @@
 import { prisma } from '@/infrastructure/db/prisma';
-import { sendTemplateEmail } from '@/features/email/email';
+import { sendTemplateEmailAfter } from '@/features/email/email';
 import { describeDevice } from '@/features/notifications/notifications';
 import { recordDeviceSeen } from '@/features/captcha/risk';
 import { resolveLoginLocation } from '@/shared/geo';
@@ -25,9 +25,49 @@ import { resolveLoginLocation } from '@/shared/geo';
  */
 
 const ALERT_KIND = 'auth.suspicious_login_alert';
+// The row written when a sign-in was flagged but no mail went out — kept apart
+// from ALERT_KIND on purpose: `shouldSendSuspiciousLoginAlert` uses ALERT_KIND
+// rows as its "already alerted recently" backstop, so a skipped send must not
+// be counted as one or it would silently mute every later alert.
+const ALERT_SKIPPED_KIND = 'auth.suspicious_login_alert_skipped';
+/** The account's own choice about this alert, stored in the generic settings
+    bag (`preferences.misc.settings`) by the two-factor screen. The client has
+    always written it; nothing read it, so the switch did nothing. */
+const ALERT_PREF_KEY = 'twoFactorAlertSuspicious';
 // Backstop for sign-ins with no usable device fingerprint (curl, some bots):
 // never mail the same account more than once per window.
 const ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Does this account want a new-sign-in email? Default ON.
+ *
+ * Only an explicit answer turns it off: an account that has never seen the
+ * switch, a malformed bag, and a failed read all keep the alert. A security
+ * notification must never be lost because a preference row is missing.
+ */
+export async function loadSuspiciousLoginAlertPref(userId: string): Promise<boolean> {
+  try {
+    const row = await prisma.userPreferences.findUnique({
+      where: { userId },
+      select: { misc: true } });
+    const misc = row?.misc && typeof row.misc === 'object' && !Array.isArray(row.misc)
+      ? row.misc as Record<string, any> : {};
+    const settings = misc.settings && typeof misc.settings === 'object' && !Array.isArray(misc.settings)
+      ? misc.settings as Record<string, any> : {};
+    const value = settings[ALERT_PREF_KEY];
+    if (typeof value === 'boolean') return value;
+    // The bag is client-writable JSON, so accept the string forms too rather
+    // than letting "false" read as an unanswered question.
+    if (typeof value === 'string') {
+      const t = value.trim().toLowerCase();
+      if (t === 'false' || t === '0' || t === 'off') return false;
+      if (t === 'true' || t === '1' || t === 'on') return true;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
 
 type HeaderLike = { get(name: string): string | null };
 
@@ -86,12 +126,51 @@ export async function shouldSendSuspiciousLoginAlert(args: {
 export async function sendSuspiciousLoginAlert(input: SuspiciousLoginAlertInput): Promise<boolean> {
   try {
     if (!input.email) return false;
+
+    // The account's choice, read server-side. The ledger still records that a
+    // suspicious sign-in happened — opting out of the email is not opting out
+    // of the record, and support answering "did anyone notice?" needs the row.
+    if (!(await loadSuspiciousLoginAlertPref(input.userId))) {
+      await prisma.activityEvent
+        .create({
+          data: {
+            userId: input.userId,
+            kind: ALERT_SKIPPED_KIND,
+            title: 'New sign-in alert not sent (turned off)',
+            severity: 'info',
+            ipAddress: input.ip || null,
+            userAgent: input.userAgent || null,
+            metadata: { method: input.method || 'password', reason: 'user_preference', prefKey: ALERT_PREF_KEY } as never,
+          },
+        })
+        .catch(() => {});
+      return false;
+    }
+
     if (!(await shouldSendSuspiciousLoginAlert({ userId: input.userId, fingerprint: input.fingerprint }))) {
+      // A known device on a moving IP, or an alert already mailed this window.
+      // Still a real suspicious sign-in — ledger line, no email.
+      await prisma.activityEvent
+        .create({
+          data: {
+            userId: input.userId,
+            kind: ALERT_SKIPPED_KIND,
+            title: 'New sign-in seen; no alert needed',
+            severity: 'info',
+            ipAddress: input.ip || null,
+            userAgent: input.userAgent || null,
+            metadata: { method: input.method || 'password', reason: 'known_device_or_recent_alert' } as never,
+          },
+        })
+        .catch(() => {});
       return false;
     }
 
     const location = resolveLoginLocation(input.headers ?? { get: () => null });
-    await sendTemplateEmail(input.email, 'suspicious_login', {
+    // Off the sign-in path: whoever is signing in has their session back before
+    // the mail provider has answered, and the alert is scheduled rather than
+    // merely started, so a frozen function cannot lose it.
+    sendTemplateEmailAfter(input.email, 'suspicious_login', {
       name: input.name || input.email.split('@')[0],
       loginTime: new Date().toLocaleString(),
       device: describeDevice(input.userAgent),

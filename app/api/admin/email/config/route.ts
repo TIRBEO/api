@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withAdmin } from '@/features/auth/role-guard';
 
-export const GET = withAdmin(async (request, session) => {
+export const GET = withAdmin(async (_request, _session) => {
 
   const config = await prisma.emailConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
   if (!config) {
@@ -11,7 +11,7 @@ export const GET = withAdmin(async (request, session) => {
   return NextResponse.json({ ...config, apiKey: config.resendApiKey, fromEmail: config.defaultFromEmail, fromName: config.defaultFromName, enabled: true });
 });
 
-export const PUT = withAdmin(async (request, session) => {
+export const PUT = withAdmin(async (request, _session) => {
 
   const body: any = await request.json();
   const { provider, apiKey, smtpHost, smtpPort, smtpUser, smtpPass, fromEmail, fromName } = body;

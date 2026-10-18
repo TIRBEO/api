@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin } from '@/features/auth/http-guards';
 import { sendEmail } from '@/features/email/email';
+import { EMAIL_CACHE_KEYS, invalidateConfigCache, invalidateEmailTemplate } from '@/features/email/emailCache';
 import { z } from 'zod';
 
 // The email_settings table is gone — admin config now lives in the
@@ -66,6 +67,8 @@ export async function emailConfigHandler(request: NextRequest) {
         update: { value: merged },
         create: { key: EMAIL_CONFIG_KEY, value: merged, description: 'Email provider + sender configuration' },
       });
+      // The held config is this process's copy of the row that just changed.
+      invalidateConfigCache(EMAIL_CACHE_KEYS.config);
       // Never echo plaintext secrets back — mask exactly like the GET branch.
       const { apiKey: patchedKey, smtpPass: patchedPass, resendApiKey: patchedResend, ...patchedSafe } = (row.value as Record<string, any>) || {};
       return NextResponse.json({
@@ -129,6 +132,7 @@ export async function emailTemplatesHandler(request: NextRequest) {
           variables: (parsed.data.variables ?? []) as any,
         },
       });
+      await invalidateEmailTemplate(slug);
       return NextResponse.json(templateForUi(template), { status: 201 });
     }
 
@@ -177,11 +181,13 @@ export async function emailTemplateDetailHandler(request: NextRequest, name: str
           ...(parsed.data.variables !== undefined ? { variables: parsed.data.variables as any } : {}),
         },
       });
+      await invalidateEmailTemplate(slug);
       return NextResponse.json(templateForUi(updated));
     }
 
     if (request.method === 'DELETE') {
       await prisma.emailTemplate.delete({ where: { slug } });
+      await invalidateEmailTemplate(slug);
       return NextResponse.json({ error: 'Deleted' }, { status: 200 });
     }
 

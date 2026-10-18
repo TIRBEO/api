@@ -112,8 +112,8 @@ export async function availableReauthMethods(userId: string): Promise<ReauthMeth
   return (await proofOptions(userId)).methods;
 }
 
-/** The methods list for the 403, plus whether the account has a real second
- *  factor at all — "it has none" is what the anti-lockout fallback keys on. */
+/** The doors this account can open, which is also the answer to the one
+ *  question the caller asks: is there any proof it could give at all. */
 async function proofOptions(userId: string): Promise<{ methods: ReauthMethod[]; hasSecondFactor: boolean }> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -124,16 +124,16 @@ async function proofOptions(userId: string): Promise<{ methods: ReauthMethod[]; 
     },
   }).catch(() => null);
 
-  const hasSecondFactor =
-    !!user && (!!user.passwordHash || !!user.security?.totpSecret || (user._count?.passkeys ?? 0) > 0);
-
   const methods: ReauthMethod[] = [];
   if ((user?._count?.passkeys ?? 0) > 0) methods.push('passkey');
   if (user?.passwordHash) methods.push('password');
   if (user?.security?.totpSecret) methods.push('totp');
   if (await signInEmailOf(userId).catch(() => null)) methods.push('code');
 
-  return { methods, hasSecondFactor };
+  // The emailed code counts. Listing it as a door and then waving the account
+  // past it would mean a passwordless account — the common OAuth one — could
+  // do every sensitive thing with nothing but the cookie it already had.
+  return { methods, hasSecondFactor: methods.length > 0 };
 }
 
 /**
@@ -351,9 +351,10 @@ async function checkProof(
     };
   }
 
-  // No proof supplied. If the account has NO possible second factor (no
-  // password, no passkeys, no TOTP), demanding one would hard-lock the
-  // account — allow the action and mark the proof absent.
+  // No proof supplied. If the account has no door at all — no password, no
+  // passkey, no TOTP, no sign-in address it could be emailed a code to —
+  // demanding one would hard-lock the account. Allow the action, mark the
+  // proof absent. Every account with even one way to prove itself gets asked.
   const { methods, hasSecondFactor: hasFactor } = await proofOptions(sessionUserId);
   if (!hasFactor) return { ok: true, method: 'none', body };
 

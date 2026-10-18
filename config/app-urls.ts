@@ -84,14 +84,10 @@ export function getFormsBaseUrl(): string {
   return `https://forms.${appDomain}`;
 }
 
-/** Support app base URL — support lives INSIDE the dashboard at /support/tickets. */
+/** Support app base URL — support is a screen inside the settings app, at
+ *  /settings/help/support, so it is the dashboard host with no path of its own. */
 export function getSupportBaseUrl(): string {
   return getDashboardBaseUrl();
-}
-
-/** Full URL to a support ticket inside the dashboard. */
-export function getSupportTicketUrl(ticketId: string): string {
-  return `${getDashboardBaseUrl()}/support/tickets/${ticketId}`;
 }
 
 /** Full URL to a form's detail page in the forms app. */

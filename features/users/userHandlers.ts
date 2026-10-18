@@ -7,7 +7,8 @@ import { maskEmail } from '@/features/auth/recovery-email';
 import { hashPassword, verifyPassword } from '@/features/auth/password';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/features/auth/otp';
 import { jsonUnauthorized } from '@/shared/response';
-import { sendTemplateEmail } from '@/features/email/email';
+import { imageBytesMatchType } from '@/features/media/imageSecurity';
+import { sendTemplateEmailAfter } from '@/features/email/email';
 import { createNotification, describeDevice, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs } from '@/features/notifications/notifications';
 import { sanitizeInput } from '@/features/security/security';
 import { verifyMergeToken } from '@/features/auth/jwt';
@@ -19,6 +20,9 @@ import { createAuditEvent, humanTitle } from '@/features/security/audit';
 import { coordsByLoginAttempt } from '@/features/security/loginCoords';
 import { logSecurityEvent } from '@/features/security/security';
 import { originFromRequest } from '@/features/activity/recordChange';
+import {
+  FORBIDDEN_SETTINGS_KEYS, SETTINGS_LIMITS, containsForbiddenSettingsKey,
+  isStorableSettingsValue, settingsBagBytes } from '@/features/users/settingsBag';
 import { readRecoveryContact, setRecoveryContact } from '@/features/identity/tirbeo';
 import { revokeLongLivedSessions } from '@/features/auth/session';
 import { secondFactorBlocker } from '@/features/auth/second-factor';
@@ -60,6 +64,16 @@ export function bustNotificationsCache(userId: string) {
 // Cache for GET /api/preferences — dashboard polls this on every page load.
 // 10s TTL: preferences rarely change, and bust on PATCH.
 const preferencesCache = createTtlCache<any>(10_000, 2000, 'preferences');
+const PREFS_CACHE_KEY = (userId: string) => `prefs:${userId}`;
+
+/** Cleared on every write this file makes to `appearance`/`privacy`, so the
+ *  settings screen never shows the value the account just changed. Onboarding
+ *  writes `appearance` too, from a module that cannot import this one without a
+ *  cycle — there the 10s TTL is the bust, and the staleness is a person's own
+ *  theme choice they just picked. */
+export function bustPreferencesCache(userId: string) {
+  preferencesCache.delete(PREFS_CACHE_KEY(userId));
+}
 
 // Cache for GET /api/user/activity — activity page polls this.
 // 5s TTL: activity logs are append-only and stale data is acceptable.
@@ -68,11 +82,6 @@ const activityCache = createTtlCache<{ events: any[]; total: number }>(5_000, 20
 // Cache for GET /api/profile/public — public profiles rarely change.
 // 30s TTL: safe for public data, busts naturally.
 const publicProfileCache = createTtlCache<any>(30_000, 2000, 'publicProfile');
-
-// Debounce for POST /api/heartbeat — dashboard polls this every ~30s.
-// Skip the DB write if we already updated within the last 25s.
-const heartbeatDebounce = new Map<string, number>();
-const HEARTBEAT_DEBOUNCE_MS = 25_000;
 
 const PROFILE_FIELD_LABELS: Record<string, string> = {
   name: 'Display name', username: 'Username', photoUrl: 'Profile photo',
@@ -314,6 +323,7 @@ export async function extendedProfileHandler(request: NextRequest) {
           where: { userId: session.userId },
           create: { userId: session.userId, appearance: nextAppearance as any },
           update: { appearance: nextAppearance as any } });
+        bustPreferencesCache(session.userId);
       }
 
       // What this write intended, in wire terms, so it can be diffed against
@@ -388,7 +398,7 @@ export async function extendedProfileHandler(request: NextRequest) {
             body: hasValue
               ? `Your ${label.toLowerCase()} was changed to "${displayValue}".`
               : `Your ${label.toLowerCase()} was removed.`,
-            link: '/account/profile',
+            link: '/settings/edit-profile',
             metadata: { field, from: prev[field] ?? null, to: displayValue } }).catch((e) => console.error('[NOTIFICATION]', e?.message));
         }
       }
@@ -458,10 +468,10 @@ export async function changePasswordHandler(request: NextRequest) {
     const userEmail = (await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } }))?.email || '';
     if (userEmail) {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
-      sendTemplateEmail(userEmail, 'password_changed', {
+      sendTemplateEmailAfter(userEmail, 'password_changed', {
         name: userEmail.split('@')[0],
         changedAt: new Date().toLocaleString(),
-        ipAddress: ip }).catch(() => {});
+        ipAddress: ip });
     }
 
     const loginIp = getClientIpFromRequest(request);
@@ -471,7 +481,7 @@ export async function changePasswordHandler(request: NextRequest) {
       type: 'security',
       title: 'Password changed',
       body: `Your password was changed from ${loginDevice} (IP ${loginIp || 'unknown'}). All other sessions were signed out.`,
-      link: '/account/security',
+      link: '/settings/security',
       metadata: { ip: loginIp, device: loginDevice, method: 'Password' },
       skipEmail: true }).catch((e) => console.error('[NOTIFICATION]', (e as Error)?.message));
 
@@ -757,7 +767,7 @@ export async function oauthUnlinkHandler(request: NextRequest, provider: string)
       type: 'security',
       title: 'Account disconnected',
       body: `Your ${provider} account was unlinked from Tirbeo. You can no longer sign in with it until you reconnect it.`,
-      link: '/account/connected-apps' }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+      link: '/settings/connected-apps' }).catch((e) => console.error('[NOTIFICATION]', e?.message));
 
     return NextResponse.json({ ok: true, message: `${provider} disconnected` });
   } catch (err: any) {
@@ -816,7 +826,7 @@ export async function integrationsHandler(request: NextRequest) {
         type: 'security',
         title: `${PROVIDER_NAMES[provider]} disconnected`,
         body: `Your ${PROVIDER_NAMES[provider]} sign-in link was removed.`,
-        link: '/account/connected-apps' }).catch((e) => console.error('[NOTIFICATION]', e?.message));
+        link: '/settings/connected-apps' }).catch((e) => console.error('[NOTIFICATION]', e?.message));
       return NextResponse.json({ ok: true, connections: await readConnections() });
     }
 
@@ -1407,12 +1417,19 @@ export async function preferencesHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const account = await prisma.user.findUnique({ where: { id: session.userId }, select: { id: true } });
-    if (!account) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+    const cacheKey = PREFS_CACHE_KEY(session.userId);
+    if (request.method === 'GET') {
+      const cached = preferencesCache.get(cacheKey);
+      if (cached) return NextResponse.json(cached);
+    }
 
     // user_preferences is the single source of truth: theme/language/timezone in
     // `appearance`, and the consent switches in `misc.consents` (where the old
     // users.consents column moved to).
+    //
+    // There is no separate "does this account exist" read first: a session only
+    // exists while its account does (`user_sessions.user` cascades on delete), so
+    // the lookup below answers the same question for free.
     const prefsRow = await prisma.userPreferences.findUnique({
       where: { userId: session.userId },
       select: { appearance: true, privacy: true, misc: true } });
@@ -1425,13 +1442,15 @@ export async function preferencesHandler(request: NextRequest) {
       allowCrashReports: privacy.allowCrashReports ?? miscConsents.allowCrashReports ?? true };
 
     if (request.method === 'GET') {
-      return NextResponse.json({
+      const payload = {
         ok: true,
         preferences: {
           theme: appearance.theme ?? 'system',
           language: appearance.language ?? 'en',
           timezone: appearance.timezone ?? 'UTC',
-          privacy: currentPrivacy } });
+          privacy: currentPrivacy } };
+      preferencesCache.set(cacheKey, payload);
+      return NextResponse.json(payload);
     }
 
     if (request.method === 'PATCH' || request.method === 'PUT') {
@@ -1469,6 +1488,7 @@ export async function preferencesHandler(request: NextRequest) {
             ...(appearanceChanged ? { appearance: nextAppearance as any } : {}),
             ...(privacyChanged ? { privacy: nextPrivacy as any } : {}),
             ...(nextMisc ? { misc: nextMisc as any } : {}) } });
+        bustPreferencesCache(session.userId);
       }
 
       // Record consent changes in the audit log with full details.
@@ -1509,6 +1529,9 @@ export async function preferencesHandler(request: NextRequest) {
 // bag once and merge-write just the key it changed. Structured choices that
 // other services read (theme/language/timezone/privacy) keep their own
 // semantic columns via /api/preferences — this bag is for the rest.
+//
+// The bounds live in features/users/settingsBag.ts: the bag is not whitelisted
+// (a dropped key is a lost piece of somebody's saved state), it is measured.
 // ═══════════════════════════════════════════════════════════════════
 export async function settingsHandler(request: NextRequest) {
   try {
@@ -1575,6 +1598,54 @@ export async function settingsHandler(request: NextRequest) {
         for (const k of ['saveLoginInfo', 'require2FA', 'twoFactorRequireForActions']) delete incoming[k];
       }
 
+      const rejectedKey = Object.keys(incoming ?? {}).find((k) => FORBIDDEN_SETTINGS_KEYS.has(k));
+      if (rejectedKey) {
+        return NextResponse.json(
+          { error: `Not a valid setting name: ${rejectedKey}`, code: 'INVALID_SETTINGS_KEY' },
+          { status: 400 });
+      }
+      const tooLongKey = Object.keys(incoming ?? {}).find((k) => k.length > SETTINGS_LIMITS.keyBytes);
+      if (tooLongKey) {
+        return NextResponse.json(
+          { error: `Setting names are limited to ${SETTINGS_LIMITS.keyBytes} characters`, code: 'SETTINGS_KEY_TOO_LONG' },
+          { status: 400 });
+      }
+      if (containsForbiddenSettingsKey(incoming)) {
+        return NextResponse.json(
+          { error: 'Settings values may not contain reserved keys', code: 'INVALID_SETTINGS_KEY' },
+          { status: 400 });
+      }
+
+      // Values that are not JSON (functions, symbols, NaN, over-deep nesting)
+      // are dropped, not stored: they would vanish on the read anyway, and a
+      // half-stored value that changes shape between write and read is worse
+      // than a named, logged omission.
+      const ignoredKeys: string[] = [];
+      for (const key of Object.keys(incoming ?? {})) {
+        const value = (incoming as Record<string, unknown>)[key];
+        if (!isStorableSettingsValue(value)) {
+          ignoredKeys.push(key);
+          delete (incoming as Record<string, unknown>)[key];
+          continue;
+        }
+        let valueBytes = 0;
+        try { valueBytes = JSON.stringify(value)?.length ?? 0; } catch { valueBytes = Number.POSITIVE_INFINITY; }
+        if (valueBytes > SETTINGS_LIMITS.valueBytes) {
+          return NextResponse.json(
+            {
+              error: `One setting is too large to store (limit ${SETTINGS_LIMITS.valueBytes} characters).`,
+              code: 'SETTINGS_VALUE_TOO_LARGE',
+              key,
+              limitBytes: SETTINGS_LIMITS.valueBytes,
+              actualBytes: Number.isFinite(valueBytes) ? valueBytes : null,
+            },
+            { status: 413 });
+        }
+      }
+      if (ignoredKeys.length) {
+        console.warn(`[SETTINGS] ignored non-JSON values for ${session.userId}: ${ignoredKeys.join(', ')}`);
+      }
+
       const keys = Object.keys(incoming ?? {});
 
       // The change ledger answers "what changed?" — so every accepted write
@@ -1609,6 +1680,26 @@ export async function settingsHandler(request: NextRequest) {
       const misc = (row?.misc && typeof row.misc === 'object' ? row.misc : {}) as Record<string, any>;
       const settings = { ...(misc.settings ?? {}) } as Record<string, unknown>;
       for (const key of keys) settings[key] = incoming[key];
+
+      // The bound that matters is the MERGED bag, not this request: a client
+      // that sends 1 KB at a time can otherwise grow the row forever.
+      const bagBytes = settingsBagBytes(settings);
+      if (bagBytes === null) {
+        return NextResponse.json(
+          { error: 'These settings could not be stored as saved.', code: 'INVALID_SETTINGS_VALUE' },
+          { status: 400 });
+      }
+      if (bagBytes > SETTINGS_LIMITS.totalBytes) {
+        return NextResponse.json(
+          {
+            error: 'Your saved settings are too large to store. Remove some and try again.',
+            code: 'SETTINGS_BAG_TOO_LARGE',
+            limitBytes: SETTINGS_LIMITS.totalBytes,
+            actualBytes: bagBytes,
+          },
+          { status: 413 });
+      }
+
       const nextMisc = { ...misc, settings };
 
       await prisma.userPreferences.upsert({
@@ -1751,6 +1842,11 @@ export async function avatarUploadHandler(request: NextRequest) {
           return NextResponse.json({ error: 'Unsupported image type' }, { status: 400 });
         }
         const buffer = Buffer.from(await file.arrayBuffer());
+        // `file.type` is what the client said, not what the bytes are; the
+        // magic numbers are the only claim here the upload cannot make itself.
+        if (!imageBytesMatchType(buffer, file.type)) {
+          return NextResponse.json({ error: 'That file is not the image it claims to be.' }, { status: 400 });
+        }
         const ext = file.type.split('/')[1] || 'jpeg';
         const r2Key = `avatars/${session.userId}/${Date.now()}.${ext}`;
         try {
@@ -1821,31 +1917,13 @@ export async function avatarUploadHandler(request: NextRequest) {
       type: 'system',
       title: 'Profile photo updated',
       body: `Your profile photo was updated.`,
-      link: '/account/profile',
+      link: '/settings/edit-profile',
       metadata: { field: 'photoUrl' } }).catch((e) => console.error('[NOTIFICATION]', e?.message));
 
     return NextResponse.json({ ok: true, photoUrl });
   } catch (err: any) {
     console.error('[AVATAR UPLOAD]', err?.message || err);
     return NextResponse.json({ error: 'Failed to update avatar' }, { status: 500 });
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// HEARTBEAT HANDLER
-// ═══════════════════════════════════════════════════════════════════
-export async function heartbeatHandler(request: NextRequest) {
-  try {
-    const session = await getSession(request);
-    if (!session) return jsonUnauthorized();
-
-    await prisma.userSession.updateMany({
-      where: { userId: session.userId, status: 'active' },
-      data: { updatedAt: new Date() } }).catch(() => {});
-
-    return NextResponse.json({ ok: true });
-  } catch {
-    return NextResponse.json({ ok: true });
   }
 }
 
@@ -2286,8 +2364,9 @@ export async function exportDataHandler(request: NextRequest) {
       console.error('[EXPORT LEDGER]', err?.message || err);
     }
     try {
-      const { sendTemplateEmail } = await import('@/features/email/email');
-      await sendTemplateEmail(user.email, 'export_ready', {
+      // The archive is already gathered; the notice about it must not be part of
+      // how long the download takes to start.
+      sendTemplateEmailAfter(user.email, 'export_ready', {
         name: user.profile?.name || user.email,
         exportedAt: exportedAt.toLocaleString() });
     } catch (err: any) {
@@ -2413,11 +2492,11 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
       logSecurityEvent({ request, userId: session.userId, eventType: 'security.deletion_scheduled', severity: 'warning', details: { reason: reason || 'user_requested' } }).catch(() => {});
 
       if (email) {
-        const { sendTemplateEmail } = await import('@/features/email/email');
-        sendTemplateEmail(email, 'account_deleted', {
+        const { getDashboardBaseUrl } = await import('@/config/app-urls');
+        sendTemplateEmailAfter(email, 'account_deleted', {
           name: email,
           dateLabel: finalAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-          dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }).catch(() => {});
+          dashboardUrl: getDashboardBaseUrl() });
       }
 
       return NextResponse.json({
@@ -2465,6 +2544,12 @@ export async function publicProfileHandler(request: NextRequest) {
 
     if (!userId) return NextResponse.json({ error: 'userId required' }, { status: 400 });
 
+    // What this endpoint answers is the same for every viewer — id, handle,
+    // join date, name and photo — so one entry per profile serves them all.
+    const cacheKey = `publicProfile:${userId}`;
+    const cached = publicProfileCache.get(cacheKey);
+    if (cached) return NextResponse.json(cached);
+
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -2472,12 +2557,14 @@ export async function publicProfileHandler(request: NextRequest) {
         profile: { select: { name: true, photoUrl: true } } } });
 
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-    return NextResponse.json({ ok: true, profile: {
+    const payload = { ok: true, profile: {
       id: user.id,
       name: user.profile?.name ?? null,
       username: user.username,
       photoUrl: user.profile?.photoUrl ?? null,
-      createdAt: user.createdAt } });
+      createdAt: user.createdAt } };
+    publicProfileCache.set(cacheKey, payload);
+    return NextResponse.json(payload);
   } catch (err: any) {
     console.error('[PUBLIC PROFILE]', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch profile' }, { status: 500 });

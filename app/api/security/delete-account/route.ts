@@ -173,7 +173,7 @@ export async function GET(request: NextRequest) {
         ? Math.max(0, Math.ceil((finalAt.getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
         : null,
     });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json({ error: 'Failed' }, { status: 500 });
   }
 }
@@ -230,7 +230,7 @@ export async function PATCH(request: NextRequest) {
       success: true,
       message: 'Deletion cancelled.',
     });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json({ error: 'Failed' }, { status: 500 });
   }
 }

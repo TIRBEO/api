@@ -3,6 +3,28 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { getDashboardBaseUrl, getApiBaseUrl } from '@/config/app-urls';
 import { getGlobalEmailSwitches, SWITCH_BY_CATEGORY } from '@/features/email/emailSwitches';
 
+/**
+ * Who owns an address.
+ *
+ * Two reads on the send path ask this exact question — the suppression gate and
+ * the unsubscribe link in the footer — so it lives in one function rather than
+ * being written twice.
+ *
+ * Deliberately NOT cached. The answer is only ever used to look up what this
+ * person agreed to, so a stale entry is a stale consent decision: an address
+ * recycles between accounts, and for the length of a TTL the next recipient
+ * would inherit the previous one's toggles. The reads that carry a consent
+ * answer (this, and the preferences it feeds) stay live; everything else about a
+ * send is cached.
+ */
+async function userIdForAddress(address: string): Promise<string | null> {
+  const row = await prisma.userEmail.findFirst({
+    where: { address: address.toLowerCase() },
+    select: { userId: true },
+  });
+  return row?.userId ?? null;
+}
+
 /** Check if current time is within user's quiet hours window. Shared with notifications.ts. */
 export function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quietHoursStart?: string | null; quietHoursEnd?: string | null } | null | undefined): boolean {
   try {
@@ -140,7 +162,7 @@ export function verifyUnsubscribeToken(token: string): { userId: string; categor
 
 /** Build the manage-preferences URL. */
 export function getManagePreferencesUrl(): string {
-  return `${getDashboardBaseUrl()}/account/notifications`;
+  return `${getDashboardBaseUrl()}/settings/notifications`;
 }
 
 /**
@@ -152,12 +174,9 @@ export function getManagePreferencesUrl(): string {
 export async function buildUnsubscribeUrl(to: string): Promise<string | null> {
   try {
     // Emails live in UserEmail rows in the consolidated schema.
-    const emailRow = await prisma.userEmail.findFirst({
-      where: { address: to.toLowerCase() },
-      select: { userId: true },
-    });
-    if (!emailRow) return null;
-    const token = generateUnsubscribeToken(emailRow.userId, 'all');
+    const uid = await userIdForAddress(to);
+    if (!uid) return null;
+    const token = generateUnsubscribeToken(uid, 'all');
     const apiBase = getApiBaseUrl();
     return `${apiBase}/api/emails/unsubscribe?token=${encodeURIComponent(token)}&email=${encodeURIComponent(to.toLowerCase())}`;
   } catch {
@@ -176,14 +195,7 @@ export async function buildUnsubscribeUrl(to: string): Promise<string | null> {
 // that have no row, and an unresolvable address used to mean "let it through"
 // even though the account had switched the category off.
 async function getPrefsByAddress(address: string, userId?: string): Promise<{ userId: string; prefs: any } | null> {
-  let uid = userId || null;
-  if (!uid) {
-    const emailRow = await prisma.userEmail.findFirst({
-      where: { address: address.toLowerCase() },
-      select: { userId: true },
-    });
-    uid = emailRow?.userId || null;
-  }
+  const uid = userId || (await userIdForAddress(address));
   if (!uid) return null;
   const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
   const prefs = await loadNotificationPrefs(uid);

@@ -10,26 +10,13 @@ const nextConfig = {
   },
   // Dev-only: allow HMR/dev resources when browsing from the LAN device.
   allowedDevOrigins: ['192.168.1.123', 'localhost'],
-  typescript: {
-    ignoreBuildErrors: true,
-  },
-  // @tirbeo/types ships TypeScript source (no prebuilt dist) — Next must
-  // compile it like the other workspace packages.
+  // No `typescript.ignoreBuildErrors` — it was `true` here, which let red
+  // builds ship; `next build` typechecking is the gate.
   serverExternalPackages: ['ioredis', 'argon2', '@prisma/client', '@prisma/adapter-pg', 'pg'],
-  async rewrites() {
-    return {
-      beforeFiles: [
-        // Clean public URL for redeemed one-time share content — same
-        // handler, same access window; the browser only sees this path.
-        { source: '/share-file/:token', destination: '/api/cdn/share/:token/content' },
-      ],
-      afterFiles: [
-        // Public file URLs: cdn.tirbeo.com/u/<userId>/<folders>/<file>
-        // (also covers the API origin itself in dev)
-        { source: '/u/:path*', destination: '/api/cdn/u/:path*' },
-      ],
-    };
-  },
+  // The /u/* and /share-file/* rewrites that used to sit here aimed at
+  // /api/cdn/**, which no longer exists: files are stored in R2 (or the
+  // database) and handed back as their own URL, so nothing on this origin
+  // serves them and both rules were a two-hop way to reach a 404.
   async headers() {
     return [
       {

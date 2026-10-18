@@ -92,7 +92,10 @@ export async function rememberDeviceAccount(deviceId: string, userId: string): P
     const redis = getRedis();
     if (!redis) return;
     const key = deviceAccountsKey(deviceId);
-    await redis.hset(key, userId, String(Date.now()));
+    // The write and its expiry leave as one queue. Kept apart, a death between
+    // them leaves a `device:*` hash with no TTL — which is the one thing this
+    // 90-day window exists to prevent.
+    await redis.multi().hset(key, userId, String(Date.now())).expire(key, DEVICE_ACCOUNTS_TTL_S).exec();
     // Cap the list so a device doesn't accumulate unbounded history.
     const all: Record<string, string> = await redis.hgetall(key);
     const entries = Object.entries(all).sort((a, b) => Number(b[1]) - Number(a[1]));

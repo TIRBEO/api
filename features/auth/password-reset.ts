@@ -328,7 +328,7 @@ export async function confirmPasswordReset(
       type: 'security',
       title: 'Password changed',
       body: 'Your password has been successfully changed. All other sessions have been signed out.',
-      link: '/account/security',
+      link: '/settings/security',
       skipEmail: true,
     }).catch(() => {});
   } catch {

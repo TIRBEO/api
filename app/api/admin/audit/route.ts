@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAdmin } from '@/features/auth/role-guard';
 import { listAuditEvents, createAuditEvent } from '@/features/security/audit';
 
-export const GET = withAdmin(async (request, session) => {
+export const GET = withAdmin(async (request, _session) => {
 
   const sp = request.nextUrl.searchParams;
   const result = await listAuditEvents({

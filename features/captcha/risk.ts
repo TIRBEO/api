@@ -195,7 +195,7 @@ async function handleIpAbuse(ip: string): Promise<void> {
 }
 
 const limitCache = new Map<string, { max: number; exp: number }>();
-export async function checkWindowLimitDB(key: string, max: number, windowMs: number, ip?: string, email?: string): Promise<boolean> {
+export async function checkWindowLimitDB(key: string, max: number, windowMs: number, ip?: string): Promise<boolean> {
   // DB-configured max (30s cache) — unchanged behavior, one rare lookup.
   try {
     let lookup = '';

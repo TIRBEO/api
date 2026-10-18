@@ -931,7 +931,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
     type: 'security',
     title: 'Password reset by administrator',
     body: 'Your password was reset by an administrator. If you did not request this, contact support immediately.',
-    link: '/account/security' }).catch(() => {});
+    link: '/settings/security' }).catch(() => {});
 
   // Revoke all existing sessions so a compromised session can't outlive the reset
   const { revokeSessionFamilyByUser } = await import('@/features/auth/session');
