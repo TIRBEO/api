@@ -3,7 +3,6 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { createSession, revokeSession, setSessionCookie, clearSessionCookie, getSessionFromToken, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf } from '@/features/auth/session';
 import { COOKIE_NAME } from '@/features/auth/jwt';
 import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
-import { isIpBlocked, logSecurityEvent } from '@/features/security/security';
 
 const ROLE_HIERARCHY: Record<string, number> = {
   editor: 1,
@@ -12,23 +11,9 @@ const ROLE_HIERARCHY: Record<string, number> = {
   super_admin: 4,
 };
 
-async function checkIpBlock(request: NextRequest): Promise<NextResponse | null> {
-  try {
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || request.headers.get('x-real-ip') || '';
-    if (!ip || ip === 'unknown') return null;
-    const blocked = await isIpBlocked(ip);
-    if (!blocked) return null;
-    logSecurityEvent({
-      request: request as unknown as Request,
-      eventType: 'request.blocked_ip',
-      severity: 'warning',
-      details: { reason: 'Request from blocked IP', ip },
-    }).catch(() => {});
-    return jsonForbidden('Access blocked');
-  } catch {
-    return null;
-  }
-}
+// IP-level blocking is delegated to Cloudflare (WAF / rate rules) — the API
+// only enforces account-status blocks, so a flagged network can never lock
+// a real user out of their own account.
 
 export async function getSession(request: NextRequest) {
   // Try cookie auth first — wrapped in try/catch so DB errors don't prevent API key fallback
@@ -60,8 +45,6 @@ export async function getSession(request: NextRequest) {
 }
 
 export async function requireSession(request: NextRequest): Promise<{ userId: string; email: string } | NextResponse> {
-  const blocked = await checkIpBlock(request);
-  if (blocked) return blocked;
   const session = await getSession(request);
   if (!session) {
     return jsonUnauthorized();
@@ -89,8 +72,6 @@ export async function isAdmin(request: NextRequest) {
 }
 
 export async function requireAdmin(request: NextRequest): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
-  const blocked = await checkIpBlock(request);
-  if (blocked) return blocked;
   const session = await getSession(request);
   if (!session) return jsonUnauthorized();
   const role = await getAdminRole(session.userId);
@@ -105,8 +86,6 @@ export function roleAtLeast(userRole: string, minimumRole: string): boolean {
 }
 
 export async function requireRole(request: NextRequest, minimumRole: string): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
-  const blocked = await checkIpBlock(request);
-  if (blocked) return blocked;
   const session = await getSession(request);
   if (!session) return jsonUnauthorized();
   const userRole = await getAdminRole(session.userId);

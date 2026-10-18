@@ -5,7 +5,6 @@ import { withRequestOrigin } from '@/infrastructure/observability/requestContext
 import { jsonError, jsonForbidden } from '@/shared/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
 import { systemFaultRef } from '@/features/users/refcode';
-import { isIpBlocked } from '@/features/security/security';
 
 import {
   loginHandler,
@@ -268,10 +267,10 @@ const INTERNAL_ROUTES = [
 
 ];
 
-// The blocklist table is gone. IP blocks are Redis-backed now (isIpBlocked in
-// features/security/security.ts — same stale-tolerant contract, never throws),
-// and user blocks are derived from the consolidated account status:
-// banned | suspended | deletion_pending | deleted are the blocking states.
+// IP-level blocking is delegated to Cloudflare (WAF / rate rules) — the API
+// never rejects on IP. User blocks are derived from the consolidated
+// account status: banned | suspended | deletion_pending | deleted are the
+// blocking states.
 const USER_BLOCK_CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
 const USER_BLOCK_STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
 const BLOCKED_USER_STATUSES = new Set(['banned', 'suspended', 'deletion_pending', 'deleted', 'restricted']);
@@ -592,7 +591,11 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
 
   let blocked = false;
   try {
-    blocked = (await isIpBlocked(ip)) || (await isUserBlocked(session?.userId));
+    // Auth endpoints must run their own structured block flow (login of a
+    // banned/deletion-pending account returns the block payload that drives
+    // the appeal & cancel-deletion screens on accounts) — a blanket 403 here
+    // would turn those paths into a dead end.
+    blocked = !pathStr.startsWith('auth/') && (await isUserBlocked(session?.userId));
   } catch (e: any) {
     console.error('[HANDLER] block check failed:', e?.message);
     return NextResponse.json({ error: 'Database connection error' }, { status: 500 });
@@ -600,7 +603,7 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
 
   if (blocked) {
     console.warn(`[AUTH] Blocked request — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
-    return jsonForbidden('Your IP or account has been blocked');
+    return jsonForbidden('Your account has been blocked');
   }
 
   // Redirect user-facing paths to the dashboard instead of returning 404.

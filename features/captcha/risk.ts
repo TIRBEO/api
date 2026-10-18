@@ -1,6 +1,5 @@
 import { createHash } from 'crypto';
 import { prisma } from '@/infrastructure/db/prisma';
-import { isIpBlocked } from '@/features/security/security';
 import { isSuspiciousAsync } from '@/features/auth/suspicious-activity';
 
 export type RiskLevel = 'none' | 'invisible' | 'standard' | 'strong';
@@ -165,34 +164,12 @@ export function clearRateLimitsByPattern(pattern: string): void {
  * DB-backed rate limiting — per-user and per-IP, survives incognito.
  * All attempts are saved to ActivityEvent (kind: auth.attempt) so
  * counts are per-user in DB, not localStorage. Incognito cannot bypass.
- * Hundreds of attempts → temp IP block (1h), next time → permanent ban.
+ *
+ * Exhausting a window yields a plain 429 with a reset time — it never
+ * escalates into an IP block. IP-level blocking is Cloudflare's job
+ * (WAF / rate rules); an in-app blocklist kept locking real users out of
+ * shared NAT networks and CI/E2E traffic.
  */
-
-
-async function handleIpAbuse(ip: string): Promise<void> {
-  if (!ip || ip === 'unknown') return;
-  try {
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-    const count = await prisma.activityEvent.count({
-      where: { kind: 'auth.attempt', ipAddress: ip, createdAt: { gte: oneHourAgo } } });
-    if (count >= 100) {
-      const { getRedis } = await import('@/features/auth/redis');
-      const redis = getRedis();
-      const raw = redis ? await redis.hget('blocklist', `ip:${ip}`).catch(() => null) : null;
-      const existing = raw ? JSON.parse(raw) as { expiresAt?: string | null } : null;
-      const isTemp = existing?.expiresAt && new Date(existing.expiresAt) > new Date(Date.now() - 24 * 60 * 60 * 1000);
-      if (existing && !existing.expiresAt) return; // already permanent
-      const { blockTarget } = await import('@/features/security/security');
-      if (isTemp) {
-        // Second abuse within 24h → permanent ban
-        await blockTarget({ targetType: 'ip', targetId: ip, reason: 'Permanent ban: repeated hundreds of auth attempts', expiresAt: null });
-      } else {
-        // First abuse → temp block 1 hour
-        await blockTarget({ targetType: 'ip', targetId: ip, reason: 'Temp block: hundreds of auth attempts', expiresAt: new Date(Date.now() + 60 * 60 * 1000) });
-      }
-      }
-  } catch {}
-}
 
 const limitCache = new Map<string, { max: number; exp: number }>();
 export async function checkWindowLimitDB(key: string, max: number, windowMs: number, ip?: string): Promise<boolean> {
@@ -221,21 +198,12 @@ export async function checkWindowLimitDB(key: string, max: number, windowMs: num
     }
   } catch {}
   try {
-    if (ip && ip !== 'unknown') {
-      // 15s-cached blocklist check — memory hit on the hot path.
-      const { isIpBlocked } = await import('@/features/security/security');
-      if (await isIpBlocked(ip)) return false;
-    }
     // Counter via the Redis-backed limiter (in-memory mirror answers
     // already-exhausted windows without touching Redis; memory fallback when
     // Redis is down). No awaited DB round-trips on this path anymore.
     const { consumeGenericWindow } = await import('@/features/auth/verify-limits');
     const r = await consumeGenericWindow(key, max, windowMs);
     if (!r.ok) return false;
-    // Pre-account attempts (signup/login OTP) have no user row yet, and
-    // activity_events.user_id has a NOT-NULL FK to users(id), so an anonymous
-    // write can never succeed. Skip the DB log; abuse is still handled below.
-    if (ip) handleIpAbuse(ip).catch(()=>{});
     return true;
   } catch {
     const now = Date.now();
@@ -395,17 +363,6 @@ export async function computeRiskScore(input: RiskInput): Promise<RiskResult> {
 
   if (input.ip) {
     const recentSuccess = hasRecentLoginSuccess(input.ip);
-    checks.push(
-      (async () => {
-        const ok = await recentSuccess;
-        if (ok) return; // user already proved who they are — clear suspicion
-        const blocked = await isIpBlocked(input.ip || '');
-        if (blocked) {
-          score += 40;
-          reasons.push('IP is blocked');
-        }
-      })()
-    );
     checks.push(
       (async () => {
         const ok = await recentSuccess;
