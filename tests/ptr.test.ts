@@ -40,20 +40,22 @@ describe('ptr send gate', () => {
     expect(res.state).toBe('restart');
   });
 
-  it('does not let another device start over without a key', async () => {
+  it('lets any device start over when it presents no key at all', async () => {
+    // A missing key proves nothing — refusing it dead-ended honest users
+    // (new tab, phone↔laptop) for the key's whole TTL. Send volume is capped
+    // by the per-email/per-IP limits in the callers instead.
     issuePtr('t:steal', 'steal@example.com', DEVICE_A);
     const res = await checkPtr('t:steal', 'steal@example.com', '', DEVICE_B);
-    expect(res).toEqual({ state: 'invalid', reason: 'missing' });
+    expect(res.state).toBe('restart');
   });
 
   it('retires the previous key when a restart issues a new one', async () => {
     const stale = issuePtr('t:rotate', 'rot@example.com', DEVICE_A);
     const fresh = issuePtr('t:rotate', 'rot@example.com', DEVICE_A);
     expect(fresh).not.toBe(stale);
-    // Same device offering the dead key: a restart, not a 403.
+    // A dead key is an out-of-step client, wherever it came from: restart.
     expect(await checkPtr('t:rotate', 'rot@example.com', stale, DEVICE_A)).toEqual({ state: 'restart' });
-    // Another device holding that key is still refused.
-    expect(await checkPtr('t:rotate', 'rot@example.com', stale, DEVICE_B)).toEqual({ state: 'invalid', reason: 'unknown' });
+    expect(await checkPtr('t:rotate', 'rot@example.com', stale, DEVICE_B)).toEqual({ state: 'restart' });
   });
 
   it('treats a released pair as a fresh first request', async () => {

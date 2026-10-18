@@ -6,11 +6,14 @@ import { getRedis } from './redis';
  *
  * Every successful auth "send" (magic link, login OTP, password reset) issues
  * an opaque 24-hex key bound to the email, the method and the device that
- * asked. Any later send for that pair must present the live key — so a leaked
- * /magic-sent URL cannot be re-run from another device, and the resend
- * endpoints stop being a free email cannon. Keys are 96-bit random and expire
- * with the 15-minute link lifetime; wrong guesses are counted per IP by the
- * caller.
+ * asked. A resend that presents the live key from a foreign device is refused
+ * — that is the replay the gate exists to stop. A resend with no key (or a
+ * stale one) is allowed as a fresh start: with no client ever setting the
+ * __dfp cookie, the device signal is only a UA hash, and refusing these
+ * locked honest users out of their own reset flow. Email volume is capped by
+ * the per-email/per-IP limits in the callers. Keys are 96-bit random and
+ * expire with the 15-minute link lifetime; wrong guesses are counted per IP
+ * by the caller.
  */
 
 const PTR_TTL_MS = 15 * 60 * 1000;
@@ -111,44 +114,38 @@ export type PtrCheck =
 
 /**
  * Gate a send. No live ptr for (method, email) → first request: allow, and the
- * caller issues one after a successful send. Live ptr → the request must
- * present it, from the device that started the flow.
+ * caller issues one after a successful send. Live ptr + a key in the body →
+ * the key must match. A request with NO key at all is a restart, always.
  *
- * A request with no key at all is not treated as an attack when it comes from
- * the device that holds the live flow: that is a user who lost the key (new
- * tab, cleared storage, a page reload mid-flow) and is honestly starting over.
- * Telling them 403 "use the original link, or start again" while the stale key
- * sits in Redis for its whole 15-minute lifetime made "start again" impossible
- * and the reset flow a dead end. Cross-device replay — the case the gate
- * actually exists for — still fails the device comparison below.
+ * A missing key proves nothing about who is asking — it is what every honest
+ * client sends after losing the key (new tab, cleared storage, a phone/laptop
+ * switch, any UA drift), because the device signal is only a UA hash: nothing
+ * ever sets the __dfp cookie. 403-ing those made "start again" impossible
+ * until the stale key's 15-minute TTL ran out and turned the reset flow into
+ * a dead end, while anyone willing to wait (or to simply start a fresh flow
+ * for a different address) bypassed the block anyway. Send volume stays
+ * capped by the per-email/per-IP limits every caller applies. The one signal
+ * that still gets refused: the LIVE key arriving from a foreign device, or a
+ * key belonging to a different address — genuine replays of a forwarded flow.
  */
 export async function checkPtr(method: string, email: string, bodyPtr: unknown, device: string): Promise<PtrCheck> {
   const active = await readIdxPtr(method, email);
   if (!active) return { state: 'no-active' };
-  if (typeof bodyPtr !== 'string' || !bodyPtr) {
-    const rec = await readRec(active);
-    if (rec && rec.device === device) return { state: 'restart' };
-    return { state: 'invalid', reason: 'missing' };
-  }
+  if (typeof bodyPtr !== 'string' || !bodyPtr) return { state: 'restart' };
   if (!/^[a-f0-9]{24}$/.test(bodyPtr) || bodyPtr !== active) {
-    // A wrong-shaped or wrong guess: same verdict, no oracle on which part
-    // failed beyond device-vs-unknown.
-    const rec = /^[a-f0-9]{24}$/.test(bodyPtr || '') ? await readRec(bodyPtr as string) : null;
-    if (!rec) {
-      // An unknown key is usually the client holding one the server has since
-      // dropped (a dev restart, or a release after the flow completed). If the
-      // live flow belongs to this same device, that is a restart, not a
-      // replay — the client would otherwise keep offering the dead key and
-      // bounce off 403 until the old flow's TTL ran out.
-      const live = await readRec(active);
-      if (live && live.device === device) return { state: 'restart' };
-      return { state: 'invalid', reason: 'unknown' };
-    }
-    if (rec.email !== email.toLowerCase()) return { state: 'invalid', reason: 'email' };
-    return { state: 'invalid', reason: 'unknown' };
+    // A wrong-shaped key, an unknown one, or a retired one from this same
+    // flow (two tabs, a rotation): all mean the client is out of step, not
+    // that it is replaying somebody else's live flow — only a key that
+    // resolves to a *different address* proves that. Restart, and the send
+    // rotates a fresh key the client can keep up with.
+    const rec = /^[a-f0-9]{24}$/.test(bodyPtr) ? await readRec(bodyPtr) : null;
+    if (rec && rec.email !== email.toLowerCase()) return { state: 'invalid', reason: 'email' };
+    return { state: 'restart' };
   }
+  // The live key, presented here: the only strong signal in the system.
+  // Wrong device with the right key = replay of a forwarded flow — refuse.
   const rec = await readRec(active);
-  if (!rec) return { state: 'invalid', reason: 'unknown' };
+  if (!rec) return { state: 'restart' }; // idx/val desync — refuse to dead-end the client
   if (rec.email !== email.toLowerCase()) return { state: 'invalid', reason: 'email' };
   if (rec.device !== device) return { state: 'invalid', reason: 'device' };
   return { state: 'ok' };
