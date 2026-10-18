@@ -58,18 +58,33 @@ function shape(a: {
   };
 }
 
-/** POST /api/support/appeal { restrictionId, note } — or, with no session,
-    { email, password, restrictionId, note }. Files the appeal against the
-    caller's own restriction and answers with the row. */
+/** The caller's most recent NON-EXPIRED decision — what an appeal argues with
+    when the filer does not name a restriction. An open-ended row (endsAt
+    null) never expires; a dated one is live until its endsAt passes. */
+async function latestActiveRestrictionId(userId: string): Promise<string | null> {
+  const r = await prisma.userRestriction.findFirst({
+    where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] },
+    orderBy: { startedAt: 'desc' },
+    select: { id: true },
+  });
+  return r?.id ?? null;
+}
+
+/** POST /api/support/appeal { restrictionId?, note } — or, with no session,
+    { email, password, restrictionId?, note }. Files the appeal against the
+    caller's own restriction and answers with the row. `restrictionId` is
+    optional: a blocked person usually cannot see the id of the decision from
+    the sign-in screen, so when it is absent the appeal attaches to their most
+    recent live restriction (and 404s with `restriction_not_found` when there
+    is no decision to argue with). */
 export async function appealFileHandler(request: NextRequest) {
   try {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-    const restrictionId = typeof body.restrictionId === 'string' ? body.restrictionId : '';
+    const restrictionId = typeof body.restrictionId === 'string' && body.restrictionId.trim()
+      ? body.restrictionId.trim()
+      : '';
     const note = typeof body.note === 'string' ? body.note.trim() : '';
 
-    if (!restrictionId) {
-      return NextResponse.json({ error: 'restrictionId is required' }, { status: 400 });
-    }
     if (note.length < NOTE_MIN) {
       return NextResponse.json(
         { error: `A review needs at least ${NOTE_MIN} characters of explanation.` },
@@ -100,9 +115,20 @@ export async function appealFileHandler(request: NextRequest) {
       userId = user.id;
     }
 
-    // The decision must exist and must be the caller's own.
+    // The decision must exist and must be the caller's own. With no explicit
+    // restrictionId, appeal the most recent live decision on the account.
+    let decisionId = restrictionId;
+    if (!decisionId) {
+      decisionId = (await latestActiveRestrictionId(userId)) ?? '';
+    }
+    if (!decisionId) {
+      return NextResponse.json(
+        { error: "There's no decision on your account to appeal.", code: 'restriction_not_found' },
+        { status: 404 },
+      );
+    }
     const restriction = await prisma.userRestriction.findFirst({
-      where: { id: restrictionId, userId },
+      where: { id: decisionId, userId },
       select: { id: true },
     });
     if (!restriction) {
@@ -111,6 +137,7 @@ export async function appealFileHandler(request: NextRequest) {
         { status: 404 },
       );
     }
+    const restrictionIdFinal = restriction.id;
 
     // One appeal per decision — and that promise needs something to make it
     // atomic. The read-then-write had nothing: no unique on (restrictionId,
@@ -122,15 +149,15 @@ export async function appealFileHandler(request: NextRequest) {
     // decisions never queue behind each other, and it releases on commit or
     // crash, so nothing can strand it.
     const filed = await prisma.$transaction(async (tx: any) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${restrictionId}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${restrictionIdFinal}))`;
       const already = await tx.userAppeal.findFirst({
-        where: { restrictionId, userId },
+        where: { restrictionId: restrictionIdFinal, userId },
         select: { id: true },
       });
       if (already) return { appeal: null };
       return {
         appeal: await tx.userAppeal.create({
-          data: { restrictionId, userId, note, decision: 'pending' } }),
+          data: { restrictionId: restrictionIdFinal, userId, note, decision: 'pending' } }),
       };
     });
 

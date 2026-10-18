@@ -85,6 +85,7 @@ import {
 import { internalProfileHandler } from '@/features/users/internalProfileHandlers';
 
 import { accountStatusHandler, adminAccountStatusHandler } from '@/features/status/accountStatus';
+import { welcomeBackHandler, welcomeBackAckHandler } from '@/features/status/welcomeBack';
 import { dataUsageHandler } from '@/features/preferences/dataUsage';
 import { feedbackHandler, adminFeedbackHandler } from '@/features/feedback/feedbackHandlers';
 
@@ -222,6 +223,8 @@ const INTERNAL_ROUTES = [
    'security/session-revoke',
    'auth/verify-email', 'auth/verify',
   'users/me',
+  // Welcome-back card for a restored account (session-authed, read + ack).
+  'users/welcome-back', 'users/welcome-back/ack',
   // 'internal/profile' is the profile service's own path to the account row. It
   // authenticates with a shared service token instead of a session, so the
   // per-request session lookup, role check and rate-limit bucket that a browser
@@ -421,6 +424,8 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
        'auth/accounts/remove': ['POST'],
         'security/session-revoke': ['POST'],
        'users/me': ['GET', 'PATCH'],
+      'users/welcome-back': ['GET'],
+      'users/welcome-back/ack': ['POST'],
       'profile': ['GET', 'PATCH', 'PUT'],
       'internal/profile': ['GET', 'PATCH'],
       'security/password': ['POST'],
@@ -687,6 +692,12 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'users/me':
         resp = await profileHandler(request);
+        break;
+      case 'users/welcome-back':
+        resp = await welcomeBackHandler(request);
+        break;
+      case 'users/welcome-back/ack':
+        resp = await welcomeBackAckHandler(request);
         break;
       case 'auth/email-otp/request':
         resp = await requestEmailOtpHandler(request);

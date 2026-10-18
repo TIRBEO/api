@@ -7,7 +7,7 @@ import {
 export const runtime = 'nodejs';
 
 /**
- * POST /api/user/reactivate — bring a deactivated account back.
+ * POST /api/user/reactivate — bring a paused account back.
  *
  * Two paths, because deactivation keeps the pausing session alive but refuses
  * NEW sign-ins:
@@ -16,6 +16,12 @@ export const runtime = 'nodejs';
  *   • Without one, they prove ownership of the sign-in email with a code —
  *     { step:'request', email } sends it, { step:'verify', email, code } spends
  *     it and restores the account.
+ *
+ * The same code door cancels a scheduled deletion: an account in
+ * `deletion_pending` is restorable here too, and verifying the code cancels
+ * the deletion instead of flipping a deactivation. The response says which
+ * happened via `restoredAs` ('reactivated' | 'deletion_cancelled'); the older
+ * fields (`ok`, `status`, `message`) stay unchanged for existing callers.
  *
  * The proxy status gate lets writes whose path contains "reactivate" through
  * even while the account is deactivated, so this is reachable either way.
@@ -31,7 +37,7 @@ export async function POST(request: NextRequest) {
       const result = await reactivateAccount(session.userId);
       const { bustProfileCache } = await import('@/features/auth/authHandlers');
       bustProfileCache(session.userId);
-      return NextResponse.json({ ok: true, status: result.status, message: 'Account reactivated' });
+      return NextResponse.json({ ok: true, status: result.status, restoredAs: 'reactivated', message: 'Account reactivated' });
     }
 
     // Signed-out: email-code reactivation.
@@ -41,7 +47,12 @@ export async function POST(request: NextRequest) {
       const issued = await requestReactivationByEmail(email);
       if (!issued.ok) {
         if (issued.reason === 'cooldown') return NextResponse.json({ error: 'Please wait before requesting another code.' }, { status: 429 });
-        if (issued.reason === 'not_deactivated') return NextResponse.json({ error: 'This account is not deactivated.' }, { status: 400 });
+        // 'not_restorable' is the new name for 'not_deactivated' — the door
+        // now also serves scheduled deletions. Answer either so old callers
+        // that surfaced this string keep working.
+        if (issued.reason === 'not_deactivated' || issued.reason === 'not_restorable') {
+          return NextResponse.json({ error: 'This account is not deactivated or scheduled for deletion.', reason: 'not_restorable' }, { status: 400 });
+        }
         return NextResponse.json({ error: 'No account found for that email.' }, { status: 404 });
       }
       const { sendTemplateEmail } = await import('@/features/email/email');
@@ -54,9 +65,17 @@ export async function POST(request: NextRequest) {
       const done = await reactivateByEmailCode(email, String(code));
       if (!done.ok) {
         if (done.reason === 'no_account') return NextResponse.json({ error: 'No account found for that email.' }, { status: 404 });
+        if (done.reason === 'not_restorable') return NextResponse.json({ error: 'This account can no longer be restored here.', reason: 'not_restorable' }, { status: 400 });
         return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
       }
-      return NextResponse.json({ ok: true, step: 'verify', message: 'Account reactivated. You can sign in again.' });
+      return NextResponse.json({
+        ok: true,
+        step: 'verify',
+        restoredAs: done.restoredAs,
+        message: done.restoredAs === 'deletion_cancelled'
+          ? 'Deletion cancelled. Your account is active again — you can sign in.'
+          : 'Account reactivated. You can sign in again.',
+      });
     }
 
     return NextResponse.json({ error: 'Invalid step. Use "request" or "verify".' }, { status: 400 });

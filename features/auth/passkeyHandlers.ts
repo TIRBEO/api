@@ -18,6 +18,7 @@ import { jsonError, jsonUnauthorized } from '@/shared/response';
 import { logSecurityEvent } from '@/features/security/security';
 import { signReauthToken } from '@/features/auth/jwt';
 import { requireReauth } from '@/features/auth/reauth';
+import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/authHandlers';
 
 const RP_NAME = 'Tirbeo';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -461,23 +462,11 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
     }
     const passkeyUser = passkey.user;
     const primaryEmail = passkeyUser.emails[0]?.address || '';
-    if (passkeyUser.status === 'banned' || passkeyUser.status === 'deleted' || passkeyUser.status === 'deletion_pending') {
-      const { ensureRefCode } = await import('@/features/users/refcode');
-      return NextResponse.json({
-        error: 'ACCOUNT_BANNED',
-        banned: true,
-        eventId: await ensureRefCode(passkeyUser.id, passkeyUser.status === 'banned' ? 'ban' : 'deleted'),
-        message: 'Your account has been permanently banned.' }, { status: 403 });
-    }
-    if (passkeyUser.status === 'suspended') {
-      const { ensureRefCode } = await import('@/features/users/refcode');
-      return NextResponse.json({
-        error: 'ACCOUNT_SUSPENDED',
-        suspended: true,
-        eventId: await ensureRefCode(passkeyUser.id, 'suspend'),
-        reason: null,
-        until: null,
-        message: 'Your account is temporarily suspended.' }, { status: 403 });
+    // One door for every blocked lifecycle state — deletion_pending and
+    // deactivated must answer with their own recoverable shapes (cancel /
+    // reactivate), not a mislabelled "permanently banned" dead end.
+    if (isBlockedSignInStatus(passkeyUser.status)) {
+      return blockedAccountResponse(passkeyUser as any);
     }
 
     const origin = getOrigin(request);

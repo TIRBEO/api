@@ -503,13 +503,21 @@ if (!statusExempt.some(p => pathname.startsWith(p))) {
         const safePaths = ['delete-account', 'auth/logout', 'auth/refresh'];
         const isAllowed = isRead || safePaths.some(p => pathname.includes(p));
         if (!isAllowed) {
+          // Same ACCOUNT_DELETION_PENDING shape the sign-in refusals carry
+          // (see blockedAccountResponse in authHandlers) — the person must see
+          // "you can still cancel it", not a dead-end "deleted" message, on
+          // every door a pending deletion opens them to. `scheduled`/`scheduledAt`
+          // stay for existing callers.
           statusResponse = jsonResponse(allowedOrigin, {
-            error: 'ACCOUNT_DELETION_SCHEDULED', scheduled: true,
+            error: 'ACCOUNT_DELETION_PENDING',
+            deletionPending: true,
+            scheduled: true,
+            eventId: await ensureRefCode(String(tokenPayload.sub), 'delete'),
             scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
+            reason: deletionReq?.reason || null,
+            until: scheduledAt ? scheduledAt.toISOString() : null,
             deletionReason: deletionReq?.reason || null,
-            message: scheduledAt
-              ? `Your account is scheduled for deletion on ${scheduledAt.toLocaleDateString()}. Cancel to regain access.`
-              : 'Your account is scheduled for deletion. Cancel to regain access.',
+            message: 'Your account is scheduled for deletion. You can still cancel it.',
           }, 403);
         }
       } else if (su?.status === 'deactivated') {

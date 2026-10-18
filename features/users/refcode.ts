@@ -14,7 +14,9 @@
 
 export type EventKind = 'ban' | 'suspend' | 'ratelimit' | 'system';
 // Codes may also be persisted for deleted accounts; helpers accept the widened kind.
-type DisplayKind = EventKind | 'deleted';
+// 'delete' (a scheduled deletion the person can still cancel) and 'deactivate'
+// (a self-serve pause) join it so every blocked-lifecycle screen can quote one.
+export type DisplayKind = EventKind | 'deleted' | 'delete' | 'deactivate';
 
 const HEX = '0123456789abcdef';
 
@@ -153,8 +155,9 @@ export async function systemFaultRef(rawSignature: string): Promise<string> {
  * The prisma import is lazy so this module stays dependency-free for the
  * proxy bundle, which imports it statically.
  */
-export async function ensureRefCode(userId: string, kind: EventKind | 'deleted'): Promise<string> {
-  const toStatus = kind === 'ban' ? 'banned' : kind === 'suspend' ? 'suspended' : kind === 'deleted' ? 'deleted' : null;
+export async function ensureRefCode(userId: string, kind: DisplayKind): Promise<string> {
+  const toStatus = kind === 'ban' ? 'banned' : kind === 'suspend' ? 'suspended' : kind === 'deleted' ? 'deleted'
+    : kind === 'delete' ? 'deletion_pending' : kind === 'deactivate' ? 'deactivated' : null;
   if (!toStatus) return generateEventId(kind);
   try {
     const { prisma } = await import('@/infrastructure/db/prisma');

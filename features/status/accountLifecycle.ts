@@ -268,26 +268,47 @@ export async function reactivateAccount(userId: string) {
  * deactivated, so the only way back for someone who closed the tab is a code to
  * the email they sign in with. Two steps: request (sends a code, rate-limited)
  * and verify (consumes it and restores the account). Returns a machine-readable
- * code so the UI can distinguish "not deactivated" from a wrong/expired code.
+ * code so the UI can distinguish "nothing to restore" from a wrong/expired code.
+ *
+ * The same door serves a scheduled deletion: an account in `deletion_pending`
+ * that cannot sign in proves ownership with this code too, and verifying it
+ * cancels the deletion instead of flipping a deactivation. `not_restorable` is
+ * the refusal for every other status (the legacy name `not_deactivated` is a
+ * subset of it — old callers branch on the reason string, not the code).
  */
 export async function requestReactivationByEmail(email: string): Promise<{ ok: boolean; reason?: string; code?: string }> {
   const userId = await userIdForEmail(email);
   if (!userId) return { ok: false, reason: 'no_account' };
   const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-  if (user?.status !== 'deactivated') return { ok: false, reason: 'not_deactivated' };
+  const restorable = user?.status === 'deactivated' || user?.status === 'deletion_pending';
+  if (!restorable) return { ok: false, reason: 'not_restorable' };
 
   const issued = await issueSensitiveCode(REACTIVATE_OTP_KIND, email, email, userId);
   if (!issued.ok) return { ok: false, reason: 'cooldown' };
   return { ok: true, code: issued.code };
 }
 
-export async function reactivateByEmailCode(email: string, code: string): Promise<{ ok: boolean; reason?: string }> {
+export async function reactivateByEmailCode(
+  email: string,
+  code: string,
+): Promise<{ ok: boolean; reason?: string; restoredAs?: 'reactivated' | 'deletion_cancelled' }> {
   const userId = await userIdForEmail(email);
   if (!userId) return { ok: false, reason: 'no_account' };
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
+  if (!user) return { ok: false, reason: 'no_account' };
+  if (user.status !== 'deactivated' && user.status !== 'deletion_pending') {
+    return { ok: false, reason: 'not_restorable' };
+  }
   const ok = await consumeSensitiveCode(REACTIVATE_OTP_KIND, email, code, email);
   if (!ok) return { ok: false, reason: 'invalid_code' };
+
+  if (user.status === 'deletion_pending') {
+    const cancelled = await cancelDeletion(userId);
+    if (!cancelled.ok) return { ok: false, reason: cancelled.error ?? 'not_restorable' };
+    return { ok: true, restoredAs: 'deletion_cancelled' };
+  }
   await reactivateAccount(userId);
-  return { ok: true };
+  return { ok: true, restoredAs: 'reactivated' };
 }
 
 /**
