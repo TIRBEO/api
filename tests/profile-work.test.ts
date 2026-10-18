@@ -7,7 +7,7 @@
  * two client source files as text.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,14 +29,28 @@ import {
 } from '@/features/auth/profile-work';
 import { maskEmail, recoveryOption, verifiedRecoveryAddress } from '@/features/auth/recovery-email';
 
-// The accounts app's copy of the same four questions, imported for real:
-// `apps/accounts/src/lib/profile-fields.ts` has no framework dependencies.
-import { WORK_FIELDS, WORK_KEYS, GENDERS } from '../../accounts/src/lib/profile-fields';
+// The api deploys standalone on Vercel, so this test must not import across
+// the apps/ boundary. The four questions are mirrored here, and the check at
+// the bottom of this file compares the mirror against the accounts app's real
+// copy (`apps/accounts/src/lib/profile-fields.ts`) whenever that exists.
+type WorkKey = 'jobRole' | 'jobCompany' | 'jobPlace' | 'jobStartedOn';
+const WORK_FIELDS: Record<WorkKey, { label: string; placeholder: string; wire: string; maxLength: number }> = {
+  jobRole: { label: 'Job title', placeholder: 'Product engineer', wire: 'companyRole', maxLength: 120 },
+  jobCompany: { label: 'Company', placeholder: 'Tirbeo', wire: 'companyName', maxLength: 120 },
+  jobPlace: { label: 'Work location', placeholder: 'Kathmandu, Nepal', wire: 'jobPlace', maxLength: 120 },
+  jobStartedOn: { label: 'Started in', placeholder: '2022', wire: 'jobStarted', maxLength: 10 },
+};
+const WORK_KEYS = Object.keys(WORK_FIELDS) as WorkKey[];
+const GENDERS = ['Female', 'Male', 'Non-binary', 'Prefer not to say'];
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../../..'); // apps/api/tests -> repo root
 
 const read = (rel: string) => readFileSync(path.join(repoRoot, rel), 'utf8');
+/* The sibling apps only exist in the monorepo checkout — on Vercel the api
+   deploys standalone, so the cross-app checks skip there. */
+const inMonorepo = existsSync(path.join(repoRoot, 'apps/myprofile'));
+const describeApps = inMonorepo ? describe : describe.skip;
 
 describe('normalizeWorkFields — the one work shape', () => {
   it('maps the settings app\'s wire names onto the row\'s columns', () => {
@@ -180,7 +194,7 @@ describe('verifiedRecoveryAddress — the mailbox a reset may be posted to', () 
   });
 });
 
-describe('the two clients ask the WORK questions in the same words', () => {
+describeApps('the two clients ask the WORK questions in the same words', () => {
   /** `apps/myprofile` renders its own labels; there is no shared package, so
       the lists are mirrored by hand and checked here rather than in review. */
   function jobFieldsFromMyprofile() {
@@ -206,6 +220,15 @@ describe('the two clients ask the WORK questions in the same words', () => {
       (m) => [m[1], m[2]] as const,
     );
   }
+
+  it('the mirror above is still identical to the accounts app\'s copy', () => {
+    const src = read('apps/accounts/src/lib/profile-fields.ts');
+    for (const k of WORK_KEYS) {
+      const f = WORK_FIELDS[k];
+      expect(src).toContain(`${k}: { label: '${f.label}', placeholder: '${f.placeholder}', wire: '${f.wire}', maxLength: ${f.maxLength} }`);
+    }
+    for (const g of GENDERS) expect(src).toContain(`'${g}'`);
+  });
 
   it('labels and placeholders match, in the same order', () => {
     expect(jobFieldsFromMyprofile()).toEqual(
