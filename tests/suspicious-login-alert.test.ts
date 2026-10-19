@@ -15,6 +15,9 @@ const mocks = vi.hoisted(() => ({
   // alerted recently?" probes.
   deviceSeenCount: 0,
   alertCount: 0,
+  // The account's `preferences.misc` bag, exactly as the row holds it — the
+  // switch's own half of the gate. `undefined` means "no preferences row".
+  misc: undefined as unknown,
   activityCreate: vi.fn(async () => ({})),
   sendTemplateEmail: vi.fn(async (..._args: unknown[]) => ({ success: true })),
   recordDeviceSeen: vi.fn(async () => {}),
@@ -30,6 +33,9 @@ vi.mock('@/infrastructure/db/prisma', () => ({
         return 0;
       }),
       create: mocks.activityCreate,
+    },
+    userPreferences: {
+      findUnique: vi.fn(async () => (mocks.misc === undefined ? null : { misc: mocks.misc })),
     },
   },
 }));
@@ -65,6 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.deviceSeenCount = 0;
   mocks.alertCount = 0;
+  mocks.misc = undefined;
   mocks.activityCreate.mockResolvedValue({} as any);
   mocks.sendTemplateEmail.mockResolvedValue({ success: true } as any);
 });
@@ -145,6 +152,59 @@ describe('sendSuspiciousLoginAlert', () => {
     const sent = await sendSuspiciousLoginAlert({ userId: 'u1', email: null, fingerprint: FP });
     expect(sent).toBe(false);
     expect(mocks.sendTemplateEmail).not.toHaveBeenCalled();
+  });
+});
+
+// ─── The switch: "Alert on suspicious sign-in" ──────────────────────
+
+describe('the twoFactorAlertSuspicious preference', () => {
+  /* A first-seen device is the case that WOULD mail, so each of these differs
+     from the one above only in what the account's own bag says. Reading the
+     preference was the missing half: the two-factor screen wrote the key and
+     nothing on the sign-in path ever looked at it. */
+  const firstSeenDevice = () =>
+    sendSuspiciousLoginAlert({ userId: 'u1', email: 'ada@example.com', fingerprint: FP, headers: headers({}) });
+
+  const settings = (value: unknown) => ({ settings: { twoFactorAlertSuspicious: value } });
+
+  it('mails when the account never answered the switch (default ON)', async () => {
+    mocks.misc = {};
+    expect(await firstSeenDevice()).toBe(true);
+  });
+
+  it('stays silent on an explicit false', async () => {
+    mocks.misc = settings(false);
+    expect(await firstSeenDevice()).toBe(false);
+    expect(mocks.sendTemplateEmail).not.toHaveBeenCalled();
+    // Opting out of the mail is not opting out of the record: the sign-in is
+    // still ledgered, under the skipped kind so it cannot mute a later alert.
+    expect(mocks.activityCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          kind: 'auth.suspicious_login_alert_skipped',
+          metadata: expect.objectContaining({ reason: 'user_preference' }),
+        }),
+      }),
+    );
+  });
+
+  it('reads the string forms the client can store', async () => {
+    for (const off of ['false', '0', 'off', ' OFF ']) {
+      mocks.misc = settings(off);
+      expect(await firstSeenDevice(), off).toBe(false);
+    }
+    mocks.misc = settings('true');
+    expect(await firstSeenDevice()).toBe(true);
+  });
+
+  it('keeps mailing when the bag is malformed rather than losing a security notice', async () => {
+    // A string where an object belongs, and no preferences row at all.
+    mocks.misc = 'not-an-object' as any;
+    expect(await firstSeenDevice()).toBe(true);
+    mocks.misc = { settings: 'not-an-object' } as any;
+    expect(await firstSeenDevice()).toBe(true);
+    mocks.misc = undefined;
+    expect(await firstSeenDevice()).toBe(true);
   });
 });
 

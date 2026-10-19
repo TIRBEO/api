@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { isHostAllowed } from '@/config/app-urls';
+import { CORS_ALLOWED_HEADERS, isHostAllowed } from '@/config/app-urls';
 
 function addCorsToResponse(res: NextResponse, request?: NextRequest) {
   if (!request) {
@@ -17,7 +17,7 @@ function addCorsToResponse(res: NextResponse, request?: NextRequest) {
     if (isHostAllowed(u.hostname)) {
       res.headers.set('Access-Control-Allow-Origin', origin);
       res.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-      res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, x-turnstile-token');
+      res.headers.set('Access-Control-Allow-Headers', CORS_ALLOWED_HEADERS);
       res.headers.set('Access-Control-Allow-Credentials', 'true');
     }
   } catch {}

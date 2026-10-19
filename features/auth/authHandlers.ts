@@ -1685,7 +1685,12 @@ export async function signupHandler(request: NextRequest) {
       console.error('[SIGNUP] Validation failed:', parsed.error.flatten());
       return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
     }
-    const { email, password, firstName, lastName, username, dob, gender, photoUrl, companyRole, companyName, jobPlace, jobStarted, role, occupation, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, turnstileToken, fingerprint, otpCode } = parsed.data;
+    const { email, password, firstName, lastName, username, dob, gender, photoUrl, companyRole, companyName, jobPlace, jobStarted, role, occupation, recoveryEmail, totpSecret, is2FAEnabled, policyAccepted, adminDataAccess, turnstileToken, fingerprint: bodyFingerprint, otpCode } = parsed.data;
+    // Same three sources the sign-in path reads. An account created on a device
+    // whose id only arrived as a header used to record `device.seen` with nothing
+    // to compare against, so the very first sign-in after signup mailed "was
+    // that you?" at the person who had just signed up.
+    const fingerprint = bodyFingerprint || deviceFingerprint(request);
     const captchaToken = turnstileToken || '';
     const normalizedEmail = email.toLowerCase().trim();
     const normalizedUsername = username.toString().trim().toLowerCase();

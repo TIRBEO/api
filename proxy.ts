@@ -5,7 +5,7 @@ import { verifyTurnstile, isTurnstileConfigured } from '@/features/auth/turnstil
 import { detectXss } from '@/features/auth/xss-scan';
 import { getMaintenanceState } from '@/shared/maintenance-state';
 import { ensureRefCode, generateEventId } from '@/features/users/refcode';
-import { isHostAllowed } from '@/config/app-urls';
+import { CORS_ALLOWED_HEADERS, isHostAllowed } from '@/config/app-urls';
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
@@ -165,7 +165,7 @@ const securityHeaders = {
 function addCorsHeaders(response: NextResponse, origin: string) {
   response.headers.set('Access-Control-Allow-Origin', origin);
   response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, X-CSRF-Nonce, x-turnstile-token, x-csrf-token');
+  response.headers.set('Access-Control-Allow-Headers', CORS_ALLOWED_HEADERS);
   response.headers.set('Access-Control-Allow-Credentials', 'true');
   response.headers.set('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset');
   response.headers.set('Access-Control-Max-Age', '86400');

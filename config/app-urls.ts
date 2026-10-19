@@ -163,6 +163,25 @@ function extraAllowedHostEntries(): string[] {
 }
 
 /**
+ * The request headers a cross-origin browser call may set. One list, because
+ * the edge (`proxy.ts`) and the response helper (`shared/response.ts`) both
+ * answer preflights and their two copies had already drifted.
+ *
+ * `x-device-fingerprint` is the per-browser id the accounts app mints: the
+ * "was that you?" sign-in mail is gated on the device, and a header a preflight
+ * refuses would take every other auth request down with it.
+ */
+export const CORS_ALLOWED_HEADERS = [
+  'Content-Type',
+  'Authorization',
+  'X-Requested-With',
+  'X-CSRF-Token',
+  'X-CSRF-Nonce',
+  'x-turnstile-token',
+  'x-device-fingerprint',
+].join(', ');
+
+/**
  * Returns true when `hostname` may be used as a CORS origin and/or a trusted
  * post-auth redirect target. Never matches on protocol/credentials — callers
  * validate those separately.
