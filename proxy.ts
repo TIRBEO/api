@@ -416,6 +416,9 @@ if (preHasCookie) {
     '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm', '/api/auth/password-reset/quick-login',
     '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
     '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
+    // The blocked screen's credential gate: sessionless email+password check
+    // a closed account proves ownership with before any decision detail shows.
+    '/api/auth/blocked-verify',
     '/api/auth/refresh',
     '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
     '/api/auth/verify',
