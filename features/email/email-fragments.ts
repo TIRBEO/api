@@ -1,4 +1,4 @@
-import { FAINT, LINE, MUTED, TEXT, TEXT_2, WARN } from '@/features/email/email-theme';
+import { FAINT, LINE, MUTED, RADIUS_PLATE, TEXT, TEXT_2, WARN } from '@/features/email/email-theme';
 
 /**
  * The HTML the mail's section slots are built from.
@@ -50,7 +50,7 @@ export function listGroup(label: string, count: number, rows: string): string {
  * where one ends and the next begins.
  */
 export function listPlate(groups: string): string {
-  return `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:14px;overflow:hidden">${groups}</div>`;
+  return `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:${RADIUS_PLATE};overflow:hidden">${groups}</div>`;
 }
 
 /** Trailing "n more" line after a list. */
