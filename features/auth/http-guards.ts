@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { createSession, revokeSession, setSessionCookie, clearSessionCookie, getSessionFromToken, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf } from '@/features/auth/session';
+import { createSession, revokeSession, setSessionCookie, clearSessionCookie, getSessionFromToken, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf, isSessionUnavailable } from '@/features/auth/session';
 import { COOKIE_NAME } from '@/features/auth/jwt';
-import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
+import { jsonUnauthorized, jsonForbidden, jsonSessionUnavailable } from '@/shared/response';
 
 const ROLE_HIERARCHY: Record<string, number> = {
   editor: 1,
@@ -23,6 +23,9 @@ export async function getSession(request: NextRequest) {
       const session = await getSessionFromToken(token);
       if (session) return session;
     } catch (e: any) {
+      // "We could not tell" must not be flattened into "no session" — it has
+      // to reach the response layer as a 503. See SessionUnavailableError.
+      if (isSessionUnavailable(e)) throw e;
       console.error('[SESSION] Cookie auth failed:', e?.message || e);
     }
   }
@@ -36,6 +39,7 @@ export async function getSession(request: NextRequest) {
         const session = await getSessionFromToken(bearerToken);
         if (session) return session;
       } catch (e: any) {
+        if (isSessionUnavailable(e)) throw e;
         console.error('[SESSION] Bearer auth failed:', e?.message || e);
       }
     }
@@ -44,12 +48,24 @@ export async function getSession(request: NextRequest) {
   return null;
 }
 
-export async function requireSession(request: NextRequest): Promise<{ userId: string; email: string } | NextResponse> {
-  const session = await getSession(request);
-  if (!session) {
-    return jsonUnauthorized();
+/**
+ * `getSession` plus the two answers a caller must not invent on its own:
+ * 401 when there is genuinely no session, 503 when the session could not be
+ * looked up. Handlers that use this get the distinction for free; handlers
+ * that call `getSession` directly get the throw and the route layer maps it.
+ */
+export async function getSessionOrResponse(request: NextRequest): Promise<{ userId: string; email: string } | NextResponse> {
+  try {
+    const session = await getSession(request);
+    return session ?? jsonUnauthorized();
+  } catch (e) {
+    if (isSessionUnavailable(e)) return jsonSessionUnavailable(request);
+    throw e;
   }
-  return session;
+}
+
+export async function requireSession(request: NextRequest): Promise<{ userId: string; email: string } | NextResponse> {
+  return getSessionOrResponse(request);
 }
 
 export async function getAdminRole(userId: string): Promise<string | null> {
@@ -65,15 +81,17 @@ export async function getAdminRole(userId: string): Promise<string | null> {
 }
 
 export async function isAdmin(request: NextRequest) {
-  const session = await getSession(request);
+  // A lookup that could not be made is "not an admin" for this caller: it is
+  // only ever asked to grant a privilege, never to end a session.
+  const session = await getSession(request).catch(() => null);
   if (!session) return false;
   const role = await getAdminRole(session.userId);
   return role != null;
 }
 
 export async function requireAdmin(request: NextRequest): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
-  const session = await getSession(request);
-  if (!session) return jsonUnauthorized();
+  const session = await getSessionOrResponse(request);
+  if (session instanceof NextResponse) return session;
   const role = await getAdminRole(session.userId);
   if (!role) return jsonForbidden();
   return { ...session, adminRole: role };
@@ -86,8 +104,8 @@ export function roleAtLeast(userRole: string, minimumRole: string): boolean {
 }
 
 export async function requireRole(request: NextRequest, minimumRole: string): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
-  const session = await getSession(request);
-  if (!session) return jsonUnauthorized();
+  const session = await getSessionOrResponse(request);
+  if (session instanceof NextResponse) return session;
   const userRole = await getAdminRole(session.userId);
   if (!userRole || !roleAtLeast(userRole, minimumRole)) {
     return jsonForbidden();
@@ -101,4 +119,4 @@ export function canManageRole(actorRole: string, targetRole: string | null): boo
   return false;
 }
 
-export { createSession, revokeSession, setSessionCookie, clearSessionCookie, COOKIE_NAME, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf };
+export { createSession, revokeSession, setSessionCookie, clearSessionCookie, COOKIE_NAME, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf, isSessionUnavailable };

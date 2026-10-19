@@ -59,6 +59,22 @@ export function jsonUnauthorized(reason?: string, request?: NextRequest) {
   return addCorsToResponse(NextResponse.json({ error: message }, { status: 401 }), request);
 }
 
+/**
+ * "We could not tell whether you are signed in" — the database did not answer
+ * the session lookup. Deliberately NOT a 401: clients read a 401 as a dead
+ * credential and sign the user out of a session that is still alive, whereas a
+ * 503 is read as a transient outage and retried.
+ */
+export function jsonSessionUnavailable(request?: NextRequest) {
+  return addCorsToResponse(
+    NextResponse.json(
+      { error: 'We could not check your session just now. Please try again in a moment.', code: 'SESSION_LOOKUP_UNAVAILABLE' },
+      { status: 503, headers: { 'Retry-After': '5' } },
+    ),
+    request,
+  );
+}
+
 export function jsonForbidden(reason?: string, request?: NextRequest) {
   return addCorsToResponse(NextResponse.json({ error: reason || 'Forbidden' }, { status: 403 }), request);
 }

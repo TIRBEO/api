@@ -4,7 +4,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/features/auth/otp';
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from '@/features/auth/signup-otp';
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/features/auth/password';
-import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN } from '@/features/auth/session';
+import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
 import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getSession, requireRole } from '@/features/auth/http-guards';
@@ -18,7 +18,7 @@ import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagi
 import { createAuditEvent } from '@/features/security/audit';
 import { enforceResendCooldown, RESEND_COOLDOWN_MS } from '@/features/auth/resend-cooldown';
 import { checkPasswordBreach } from '@/features/auth/breach';
-import { jsonUnauthorized } from '@/shared/response';
+import { jsonUnauthorized, jsonSessionUnavailable } from '@/shared/response';
 import { createNotification, describeDevice, NEW_ACCOUNT_PREFS } from '@/features/notifications/notifications';
 import { createTtlCache } from '@/infrastructure/cache';
 import { logPerformance } from '@/infrastructure/observability/perf';
@@ -310,6 +310,10 @@ export async function sessionHandler(request: NextRequest) {
     logPerformance('auth/session', startTime);
     return NextResponse.json({ user: userData });
   } catch (err: any) {
+    /* The dashboard's session probe is the one call that decides whether the
+       tab keeps its cookies, so it must not answer "failed" for a lookup that
+       simply could not be made — see SessionUnavailableError. */
+    if (isSessionUnavailable(err)) return jsonSessionUnavailable(request);
     console.error('[SESSION]', err?.message || err);
     return NextResponse.json({ error: 'Failed to fetch session' }, { status: 500 });
   }

@@ -31,10 +31,39 @@ const sessionCache = createTtlCache<{ userId: string; email: string; sessionId: 
 const SESSION_CACHE_DEADLINE_MS = 1_500;
 const SESSION_DB_DEADLINE_MS = 3_500;
 
-function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
+/**
+ * The session could not be LOOKED UP (pool exhausted, DB unreachable), which is
+ * a different fact from "looked up, and it is dead".
+ *
+ * Collapsing the two into a 401 is what logs people out on a healthy account:
+ * the dashboard treats a 401 as a dead credential and calls /api/auth/logout,
+ * which revokes the session row — so one 3.5-second checkout timeout becomes a
+ * durable sign-out that no retry can undo. Throw this instead and answer 503,
+ * which every client already reads as "the server is having a moment".
+ */
+export class SessionUnavailableError extends Error {
+  constructor(message = 'Session lookup unavailable') {
+    super(message);
+    this.name = 'SessionUnavailableError';
+  }
+}
+
+/** Instance check that survives the class being loaded twice (route bundle +
+ *  custom WS server), which `instanceof` does not. */
+export function isSessionUnavailable(err: unknown): boolean {
+  return err instanceof SessionUnavailableError ||
+    (err as { name?: string } | null)?.name === 'SessionUnavailableError';
+}
+
+/** What `withDeadline` resolves to when the work has not answered in time.
+ *  A sentinel instead of `null` because callers need to tell "no result" apart
+ *  from "no answer" — see SessionUnavailableError. */
+const DB_UNANSWERED = Symbol('db-unanswered');
+
+function withDeadline<T, U = null>(p: Promise<T>, ms: number, onTimeout?: U): Promise<T | U> {
   return Promise.race([
     p,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+    new Promise<U>((resolve) => setTimeout(() => resolve(onTimeout as U), ms)),
   ]);
 }
 
@@ -432,25 +461,27 @@ export async function getSessionFromToken(token: string) {
       }
     }
 
-    let session: any = null;
+    let session: any;
     try {
-      session = await withDeadline(
+      /* DB_UNANSWERED rather than `null`: the deadline wrapper's own "no" is
+         the same value a missing row is, and reading the two alike would make
+         every genuinely-dead session a 503 that never clears. */
+      const outcome = await withDeadline(
         prisma.userSession.findUnique({
           where: { id: payload.sid },
           include: { user: { select: { id: true, username: true, status: true, isAdmin: true, security: { select: { saveLoginInfo: true } } } } } }),
         SESSION_DB_DEADLINE_MS,
+        DB_UNANSWERED,
       );
-      if (session === null) {
-        // Deadline hit (DB unreachable) — fail closed FAST instead of hanging.
-        console.error('[SESSION] DB lookup timed out — rejecting session (fail closed, fast)');
-        return null;
+      if (outcome === DB_UNANSWERED) {
+        console.error('[SESSION] DB lookup timed out — session state unknown (503)');
+        throw new SessionUnavailableError();
       }
+      session = outcome;
     } catch (e: any) {
+      if (isSessionUnavailable(e)) throw e;
       console.error('[SESSION] DB query failed during session lookup:', e?.message);
-      // When DB is down, fail closed — reject the session rather than
-      // allowing unauthenticated access. The cached identity may still
-      // serve stale data, which is acceptable for read-heavy paths.
-      return null;
+      throw new SessionUnavailableError();
     }
     if (!session) {
       sessionCache.set(payload.sid, null);
@@ -510,6 +541,9 @@ export async function getSessionFromToken(token: string) {
     void setCachedSessionIdentity(payload.sid, result);
     return result;
   } catch (e: any) {
+    // "Could not look" outranks the blanket guard below: it must reach the
+    // caller as a 503, not be flattened into the 401 that `null` becomes.
+    if (isSessionUnavailable(e)) throw e;
     console.error('[SESSION] getSessionFromToken error:', e?.message || e);
     return null;
   }

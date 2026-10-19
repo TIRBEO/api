@@ -1,8 +1,8 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
-import { getSession, requireSession } from '@/features/auth/http-guards';
+import { getSession, requireSession, isSessionUnavailable } from '@/features/auth/http-guards';
 import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
-import { jsonError, jsonForbidden } from '@/shared/response';
+import { jsonError, jsonForbidden, jsonSessionUnavailable } from '@/shared/response';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
 import { systemFaultRef } from '@/features/users/refcode';
 
@@ -564,6 +564,10 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   const authHeader = request.headers.get('authorization') || '';
   const pathStr = slug.join('/');
   let session: any = null;
+  /** True when a session was offered but could not be looked up. Distinct from
+      "no session": answering 401 here is what signs people out of a live
+      account, because every client treats a 401 as a dead credential. */
+  let sessionUnusable = false;
 
   try {
     session = await getSession(request);
@@ -577,7 +581,22 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
       }
     }
   } catch (e: any) {
-    console.error('[HANDLER] getSession failed:', e?.message);
+    if (isSessionUnavailable(e)) {
+      sessionUnusable = true;
+      console.error(`[HANDLER] session lookup unavailable — path: ${pathStr}`);
+    } else {
+      console.error('[HANDLER] getSession failed:', e?.message);
+    }
+  }
+
+  /* The lookup never answered. Every handler below reads `session === null`
+     and answers 401, and 401 is the one status the clients obey by discarding a
+     session that is still alive — so the API refuses on its own behalf here,
+     with a status that means "ask again in a moment". `auth/*` and `health`
+     stay reachable: signing in, refreshing and signing out must not depend on a
+     lookup that this request could not make. */
+  if (sessionUnusable && !pathStr.startsWith('auth/') && pathStr !== 'health') {
+    return jsonSessionUnavailable(request);
   }
 
   // ── Vercel serverless: trigger due background jobs on first request ──
