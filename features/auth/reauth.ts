@@ -4,6 +4,7 @@ import { verifyReauthToken } from '@/features/auth/jwt';
 import { verifyPassword } from '@/features/auth/password';
 import { verifyTotp } from '@/features/auth/totp';
 import { checkWindowLimitDB } from '@/features/captcha/risk';
+import { isRequire2FA, secondFactorBlocker } from '@/features/auth/second-factor';
 import { getSession } from '@/features/auth/http-guards';
 import { consumeReauthCode, issueReauthCode, signInEmailOf } from '@/features/auth/reauthCode';
 import { OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
@@ -28,6 +29,10 @@ import { maskEmail } from '@/features/auth/recovery-email';
  *
  * `reauthCode` is deliberately its own field: `code` has meant TOTP since the
  * legacy flow and still does.
+ *
+ * An account that switched on "require 2FA for sensitive actions" is not
+ * satisfied by proof #2 alone: the password unlocks the second-factor check in
+ * `second-factor.ts`, and the action waits for the code beside it.
  *
  * The request body is read exactly once here and returned to the caller so
  * handlers don't double-consume it.
@@ -279,6 +284,21 @@ async function checkProof(
       select: { passwordHash: true },
     });
     if (user?.passwordHash && (await verifyPassword(user.passwordHash, password))) {
+      /* "Require 2FA for sensitive actions" means the password is only the
+         first factor here. Checked at the door every guarded action comes
+         through, not in the twelve handlers on the other side of it — a rule
+         enforced per-caller is a rule the next caller forgets. The proof the
+         policy wants is the one the person brings alongside: an authenticator
+         code or a spent backup code. */
+      if (await isRequire2FA(sessionUserId)) {
+        const blocked = await secondFactorBlocker(sessionUserId, body);
+        if (blocked) {
+          logReauthProof(request, sessionUserId, 'failed', 'password', 'second_factor_missing');
+          return { ok: false, response: blocked };
+        }
+        logReauthProof(request, sessionUserId, 'verified', 'totp');
+        return { ok: true, method: 'totp', body };
+      }
       logReauthProof(request, sessionUserId, 'verified', 'password');
       return { ok: true, method: 'password', body };
     }

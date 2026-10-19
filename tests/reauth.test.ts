@@ -20,12 +20,18 @@ const mocks = vi.hoisted(() => ({
   getSession: vi.fn(async () => ({ userId: 'u1', sessionId: 's1' })),
 }));
 
-// Password/TOTP verifiers: deterministic, hermetic.
+// Password/TOTP verifiers: deterministic, hermetic. `hashRecoveryCode` is
+// reached by the second-factor policy check when a backup code is the proof, so
+// it needs an export here even though this suite's own paths use the TOTP code.
 vi.mock('@/features/auth/password', () => ({
   verifyPassword: vi.fn(async (_hash: string, pw: string) => pw === 'right-password'),
+  hashRecoveryCode: vi.fn((c: string) => `hashed:${c}`),
 }));
 vi.mock('@/features/auth/totp', () => ({
   verifyTotp: vi.fn(async (code: string) => code === '123456'),
+  normalizeTotpCode: vi.fn((code: unknown) =>
+    typeof code === 'string' ? code.replace(/\s/g, '').slice(0, 6) : undefined
+  ),
 }));
 
 // Rate limiter: per-test control via mocks.checkWindowLimitDB.
@@ -45,9 +51,21 @@ vi.mock('@/infrastructure/db/prisma', () => ({
       }),
     },
     userSecurity: {
-      findUnique: vi.fn(async () =>
-        mocks.prismaUser?.totpSecret ? { totpSecret: mocks.prismaUser.totpSecret } : null
-      ),
+      // One fixture row, read by three different selects: the TOTP secret, and
+      // the two columns the "require 2FA for sensitive actions" policy is made
+      // of. Returning an object without the keys the caller did not ask for is
+      // what keeps a fixture that only sets a secret from reading as policy ON.
+      findUnique: vi.fn(async () => {
+        const u = mocks.prismaUser;
+        if (!u) return null;
+        const sec: any = {};
+        if (u.totpSecret) sec.totpSecret = u.totpSecret;
+        if ('require2FA' in u) sec.require2FA = u.require2FA;
+        if ('totpEnabled' in u) sec.totpEnabled = u.totpEnabled;
+        if ('backupCodes' in u) sec.backupCodes = u.backupCodes;
+        return Object.keys(sec).length ? sec : null;
+      }),
+      updateMany: vi.fn(async () => ({ count: 1 })),
     },
   },
 }));
@@ -155,6 +173,65 @@ describe('requireReauth — password', () => {
     const r = await requireReauth(fakeRequest({ password: 'right-password' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(400);
+  });
+});
+
+// ─── "Require 2FA for sensitive actions" ────────────────────────────
+
+describe('requireReauth — the require2FA policy', () => {
+  /* The switch is a floor, not a label: with it on, the password stops being a
+     sufficient proof on its own for anything behind this guard. The flag is
+     inert without an enrolled authenticator — `isRequire2FA` asks for both
+     columns — so the OFF half of each pair is the row's own rule, not a
+     preference the person can hold an app they never set up. */
+  const policyOn = {
+    passwordHash: 'hash', totpSecret: 'secret', totpEnabled: true, require2FA: true,
+    _count: { passkeys: 0 },
+  };
+
+  it('refuses a lone password with SECOND_FACTOR_REQUIRED', async () => {
+    mocks.prismaUser = policyOn;
+    const r = await requireReauth(fakeRequest({ password: 'right-password' }), 'u1');
+    expect(r.ok).toBe(false);
+    if ('response' in r) {
+      expect(r.response.status).toBe(403);
+      const payload: any = await r.response.json();
+      expect(payload.error).toBe('SECOND_FACTOR_REQUIRED');
+      expect(payload.requires2FA).toBe(true);
+    }
+  });
+
+  it('accepts the password once an authenticator code rides with it', async () => {
+    mocks.prismaUser = policyOn;
+    const r = await requireReauth(fakeRequest({ password: 'right-password', code: '123456' }), 'u1');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.method).toBe('totp');
+  });
+
+  it('accepts the password once an unused backup code rides with it', async () => {
+    mocks.prismaUser = {
+      ...policyOn,
+      backupCodes: [{ code: 'hashed:SINGLE-USE', used: false }],
+    };
+    const r = await requireReauth(fakeRequest({ password: 'right-password', backupCode: 'SINGLE-USE' }), 'u1');
+    expect(r.ok).toBe(true);
+  });
+
+  it('stays inert while the authenticator is not enrolled', async () => {
+    mocks.prismaUser = {
+      passwordHash: 'hash', totpSecret: null, totpEnabled: false, require2FA: true,
+      _count: { passkeys: 0 },
+    };
+    const r = await requireReauth(fakeRequest({ password: 'right-password' }), 'u1');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.method).toBe('password');
+  });
+
+  it('is out of the way when the switch is off', async () => {
+    mocks.prismaUser = { ...policyOn, require2FA: false };
+    const r = await requireReauth(fakeRequest({ password: 'right-password' }), 'u1');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.method).toBe('password');
   });
 });
 
