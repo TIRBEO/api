@@ -113,7 +113,7 @@ const PROFILE_SELECT = {
     select: {
       name: true, photoUrl: true,
       bio: true, gender: true, birthday: true, website: true,
-      jobRole: true, jobCompany: true } },
+      jobRole: true, jobCompany: true, pronouns: true, location: true } },
   preferences: { select: { appearance: true, misc: true } },
   phone: { select: { number: true, verifiedAt: true } },
   security: { select: { totpEnabled: true, mustChangePw: true, backupCodes: true } },
@@ -133,7 +133,9 @@ const PROFILE_ROW_FIELDS: Record<string, string> = {
   gender: 'gender',
   website: 'website',
   companyName: 'jobCompany',
-  companyRole: 'jobRole' };
+  companyRole: 'jobRole',
+  pronouns: 'pronouns',
+  location: 'location' };
 
 /**
  * Fields that stay on the `users` row itself. Every other concern has moved to
@@ -190,6 +192,8 @@ async function readProfileState(userId: string): Promise<{ wire: ProfileWire; fl
       gender: p?.gender ?? null,
       website: p?.website ?? null,
       birthday: p?.birthday ?? null,
+      pronouns: p?.pronouns ?? null,
+      location: p?.location ?? null,
       companyName: p?.jobCompany ?? null,
       companyRole: p?.jobRole ?? null,
       phoneNumber: user.phone?.number ?? null },
@@ -250,7 +254,9 @@ export async function extendedProfileHandler(request: NextRequest) {
         companySize: z.string().optional().nullable(),
         gender: z.string().optional().nullable(),
         birthday: z.string().optional().nullable(),
-        secondaryEmail: z.string().optional().nullable() }).passthrough();
+        secondaryEmail: z.string().optional().nullable(),
+        pronouns: z.string().max(40).optional().nullable(),
+        location: z.string().max(120).optional().nullable() }).passthrough();
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
         console.error('[PATCH /api/profile] Zod validation error:', parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; '));

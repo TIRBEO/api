@@ -3407,7 +3407,7 @@ async function buildProfilePayload(userId: string): Promise<any | null> {
         isAdmin: true,
         createdAt: true,
         updatedAt: true,
-        profile: { select: { name: true, bio: true, gender: true, birthday: true, photoUrl: true, website: true, jobRole: true, jobCompany: true, jobPlace: true, jobStarted: true, location: true } },
+        profile: { select: { name: true, bio: true, gender: true, birthday: true, photoUrl: true, website: true, jobRole: true, jobCompany: true, jobPlace: true, jobStarted: true, location: true, pronouns: true } },
         emails: { select: { address: true, kind: true, verifiedAt: true, isDefault: true }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }] },
         security: { select: { totpEnabled: true, backupCodes: true, mustChangePw: true } },
         preferences: { select: { appearance: true, misc: true } },
@@ -3458,6 +3458,8 @@ async function buildProfilePayload(userId: string): Promise<any | null> {
     jobPlace: p.jobPlace ?? null,
     jobStarted: p.jobStarted ?? null,
     occupation: p.jobPlace ?? null,
+    pronouns: p.pronouns ?? null,
+    location: p.location ?? null,
     country: p.location ?? null,
     phoneNumber: extras.phoneNumber ?? null,
     industry: extras.industry ?? null,
@@ -3554,7 +3556,12 @@ export async function profileHandler(request: NextRequest) {
         jobPlace: z.string().optional().nullable(),
         jobStarted: z.string().max(10).optional().nullable(),
         industry: z.string().optional().nullable(),
-        companySize: z.string().optional().nullable() });
+        companySize: z.string().optional().nullable(),
+        // Personal details — the edit-profile sheet writes these, and the
+        // accounts app reads them back; `location` is the canonical wire name
+        // (`country` is the older spelling still accepted below).
+        pronouns: z.string().max(40).optional().nullable(),
+        location: z.string().max(120).optional().nullable() });
       const parsed = schema.safeParse(body);
       if (!parsed.success) {
         const issues = parsed.error.issues;
@@ -3592,7 +3599,8 @@ export async function profileHandler(request: NextRequest) {
         name: 'name', photoUrl: 'photoUrl', bio: 'bio', gender: 'gender',
         birthday: 'birthday', website: 'website', country: 'location',
         occupation: 'jobPlace', companyName: 'jobCompany', companyRole: 'jobRole',
-        jobPlace: 'jobPlace', jobStarted: 'jobStarted' };
+        jobPlace: 'jobPlace', jobStarted: 'jobStarted',
+        pronouns: 'pronouns', location: 'location' };
       for (const [key, col] of Object.entries(PROFILE_MAP)) {
         if (data[key] !== undefined) profileData[col] = data[key] ?? null;
       }

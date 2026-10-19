@@ -3,6 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { prisma } from '@/infrastructure/db/prisma';
 import { originFromInternalHeaders, recordChange } from '@/features/activity/recordChange';
+import { bustProfileCache } from '@/features/auth/authHandlers';
 
 /**
  * Profile read and write for the profile service (`apps/myprofile`), on the
@@ -234,6 +235,11 @@ export async function internalProfileHandler(request: NextRequest) {
     });
 
     const nowWire = toWire(updated);
+    /* The main API's own profile caches (in-memory + the shared Redis copy
+       apps/myprofile reads first) were built from a payload that predates
+       this write; without this bust the edit is durable in the database but
+       invisible to every read for the caches' full TTL. */
+    bustProfileCache(userId);
     const same = (a: unknown, b: unknown) => {
       if (a instanceof Date || b instanceof Date) {
         return new Date((a ?? 0) as any).getTime() === new Date((b ?? 0) as any).getTime();
