@@ -113,24 +113,6 @@ export async function verifyPasswordResetToken(token: string): Promise<string | 
   }
 }
 
-export async function signRecoveryToken(userId: string): Promise<string> {
-  return new SignJWT({ sub: userId, purpose: 'account-recovery' })
-    .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt()
-    .setExpirationTime('15m')
-    .sign(getSecret());
-}
-
-export async function verifyRecoveryToken(token: string): Promise<string | null> {
-  try {
-    const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
-    if (payload.sub && payload.purpose === 'account-recovery') return payload.sub as string;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 export async function signSuspiciousLoginToken(userId: string): Promise<string> {
   return new SignJWT({ sub: userId, purpose: 'suspicious-login' })
     .setProtectedHeader({ alg: 'HS256' })

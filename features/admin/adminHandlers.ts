@@ -1050,39 +1050,3 @@ export async function getStats(request: NextRequest) {
     counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
     adminUsers: adminUsers.map(u => ({ id: u.id, email: u.email, name: u.profile?.name ?? null, adminRole: 'admin' })) }, { ttl: 15, swr: 120 });
 }
-
-export async function adminMaintenanceHandler(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
-  if (session instanceof NextResponse) return session;
-
-  const { getMaintenanceState, setMaintenanceMode } = await import('@/infrastructure/realtime/ws/server');
-
-  if (request.method === 'GET') {
-    // Also process expired scheduled deletions on maintenance check
-    const { processScheduledDeletions } = await import('@/features/users/userHandlers');
-    const deletionResult = await processScheduledDeletions().catch(() => ({ deleted: 0 }));
-    return NextResponse.json({ ...getMaintenanceState(), deletedUsers: deletionResult.deleted });
-  }
-
-  try {
-    const body = await request.json().catch(() => ({}));
-    const { enabled, message, estimatedEnd, allowedUsers, scheduledStart, scheduledEnd } = body as {
-      enabled?: boolean; message?: string; estimatedEnd?: number | null;
-      allowedUsers?: string[]; scheduledStart?: number | null; scheduledEnd?: number | null;
-    };
-    if (typeof enabled !== 'boolean') {
-      return NextResponse.json({ error: 'enabled (boolean) is required' }, { status: 400 });
-    }
-    setMaintenanceMode(enabled, message, estimatedEnd ?? undefined, allowedUsers, scheduledStart, scheduledEnd);
-    createAuditEvent({
-      action: enabled ? 'maintenance.enabled' : 'maintenance.disabled',
-      actorId: session.userId,
-      targetType: 'maintenance',
-      targetId: 'system',
-      metadata: { message: message || undefined } }).catch(() => {});
-    return NextResponse.json({ ok: true, ...getMaintenanceState() });
-  } catch (err: any) {
-    console.error('[ADMIN MAINTENANCE]', err?.message || err);
-    return NextResponse.json({ error: 'Failed to update maintenance mode' }, { status: 500 });
-  }
-}

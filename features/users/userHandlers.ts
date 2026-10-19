@@ -672,7 +672,7 @@ const PREF_FREQUENCIES = ['daily', 'weekly', 'monthly'];
  */
 function prefsEndpoint(
   keys: string[],
-  options: { allKeys?: boolean; validate?: (patch: Record<string, unknown>) => string | null } = {},
+  options: { validate?: (patch: Record<string, unknown>) => string | null } = {},
 ) {
   const allowed = new Set(keys);
   return async function handlePrefs(request: NextRequest) {
@@ -681,7 +681,6 @@ function prefsEndpoint(
       if (!session) return jsonUnauthorized();
 
       const shape = (prefs: Record<string, any>) => {
-        if (options.allKeys) return { ok: true, ...prefs };
         const out: Record<string, any> = { ok: true };
         for (const key of allowed) out[key] = prefs[key];
         return out;
@@ -714,8 +713,6 @@ function prefsEndpoint(
     }
   };
 }
-
-export const notificationPrefsHandler = prefsEndpoint([], { allKeys: true, validate: validatePrefs });
 
 export const notificationChannelsHandler = prefsEndpoint(['email', 'push']);
 
