@@ -173,14 +173,12 @@ export async function runDueJobs(): Promise<{ job: string; ran: boolean; duratio
   const runs = await lastRuns();
 
   const jobDefs: [JobName, () => Promise<void>][] = [
-    ['cleanup', async () => {
-      const { cleanupOldNotifications } = await import('@/jobs/jobs');
-      await cleanupOldNotifications();
-    }],
-    ['recap', async () => {
-      const { sendAccountSummaries } = await import('@/jobs/jobs');
-      await sendAccountSummaries();
-    }],
+    /* Deletion first, on purpose. The run has an 8-second budget before this
+       process would be cut off, and the job behind it used to sit third —
+       after two mail jobs that send one message per account — so a night with
+       anything to say starved the sweep entirely: accounts whose 30 days were
+       up stayed `deletion_pending` with the screen still promising them a date.
+       The one job that cannot be undone is the one that must not be queued. */
     ['permanent_deletion', async () => {
       const m = await import('@/jobs/jobs-permanent-deletion');
       await m.permanentDeletionJob();
@@ -188,6 +186,14 @@ export async function runDueJobs(): Promise<{ job: string; ran: boolean; duratio
     ['deletion_sweep', async () => {
       const { processScheduledDeletions } = await import('@/features/users/userHandlers');
       await processScheduledDeletions();
+    }],
+    ['cleanup', async () => {
+      const { cleanupOldNotifications } = await import('@/jobs/jobs');
+      await cleanupOldNotifications();
+    }],
+    ['recap', async () => {
+      const { sendAccountSummaries } = await import('@/jobs/jobs');
+      await sendAccountSummaries();
     }],
     ['push_prune', async () => {
       const m = await import('@/infrastructure/push/push-notifications');
