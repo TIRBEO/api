@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin, requireRole, canManageRole } from '@/features/auth/http-guards';
 import { hashPassword } from '@/features/auth/password';
@@ -46,6 +47,41 @@ function statusLabel(status: string): string {
 }
 
 const ENFORCE_STATUSES = ['banned', 'suspended'] as const;
+
+/** Every value of the users.status enum, in the schema's own words. A filter
+    list built from here cannot drift from a migration that adds a state. */
+const USER_STATUSES = [
+  'active',
+  'restricted',
+  'banned',
+  'suspended',
+  'deactivated',
+  'deletion_pending',
+  'deleted',
+] as const;
+
+/** `statusLabel` is a display string and deliberately lossy — restricted and
+    deactivated both read as ACTIVE — so the raw enum travels beside it rather
+    than replacing it. A screen that filters by `deactivated` must be able to
+    show the row it found as deactivated. */
+function isUserStatus(v: string | null): v is (typeof USER_STATUSES)[number] {
+  return v !== null && (USER_STATUSES as readonly string[]).includes(v);
+}
+
+/** Order the list by what the caller asked for. Names live on the profile
+    row, which is one-to-one and may be absent, so those rows sort last. */
+function userOrderBy(sort: string | null): Prisma.UserOrderByWithRelationInput {
+  switch (sort) {
+    case 'oldest':
+      return { createdAt: 'asc' };
+    case 'newest':
+      return { createdAt: 'desc' };
+    case 'name':
+      return { profile: { name: { sort: 'asc', nulls: 'last' } } };
+    default:
+      return { lastActiveAt: { sort: 'desc', nulls: 'last' } };
+  }
+}
 
 /**
  * Batch-load the enforcement rows backing the legacy ban/suspend columns:
@@ -99,6 +135,7 @@ async function shapeUserRow(
     isBanned: u.status === 'banned',
     isSuspended: u.status === 'suspended',
     status: statusLabel(u.status),
+    statusKind: u.status,
     eventId,
     banRefCode: u.status === 'banned' ? eventId : null,
     suspendRefCode: u.status === 'suspended' ? eventId : null,
@@ -107,6 +144,7 @@ async function shapeUserRow(
     reason: kind ? (rest?.detail ?? ev?.reason ?? null) : null,
     until: kind ? (rest?.endsAt ?? (ev?.metadata as any)?.until ?? null) : null,
     createdAt: u.createdAt,
+    updatedAt: u.updatedAt,
     lastActiveAt: u.lastActiveAt,
     lastLoginAt: u.lastLoginAt,
     consents,
@@ -125,6 +163,7 @@ const ADMIN_USER_SELECT = {
   status: true,
   isAdmin: true,
   createdAt: true,
+  updatedAt: true,
   lastActiveAt: true,
   lastLoginAt: true,
   profile: { select: { name: true, photoUrl: true } },
@@ -138,6 +177,7 @@ export async function listUsers(request: NextRequest) {
 
   const page = Number(request.nextUrl.searchParams.get('page')) || 1;
   const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 100, 500);
+  const orderBy = userOrderBy(request.nextUrl.searchParams.get('sort'));
 
   const { baseWhere, findWhere, recapCond, pausedCond } = buildUserFilters(request, session);
 
@@ -147,7 +187,7 @@ export async function listUsers(request: NextRequest) {
     prisma.user.findMany({
       where: findWhere,
       select: ADMIN_USER_SELECT,
-      orderBy: { lastActiveAt: 'desc' },
+      orderBy,
       skip: (page - 1) * limit,
       take: limit }),
     prisma.user.count({ where: findWhere }),
@@ -178,16 +218,31 @@ export async function listUsers(request: NextRequest) {
 /** Shared where-clause builder for the users list + CSV export. */
 function buildUserFilters(request: NextRequest, _session: { adminRole?: string | null }) {
   const search = request.nextUrl.searchParams.get('search') || '';
-  // Search matches email, profile name, or an exact ban/suspend ref code held
-  // in a status event's metadata.refCode.
+  // Search matches email, handle, profile name, an exact id, or a ban/suspend
+  // ref code held in a status event's metadata. An id is a prefix of a uuid, so
+  // `contains` rather than `equals` still lands on one row — and an operator
+  // pasting eight characters of a link is how this lookup actually gets used.
   const baseWhere: any = search
     ? {
         OR: [
-          { email: { contains: search } },
-          { profile: { is: { name: { contains: search } } } },
+          { email: { contains: search, mode: 'insensitive' } },
+          { username: { contains: search, mode: 'insensitive' } },
+          { profile: { is: { name: { contains: search, mode: 'insensitive' } } } },
+          { id: { contains: search } },
           { statusEvents: { some: { toStatus: { in: [...ENFORCE_STATUSES] }, metadata: { path: ['refCode'], equals: search } } } },
         ] }
     : {};
+
+  // The lifecycle state, in the schema's own words. Anything outside the enum
+  // is ignored rather than passed to Prisma, where it would throw a 500 on a
+  // typo in a query string.
+  const status = request.nextUrl.searchParams.get('status');
+  const statusCondition = isUserStatus(status) ? { status } : null;
+
+  // Console access is one boolean today, so the filter is yes or no; anything
+  // else means the caller did not ask.
+  const admin = request.nextUrl.searchParams.get('admin');
+  const adminCondition = admin === 'yes' ? { isAdmin: true } : admin === 'no' ? { isAdmin: false } : null;
 
   // Opt-in filter — matched against the notification prefs jsonb on user_preferences.
   const recapCond = { preferences: { is: { notif: { path: ['summaryEnabled'], equals: true } } } };
@@ -198,7 +253,9 @@ function buildUserFilters(request: NextRequest, _session: { adminRole?: string |
     optIn === 'paused' ? pausedCond :
     optIn === 'any' ? { OR: [recapCond, pausedCond] } :
     optIn === 'none' ? { NOT: { OR: [recapCond, pausedCond] } } : null;
-  const findWhere = optInCondition ? { ...baseWhere, AND: [optInCondition] } : baseWhere;
+
+  const filters = [statusCondition, adminCondition, optInCondition].filter(Boolean);
+  const findWhere = filters.length ? { ...baseWhere, AND: filters } : baseWhere;
 
   return { baseWhere, findWhere, optInCondition, recapCond, pausedCond };
 }
@@ -311,6 +368,7 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     _count: user._count,
     sessions: user.sessions,
     status: shaped.status,
+    statusKind: shaped.statusKind,
     eventId: shaped.eventId,
     roles: [],
     signupConsent: shaped.signupConsent,
