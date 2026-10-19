@@ -81,32 +81,63 @@ export async function effectiveLinks(userId: string): Promise<Record<string, str
   return readOauthLinks(userId);
 }
 
-/**
- * When a provider was linked. The OAuth callback files an `oauth.<provider>.connected`
- * activity event; a merge files `account.merge` with the provider in metadata.
- * The oldest such event is the link date. Falls back to the account's own
- * login ledger so a link created before events existed still shows a date.
- */
-async function linkedAtFor(userId: string, provider: ProviderKey): Promise<string | null> {
-  const ev = await prisma.activityEvent.findFirst({
-    where: {
-      userId,
-      OR: [
-        { kind: `oauth.${provider}.connected` },
-        { kind: 'account.merge', metadata: { path: ['provider'], equals: provider } },
-      ],
-    },
-    orderBy: { createdAt: 'asc' },
-    select: { createdAt: true },
-  }).catch(() => null);
-  if (ev) return ev.createdAt.toISOString();
+/** An open-ended row (endsAt null) never expires; a dated row is live until its
+    endsAt passes. Owned here because both the sign-in refusal and the settings
+    read need the same row, and two predicates drift apart. */
+export type RestrictionRow = { id: string; title: string; detail: string | null; endsAt: Date | null };
 
-  const login = await prisma.userLogin.findFirst({
-    where: { userId, success: true, method: provider },
-    orderBy: { createdAt: 'asc' },
-    select: { createdAt: true },
-  }).catch(() => null);
-  return login ? login.createdAt.toISOString() : null;
+export async function liveRestrictionRow(userId: string): Promise<RestrictionRow | null> {
+  const r = await prisma.userRestriction.findFirst({
+    where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] },
+    orderBy: { startedAt: 'desc' },
+    select: { id: true, title: true, detail: true, endsAt: true },
+  });
+  return r ?? null;
+}
+
+export type ProviderLoginRow = { method: string; createdAt: Date };
+
+function providerLoginRows(userId: string): Promise<ProviderLoginRow[]> {
+  return prisma.userLogin
+    .findMany({
+      where: { userId, success: true, method: { in: PROVIDER_KEYS } },
+      orderBy: { createdAt: 'asc' },
+      select: { method: true, createdAt: true },
+    })
+    .catch(() => [] as ProviderLoginRow[]);
+}
+
+/** When each provider first appeared in the account's own record: the oldest
+    `oauth.<provider>.connected` event, or the oldest `account.merge` row naming
+    that provider. One read for all three.
+
+    The loop version asked twice per provider, serially, and one of those asks
+    filtered on a JSON path — six round trips through the pooler, on the path
+    the settings gate renders nothing until it has answered. */
+const LINK_EVENT_KINDS = PROVIDER_KEYS.map((p) => `oauth.${p}.connected`);
+
+async function linkEventDates(userId: string): Promise<Record<string, string>> {
+  const rows = await prisma.activityEvent
+    .findMany({
+      where: { userId, OR: [{ kind: { in: LINK_EVENT_KINDS } }, { kind: 'account.merge' }] },
+      orderBy: { createdAt: 'asc' },
+      // Oldest first, and the answer wanted is the first hit per provider, so
+      // the head of the list is the useful part. A provider linked after the
+      // first 100 such events falls back to the login ledger below.
+      take: 100,
+      select: { kind: true, metadata: true, createdAt: true },
+    })
+    .catch(() => [] as { kind: string; metadata: unknown; createdAt: Date }[]);
+
+  const out: Record<string, string> = {};
+  for (const row of rows) {
+    const provider = row.kind.startsWith('oauth.')
+      ? row.kind.split('.')[1]
+      : String(((row.metadata as Record<string, unknown> | null)?.provider ?? '') as string);
+    if (!isProviderKey(provider) || out[provider]) continue;
+    out[provider] = row.createdAt.toISOString();
+  }
+  return out;
 }
 
 export interface ConnectionRow {
@@ -119,31 +150,43 @@ export interface ConnectionRow {
   lastUsedAt: string | null;
 }
 
-export async function listConnections(userId: string): Promise<ConnectionRow[]> {
-  const [links, logins] = await Promise.all([
-    effectiveLinks(userId),
-    prisma.userLogin.findMany({
-      where: { userId, success: true, method: { in: PROVIDER_KEYS } },
-      orderBy: { createdAt: 'asc' },
-      select: { method: true, createdAt: true },
-    }).catch(() => [] as { method: string; createdAt: Date }[]),
-  ]);
-
-  const rows: ConnectionRow[] = [];
-  for (const provider of PROVIDER_KEYS) {
+/** The rows, from reads the caller already has. A link with no event of its
+    own shows the first sign-in through that provider, which is the oldest date
+    the account can actually prove. */
+function connectionRows(
+  userId: string,
+  links: Record<string, string>,
+  logins: ProviderLoginRow[],
+  linkedAt: Record<string, string>,
+): ConnectionRow[] {
+  return PROVIDER_KEYS.map((provider) => {
     const used = logins.filter((row) => row.method === provider);
     const accountId = links[provider] ?? null;
-    rows.push({
+    return {
       id: `${userId}:${provider}`,
       provider,
       connected: !!accountId,
       accountId,
-      linkedAt: accountId ? await linkedAtFor(userId, provider) : null,
+      linkedAt: accountId ? (linkedAt[provider] ?? (used.length ? used[0].createdAt.toISOString() : null)) : null,
       firstNameUsedAt: used.length ? used[0].createdAt.toISOString() : null,
       lastUsedAt: used.length ? used[used.length - 1].createdAt.toISOString() : null,
-    });
-  }
-  return rows;
+    };
+  });
+}
+
+export type ConnectionsPreload = {
+  links?: Record<string, string>;
+  logins?: ProviderLoginRow[];
+  linkedAt?: Record<string, string>;
+};
+
+export async function listConnections(userId: string, preloaded?: ConnectionsPreload): Promise<ConnectionRow[]> {
+  const [links, logins, linkedAt] = await Promise.all([
+    preloaded?.links ?? effectiveLinks(userId),
+    preloaded?.logins ?? providerLoginRows(userId),
+    preloaded?.linkedAt ?? linkEventDates(userId),
+  ]);
+  return connectionRows(userId, links, logins, linkedAt);
 }
 
 export interface SignInMethods {
@@ -160,11 +203,15 @@ export interface SignInMethods {
  * only provider must be refused, exactly like a passwordless account with one
  * passkey that tries to delete the passkey.
  */
-export async function signInMethods(userId: string): Promise<SignInMethods> {
+export async function signInMethods(
+  userId: string,
+  preloaded?: { links?: Record<string, string>; passwordHash?: string | null; passkeyCount?: number },
+): Promise<SignInMethods> {
   const [user, linkMap, passkeyCount] = await Promise.all([
-    prisma.user.findUnique({ where: { id: userId }, select: { passwordHash: true } }).catch(() => null),
-    effectiveLinks(userId),
-    prisma.passkey.count({ where: { userId } }).catch(() => 0),
+    preloaded?.passwordHash !== undefined ? { passwordHash: preloaded.passwordHash }
+      : prisma.user.findUnique({ where: { id: userId }, select: { passwordHash: true } }).catch(() => null),
+    preloaded?.links ?? effectiveLinks(userId),
+    preloaded?.passkeyCount ?? prisma.passkey.count({ where: { userId } }).catch(() => 0),
   ]);
   const oauth = Object.keys(linkMap).filter(isProviderKey) as ProviderKey[];
   const password = !!user?.passwordHash;
@@ -510,30 +557,54 @@ export interface AccountState {
 }
 
 export async function readAccountState(userId: string): Promise<AccountState> {
-  const [user, deactivation, active, methods, connections] = await Promise.all([
-    prisma.user.findUnique({ where: { id: userId }, select: { status: true } }).catch(() => null),
-    prisma.userDeactivation.findUnique({ where: { userId } }).catch(() => null),
-    activeDeletionFor(userId),
-    signInMethods(userId),
-    listConnections(userId),
-  ]);
+  /* ONE round of reads.
+   *
+   * The settings gate paints nothing before this answers, so every serial await
+   * in here is time a reader spends watching a spinner. The status, the three
+   * closure clocks, the live decision, the appeals against it, the ways back in
+   * and the connected apps are all rows that can be asked for at the same time.
+   *
+   * What is left for a second round is the reference code, and only when the
+   * account is actually closed — the rare case, and the one where there is no
+   * dashboard being withheld behind it. */
+  const [user, deactivation, deletionRequest, restriction, links, logins, linkedAt, appealRows, passkeyCount] =
+    await Promise.all([
+      prisma.user.findUnique({ where: { id: userId }, select: { status: true, passwordHash: true } }).catch(() => null),
+      prisma.userDeactivation.findUnique({ where: { userId } }).catch(() => null),
+      prisma.userDeletionRequest
+        .findUnique({ where: { userId }, select: { reason: true, finalAt: true, cancelledAt: true, executedAt: true } })
+        .catch(() => null),
+      liveRestrictionRow(userId).catch(() => null),
+      effectiveLinks(userId),
+      providerLoginRows(userId),
+      linkEventDates(userId),
+      prisma.userAppeal
+        .findMany({ where: { userId }, select: { restrictionId: true } })
+        .catch(() => [] as { restrictionId: string }[]),
+      prisma.passkey.count({ where: { userId } }).catch(() => 0),
+    ]);
 
   const status = (user?.status as string) ?? 'active';
-  // The closure's own facts — reason, end date, reference, the decision row —
-  // come from the single source of truth (features/auth/blockFacts), the same
-  // one the sign-in answered from, so the settings screen can never describe
-  // the closure differently from the login form that opened it.
+  // A cancelled or already-executed request is no clock — the same rule
+  // `activeDeletionFor` applies, read off the row this round already fetched.
+  const active =
+    deletionRequest && !deletionRequest.cancelledAt && !deletionRequest.executedAt
+      ? { finalAt: deletionRequest.finalAt }
+      : null;
+
+  /* The closure's own facts — reason, end date, reference, the decision row —
+     come from the single source of truth (features/auth/blockFacts), the same
+     one the sign-in answered from, so the settings screen can never describe
+     the closure differently from the login form that opened it. The rows it
+     would read are already in hand, so they are handed in rather than asked for
+     again. For a status that is not a closure it answers null without a query,
+     which is almost every account and the whole point of this round. */
   const { blockFactsFor } = await import('@/features/auth/blockFacts');
-  const facts = await blockFactsFor(userId, status);
+  const facts = await blockFactsFor(userId, status, { deactivation, deletionRequest, restriction });
 
   const deactivated = status === 'deactivated' && !!deactivation && !deactivation.resumedAt;
   const deletionPending = status === 'deletion_pending' && !!active;
-  const appealFiled = facts?.decisionId
-    ? !!(await prisma.userAppeal.findFirst({
-        where: { userId, restrictionId: facts.decisionId },
-        select: { id: true },
-      }).catch(() => null))
-    : false;
+  const appealFiled = !!facts?.decisionId && appealRows.some((a) => a.restrictionId === facts.decisionId);
 
   return {
     status,
@@ -548,7 +619,7 @@ export async function readAccountState(userId: string): Promise<AccountState> {
     deactivatedReason: deactivated ? deactivation!.reason ?? null : null,
     deletionPending,
     deletionFinalAt: deletionPending ? active!.finalAt.toISOString() : null,
-    signInMethods: methods,
-    connections,
+    signInMethods: await signInMethods(userId, { links, passwordHash: user?.passwordHash ?? null, passkeyCount }),
+    connections: connectionRows(userId, links, logins, linkedAt),
   };
 }

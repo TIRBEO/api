@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { ensureRefCode } from '@/features/users/refcode';
-import { activeDeletionFor } from '@/features/status/accountLifecycle';
+import { activeDeletionFor, liveRestrictionRow, type RestrictionRow } from '@/features/status/accountLifecycle';
 
 /* ═══════════════════════════════════════════════════════════════════
    The single source of truth about a closed account.
@@ -64,26 +64,37 @@ function blockBody(facts: BlockFacts) {
 }
 
 /** The most recent NON-EXPIRED restriction on the account — the live decision
- *  behind a banned/suspended block. An open-ended row (endsAt null) never
- *  expires; a dated row is live until its endsAt passes. Best-effort: the block
- *  answer must not fail because the detail read did — reason and until read
- *  null rather than turning a 403 the person can act on into a 500. */
-async function activeRestrictionFor(userId: string): Promise<{ id: string; title: string; detail: string | null; endsAt: Date | null } | null> {
-  try {
-    const r = await prisma.userRestriction.findFirst({
-      where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] },
-      orderBy: { startedAt: 'desc' },
-      select: { id: true, title: true, detail: true, endsAt: true } });
-    return r ?? null;
-  } catch {
-    return null;
-  }
+ *  behind a banned/suspended block. Owned by the lifecycle module (see
+ *  `liveRestrictionRow`) so the sign-in refusal and the settings read cannot
+ *  pick a different row. Best-effort: the block answer must not fail because
+ *  the detail read did — reason and until read null rather than turning a 403
+ *  the person can act on into a 500. */
+async function activeRestrictionFor(userId: string) {
+  return liveRestrictionRow(userId).catch(() => null);
 }
+
+/** Rows a caller has already read for itself.
+ *
+ *  `readAccountState` needs the status AND the decision behind it, and the
+ *  rows are the same ones. Without this seam it reads them once for its own
+ *  derivation and `blockFactsFor` reads them again — and every extra read here
+ *  is another trip through the pooler on the path the settings gate waits
+ *  behind. Passing them in changes no answer: the facts are derived by the one
+ *  implementation below either way. */
+export type BlockFactsPreload = {
+  deactivation?: { reason: string | null } | null;
+  deletionRequest?: { reason: string | null; finalAt: Date; cancelledAt: Date | null; executedAt: Date | null } | null;
+  restriction?: RestrictionRow | null;
+};
 
 /** Read the decision of record for a closed account. Returns null for a status
  *  that is not a closure, so a caller cannot accidentally "block" an active
  *  account. Every read degrades to a missing detail, never to a failed refusal. */
-export async function blockFactsFor(userId: string, status: string | null | undefined): Promise<BlockFacts | null> {
+export async function blockFactsFor(
+  userId: string,
+  status: string | null | undefined,
+  preload?: BlockFactsPreload,
+): Promise<BlockFacts | null> {
   if (!isBlockedSignInStatus(status)) return null;
   const kind = status as BlockKind;
   const shape = SHAPE[kind];
@@ -92,20 +103,27 @@ export async function blockFactsFor(userId: string, status: string | null | unde
   let decisionId: string | null = null;
 
   if (kind === 'banned' || kind === 'suspended') {
-    const restriction = await activeRestrictionFor(userId);
+    const restriction = preload?.restriction !== undefined ? preload.restriction : await activeRestrictionFor(userId);
     decisionId = restriction?.id ?? null;
     reason = restriction ? (restriction.detail || restriction.title) : null;
     until = restriction?.endsAt ? restriction.endsAt.toISOString() : null;
   } else if (kind === 'deletion_pending') {
-    const [active, dr] = await Promise.all([
-      activeDeletionFor(userId),
-      prisma.userDeletionRequest.findUnique({ where: { userId }, select: { reason: true } }).catch(() => null),
-    ]);
-    reason = dr?.reason ?? null;
-    until = active?.finalAt ? active.finalAt.toISOString() : null;
+    if (preload?.deletionRequest !== undefined) {
+      const dr = preload.deletionRequest;
+      reason = dr?.reason ?? null;
+      // A request the person cancelled, or the sweep already ran, is no clock.
+      until = dr && !dr.cancelledAt && !dr.executedAt ? dr.finalAt.toISOString() : null;
+    } else {
+      const [active, dr] = await Promise.all([
+        activeDeletionFor(userId),
+        prisma.userDeletionRequest.findUnique({ where: { userId }, select: { reason: true } }).catch(() => null),
+      ]);
+      reason = dr?.reason ?? null;
+      until = active?.finalAt ? active.finalAt.toISOString() : null;
+    }
   } else if (kind === 'deactivated') {
-    const deactivation = await prisma.userDeactivation.findUnique({ where: { userId }, select: { reason: true } }).catch(() => null);
-    reason = deactivation?.reason ?? null;
+    reason = (preload?.deactivation !== undefined ? preload.deactivation
+      : await prisma.userDeactivation.findUnique({ where: { userId }, select: { reason: true } }).catch(() => null))?.reason ?? null;
   }
 
   // A lost reference table must not swallow the refusal: ensureRefCode falls

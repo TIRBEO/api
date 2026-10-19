@@ -62,6 +62,11 @@ vi.mock('@/features/users/refcode', () => ({
 
 vi.mock('@/features/status/accountLifecycle', () => ({
   activeDeletionFor: vi.fn(async () => mocks.deletion),
+  /* The lifecycle owns the live-decision read — the sign-in refusal and the
+     settings gate both ask it, so neither can pick a different row. Same
+     fixture rows the prisma stub below holds. */
+  liveRestrictionRow: vi.fn(async (userId: string) =>
+    mocks.restrictions.find((r) => r.userId === userId) || null),
 }));
 
 vi.mock('@/features/captcha/risk', () => ({
