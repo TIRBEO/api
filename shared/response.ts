@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { CORS_ALLOWED_HEADERS, isHostAllowed } from '@/config/app-urls';
 
-function addCorsToResponse(res: NextResponse, request?: NextRequest) {
+export function addCorsToResponse(res: NextResponse, request?: NextRequest) {
   if (!request) {
     res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
     res.headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');

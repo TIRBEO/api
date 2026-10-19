@@ -2,7 +2,8 @@ import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
 import { getSession, requireSession, isSessionUnavailable } from '@/features/auth/http-guards';
 import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
-import { jsonError, jsonForbidden, jsonSessionUnavailable } from '@/shared/response';
+import { jsonError, jsonForbidden, jsonSessionUnavailable, addCorsToResponse } from '@/shared/response';
+import { isPublicApiDoor } from '@/features/auth/publicDoors';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
 import { systemFaultRef } from '@/features/users/refcode';
 
@@ -268,31 +269,18 @@ const INTERNAL_ROUTES = [
 ];
 
 // IP-level blocking is delegated to Cloudflare (WAF / rate rules) — the API
-// never rejects on IP. User blocks are derived from the consolidated
-// account status: banned | suspended | deletion_pending | deleted are the
-// blocking states.
-const USER_BLOCK_CACHE_TTL = 60000; // 60s cache for blocks — stale-while-revalidate pattern
-const USER_BLOCK_STALE_TTL = 300_000; // serve stale data for up to 5 min if DB is down
-const BLOCKED_USER_STATUSES = new Set(['banned', 'suspended', 'deletion_pending', 'deleted', 'restricted']);
-const userBlockCache = new Map<string, { blocked: boolean; ts: number }>();
-
-async function isUserBlocked(userId?: string) {
-  if (!userId) return false;
-  const hit = userBlockCache.get(userId);
-  if (hit && Date.now() - hit.ts < USER_BLOCK_CACHE_TTL) return hit.blocked;    try {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-    const blocked = !!user && BLOCKED_USER_STATUSES.has(user?.status);
-    userBlockCache.set(userId, { blocked, ts: Date.now() });
-    if (userBlockCache.size > 2000) {
-      const now = Date.now();
-      for (const [k, v] of userBlockCache) { if (now - v.ts > USER_BLOCK_CACHE_TTL) userBlockCache.delete(k); }
-    }
-    return blocked;
+// never rejects on IP. What closes an account, which doors a closed account
+// keeps, and the body that says so all live in features/auth/blockFacts, and
+// the edge asks them of every request. This asks the same question again here,
+// for the callers the edge had no session to look up — an API key.
+async function closedAccountRefusal(userId: string | undefined, pathStr: string, method: string) {
+  if (!userId || isPublicApiDoor(`/api/${pathStr}`, method)) return null;
+  try {
+    const { closedAccountGate } = await import('@/features/auth/blockFacts');
+    return await closedAccountGate(userId, `/api/${pathStr}`, method);
   } catch (e: any) {
-    console.error('[BLOCKLIST] user status query failed, serving stale cache:', e?.message);
-    // Serve stale cache if available instead of failing
-    if (hit && Date.now() - hit.ts < USER_BLOCK_STALE_TTL) return hit.blocked;
-    return false;
+    console.error('[BLOCKLIST] closure check failed:', e?.message);
+    return null;
   }
 }
 
@@ -608,21 +596,10 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
     }).catch(() => {});
   }
 
-  let blocked = false;
-  try {
-    // Auth endpoints must run their own structured block flow (login of a
-    // banned/deletion-pending account returns the block payload that drives
-    // the appeal & cancel-deletion screens on accounts) — a blanket 403 here
-    // would turn those paths into a dead end.
-    blocked = !pathStr.startsWith('auth/') && (await isUserBlocked(session?.userId));
-  } catch (e: any) {
-    console.error('[HANDLER] block check failed:', e?.message);
-    return NextResponse.json({ error: 'Database connection error' }, { status: 500 });
-  }
-
-  if (blocked) {
-    console.warn(`[AUTH] Blocked request — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
-    return jsonForbidden('Your account has been blocked');
+  const refusal = await closedAccountRefusal(session?.userId, pathStr, method);
+  if (refusal) {
+    console.warn(`[AUTH] Closed account at a door it does not keep — ip: ${ip}, user: ${session?.userId}, path: ${pathStr}`);
+    return addCorsToResponse(NextResponse.json(refusal, { status: 403 }), request);
   }
 
   // Redirect user-facing paths to the dashboard instead of returning 404.

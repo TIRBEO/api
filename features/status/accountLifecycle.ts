@@ -264,54 +264,6 @@ export async function reactivateAccount(userId: string) {
 }
 
 /**
- * Reactivation for a SIGNED-OUT deactivated account. Sign-in is refused while
- * deactivated, so the only way back for someone who closed the tab is a code to
- * the email they sign in with. Two steps: request (sends a code, rate-limited)
- * and verify (consumes it and restores the account). Returns a machine-readable
- * code so the UI can distinguish "nothing to restore" from a wrong/expired code.
- *
- * The same door serves a scheduled deletion: an account in `deletion_pending`
- * that cannot sign in proves ownership with this code too, and verifying it
- * cancels the deletion instead of flipping a deactivation. `not_restorable` is
- * the refusal for every other status (the legacy name `not_deactivated` is a
- * subset of it — old callers branch on the reason string, not the code).
- */
-export async function requestReactivationByEmail(email: string): Promise<{ ok: boolean; reason?: string; code?: string }> {
-  const userId = await userIdForEmail(email);
-  if (!userId) return { ok: false, reason: 'no_account' };
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-  const restorable = user?.status === 'deactivated' || user?.status === 'deletion_pending';
-  if (!restorable) return { ok: false, reason: 'not_restorable' };
-
-  const issued = await issueSensitiveCode(REACTIVATE_OTP_KIND, email, email, userId);
-  if (!issued.ok) return { ok: false, reason: 'cooldown' };
-  return { ok: true, code: issued.code };
-}
-
-export async function reactivateByEmailCode(
-  email: string,
-  code: string,
-): Promise<{ ok: boolean; reason?: string; restoredAs?: 'reactivated' | 'deletion_cancelled' }> {
-  const userId = await userIdForEmail(email);
-  if (!userId) return { ok: false, reason: 'no_account' };
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-  if (!user) return { ok: false, reason: 'no_account' };
-  if (user.status !== 'deactivated' && user.status !== 'deletion_pending') {
-    return { ok: false, reason: 'not_restorable' };
-  }
-  const ok = await consumeSensitiveCode(REACTIVATE_OTP_KIND, email, code, email);
-  if (!ok) return { ok: false, reason: 'invalid_code' };
-
-  if (user.status === 'deletion_pending') {
-    const cancelled = await cancelDeletion(userId);
-    if (!cancelled.ok) return { ok: false, reason: cancelled.error ?? 'not_restorable' };
-    return { ok: true, restoredAs: 'deletion_cancelled' };
-  }
-  await reactivateAccount(userId);
-  return { ok: true, restoredAs: 'reactivated' };
-}
-
-/**
  * Revoke every active session for the user except `keepId`. Sessions are active
  * while `revokedAt` is null (the consolidated schema dropped the status column
  * semantics — the stamp is the truth). We keep the requesting session so the
@@ -345,7 +297,6 @@ export async function revokeOtherSessions(userId: string, keepId: string | null)
 export const OTP_TTL_MINUTES = 15;
 const MAX_OTP_ATTEMPTS = 5;
 export const DELETE_OTP_KIND = 'account_delete';
-export const REACTIVATE_OTP_KIND = 'account_reactivate';
 
 /**
  * Exported for the reauth code (`features/auth/reauthCode.ts`), which is the
@@ -530,15 +481,25 @@ export async function cancelDeletion(userId: string): Promise<{ ok: boolean; err
 
 export interface AccountState {
   status: string;
+  /** The reason behind the current enforcement, when one was recorded. */
+  reason: string | null;
+  /** When the current enforcement ends (ISO) — a suspension's end, a
+      deletion's final date. Null for open-ended states. */
+  until: string | null;
   deactivated: boolean;
   deactivatedAt: string | null;
   deactivatedReason: string | null;
   deletionPending: boolean;
   deletionFinalAt: string | null;
-  deletionDaysRemaining: number | null;
+  /** The decision row behind a ban or suspension — what an appeal is filed
+      against. Null when the closure isn't a restriction. */
+  decisionId: string | null;
+  /** Whether the live decision has already been appealed, so the closure
+      screen can stop offering a second appeal. */
+  appealFiled: boolean;
   /** The persisted event reference for the current enforcement state, so the
-      in-app lock screens can show/attach it the same way the /blocked
-      hand-off does. Null when nothing was ever decided. */
+      in-app lock screens can show/attach it the way a support thread quotes
+      it. Null when nothing was ever decided. */
   refCode: string | null;
   signInMethods: SignInMethods;
   connections: ConnectionRow[];
@@ -554,30 +515,34 @@ export async function readAccountState(userId: string): Promise<AccountState> {
   ]);
 
   const status = (user?.status as string) ?? 'active';
+  // The closure's own facts — reason, end date, reference, the decision row —
+  // come from the single source of truth (features/auth/blockFacts), the same
+  // one the sign-in answered from, so the settings screen can never describe
+  // the closure differently from the login form that opened it.
+  const { blockFactsFor } = await import('@/features/auth/blockFacts');
+  const facts = await blockFactsFor(userId, status);
+
   const deactivated = status === 'deactivated' && !!deactivation && !deactivation.resumedAt;
   const deletionPending = status === 'deletion_pending' && !!active;
-
-  const refKind =
-    status === 'banned' ? 'ban' : status === 'suspended' ? 'suspend' :
-    status === 'deletion_pending' ? 'delete' : status === 'deactivated' ? 'deactivate' :
-    status === 'deleted' ? 'deleted' : null;
-  let refCode: string | null = null;
-  if (refKind) {
-    const { ensureRefCode } = await import('@/features/users/refcode');
-    refCode = await ensureRefCode(userId, refKind).catch(() => null);
-  }
+  const appealFiled = facts?.decisionId
+    ? !!(await prisma.userAppeal.findFirst({
+        where: { userId, restrictionId: facts.decisionId },
+        select: { id: true },
+      }).catch(() => null))
+    : false;
 
   return {
     status,
-    refCode,
+    reason: facts?.reason ?? null,
+    until: facts?.until ?? null,
+    decisionId: facts?.decisionId ?? null,
+    appealFiled,
+    refCode: facts?.eventId || null,
     deactivated,
     deactivatedAt: deactivated ? deactivation!.pausedAt.toISOString() : null,
     deactivatedReason: deactivated ? deactivation!.reason ?? null : null,
     deletionPending,
     deletionFinalAt: deletionPending ? active!.finalAt.toISOString() : null,
-    deletionDaysRemaining: deletionPending
-      ? Math.max(0, Math.ceil((active!.finalAt.getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
-      : null,
     signInMethods: methods,
     connections,
   };

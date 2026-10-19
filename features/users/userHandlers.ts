@@ -1906,8 +1906,15 @@ export async function avatarUploadHandler(request: NextRequest) {
 
     if (!photoUrl) return NextResponse.json({ error: 'No image provided' }, { status: 400 });
 
-    // Double-check: reject data: URLs that might slip through
-    if (photoUrl.startsWith('data:') || photoUrl.startsWith('javascript:') || photoUrl.startsWith('vbscript:')) {
+    // Reject script schemes outright (XSS). A data: URL here can only be the
+    // server-generated fallback from a magic-byte-validated image upload (the
+    // user-supplied URL path above already enforces https-only, so data: can't
+    // arrive from there) — so data:image/... is safe to keep and lets the
+    // avatar work when R2/media storage isn't configured.
+    if (photoUrl.startsWith('javascript:') || photoUrl.startsWith('vbscript:')) {
+      return NextResponse.json({ error: 'Avatar URL scheme not allowed' }, { status: 400 });
+    }
+    if (photoUrl.startsWith('data:') && !photoUrl.startsWith('data:image/')) {
       return NextResponse.json({ error: 'Avatar URL scheme not allowed' }, { status: 400 });
     }
 

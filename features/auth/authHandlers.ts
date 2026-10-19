@@ -29,13 +29,13 @@ import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate
 import { getTurnstileSiteKey } from '@/features/auth/turnstile';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
 import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
-import { ensureRefCode, systemFaultRef } from '@/features/users/refcode';
+import { systemFaultRef } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, getVerifyMax, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
 import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
 import { normalizeWorkFields } from '@/features/auth/profile-work';
-import { activeDeletionFor } from '@/features/status/accountLifecycle';
+import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/blockFacts';
 
 // Cache email existence lookups (login/signup fire these on every debounced
 // keystroke). Results are almost never changed mid-session, so a 30s TTL is
@@ -1103,23 +1103,6 @@ export async function loginHandler(request: NextRequest) {
       logSecurityEvent({ request, eventType: 'auth.login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid email or username or password' }, { status: 401 });
     }
-    if (isBlockedSignInStatus(user.status)) {
-      if (user.status === 'suspended') {
-        const until = await suspensionUntil(user.id);
-        if (until && until < new Date()) {
-          // Suspension expired — lift it on first hit and let the sign in.
-          await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
-          logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: until.toISOString() } }).catch(() => {});
-        } else {
-          return blockedAccountResponse(user);
-        }
-      } else {
-        // deleted / banned / deletion_pending / deactivated — one structured
-        // 403 so the client can render the right recovery door (cancel the
-        // deletion, reactivate, appeal) instead of a generic dead end.
-        return blockedAccountResponse(user);
-      }
-    }
     if (!user.passwordHash) {
       return NextResponse.json({ error: 'Invalid email or username or password' }, { status: 401 });
     }
@@ -1151,6 +1134,29 @@ export async function loginHandler(request: NextRequest) {
       // Record failed login attempt (user_logins + activity_events)
       recordLoginHistory({ request, userId: user.id, email: user.email || '', success: false, method: 'password' }).catch(() => {});
       return NextResponse.json({ error: 'Invalid email or username or password' }, { status: 401 });
+    }
+
+    /* The account's status is only ever revealed to someone who just proved
+       they own it. Answering this before verifyPassword turned the sign-in
+       form into an oracle: any visitor could ask "is this email banned?" and
+       get a true answer, with the reference code and the reason, without ever
+       knowing the password. */
+    if (isBlockedSignInStatus(user.status)) {
+      if (user.status === 'suspended') {
+        const until = await suspensionUntil(user.id);
+        if (until && until < new Date()) {
+          // Suspension expired — lift it on first hit and let the sign in.
+          await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
+          logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: until.toISOString() } }).catch(() => {});
+        } else {
+          return blockedAccountResponse(user, request);
+        }
+      } else {
+        // deleted / banned / deletion_pending / deactivated — the facts plus a
+        // session, so the settings app can render the right recovery door
+        // (cancel the deletion, reactivate, appeal) in place of the dashboard.
+        return blockedAccountResponse(user, request);
+      }
     }
 
     const risk = await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true });
@@ -1270,12 +1276,6 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       logSecurityEvent({ request, eventType: 'auth.admin_login_failed', details: { reason: 'no_such_user' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
-    if (user.status === 'banned') {
-      return NextResponse.json({ error: 'ACCOUNT_BANNED', banned: true, eventId: await ensureRefCode(user.id, 'ban'), reason: 'No reason provided', message: 'This admin account is banned.' }, { status: 403 });
-    }
-    if (user.status === 'suspended' || user.status === 'deleted') {
-      return NextResponse.json({ error: 'ACCOUNT_SUSPENDED', suspended: true, reason: 'No reason provided', message: 'This admin account is suspended.' }, { status: 403 });
-    }
     if (!user.passwordHash) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
@@ -1309,6 +1309,12 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
         details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
         dashboardUrl: getAdminBaseUrl() });
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
+    }
+
+    // What is true about an account is only ever said out loud to someone who
+    // has just proved they hold its password — see loginHandler.
+    if (isBlockedSignInStatus(user.status)) {
+      return blockedAccountResponse(user);
     }
 
     const risk = await computeRiskScore({ ip, ua: userAgent, sessionId, fingerprint, authPath: true });
@@ -2345,8 +2351,12 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       if (!existing) {
         return NextResponse.json({ error: 'Could not reach your existing account. Please try again.' }, { status: 500 });
       }
-      if (existing.status === 'banned' || existing.status === 'suspended' || existing.status === 'deleted') {
-        return blockedAccountResponse(existing);
+      if (isBlockedSignInStatus(existing.status)) {
+        // The provider identity has just been verified for this address, so this
+        // is a matched credential: hand the session like every other sign-in
+        // does, and the client routes the closed account to the settings screen
+        // (see ./blockFacts).
+        return blockedAccountResponse(existing, request);
       }
       await setOauthLink(existing.id, data.provider, data.providerId);
       if (!existing.name && displayName) {
@@ -2470,94 +2480,9 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
   }
 }
 
-/** The most recent NON-EXPIRED restriction on the account — the live decision
- *  behind a banned/suspended block. An open-ended row (endsAt null) never
- *  expires; a dated row is live until its endsAt passes. Best-effort: the
- *  block answer must not fail because the detail read did — reason and until
- *  read null rather than turning a 403 the user can act on into a 500. */
-async function activeRestrictionFor(userId: string): Promise<{ title: string; detail: string | null; endsAt: Date | null } | null> {
-  try {
-    const r = await prisma.userRestriction.findFirst({
-      where: { userId, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] },
-      orderBy: { startedAt: 'desc' },
-      select: { title: true, detail: true, endsAt: true } });
-    return r ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/** Every status that refuses a sign-in, and the one place the refusal is
- *  shaped. Deletion_pending and deactivated are recoverable states — their
- *  payloads carry the cancel/reactivate affordance (plus the persisted
- *  reference code) so the accounts app can offer the way back instead of a
- *  dead end. Banned/suspended carry the live restriction's reason + until. */
-export async function blockedAccountResponse(user: LoginUser): Promise<NextResponse> {
-  if (user.status === 'banned') {
-    const restriction = await activeRestrictionFor(user.id);
-    return NextResponse.json({
-      error: 'ACCOUNT_BANNED',
-      banned: true,
-      eventId: await ensureRefCode(user.id, 'ban'),
-      reason: restriction ? (restriction.detail || restriction.title) : null,
-      until: restriction?.endsAt ? restriction.endsAt.toISOString() : null,
-      message: 'Your account has been banned.' }, { status: 403 });
-  }
-  if (user.status === 'suspended') {
-    const restriction = await activeRestrictionFor(user.id);
-    return NextResponse.json({
-      error: 'ACCOUNT_SUSPENDED',
-      suspended: true,
-      eventId: await ensureRefCode(user.id, 'suspend'),
-      reason: restriction ? (restriction.detail || restriction.title) : null,
-      until: restriction?.endsAt ? restriction.endsAt.toISOString() : null,
-      message: 'Your account is temporarily suspended.' }, { status: 403 });
-  }
-  if (user.status === 'deletion_pending') {
-    let active: { finalAt: Date } | null = null;
-    let reason: string | null = null;
-    try {
-      active = await activeDeletionFor(user.id);
-      const dr = await prisma.userDeletionRequest.findUnique({ where: { userId: user.id }, select: { reason: true } });
-      reason = dr?.reason ?? null;
-    } catch { /* a lost read narrows the payload (reason/until null) rather than
-                 turning the 403 — which is the person's way back — into a 500 */ }
-    return NextResponse.json({
-      error: 'ACCOUNT_DELETION_PENDING',
-      deletionPending: true,
-      eventId: await ensureRefCode(user.id, 'delete'),
-      reason,
-      until: active?.finalAt ? active.finalAt.toISOString() : null,
-      message: 'Your account is scheduled for deletion. You can still cancel it.' }, { status: 403 });
-  }
-  if (user.status === 'deactivated') {
-    let deactivation: { reason: string | null } | null = null;
-    try {
-      deactivation = await prisma.userDeactivation.findUnique({ where: { userId: user.id }, select: { reason: true } });
-    } catch { /* read failure → reason just reads null */ }
-    return NextResponse.json({
-      error: 'ACCOUNT_DEACTIVATED',
-      deactivated: true,
-      eventId: await ensureRefCode(user.id, 'deactivate'),
-      reason: deactivation?.reason ?? null,
-      until: null,
-      message: 'Your account is paused. You can reactivate it any time.' }, { status: 403 });
-  }
-  return NextResponse.json({
-    error: 'ACCOUNT_DELETED',
-    deleted: true,
-    eventId: await ensureRefCode(user.id, 'deleted'),
-    message: 'Your account has been deleted.' }, { status: 403 });
-}
-
-/** Statuses that refuse a sign-in. Kept beside blockedAccountResponse so a
- *  caller that gates "is this user blocked?" and the response shape itself
- *  cannot drift apart. Exported for the passkey sign-in route, which must
- *  refuse through the same door. */
-const BLOCKED_SIGN_IN_STATUSES: ReadonlySet<string> = new Set(['banned', 'suspended', 'deleted', 'deletion_pending', 'deactivated']);
-export function isBlockedSignInStatus(status: string | null | undefined): boolean {
-  return !!status && BLOCKED_SIGN_IN_STATUSES.has(status);
-}
+/** Every status that refuses a sign-in, and the one place that refusal is
+ *  shaped, both live in ./blockFacts — so the sign-in refusal and the
+ *  interruption screen cannot describe the same decision differently. */
 
 export async function requestLoginOtpHandler(request: NextRequest) {
   try {
@@ -2656,10 +2581,12 @@ export async function requestLoginOtpHandler(request: NextRequest) {
       return NextResponse.json({ message: 'If an account exists, a code has been sent.', ptr: issuePtr('login-otp', email, ptrDevice) });
     }
 
-    // One shape for every blocked lifecycle state — including deletion_pending
-    // and deactivated, which used to fall through inline here (and out of the
-    // client's mapping) as a generic "deleted"-style dead end.
-    if (isBlockedSignInStatus(user.status)) return blockedAccountResponse(user);
+    /* Nothing is said about the account's status here. This endpoint has one
+       credential — an email address — and an email address is not proof of
+       anything. Saying "this account is banned" to it would let any visitor
+       sort a mailing list into people who are blocked and people who are not.
+       The code is issued anyway; verifyLoginOtpHandler below is where the
+       mailbox is proven, and that is where the decision is shown. */
 
     const code = genSignupOtp();
     // Deliver to (and store under) the account's real address: when somebody
@@ -2697,9 +2624,6 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     if (!user) {
       return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
     }
-    if (isBlockedSignInStatus(user.status)) {
-      return blockedAccountResponse(user);
-    }
     if (!(await isLoginUserEmailVerified(user))) {
       return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
     }
@@ -2721,6 +2645,13 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
     if (!otpOk) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.login_failed', details: { reason: 'invalid_otp' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
+    }
+
+    // The code is what proves the mailbox — so the code is what earns the
+    // answer. A decision about an account is only ever shown to someone who has
+    // just presented a credential that matches it.
+    if (isBlockedSignInStatus(user.status)) {
+      return blockedAccountResponse(user, request);
     }
 
     // If 2FA is enabled, always require the authenticator code before issuing
@@ -4053,13 +3984,15 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
     const { quickLoginWithOtp } = await import('@/features/auth/password-reset');
     const result = await quickLoginWithOtp(email, code);
     if (!result.success) {
-      // Blocked accounts (banned/suspended) return 403 with the structured
-      // block payload so the accounts app can redirect to the blocked screen.
+      // The code has just been verified against the account's own mailbox, so
+      // this is a matched credential: a closed account is answered the same way
+      // every other sign-in answers it — the decision of record plus a session
+      // that opens only the settings closure screen (see ./blockFacts).
       const anyResult = result as any;
       if (anyResult.block) {
-        return NextResponse.json(
-          { error: anyResult.error, [anyResult.block.kind === 'banned' ? 'banned' : 'suspended']: true, ...anyResult.block },
-          { status: 403 },
+        return blockedAccountResponse(
+          { id: String(anyResult.userId), status: anyResult.block.kind, email: anyResult.email ?? null },
+          request,
         );
       }
       logSecurityEvent({ request, eventType: 'auth.otp_login_failed', severity: 'warning', details: { email: String(email).toLowerCase(), reason: result.error || 'invalid_or_expired_code' } }).catch(() => {});
@@ -4294,7 +4227,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
     if (isBlockedSignInStatus(user.status)) {
-      return blockedAccountResponse(user);
+      return blockedAccountResponse(user, request);
     }
     if (!(await isLoginUserEmailVerified(user))) {
       return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
@@ -4452,9 +4385,8 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
     if (!user || !recoveryEmail) {
       return NextResponse.json({ error: 'No verified recovery email is set for this account' }, { status: 400 });
     }
-    if (isBlockedSignInStatus(user.status)) {
-      return blockedAccountResponse(user);
-    }
+    // No status answer to an email address — see requestLoginOtpHandler. The
+    // recovery mailbox is what gets proven, and it gets proven below.
     const recRow = await prisma.userEmail.findFirst({
       where: { userId: user.id, address: recoveryEmail },
       select: { verifiedAt: true } });
@@ -4496,7 +4428,6 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
       logSecurityEvent({ request, eventType: 'auth.recovery_login_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'no_such_user' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid email or code' }, { status: 401 });
     }
-    if (isBlockedSignInStatus(user.status)) return blockedAccountResponse(user);
     if (!(await isLoginUserEmailVerified(user))) return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
 
     // The code was bound to the recovery mailbox it was posted to; verify
@@ -4506,6 +4437,9 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.recovery_login_failed', severity: 'warning', details: { email: email.toLowerCase(), reason: 'invalid_or_expired_code' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
     }
+    // Only now, with the recovery mailbox proven, is the account's state
+    // anything we are allowed to say out loud.
+    if (isBlockedSignInStatus(user.status)) return blockedAccountResponse(user, request);
 
     if (user.is2FAEnabled) {
       const tempToken = await signTemp2faToken(user.id);
@@ -4555,7 +4489,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 });
     }
     if (isBlockedSignInStatus(user.status)) {
-      return blockedAccountResponse(user);
+      return blockedAccountResponse(user, request);
     }
 
     // Confirming "this was me" by email link is not a second factor: a 2FA

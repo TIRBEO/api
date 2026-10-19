@@ -320,12 +320,19 @@ describe('oauth account creation', () => {
     expect(state.linked.at(-1)?.oauth).toEqual({ google: 'google-1' });
   });
 
-  it('refuses a banned or suspended account without creating or linking anything', async () => {
+  it('a banned or suspended account is let in on the closure screen — nothing created or linked', async () => {
     for (const status of ['banned', 'suspended']) {
       seedOwner({ status });
       state.linked = [];
       const res = await oauthSignupCompleteHandler(post(await completeBody({ email: OWNER.email })));
-      expect(res.status).toBe(403);
+      // The provider assertion is a matched credential: the person gets the
+      // decision of record plus a session that only opens the settings closure
+      // screen (blockedAccountResponse) — never the account's own data.
+      expect(res.status).toBe(200);
+      const body: any = await res.json();
+      expect(body.blocked).toBe(true);
+      expect(body.kind).toBe(status);
+      expect(body.ok).toBeUndefined();
       expect(state.creates).toHaveLength(0);
       expect(state.linked).toHaveLength(0);
     }

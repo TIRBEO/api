@@ -7,7 +7,7 @@ import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
 import { getAccountsBaseUrl } from '@/config/app-urls';
 import { fetchLoginUserByEmail, fetchLoginUserById } from '@/features/identity/tirbeo';
 import { verifiedRecoveryAddress } from '@/features/auth/recovery-email';
-import { ensureRefCode } from '@/features/users/refcode';
+import { blockFactsFor, blockWireFields } from '@/features/auth/blockFacts';
 
 const RESET_TTL_MINUTES = 15;
 const MAX_OTP_ATTEMPTS = 5;
@@ -357,35 +357,6 @@ export async function quickLoginWithOtp(
 ): Promise<{ success: boolean; error?: string; sessionToken?: string; refreshToken?: string; userId?: string }> {
   const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: false, error: 'Invalid or expired code' };
-  if (user.status === 'deleted') return { success: false, error: 'This account has been deleted.' };
-  if (user.status === 'banned') {
-    return {
-      success: false,
-      error: 'ACCOUNT_BANNED',
-      banned: true,
-      block: {
-        kind: 'banned',
-        eventId: await ensureRefCode(user.id, 'ban'),
-        reason: null,
-        until: null,
-        message: 'Your account has been banned.',
-      },
-    } as any;
-  }
-  if (user.status === 'suspended') {
-    return {
-      success: false,
-      error: 'ACCOUNT_SUSPENDED',
-      suspended: true,
-      block: {
-        kind: 'suspended',
-        eventId: await ensureRefCode(user.id, 'suspend'),
-        reason: null,
-        until: null,
-        message: 'Your account is temporarily suspended.',
-      },
-    } as any;
-  }
   const emailRow = await prisma.userEmail.findFirst({
     where: { userId: user.id, address: email.toLowerCase() },
     select: { verifiedAt: true },
@@ -402,6 +373,17 @@ export async function quickLoginWithOtp(
   if (!ok) {
     await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
     return { success: false, error: 'Invalid or expired code' };
+  }
+
+  /* The account's lifecycle state is spoken only to someone who just produced
+     the code that its verified mailbox received. Answering here before the
+     code was checked made this endpoint an oracle: post an email address,
+     read out whether the person behind it is banned, and get the ban's
+     reference code for free. */
+  const block = await blockFactsFor(user.id, user.status);
+  if (block) {
+    const { error } = blockWireFields(block.kind);
+    return { success: false, error, block, userId: user.id, email: user.email } as any;
   }
 
   // Delete all OTPs for this user

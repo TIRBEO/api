@@ -18,7 +18,7 @@ import { jsonError, jsonUnauthorized } from '@/shared/response';
 import { logSecurityEvent } from '@/features/security/security';
 import { signReauthToken } from '@/features/auth/jwt';
 import { requireReauth } from '@/features/auth/reauth';
-import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/authHandlers';
+import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/blockFacts';
 
 const RP_NAME = 'Tirbeo';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -462,12 +462,6 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
     }
     const passkeyUser = passkey.user;
     const primaryEmail = passkeyUser.emails[0]?.address || '';
-    // One door for every blocked lifecycle state — deletion_pending and
-    // deactivated must answer with their own recoverable shapes (cancel /
-    // reactivate), not a mislabelled "permanently banned" dead end.
-    if (isBlockedSignInStatus(passkeyUser.status)) {
-      return blockedAccountResponse(passkeyUser as any);
-    }
 
     const origin = getOrigin(request);
 
@@ -494,6 +488,18 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
     await prisma.passkey.update({
       where: { id: passkey.id },
       data: { counter: BigInt(verification.authenticationInfo.newCounter) } });
+
+    // One door for every blocked lifecycle state — deletion_pending and
+    // deactivated must answer with their own recoverable shapes (cancel /
+    // reactivate), not a mislabelled "permanently banned" dead end.
+    //
+    // After the assertion: the credential ID alone is a public-ish identifier,
+    // and answering with the account's status before the signature was checked
+    // let any visitor read "is this person banned?" out of a passkey they do
+    // not own. Only a verified assertion proves who is standing here.
+    if (isBlockedSignInStatus(passkeyUser.status)) {
+      return blockedAccountResponse(passkeyUser as any, request);
+    }
 
     // Create session
     const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();

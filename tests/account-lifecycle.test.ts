@@ -1,25 +1,20 @@
 /**
- * Account lifecycle recovery + welcome back.
+ * Welcome back, computed from the status ledger.
  *
- * Two halves of the account-lifecycle status feature, driven as pure unit
- * tests over an in-memory stand-in for the tables the lifecycle writes touch
- * (`otps`, `users`, `user_deletion_requests`, `user_deactivations`,
+ * A unit test over an in-memory stand-in for the tables the lifecycle writes
+ * touch (`otps`, `users`, `user_deletion_requests`, `user_deactivations`,
  * `user_status_events`, `user_preferences`):
  *
- *   1. The email-code restoration door. `requestReactivationByEmail` used to
- *      accept only a `deactivated` account; an account sitting in
- *      `deletion_pending` had no way back once its session died — the screen
- *      told them "not deactivated" and the sign-in itself was refused. It now
- *      accepts both, spending the code either cancels the scheduled deletion
- *      (`restoredAs:'deletion_cancelled'`) or lifts the pause
- *      (`restoredAs:'reactivated'`).
- *   2. `getWelcomeBack` — the one-shot card computed from the status-event
- *      ledger after a restoration, suppressed once acknowledged into
- *      `preferences.misc.welcomeBackSeenAt`.
+ *   `getWelcomeBack` — the one-shot card computed from the status-event ledger
+ *   after a restoration, suppressed once acknowledged into
+ *   `preferences.misc.welcomeBackSeenAt`.
  *
- * The OTP core (issue/consume, hashing shape, attempt counter, cooldown gate)
- * is real; only the mail transport, Redis and the database are stubbed —
- * same fixture style as tests/reauth-code.test.ts.
+ * The email-code restoration door this file used to test is retired: a closed
+ * account now proves ownership by signing in, which hands it a session whose
+ * Reactivate button is the same write. See docs/closed-accounts.md.
+ *
+ * Only the mail transport, Redis and the database are stubbed — same fixture
+ * style as tests/reauth-code.test.ts.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { NextRequest } from 'next/server';
@@ -173,10 +168,6 @@ vi.mock('@/infrastructure/db/prisma', () => ({
   },
 }));
 
-import {
-  requestReactivationByEmail, reactivateByEmailCode,
-  REACTIVATE_OTP_KIND,
-} from '@/features/status/accountLifecycle';
 import { getWelcomeBack, welcomeBackHandler, welcomeBackAckHandler } from '@/features/status/welcomeBack';
 
 // ─── Fixtures ───────────────────────────────────────────────────────
@@ -205,125 +196,12 @@ function account(userId: string, email: string, status: string) {
   return userId;
 }
 
-function deletionPendingAccount(userId = 'u1', email = 'alice@gmail.com') {
-  account(userId, email, 'deletion_pending');
-  mocks.deletionRequests.set(userId, {
-    userId, reason: 'too expensive', finalAt: D('2026-11-01T00:00:00Z'), cancelledAt: null, executedAt: null,
-  });
-}
-
-function deactivatedAccount(userId = 'u1', email = 'alice@gmail.com') {
-  account(userId, email, 'deactivated');
-  mocks.deactivations.set(userId, { userId, reason: 'taking a break', pausedAt: D('2026-10-01T00:00:00Z'), resumedAt: null });
-}
-
 function req(path: string, method = 'POST', body?: unknown) {
   return new NextRequest(`https://api.tirbeo.com${path}`, {
     method,
     ...(body !== undefined ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}),
   });
 }
-
-// ─── The restoration door accepts both recoverable states ───────────
-
-describe('requestReactivationByEmail — deactivated AND deletion_pending', () => {
-  it('issues a code for a deactivated account (unchanged behaviour)', async () => {
-    deactivatedAccount();
-    const issued = await requestReactivationByEmail('alice@gmail.com');
-    expect(issued.ok).toBe(true);
-    const row = mocks.otpRows[0];
-    expect(row.kind).toBe(REACTIVATE_OTP_KIND);
-    // Bound to the address, exactly as before.
-    expect(row.otpHash).toBe('hash:424242|alice@gmail.com');
-  });
-
-  it('issues the same code door for a scheduled deletion', async () => {
-    deletionPendingAccount();
-    const issued = await requestReactivationByEmail('alice@gmail.com');
-    expect(issued.ok).toBe(true);
-    expect(mocks.otpRows[0].kind).toBe(REACTIVATE_OTP_KIND);
-  });
-
-  it('refuses an account in neither recoverable state with not_restorable', async () => {
-    account('u1', 'alice@gmail.com', 'active');
-    const issued = await requestReactivationByEmail('alice@gmail.com');
-    expect(issued).toEqual({ ok: false, reason: 'not_restorable' });
-    expect(mocks.otpRows).toHaveLength(0);
-  });
-
-  it('refuses a banned account — restoration is not an appeal door', async () => {
-    account('u1', 'alice@gmail.com', 'banned');
-    expect(await requestReactivationByEmail('alice@gmail.com')).toEqual({ ok: false, reason: 'not_restorable' });
-  });
-
-  it('unknown address: no_account, and nothing minted', async () => {
-    expect(await requestReactivationByEmail('nobody@gmail.com')).toEqual({ ok: false, reason: 'no_account' });
-    expect(mocks.otpRows).toHaveLength(0);
-  });
-
-  it('resend cooldown still gates the second request', async () => {
-    deactivatedAccount();
-    expect((await requestReactivationByEmail('alice@gmail.com')).ok).toBe(true);
-    mocks.gate = { allowed: false, remainingMs: 30_000 };
-    expect(await requestReactivationByEmail('alice@gmail.com')).toEqual({ ok: false, reason: 'cooldown' });
-  });
-});
-
-describe('reactivateByEmailCode — restores as the right kind of thing', () => {
-  it('a deletion_pending account CANCELS the deletion and comes back active', async () => {
-    deletionPendingAccount();
-    await requestReactivationByEmail('alice@gmail.com');
-
-    const done = await reactivateByEmailCode('alice@gmail.com', '424242');
-    expect(done).toEqual({ ok: true, restoredAs: 'deletion_cancelled' });
-
-    expect(mocks.users.get('u1')!.status).toBe('active');
-    expect(mocks.deletionRequests.get('u1')!.cancelledAt).toBeInstanceOf(Date);
-    // The ledger recorded the reinstatement the welcome-back card reads.
-    const ev = mocks.statusEvents.find((e) => e.toStatus === 'active');
-    expect(ev).toMatchObject({ fromStatus: 'deletion_pending', reason: 'user_cancelled_deletion', actor: 'user' });
-    expect(mocks.otpRows).toHaveLength(0); // spent, not marked used
-  });
-
-  it('a deactivated account REACTIVATES and stamps resumedAt', async () => {
-    deactivatedAccount();
-    await requestReactivationByEmail('alice@gmail.com');
-
-    const done = await reactivateByEmailCode('alice@gmail.com', '424242');
-    expect(done).toEqual({ ok: true, restoredAs: 'reactivated' });
-
-    expect(mocks.users.get('u1')!.status).toBe('active');
-    expect(mocks.deactivations.get('u1')!.resumedAt).toBeInstanceOf(Date);
-  });
-
-  it('a wrong code restores nothing and costs an attempt', async () => {
-    deletionPendingAccount();
-    await requestReactivationByEmail('alice@gmail.com');
-
-    const done = await reactivateByEmailCode('alice@gmail.com', '111111');
-    expect(done).toEqual({ ok: false, reason: 'invalid_code' });
-    expect(mocks.users.get('u1')!.status).toBe('deletion_pending');
-    expect(mocks.deletionRequests.get('u1')!.cancelledAt).toBe(null);
-  });
-
-  it('an already-restored account refuses with not_restorable', async () => {
-    deletionPendingAccount();
-    await requestReactivationByEmail('alice@gmail.com');
-    expect((await reactivateByEmailCode('alice@gmail.com', '424242')).ok).toBe(true);
-
-    const again = await reactivateByEmailCode('alice@gmail.com', '424242');
-    expect(again).toEqual({ ok: false, reason: 'not_restorable' });
-  });
-
-  it('a spent (expired) code cannot cancel the deletion', async () => {
-    deletionPendingAccount();
-    await requestReactivationByEmail('alice@gmail.com');
-    mocks.otpRows[0].expiresAt = new Date(Date.now() - 1000);
-
-    expect(await reactivateByEmailCode('alice@gmail.com', '424242')).toEqual({ ok: false, reason: 'invalid_code' });
-    expect(mocks.users.get('u1')!.status).toBe('deletion_pending');
-  });
-});
 
 // ─── Welcome back, computed from the status ledger ──────────────────
 

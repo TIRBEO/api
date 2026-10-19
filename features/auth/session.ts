@@ -436,7 +436,12 @@ export async function getSessionFromToken(token: string) {
       const user = await prisma.user.findUnique({
         where: { id: payload.sub },
         select: { id: true, username: true, status: true, isAdmin: true } });
-      if (!user || user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') return null;
+      // Blocked statuses (banned/suspended/deleted) are NOT refused here: the
+      // proxy status gate is the single enforcement point and blocks every
+      // non-exempt route, exactly as it already does for deactivated and
+      // deletion_pending. Refusing here would also make it impossible for a
+      // blocked user to read their own status or file an appeal.
+      if (!user) return null;
       const email = await userEmailForSession(user.id, user.username);
       return { userId: user.id, email, sessionId: 'cli', adminRole: user.isAdmin ? 'admin' : null };
     }
@@ -530,11 +535,18 @@ export async function getSessionFromToken(token: string) {
     }
 
     const user = session.user;
-    if (!user || user.status === 'banned' || user.status === 'suspended' || user.status === 'deleted') {
+    if (!user) {
       sessionCache.set(payload.sid, null);
       return null;
     }
 
+    // Resolve the identity even for banned/suspended/deleted accounts. The
+    // proxy status gate remains the enforcement point (it blocks every
+    // non-exempt route and revokes sessions for `deleted`), which is the same
+    // contract deactivated/deletion_pending already rely on. Without this, a
+    // blocked user could not read /api/user/account-state or appeal.
+    // NOTE: the WS server also resolves through here, so blocked sockets
+    // authenticate; they receive no data beyond what the gate permits.
     const email = await userEmailForSession(user.id, user.username);
     const result = { userId: user.id, email, sessionId: session.id, adminRole: user.isAdmin ? 'admin' : null };
     sessionCache.set(payload.sid, result);

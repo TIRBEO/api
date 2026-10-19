@@ -4,7 +4,8 @@ import { isSuspicious } from '@/features/auth/suspicious-activity';
 import { verifyTurnstile, isTurnstileConfigured } from '@/features/auth/turnstile';
 import { detectXss } from '@/features/auth/xss-scan';
 import { getMaintenanceState } from '@/shared/maintenance-state';
-import { ensureRefCode, generateEventId } from '@/features/users/refcode';
+import { generateEventId } from '@/features/users/refcode';
+import { isPublicApiDoor } from '@/features/auth/publicDoors';
 import { CORS_ALLOWED_HEADERS, isHostAllowed } from '@/config/app-urls';
 
 function isAllowedOrigin(origin: string): boolean {
@@ -400,59 +401,9 @@ if (preHasCookie) {
     }
   }
 
-  // ── Public paths — no auth or CSRF required ──
-  const publicPaths = [
-    '/api/auth/login', '/api/auth/signup', '/api/auth/logout',
-    '/api/auth/verify-email',
-    '/api/auth/email-exists',
-    '/api/auth/username-exists',
-    '/api/auth/signup-otp/request', '/api/auth/signup-otp/verify',
-    '/api/auth/login-otp/request', '/api/auth/login-otp/verify',
-    '/api/auth/magic-link/request', '/api/auth/magic-link/verify',
-    '/api/auth/verify-2fa', '/api/auth/recovery-2fa',
-    '/api/auth/google', '/api/auth/google/callback', '/api/auth/github', '/api/auth/github/callback', '/api/auth/discord', '/api/auth/discord/callback',
-    '/api/auth/oauth/merge', // login-merge: authorized by signed short-lived token in body, no session involved
-    '/api/auth/oauth/pending', '/api/auth/oauth/complete', '/api/auth/oauth-consent', '/api/auth/oauth/consent',
-    '/api/auth/password-reset/request', '/api/auth/password-reset/verify', '/api/auth/password-reset/confirm', '/api/auth/password-reset/quick-login',
-    '/api/auth/email-otp/request', '/api/auth/email-otp/verify', '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
-    '/api/auth/account-recovery', '/api/auth/recovery-email/send-code',
-    // The blocked screen's credential gate: sessionless email+password check
-    // a closed account proves ownership with before any decision detail shows.
-    '/api/auth/blocked-verify',
-    '/api/auth/refresh',
-    '/api/auth/suspicious-login/confirm', '/api/auth/suspicious-login/deny',
-    '/api/auth/verify',
-    // Session-free by design: the login screen shows attempt limits (GET) and
-    // remaining-attempts for the typed email (GET) before any session exists.
-    // Keep PUT/POST protected — their handlers enforce admin role themselves.
-    '/api/auth/limits', '/api/auth/remaining',
-    '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
-  '/api/admin/passkey/options', '/api/admin/passkey/verify',
-  '/api/auth/passkey/auth-options', '/api/auth/passkey/verify',
-    '/api/public/', '/api/newsletter/',
-    '/api/waitlist',
-    '/api/feedback',
-    '/api/forms/public/',
-    '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
-    '/auth/discord', '/auth/discord/callback',
-     '/api/image/',
-     '/api/cdn/share/',
-     '/api/cdn/u/',
-     '/api/health',
-     '/api/security/log',
-     // Client telemetry lands events for logged-out visitors too (the login
-     // page tracks failures before any session exists); the ingest route
-     // attributes a session when one is attached and rate-limits by IP.
-     '/api/telemetry/',
-     '/api/debug/',
-     '/api/email/unsubscribe',
-     '/api/emails/unsubscribe',
-  ];
-
-// Public form submission: POST /api/forms/{slug}/submit (auth via access_key in body)
+  // ── Public doors — no session, no CSRF (the list lives in features/auth/publicDoors) ──
 const isPublicFormSubmit = /^\/api\/forms\/[^/]+\/submit\/?$/.test(pathname) && request.method === 'POST';
-const isPublicPath = publicPaths.some(p => pathname.startsWith(p)) || isPublicFormSubmit;
-if (isPublicPath) return response;
+if (isPublicApiDoor(pathname, request.method)) return response;
 
 // ── Internal service-to-service routes ──
 // `/api/internal/*` is called by another first-party service (the profile
@@ -483,151 +434,31 @@ if (!hasCookie && !hasAuthHeader && !isCredentialAppeal) {
   return jsonResponse(allowedOrigin, { error: 'Not authenticated' }, 401);
 }
 
-// ── Account status enforcement (deleted / deletion-pending / suspended / banned) ──
-// Runs once per authenticated request. The consolidated schema replaced the
-// old isBanned/isSuspended/deletedAt/scheduledDeletionAt columns with a single
-// `status` enum (UserStatusKind): banned | suspended | deletion_pending |
-// deleted are the blocking states. Suspension/ban reason/until come from the
-// newest user restriction; expired suspensions are lifted automatically on
-// first hit.
-// /api/support/appeal is exempt: it authenticates with account credentials
-// precisely so blocked users can file an appeal without a session.
-const statusExempt = ['/api/auth/', '/api/health', '/api/users/me/status', '/api/support/appeal'];
-let statusResponse: NextResponse | null = null;
-if (!statusExempt.some(p => pathname.startsWith(p))) {
-  try {
-    // Reuse the cached JWT payload from the early admin check to avoid
-    // a second verifyToken call (saves ~2-5s per request).
-    const tokenPayload = cachedPayload?.sub
-      ? cachedPayload
-      : null;
-    if (tokenPayload?.sub) {
-      const _statusCache: Map<string, { data: any; expiry: number }> = (globalThis as any).__statusCache || ((globalThis as any).__statusCache = new Map());
-      const STATUS_CACHE_TTL = 60000;
-      const cachedStatus = _statusCache.get(tokenPayload.sub);
-      let su: any = null;
-      const { prisma } = await import('@/infrastructure/db/prisma');
-      if (cachedStatus && cachedStatus.expiry > Date.now()) {
-        su = cachedStatus.data;
-      } else {
-        su = await prisma.user.findUnique({
-          where: { id: String(tokenPayload.sub) },
-          select: {
-            status: true,
-            deletionRequest: { select: { finalAt: true, reason: true, cancelledAt: true, executedAt: true } },
-            restrictions: { orderBy: { startedAt: 'desc' }, take: 1, select: { title: true, detail: true, endsAt: true } },
-          },
-        });
-        _statusCache.set(tokenPayload.sub, { data: su, expiry: Date.now() + STATUS_CACHE_TTL });
-        // Seed the ban-check cache from the same query so state-changing POSTs
-        // don't issue a second user lookup for the same token. Mirrors the
-        // state-change gate below: deletion_pending is handled read-only by
-        // the status pass above, so it is NOT blocked here — that keeps the
-        // cancel-deletion POST reachable.
-        const _seedBanCache: Map<string, { status: string; blocked: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
-        _seedBanCache.set(tokenPayload.sub, {
-          status: su?.status || 'active',
-          blocked: su?.status === 'deleted' || su?.status === 'suspended' || su?.status === 'banned',
-          ts: Date.now(),
-        });
-        if (_statusCache.size > 2000) {
-          const now = Date.now();
-          for (const [k, v] of _statusCache) { if (now - v.expiry > STATUS_CACHE_TTL) _statusCache.delete(k); }
-        }
-      }
-      const deletionReq = su?.deletionRequest && !su.deletionRequest.cancelledAt && !su.deletionRequest.executedAt
-        ? su.deletionRequest
-        : null;
-      if (su?.status === 'deleted') {
-        await prisma.userSession.updateMany({
-          where: { userId: tokenPayload.sub, revokedAt: null },
-          data: { revokedAt: new Date() },
-        }).catch(() => {});
-        statusResponse = jsonResponse(allowedOrigin, {
-          error: 'ACCOUNT_DELETED', deleted: true,
-          eventId: await ensureRefCode(String(tokenPayload.sub), 'deleted'),
-          message: 'Your account has been deleted.',
-        }, 403);
-      } else if (su?.status === 'deletion_pending') {
-        const isRead = request.method === 'GET' || request.method === 'HEAD';
-        const scheduledAt: Date | null = deletionReq?.finalAt ? new Date(deletionReq.finalAt) : null;
-        // While deletion is scheduled, user is read-only: only GET + cancel deletion + logout/refresh allowed
-        const safePaths = ['delete-account', 'auth/logout', 'auth/refresh'];
-        const isAllowed = isRead || safePaths.some(p => pathname.includes(p));
-        if (!isAllowed) {
-          // Same ACCOUNT_DELETION_PENDING shape the sign-in refusals carry
-          // (see blockedAccountResponse in authHandlers) — the person must see
-          // "you can still cancel it", not a dead-end "deleted" message, on
-          // every door a pending deletion opens them to. `scheduled`/`scheduledAt`
-          // stay for existing callers.
-          statusResponse = jsonResponse(allowedOrigin, {
-            error: 'ACCOUNT_DELETION_PENDING',
-            deletionPending: true,
-            scheduled: true,
-            eventId: await ensureRefCode(String(tokenPayload.sub), 'delete'),
-            scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
-            reason: deletionReq?.reason || null,
-            until: scheduledAt ? scheduledAt.toISOString() : null,
-            deletionReason: deletionReq?.reason || null,
-            message: 'Your account is scheduled for deletion. You can still cancel it.',
-          }, 403);
-        }
-      } else if (su?.status === 'deactivated') {
-        // A deactivated account is a soft door: the person paused it themselves.
-        // The session that paused it stays live so they can reach the
-        // "deactivated" screen and undo it in place, but everything else is
-        // read-only — writes are refused with a clear reactivation path.
-        // (NEW sign-ins are refused separately, by loginHandler.)
-        const isRead = request.method === 'GET' || request.method === 'HEAD';
-        const safePaths = ['reactivate', 'deactivate', 'auth/logout', 'auth/refresh'];
-        const isAllowed = isRead || safePaths.some(p => pathname.includes(p));
-        if (!isAllowed) {
-          statusResponse = jsonResponse(allowedOrigin, {
-            error: 'ACCOUNT_DEACTIVATED', deactivated: true,
-            message: 'Your account is deactivated. Reactivate it to continue.',
-          }, 403);
-        }
-      } else if (su?.status === 'banned') {
-        const restriction = su?.restrictions?.[0] || null;
-        const until = restriction?.endsAt ? new Date(restriction.endsAt) : null;
-        if (until && until < new Date()) {
-          // Ban expired — lift it on first hit.
-          await prisma.user.update({
-            where: { id: String(tokenPayload.sub) },
-            data: { status: 'active' },
-          }).catch(() => {});
-        } else {
-          statusResponse = jsonResponse(allowedOrigin, {
-            error: 'ACCOUNT_BANNED', banned: true,
-            eventId: await ensureRefCode(String(tokenPayload.sub), 'ban'),
-            reason: restriction?.detail || restriction?.title || 'No reason provided',
-            until: until ? until.toISOString() : null,
-            message: `Your account is banned${until ? ` until ${until.toUTCString()}` : ''}.`,
-          }, 403);
-        }
-      } else if (su?.status === 'suspended') {
-        const restriction = su?.restrictions?.[0] || null;
-        const until = restriction?.endsAt ? new Date(restriction.endsAt) : null;
-        if (until && until < new Date()) {
-          // Suspension expired — lift it on first hit.
-          await prisma.user.update({
-            where: { id: String(tokenPayload.sub) },
-            data: { status: 'active' },
-          }).catch(() => {});
-        } else {
-          statusResponse = jsonResponse(allowedOrigin, {
-            error: 'ACCOUNT_SUSPENDED', suspended: true,
-            eventId: await ensureRefCode(String(tokenPayload.sub), 'suspend'),
-            reason: restriction?.detail || restriction?.title || 'No reason provided',
-            until: until ? until.toISOString() : null,
-            message: `Your account is suspended${until ? ` until ${until.toUTCString()}` : ''}.`,
-          }, 403);
-        }
-      }
-    }
-  } catch { /* never block on guard failure */ }
+// ── Closed accounts: one door policy, enforced at the edge ──
+// A closed account that has just proved its credentials is handed a session
+// (blockedAccountResponse) so it can read its own closure in /settings. That
+// session opens the doors named in features/auth/blockFacts and nothing else,
+// and the refusal carries the same decision of record the sign-in handed out —
+// so a door and the settings screen cannot describe the closure differently.
+// This runs for the cookie and a Bearer token alike, and in front of every
+// route, including the ones that live outside the dispatcher.
+let closedSubject = cachedPayload?.sub ?? null;
+if (!closedSubject && hasAuthHeader) {
+  const bearer = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+  if (bearer.startsWith('eyJ')) {
+    try {
+      const { verifyToken } = await import('@/features/auth/jwt');
+      closedSubject = ((await verifyToken(bearer)) as { sub?: string } | null)?.sub ?? null;
+    } catch { /* an unreadable token is the handler's problem, not a block */ }
+  }
 }
-if (statusResponse) return statusResponse;
+if (closedSubject) {
+  try {
+    const { closedAccountGate } = await import('@/features/auth/blockFacts');
+    const refusal = await closedAccountGate(closedSubject, pathname, request.method);
+    if (refusal) return jsonResponse(allowedOrigin, refusal, 403);
+  } catch { /* a guard that cannot read the account must not block the account */ }
+}
 
 if (hasAuthHeader) {
   const authHeader = request.headers.get('authorization') || '';
@@ -646,41 +477,6 @@ if (hasAuthHeader) {
           error: 'CSRF token missing or invalid. Include X-CSRF-Token header matching __csrf cookie.',
         }, 403);
       }
-    }
-  }
-
-  // ── Blocked-status check (single cached JWT verify) ──
-  // Use cachedPayload from the early admin check to avoid re-verifying.
-  if (hasCookie && STATE_METHODS.has(request.method) && cachedPayload?.sub && !pathname.startsWith('/api/support/appeal')) {
-    try {
-      // Check deleted/suspended/banned inline (cached per-user, 60s TTL, max 2000
-      // entries). deletion_pending stays out of this set on purpose: the
-      // status-enforcement pass above already gates it and keeps the
-      // "cancel my deletion" POST reachable.
-      const _banCache: Map<string, { status: string; blocked: boolean; ts: number }> = (globalThis as any).__banCheckCache || ((globalThis as any).__banCheckCache = new Map());
-      const _bcKey = cachedPayload.sub;
-      const _bcHit = _banCache.get(_bcKey);
-      const statusBlockMessage = (status: string) =>
-        status === 'deleted' ? 'Account has been deleted'
-          : status === 'suspended' ? 'Account has been suspended'
-          : status === 'banned' ? 'Account has been banned'
-          : 'Account is scheduled for deletion';
-      if (!_bcHit || Date.now() - _bcHit.ts > 60_000) {
-        const { prisma } = await import('@/infrastructure/db/prisma');
-        const user = await prisma.user.findUnique({ where: { id: cachedPayload.sub }, select: { status: true } });
-        const status = user?.status || 'active';
-        const blocked = status === 'deleted' || status === 'suspended' || status === 'banned';
-        _banCache.set(_bcKey, { status, blocked, ts: Date.now() });
-        if (_banCache.size > 2000) {
-          const now = Date.now();
-          for (const [k, v] of _banCache) { if (now - v.ts > 60_000) _banCache.delete(k); }
-        }
-        if (blocked) return jsonResponse(allowedOrigin, { error: statusBlockMessage(status) }, 403);
-      } else if (_bcHit.blocked) {
-        return jsonResponse(allowedOrigin, { error: statusBlockMessage(_bcHit.status) }, 403);
-      }
-    } catch {
-      // Block/ban check failed — allow request, handler will re-check
     }
   }
 
