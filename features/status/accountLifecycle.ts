@@ -481,6 +481,10 @@ export async function cancelDeletion(userId: string): Promise<{ ok: boolean; err
 
 export interface AccountState {
   status: string;
+  /** The status closes the account — banned | suspended | deletion_pending |
+      deactivated | deleted. One flag the gate and the closure screens branch
+      on, so no caller has to re-derive "is this a closure?" from the status. */
+  blocked: boolean;
   /** The reason behind the current enforcement, when one was recorded. */
   reason: string | null;
   /** When the current enforcement ends (ISO) — a suspension's end, a
@@ -533,6 +537,7 @@ export async function readAccountState(userId: string): Promise<AccountState> {
 
   return {
     status,
+    blocked: !!facts,
     reason: facts?.reason ?? null,
     until: facts?.until ?? null,
     decisionId: facts?.decisionId ?? null,
