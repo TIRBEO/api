@@ -2,6 +2,7 @@ import './ipv4-first';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
+import { createBoundedIpv4Lookup, BoundedLookupSocket } from './bounded-lookup';
 // Dependency-free (prisma is only ever lazily imported inside it), so this
 // static import creates no cycle while letting the write choke point stamp refs.
 import { generateEventId } from '@/features/users/refcode';
@@ -21,6 +22,11 @@ const globalForPrisma = globalThis as unknown as { prisma: PrismaClient; pgPool:
 // checkout timeout.
 const POOL_MAX = parseInt(process.env.DATABASE_POOL_MAX || '', 10) || (process.env.NODE_ENV === 'production' ? 8 : 6);
 const POOL_MIN = parseInt(process.env.DATABASE_POOL_MIN || '', 10) || (process.env.NODE_ENV === 'production' ? 3 : 2);
+// Every pool connection resolves DNS through this bounded lookup instead of
+// the socket default: a hung getaddrinfo cannot be aborted by pg's timers (or
+// ours), and production logs showed warm-up attempts burning 101–210s on a
+// wedged resolver before the late error was wrapped as "connection timeout".
+const boundedPoolLookup = createBoundedIpv4Lookup();
 const POOL_CONFIG = {
   // Maximum number of clients in the pool.
   max: POOL_MAX,
@@ -31,7 +37,12 @@ const POOL_CONFIG = {
   idleTimeoutMillis: process.env.NODE_ENV === 'production' ? 30_000 : 45_000,
   // Allow idle clients to be reaped faster in development
   // where instances are short-lived.
-  connectionTimeoutMillis: 15_000 };
+  connectionTimeoutMillis: 15_000,
+  // pg calls a function-valued `stream` with the connection config and uses
+  // the result as the socket (pg/lib/connection.js). The override only
+  // changes name resolution (family 4 +3s timeout + cache); TLS upgrade,
+  // keepalive and destroy semantics all keep working on the returned socket.
+  stream: () => new BoundedLookupSocket(boundedPoolLookup) };
 
 // ─── Pool Creation ───
 function createPool(): Pool {
@@ -170,6 +181,14 @@ async function warmPool(pool: Pool, isColdStart = false): Promise<void> {
   }
 }
 
+// Total wall-clock budget for the warm-up retry loop. Retries exist to ride
+// out a Supabase pooler cold wake, but a lambda that can't get a connection
+// in the first ~20s won't be saved by minute five — the loop only adds
+// warn-spam (prod: 5 attempts × up to ~40s + backoff ≈ minutes of [DB-POOL]
+// noise). The pool still connects lazily on the first real query either way.
+const WARMUP_TOTAL_CAP_MS =
+  parseInt(process.env.WARMUP_TOTAL_CAP_MS || '', 10) || (process.env.VERCEL ? 20_000 : 60_000);
+
 async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
   const start = performance.now();
   const maxRetries = isColdStart ? 8 : 5; // more retries for cold starts
@@ -207,6 +226,10 @@ async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
         const maxDelay = isColdStart ? 15000 : 8000;
         const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 500, maxDelay);
         const reason = err?.code || err?.message || 'unknown';
+        if (performance.now() - start + delay >= WARMUP_TOTAL_CAP_MS) {
+          console.warn(`[DB-POOL] Warm-up abandoned after ${totalMs}ms (total cap ${WARMUP_TOTAL_CAP_MS}ms), last failure: ${reason}`);
+          return;
+        }
         console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed after ${tookMs}ms (${reason}), ` +
           `retrying in ${Math.round(delay)}ms...`);
         await new Promise(r => setTimeout(r, delay));
