@@ -1,5 +1,5 @@
 import { getDashboardBaseUrl, prodSafeEnvUrl } from '@/config/app-urls';
-import { TIRBEO_MAIL_DOMAIN } from '@/features/identity/tirbeo';
+import { TIRBEO_MAIL_DOMAIN } from '@/features/identity/tirbeo-domain';
 import {
   BTN,
   CARD,

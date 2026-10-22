@@ -134,6 +134,20 @@ function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T>
   return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
 }
 
+/* A wait that does not count as work.
+ *
+ * Every timer below is pool maintenance: it exists to make a *server* faster on
+ * its next request. Nothing should be kept alive by it. Without this, a build
+ * or test script that happens to read the pool through an import is held open
+ * by the maintenance timers and never exits — which is what turned Vercel's
+ * 45-minute build cap into a timeout. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
 /** One usable connection: checkout + handshake + login + probe. */
 function warmOne(pool: Pool): Promise<void> {
   return withDeadline(
@@ -231,7 +245,7 @@ async function warmAttempts(pool: Pool, isColdStart: boolean): Promise<void> {
         }
         console.warn(`[DB-POOL] Warm-up attempt ${attempt}/${maxRetries} failed after ${tookMs}ms (${reason}), ` +
           `retrying in ${Math.round(delay)}ms...`);
-        await new Promise(r => setTimeout(r, delay));
+        await sleep(delay);
       } else {
         console.error(`[DB-POOL] Warm-up failed after ${totalMs}ms (${maxRetries} attempts):`, err?.message);
       }
@@ -369,13 +383,18 @@ function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
             await refreshIdleConnections();
           }
         } catch (err: any) {
-          if (isColdStartError(err)) {
+          // Re-warm only a database this process has actually talked to before.
+          // A host that never resolves (wrong URL, DB deleted) also reads as a
+          // cold start, and re-warming it from this timer started a fresh ~46s
+          // retry grind every 20s for the life of the process.
+          if (isColdStartError(err) && hasConnectedBefore() && isIdleLongEnough()) {
             recordColdStart();
             reWarmAfterColdStart().catch(() => {});
           }
         }
         scheduleKeepAlive();
       }, KEEP_ALIVE_MS);
+      g.__tirbeoPoolKeepAlive.unref?.();
     }
     scheduleKeepAlive();
   }
@@ -394,6 +413,7 @@ interface ColdStartState {
   lastColdStartDetected: number;
   coldStartCount: number;
   coldStartWakeTimeMs: number; // avg time to wake up
+  everConnected: boolean; // this process has completed at least one DB round-trip
 }
 
 const g7 = globalThis as any;
@@ -403,7 +423,8 @@ if (!g7.__tirbeoColdStartState) {
     lastActivity: Date.now(),
     lastColdStartDetected: 0,
     coldStartCount: 0,
-    coldStartWakeTimeMs: 0 };
+    coldStartWakeTimeMs: 0,
+    everConnected: false };
 }
 const coldStartState: ColdStartState = g7.__tirbeoColdStartState;
 
@@ -443,8 +464,17 @@ function recordColdStart() {
   }
 }
 
+/** Has this process ever completed a DB round-trip?
+ *
+ * `lastActivity` starts at boot, so idleness alone cannot tell a sleeping
+ * database apart from one that was never reachable. */
+function hasConnectedBefore(): boolean {
+  return coldStartState.everConnected;
+}
+
 /** Mark that the DB is responsive again */
 function recordActivity() {
+  coldStartState.everConnected = true;
   if (coldStartState.isColdStart && coldStartState.lastColdStartDetected > 0) {
     const wakeTime = Date.now() - coldStartState.lastColdStartDetected;
     coldStartState.coldStartWakeTimeMs =
@@ -506,7 +536,7 @@ export async function withRetry<T>(
 
         console.warn(`[DB-RETRY] Query failed (attempt ${attempt + 1}/${maxRetries + 1}), ` +
           `retrying in ${Math.round(delay)}ms... ${isColdStart ? '(cold start)' : ''}`);
-        await new Promise(r => setTimeout(r, delay));
+        await sleep(delay);
       } else {
         throw err;
       }
@@ -630,6 +660,7 @@ if (typeof setTimeout !== 'undefined' && !process.env.VERCEL) {
         monitorPool();
         scheduleMonitor();
       }, POOL_CHECK_INTERVAL);
+      gMonitor.__tirbeoPoolMonitorTimer.unref?.();
     })();
   }
 }

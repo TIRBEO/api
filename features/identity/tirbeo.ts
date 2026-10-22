@@ -1,54 +1,12 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import type { UserStatusKind } from '@prisma/client';
+import { TIRBEO_MAIL_DOMAIN, isValidTirbeoUsername, parseTirbeoIdentifier, tirbeoEmailFor } from './tirbeo-domain';
 
-// Tirbeo identities are company accounts on one well-known domain:
-// username@tirbeo.com. The consolidated schema stores them directly:
-//   - users.username          the public handle (unique)
-//   - user_email (primary)    the login address (username@tirbeo.com or an
-//                             external email for accounts without a handle)
-//   - user_email (recovery)   contact/recovery address — NEVER a login identity
-//
-// The domain is one environment value (TIRBEO_MAIL_DOMAIN) because it is a
-// property of the mail system, not of the product: moving handles to
-// username@users.tirbeo.com is a DNS/Mailcow decision, and every identity,
-// login parse and mailbox derivation below follows it from here. It must be set
-// to the same value in every app that reads a handle.
-
-export const TIRBEO_MAIL_DOMAIN = (process.env.TIRBEO_MAIL_DOMAIN || 'tirbeo.com')
-  .trim().toLowerCase().replace(/^@+/, '');
-export const TIRBEO_MAIL_DOMAIN_LITE = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/;
-export const USERNAME_RE = /^[a-z0-9](?:[a-z0-9._-]*[a-zA-Z0-9])?$/;
-
-export function isValidTirbeoUsername(username?: string | null): username is string {
-  return !!username && USERNAME_RE.test(username) && username.length <= 64;
-}
-
-export function tirbeoEmailFor(username: string): string {
-  return `${username}@${TIRBEO_MAIL_DOMAIN}`;
-}
-
-export function isTirbeoEmail(email?: string | null): boolean {
-  if (!email) return false;
-  return email.split('@').pop()?.toLowerCase() === TIRBEO_MAIL_DOMAIN;
-}
-
-// Parse a login identifier. Accepts
-//   - a bare username:   "alex"        (preferred UX, no domain typing)
-//   - full tirbeo email: "alex@tirbeo.com"  (case-insensitive)
-// Any other email domain is NOT a Tirbeo identity and returns null.
-export function parseTirbeoIdentifier(identifier?: string | null): { username: string; email: string } | null {
-  if (!identifier) return null;
-  const value = identifier.trim().toLowerCase().replace(/\s+/g, '');
-  if (!value) return null;
-  if (value.includes('@')) {
-    const [local, domain] = value.split('@');
-    if (!local || domain !== TIRBEO_MAIL_DOMAIN) return null;
-    if (!isValidTirbeoUsername(local)) return null;
-    return { username: local, email: value };
-  }
-  if (!isValidTirbeoUsername(value)) return null;
-  return { username: value, email: tirbeoEmailFor(value) };
-}
+// The domain, the handle pattern and the pure parsers live in
+// `tirbeo-domain.ts`, which imports nothing: this file is the database-facing
+// half of the same subject, and the build-time mail check must not have to
+// boot a connection pool to ask what a handle ends with.
+export * from './tirbeo-domain';
 
 // The login/auth view of a user, assembled from the consolidated tables.
 // Field names mirror the pre-consolidation User columns so auth handlers
