@@ -139,9 +139,9 @@ const button = (url: string, label: string, variant: BtnVariant = 'primary'): st
   const href = esc(url);
   const text = esc(label);
   if (variant === 'ghost') {
-    return `<p style="margin:14px 0 0;font-size:14px;line-height:22px"><a href="${href}" style="color:${MUTED};text-decoration:underline">${text}</a></p>`;
+    return `<p style="margin:16px 0 14px;font-size:14px;line-height:22px"><a href="${href}" style="color:${MUTED};text-decoration:underline">${text}</a></p>`;
   }
-  return `<p style="margin:22px 0 0;font-size:15px;line-height:24px"><a href="${href}" style="color:${LINK};font-weight:bold;text-decoration:underline">${text}</a></p>`;
+  return `<p style="margin:22px 0 14px;font-size:15px;line-height:24px"><a href="${href}" style="color:${LINK};font-weight:bold;text-decoration:underline">${text}</a></p>`;
 };
 
 const btn = (url: string, label: string): string => button(url, label, 'primary');
