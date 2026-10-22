@@ -121,8 +121,8 @@ const PLAIN_VALUES: Record<string, string> = {
   contact: 'john@example.com',
   account: 'johndoe@tirbeo.com',
   origin: '203.0.113.9 · Berlin, Germany',
-  replyHref: 'mailto:john@example.com?subject=Re%3A%20A%20sign-in',
-  replyLabel: 'Reply to john@example.com',
+  replyHref: 'https://admin.tirbeo.com/admin/tickets/a1b2-c3d4-e5f6-7a8b',
+  replyLabel: 'Answer in the admin panel',
   replyHtml: `<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:${TEXT_2}">We found the session you asked about — it was you, on a phone, in Kathmandu. Nothing was changed on the account, and we have left it signed in.</p>`
     + `<p style="margin:0;font-size:15px;line-height:25px;color:${TEXT_2}">If that was not you, turn on two-step verification and end the other sessions from the security screen.</p>`,
 };

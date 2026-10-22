@@ -50,7 +50,7 @@ import { sendTemplateEmail, supportSender } from '@/features/email/email';
 const ENV_KEYS = [
   'EMAIL_PROVIDER', 'RESEND_API_KEY', 'EMAIL_RESEND_DOMAIN', 'ADMIN_FROM_EMAIL',
   'SUPPORT_EMAIL', 'EMAIL_HELLO_FROM', 'EMAIL_CODE_FROM', 'EMAIL_SECURITY_FROM',
-  'EMAIL_SUPPORT_FROM', 'EMAIL_ADMIN_FROM',
+  'EMAIL_SUPPORT_FROM', 'EMAIL_ADMIN_FROM', 'EMAIL_ALERT_FROM', 'EMAIL_NOTICE_FROM',
 ] as const;
 
 const saved: Record<string, string | undefined> = {};
@@ -100,21 +100,24 @@ const REQUEST_VARS = {
 };
 
 describe('the sender line, per kind of mail', () => {
-  it('a sign-in code comes from no-reply, named Tirbeo', async () => {
-    expect(await senderOf('login_otp', { otp: '123456' })).toBe('Tirbeo <no-reply@tirbeo.com>');
+  /* Three verified domains, and the address says what the mail is before the
+     subject does: the brand's own voice on tirbeo.com, the machines on
+     mails.tirbeo.com, an account's identity on users.tirbeo.com. */
+  it('a sign-in code is machine mail, not brand mail', async () => {
+    expect(await senderOf('login_otp', { otp: '123456' })).toBe('Tirbeo <code@mails.tirbeo.com>');
   });
 
-  it('a warning about the account comes from security', async () => {
+  it('a warning about the account comes from security, on the brand domain', async () => {
     expect(await senderOf('suspicious_login', {
       device: 'Chrome on Linux', location: 'Kathmandu, Nepal', ipAddress: '1.2.3.4', loginTime: 'today',
     })).toBe('Tirbeo Security <security@tirbeo.com>');
   });
 
-  it('an alert to the team comes from the same security mailbox a person reads', async () => {
+  it('an alert to the team is ops mail — nobody outside replies to it', async () => {
     expect(await senderOf('admin_alert', {
       subject: 'Account holder disputed a sign-in', message: 'The owner said it was not them.',
       details: 'Account: ada@example.com', dashboardUrl: 'https://admin.tirbeo.com', refCode: 'EVT-ABC12345',
-    })).toBe('Tirbeo Security <security@tirbeo.com>');
+    })).toBe('Tirbeo Ops <alerts@mails.tirbeo.com>');
   });
 
   it('a support answer comes from support and invites a reply', async () => {
@@ -125,10 +128,10 @@ describe('the sender line, per kind of mail', () => {
     expect(mocks.sends[0].replyTo).toBeTruthy();
   });
 
-  it('anything else is brand mail from the hello mailbox', async () => {
+  it('a digest or a maintenance notice is machine mail', async () => {
     expect(await senderOf('product_update', {
       title: 'What changed', message: 'Something changed.', ctaUrl: 'https://tirbeo.com', ctaLabel: 'See it',
-    })).toBe('Tirbeo <hello@tirbeo.com>');
+    })).toBe('Tirbeo <team@mails.tirbeo.com>');
   });
 
   it('a deployment can name its own mailboxes', async () => {

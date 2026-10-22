@@ -866,11 +866,26 @@ export async function sendTemplateEmail(
   }
 
   // ─── Sending domain ───
-  // tirbeo.com is the only domain verified on Resend; mails./send. subdomains
-  // were never verified and every send from them fails with a 403. Keep the
-  // per-category sender NAMES (a code email should not read like a digest),
-  // but every address must live on the verified domain until the subdomains
-  // are actually verified there.
+  /* Three domains are verified on Resend, and a reader who has seen the mail
+     learns what it is from the address before they read the subject. So each
+     kind gets its own, and each own is chosen for what that mail has to do:
+
+       tirbeo.com         — the brand's own voice. Security warnings, answers
+                            from support, and anything a person might forward or
+                            check against a search engine. The apex carries the
+                            longest-standing reputation, so the mail that must
+                            not be guessed at as phishing sits here.
+       mails.tirbeo.com   — the machines. One-time codes, digests, maintenance
+                            notices and staff alerts: mail nobody is expected to
+                            answer, so nothing that needs the brand's best
+                            address is spent on it.
+       users.tirbeo.com   — the accounts. A handle's own mailbox, and the
+                            sender on a support request, which is a person
+                            writing rather than the product announcing.
+
+     Every one of them stays env-overridable, and `verifiedSender` drops any
+     address whose domain Resend has not confirmed — a wrong default degrades to
+     the working sender instead of failing the send. */
   const SECURITY_TEMPLATES = new Set([
     'password_changed', 'suspicious_login', 'two_factor_disabled', 'two_factor_enabled', 'login_alert',
     'account_suspended', 'account_deleted', 'account_deactivated', 'export_ready',
@@ -885,6 +900,13 @@ export async function sendTemplateEmail(
   // A conversation reads differently from a notice, and so does its sender:
   // "Tirbeo Support" answering beats an automated name answering.
   const SUPPORT_TEMPLATES = new Set(['support_request_received', 'support_reply', 'support_request_admin']);
+  // Scheduled, recurring, or "here is something worth knowing" — read when
+  // convenient, never answered, and unsubscribable.
+  const NOTICE_TEMPLATES = new Set([
+    'notification_digest', 'weekly_summary', 'product_update', 'reactivation',
+    'maintenance_notification', 'maintenance_complete', 'security_tip',
+    'tirbeo_account_onboarding',
+  ]);
   const humanMailboxTemplates = ['welcome'];
 
   const adminFrom = process.env.ADMIN_FROM_EMAIL || fallbackSender();
@@ -902,12 +924,13 @@ export async function sendTemplateEmail(
 
   const DOMAIN_FROM = {
     casual: { email: alias('EMAIL_HELLO_FROM', 'hello@tirbeo.com'), name: branding.brandName || 'Tirbeo' },
-    code: { email: alias('EMAIL_CODE_FROM', 'no-reply@tirbeo.com'), name: 'Tirbeo' },
+    code: { email: alias('EMAIL_CODE_FROM', 'code@mails.tirbeo.com'), name: 'Tirbeo' },
     security: { email: alias('EMAIL_SECURITY_FROM', 'security@tirbeo.com'), name: 'Tirbeo Security' },
     support: { email: alias('EMAIL_SUPPORT_FROM', 'support@tirbeo.com'), name: 'Tirbeo Support' },
-    // An alert about the admin panel is a security matter with a different
-    // reader, so it comes from the same mailbox security mail does.
-    admin: { email: alias('EMAIL_ADMIN_FROM', 'security@tirbeo.com'), name: 'Tirbeo Security' },
+    notice: { email: alias('EMAIL_NOTICE_FROM', 'team@mails.tirbeo.com'), name: branding.brandName || 'Tirbeo' },
+    // An alert about the admin panel is for the people who run it, never a
+    // reader's inbox — so it costs the brand nothing to put it on the machines.
+    admin: { email: alias('EMAIL_ALERT_FROM', 'alerts@mails.tirbeo.com'), name: 'Tirbeo Ops' },
     // Mail a named person signs off — a welcome — carries the address the
     // admin configured as their own, not an automated one.
     human: { email: adminFrom, name: branding.emailFromName || branding.brandName || 'Tirbeo' },
@@ -917,6 +940,7 @@ export async function sendTemplateEmail(
     : CODE_TEMPLATES.has(templateName) ? 'code'
     : SECURITY_TEMPLATES.has(templateName) ? 'security'
     : humanMailboxTemplates.includes(templateName) ? 'human'
+    : NOTICE_TEMPLATES.has(templateName) ? 'notice'
     : 'casual';
 
   const config = await getEmailConfig();
