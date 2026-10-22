@@ -189,15 +189,17 @@ describe('requireReauth — the require2FA policy', () => {
     _count: { passkeys: 0 },
   };
 
-  it('refuses a lone password with SECOND_FACTOR_REQUIRED', async () => {
+  it('refuses a lone password with the ordered chain it still owes', async () => {
     mocks.prismaUser = policyOn;
     const r = await requireReauth(fakeRequest({ password: 'right-password' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) {
       expect(r.response.status).toBe(403);
       const payload: any = await r.response.json();
-      expect(payload.error).toBe('SECOND_FACTOR_REQUIRED');
-      expect(payload.requires2FA).toBe(true);
+      // The chain answer, not just the second factor: the sheet walks every
+      // link the account has, and this one is still owed the authenticator.
+      expect(payload.error).toBe('REAUTH_REQUIRED');
+      expect(payload.methods).toEqual(['password', 'totp']);
     }
   });
 
@@ -271,7 +273,7 @@ describe('requireReauth — TOTP', () => {
   });
 
   it('ignores TOTP when allowTotp=false and demands another proof', async () => {
-    mocks.prismaUser = { passwordHash: null, totpSecret: 'secret', _count: { passkeys: 0 } };
+    mocks.prismaUser = { passwordHash: null, totpSecret: 'secret', security: { totpSecret: 'secret', totpEnabled: true }, _count: { passkeys: 0 } };
     const r = await requireReauth(fakeRequest({ totpCode: '123456' }), 'u1', { allowTotp: false });
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(403);

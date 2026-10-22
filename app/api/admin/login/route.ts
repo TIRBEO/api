@@ -1,3 +1,4 @@
+import { resolveLoginLocation } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { adminLoginHandler } from '@/features/auth/authHandlers';
@@ -83,10 +84,11 @@ async function handleVerify(request: NextRequest) {
     setSessionCookie(res, token, refreshToken);
 
     const { sendTemplateEmail: sendLoginAlert } = await import('@/features/email/email');
+    const { describeDevice } = await import('@/features/notifications/notifications');
     sendLoginAlert(user.email, 'login_alert', {
       name: user.email.split('@')[0],
-      location: 'Admin Panel',
-      device: request.headers.get('user-agent') || 'Unknown device',
+      location: resolveLoginLocation(request.headers),
+      device: describeDevice(request.headers.get('user-agent')),
       loginTime: new Date().toLocaleString(),
     }).catch(() => {});
 

@@ -167,29 +167,6 @@ export async function resolveTirbeoIdentifier(
   return { user, matchedBy: 'legacy_email' as const };
 }
 
-// Claim (or re-point) the canonical Tirbeo identity for a user:
-// sets users.username and records username@tirbeo.com as the primary email.
-export async function createTirbeoIdentity(input: {
-  userId: string;
-  username: string;
-  source: 'sso' | 'admin' | 'self_service' | 'legacy';
-}) {
-  const username = input.username.trim().toLowerCase();
-  if (!isValidTirbeoUsername(username)) {
-    throw new Error('Invalid Tirbeo username. Use letters, numbers, dots, dashes or underscores.');
-  }
-  const email = tirbeoEmailFor(username);
-  await prisma.$transaction(async (tx) => {
-    await tx.user.update({ where: { id: input.userId }, data: { username } });
-    await tx.userEmail.upsert({
-      where: { userId_address: { userId: input.userId, address: email } },
-      create: { userId: input.userId, address: email, kind: 'primary', isDefault: true, verifiedAt: new Date() },
-      update: { kind: 'primary', isDefault: true, verifiedAt: new Date() },
-    });
-  });
-  return { userId: input.userId, username, email };
-}
-
 /** The address the account would be recovered with, and whether its owner has
     proved they receive it. Read from the same row setRecoveryContact writes, so
     a screen can't show an address the recovery mail would never go to — the
@@ -214,6 +191,16 @@ export async function setRecoveryContact(input: {
 }) {
   const email = input.email.trim().toLowerCase();
   const verifiedAt = input.verifiedAt === null ? null : (input.verifiedAt ?? new Date());
+  // Never flip the login row. Rows are unique per (userId, address), so
+  // setting the recovery contact to the account's own primary address would
+  // rewrite that primary row to kind 'recovery' and strip the account's login
+  // email. Guarded call sites reject this with a 400; the unguarded ones stop
+  // here.
+  const primary = await prisma.userEmail.findFirst({
+    where: { userId: input.userId, kind: 'primary' },
+    select: { address: true },
+  });
+  if (primary?.address?.toLowerCase() === email) return null;
   // Demote any previous recovery address for this user.
   const previous = await prisma.userEmail.findMany({ where: { userId: input.userId, kind: 'recovery' } });
   for (const row of previous) {

@@ -14,25 +14,36 @@ import { maskEmail } from '@/features/auth/recovery-email';
  * Re-authentication proof for sensitive actions (disable 2FA, revoke all
  * sessions, delete passkeys). A stolen session cookie alone must not suffice.
  *
- * Accepted proofs, checked in order:
+ * Accepted proofs:
  *   1. passkey  — `reauthToken`: the ≤5-min JWT from the WebAuthn
- *                 reauth-options/reauth-verify flow (userVerification required)
- *   2. password — `password`: verified against the user's password hash;
- *                 failures are rate-limited (5 per 15 min per user)
- *   3. code     — `reauthCode`: the 6-digit code emailed to the account's
- *                 sign-in address (POST /api/auth/reauth/send-code). The door
- *                 for accounts that have no password and no passkey/TOTP —
- *                 without it they could not complete a sensitive action at all
- *   4. totp     — `totpCode`/`code` (body or ?code= query): a valid 6-digit
- *                 TOTP code doubles as the proof, preserving the legacy
- *                 disable-2FA UX
+ *                 reauth-options/reauth-verify flow (userVerification required).
+ *                 One ceremony opens the whole door.
+ *   2. totp     — `totpCode`/`code` (body or ?code= query): a valid 6-digit
+ *                 authenticator code, honored on its own while the account has
+ *                 NOT switched on "require 2FA" — preserving the legacy
+ *                 disable-2FA UX where the code is both the proof and the
+ *                 thing being switched off.
+ *   3. the chain — every door the account actually has, walked in order and
+ *                 all of it required, one combined body:
+ *                   `password`   first, when the account has a password
+ *                   `reauthCode` next — the 6-digit code emailed to the
+ *                                account's sign-in address (POST
+ *                                /api/auth/reauth/send-code)
+ *                   `totp`       last, when the account switched on "require
+ *                                2FA for sensitive actions" WITH an
+ *                                authenticator enrolled (a backup code rides
+ *                                in place of the app code)
+ *
+ * The chain is what the "require 2FA for sensitive actions" toggle means, and
+ * it generalizes: an account with a password owes the password AND the emailed
+ * code, not one or the other. One proof being wrong (or absent) answers 403
+ * `REAUTH_REQUIRED` with `methods` — the ordered chain this account must walk —
+ * and the client sheet collects every step before re-running the action with
+ * the whole proof in one body. Links are checked in order, so a wrong password
+ * never spends a live emailed code.
  *
  * `reauthCode` is deliberately its own field: `code` has meant TOTP since the
  * legacy flow and still does.
- *
- * An account that switched on "require 2FA for sensitive actions" is not
- * satisfied by proof #2 alone: the password unlocks the second-factor check in
- * `second-factor.ts`, and the action waits for the code beside it.
  *
  * The request body is read exactly once here and returned to the caller so
  * handlers don't double-consume it.
@@ -117,6 +128,29 @@ export async function availableReauthMethods(userId: string): Promise<ReauthMeth
   return (await proofOptions(userId)).methods;
 }
 
+/**
+ * The ordered chain THIS account must walk: every door it has, all of them,
+ * password first, then the emailed code, then the authenticator when the
+ * "require 2FA for sensitive actions" toggle is on with an app enrolled
+ * (`isRequire2FA` asks both columns, so the toggle stays inert without one).
+ * An empty chain means nothing can be demanded — see the `none` fallback.
+ */
+async function requiredFactors(userId: string): Promise<ReauthMethod[]> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      passwordHash: true,
+      security: { select: { totpSecret: true, totpEnabled: true } },
+    },
+  }).catch(() => null);
+
+  const factors: ReauthMethod[] = [];
+  if (user?.passwordHash) factors.push('password');
+  if (await signInEmailOf(userId).catch(() => null)) factors.push('code');
+  if (user?.security?.totpSecret && (await isRequire2FA(userId).catch(() => false))) factors.push('totp');
+  return factors;
+}
+
 /** The doors this account can open, which is also the answer to the one
  *  question the caller asks: is there any proof it could give at all. */
 async function proofOptions(userId: string): Promise<{ methods: ReauthMethod[]; hasSecondFactor: boolean }> {
@@ -124,7 +158,7 @@ async function proofOptions(userId: string): Promise<{ methods: ReauthMethod[]; 
     where: { id: userId },
     select: {
       passwordHash: true,
-      security: { select: { totpSecret: true } },
+      security: { select: { totpSecret: true, totpEnabled: true } },
       _count: { select: { passkeys: true } },
     },
   }).catch(() => null);
@@ -132,7 +166,10 @@ async function proofOptions(userId: string): Promise<{ methods: ReauthMethod[]; 
   const methods: ReauthMethod[] = [];
   if ((user?._count?.passkeys ?? 0) > 0) methods.push('passkey');
   if (user?.passwordHash) methods.push('password');
-  if (user?.security?.totpSecret) methods.push('totp');
+  // The secret survives disabling 2FA — only an *enabled* authenticator is a
+  // door. Offering it against a switched-off second factor confuses the
+  // person with a tab that has no meaning.
+  if (user?.security?.totpEnabled && user?.security?.totpSecret) methods.push('totp');
   if (await signInEmailOf(userId).catch(() => null)) methods.push('code');
 
   // The emailed code counts. Listing it as a door and then waving the account
@@ -263,7 +300,7 @@ async function checkProof(
   sessionUserId: string,
   opts: { allowTotp?: boolean },
 ): Promise<ReauthResult> {
-  // 1) Passkey reauth proof
+  // 1) Passkey reauth proof — one ceremony opens the whole door.
   const reauthToken = typeof body?.reauthToken === 'string' ? body.reauthToken : undefined;
   if (reauthToken) {
     const sub = await verifyReauthToken(reauthToken);
@@ -272,84 +309,20 @@ async function checkProof(
       return { ok: true, method: 'passkey', body };
     }
     logReauthProof(request, sessionUserId, 'failed', 'passkey', 'token_invalid_or_mismatched');
-    const methods = await availableReauthMethods(sessionUserId);
-    return reauthRequired(opts.allowTotp === false ? methods.filter((m) => m !== 'totp') : methods);
+    return reauthRequired(await requiredFactors(sessionUserId));
   }
 
-  // 2) Password proof
-  const password = typeof body?.password === 'string' ? body.password : undefined;
-  if (password) {
-    const user = await prisma.user.findUnique({
-      where: { id: sessionUserId },
-      select: { passwordHash: true },
-    });
-    if (user?.passwordHash && (await verifyPassword(user.passwordHash, password))) {
-      /* "Require 2FA for sensitive actions" means the password is only the
-         first factor here. Checked at the door every guarded action comes
-         through, not in the twelve handlers on the other side of it — a rule
-         enforced per-caller is a rule the next caller forgets. The proof the
-         policy wants is the one the person brings alongside: an authenticator
-         code or a spent backup code. */
-      if (await isRequire2FA(sessionUserId)) {
-        const blocked = await secondFactorBlocker(sessionUserId, body);
-        if (blocked) {
-          logReauthProof(request, sessionUserId, 'failed', 'password', 'second_factor_missing');
-          return { ok: false, response: blocked };
-        }
-        logReauthProof(request, sessionUserId, 'verified', 'totp');
-        return { ok: true, method: 'totp', body };
-      }
-      logReauthProof(request, sessionUserId, 'verified', 'password');
-      return { ok: true, method: 'password', body };
-    }
-    logReauthProof(request, sessionUserId, 'failed', 'password', 'invalid_password');
-    // Failed password — rate limit before revealing anything.
-    const allowed = await checkWindowLimitDB(`reauth:pw:${sessionUserId}`, PASSWORD_MAX_ATTEMPTS, PASSWORD_WINDOW_MS).catch(() => true);
-    if (!allowed) {
-      return {
-        ok: false,
-        response: NextResponse.json(
-          { error: 'REAUTH_RATE_LIMITED', message: 'Too many attempts. Try again in a few minutes.' },
-          { status: 429 },
-        ),
-      };
-    }
-    return {
-      ok: false,
-      response: NextResponse.json({ error: 'INVALID_PASSWORD', message: 'Incorrect password. Please try again.' }, { status: 400 }),
-    };
-  }
-
-  // 3) Emailed-code proof. Checked before TOTP and independently of
-  //    `allowTotp`, because it is not a second factor the account configured —
-  //    it is the mailbox the account signs in with, and it is the only door an
-  //    account whose passkey is gone has left.
-  const reauthCode = typeof body?.reauthCode === 'string' ? body.reauthCode.trim() : undefined;
-  if (reauthCode) {
-    // A wrong shape can't be the code we sent, and must not spend an attempt on
-    // the live one.
-    if (!/^\d{6}$/.test(reauthCode)) {
-      logReauthProof(request, sessionUserId, 'failed', 'code', 'malformed_code');
-      return { ok: false, response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }) };
-    }
-    if (await consumeReauthCode(sessionUserId, reauthCode).catch(() => false)) {
-      logReauthProof(request, sessionUserId, 'verified', 'code');
-      return { ok: true, method: 'code', body };
-    }
-    logReauthProof(request, sessionUserId, 'failed', 'code', 'invalid_or_spent_code');
-    return {
-      ok: false,
-      response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }),
-    };
-  }
-
-  // 4) TOTP proof (legacy disable-2FA flow sends ?code=)
+  // 2) A volunteered authenticator code, honored on its own while the 2FA
+  //    policy is OFF: the legacy disable-2FA flow (?code=, totpCode, body.code)
+  //    treats the code as both the proof and the thing being switched off.
+  //    With the policy ON the code is a chain link instead, checked in order
+  //    below — which is what "require 2FA for sensitive actions" means.
   const totpCode =
     (typeof body?.totpCode === 'string' && body.totpCode) ||
     (typeof body?.code === 'string' && body.code) ||
     request.nextUrl?.searchParams.get('code') ||
     undefined;
-  if (totpCode && opts.allowTotp !== false) {
+  if (totpCode && opts.allowTotp !== false && !(await isRequire2FA(sessionUserId))) {
     if (typeof totpCode !== 'string' || totpCode.length !== 6) {
       return {
         ok: false,
@@ -371,6 +344,31 @@ async function checkProof(
     };
   }
 
+  // 3) The chain: every door this account has, all of them, in order. Links
+  //    are checked one at a time — and spent one at a time, so a wrong
+  //    password never burns the live emailed code that rides with it.
+  const required = await requiredFactors(sessionUserId);
+  for (const factor of required) {
+    const fail = await checkChainLink(request, sessionUserId, factor, required, body);
+    if (fail) return fail;
+  }
+  if (required.length) {
+    return { ok: true, method: required[required.length - 1], body };
+  }
+
+  // 4) Nothing the chain demands, but proofs were still presented: answer them
+  //    the way the guard always has — a password for an account with no hash
+  //    is refused (and rate-limited), a well-formed code is still spent.
+  const password = typeof body?.password === 'string' ? body.password : undefined;
+  if (password) return wrongPassword(request, sessionUserId);
+
+  const strayCode = typeof body?.reauthCode === 'string' ? body.reauthCode.trim() : undefined;
+  if (strayCode) {
+    const fail = await checkChainLink(request, sessionUserId, 'code', [], body);
+    if (fail) return fail;
+    return { ok: true, method: 'code', body };
+  }
+
   // No proof supplied. If the account has no door at all — no password, no
   // passkey, no TOTP, no sign-in address it could be emailed a code to —
   // demanding one would hard-lock the account. Allow the action, mark the
@@ -379,5 +377,88 @@ async function checkProof(
   if (!hasFactor) return { ok: true, method: 'none', body };
 
   // Otherwise ask, and ask honestly: only the doors this account can open.
-  return reauthRequired(methods);
+  // A caller that has ruled TOTP out for this action must not be handed a menu
+  // advertising it.
+  return reauthRequired(opts.allowTotp === false ? methods.filter((m) => m !== 'totp') : methods);
+}
+
+/** One link of the chain, checked against the already-read body. `null` means
+ *  the link holds; a `ReauthFail` is the response that says why it doesn't. */
+async function checkChainLink(
+  request: NextRequest,
+  sessionUserId: string,
+  factor: ReauthMethod,
+  required: ReauthMethod[],
+  body: any,
+): Promise<ReauthFail | null> {
+  if (factor === 'password') {
+    const password = typeof body?.password === 'string' ? body.password : undefined;
+    // Missing is not "wrong": the sheet still has the whole ordered chain to
+    // collect, and `REAUTH_REQUIRED.methods` is what walks it.
+    if (!password) return reauthRequired(required);
+    const user = await prisma.user.findUnique({
+      where: { id: sessionUserId },
+      select: { passwordHash: true },
+    });
+    if (user?.passwordHash && (await verifyPassword(user.passwordHash, password))) {
+      logReauthProof(request, sessionUserId, 'verified', 'password');
+      return null;
+    }
+    return wrongPassword(request, sessionUserId);
+  }
+
+  if (factor === 'code') {
+    const reauthCode = typeof body?.reauthCode === 'string' ? body.reauthCode.trim() : undefined;
+    if (!reauthCode) return reauthRequired(required);
+    // A wrong shape can't be the code we sent, and must not spend an attempt on
+    // the live one.
+    if (!/^\d{6}$/.test(reauthCode)) {
+      logReauthProof(request, sessionUserId, 'failed', 'code', 'malformed_code');
+      return { ok: false, response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }) };
+    }
+    if (await consumeReauthCode(sessionUserId, reauthCode).catch(() => false)) {
+      logReauthProof(request, sessionUserId, 'verified', 'code');
+      return null;
+    }
+    logReauthProof(request, sessionUserId, 'failed', 'code', 'invalid_or_spent_code');
+    return { ok: false, response: NextResponse.json(INVALID_REAUTH_CODE, { status: 400 }) };
+  }
+
+  // factor === 'totp' — the policy's link. A live authenticator code or an
+  // unspent backup code satisfies it (`second-factor.ts`); nothing presented
+  // means the chain is still owed, so hand it the ordered chain rather than a
+  // bare SECOND_FACTOR_REQUIRED.
+  const presented =
+    (typeof body?.totpCode === 'string' && body.totpCode) ||
+    (typeof body?.code === 'string' && body.code) ||
+    (typeof body?.backupCode === 'string' && body.backupCode) ||
+    request.nextUrl?.searchParams.get('code');
+  if (!presented) return reauthRequired(required);
+  const blocked = await secondFactorBlocker(sessionUserId, body);
+  if (blocked) {
+    logReauthProof(request, sessionUserId, 'failed', 'totp', 'second_factor_invalid');
+    return { ok: false, response: blocked };
+  }
+  logReauthProof(request, sessionUserId, 'verified', 'totp');
+  return null;
+}
+
+/** A presented password that doesn't match: log it, rate-limit before
+ *  revealing anything, then say either "too many attempts" or "wrong". */
+async function wrongPassword(request: NextRequest, sessionUserId: string): Promise<ReauthFail> {
+  logReauthProof(request, sessionUserId, 'failed', 'password', 'invalid_password');
+  const allowed = await checkWindowLimitDB(`reauth:pw:${sessionUserId}`, PASSWORD_MAX_ATTEMPTS, PASSWORD_WINDOW_MS).catch(() => true);
+  if (!allowed) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'REAUTH_RATE_LIMITED', message: 'Too many attempts. Try again in a few minutes.' },
+        { status: 429 },
+      ),
+    };
+  }
+  return {
+    ok: false,
+    response: NextResponse.json({ error: 'INVALID_PASSWORD', message: 'Incorrect password. Please try again.' }, { status: 400 }),
+  };
 }

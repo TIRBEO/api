@@ -1,4 +1,4 @@
-import { FAINT, LINE, MUTED, RADIUS_PLATE, TEXT, TEXT_2, WARN } from '@/features/email/email-theme';
+import { FAINT, MUTED, TEXT, TEXT_2 } from '@/features/email/email-theme';
 
 /**
  * The HTML the mail's section slots are built from.
@@ -45,12 +45,12 @@ export function listGroup(label: string, count: number, rows: string): string {
 /**
  * Groups a set of lists apart from the copy around them.
  *
- * The same bordered plate the detail rows use, with a hairline between rows
- * instead of a gap — a list of events is read top to bottom, and the rule says
- * where one ends and the next begins.
+ * No plate and no border: the hairlines between rows already say where one
+ * event ends and the next begins, and a box around them is a second way of
+ * saying the same thing.
  */
 export function listPlate(groups: string): string {
-  return `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:${RADIUS_PLATE};overflow:hidden">${groups}</div>`;
+  return `<div style="margin:24px 0">${groups}</div>`;
 }
 
 /** Trailing "n more" line after a list. */
@@ -58,13 +58,14 @@ export function moreRow(text: string): string {
   return `<div style="padding:11px 0;font-size:13px;line-height:19px;color:${MUTED}">${text}</div>`;
 }
 
-/** The "things to look at" section — amber rule, never a red block. */
+/** The "things to look at" section — a bold lead-in and plain lines, the same
+    shape the rest of the mail's prose uses. */
 export function attentionPanel(heading: string, lines: string[]): string {
-  return `<div style="margin:22px 0;padding:2px 0 2px 16px;border-left:2px solid ${WARN}">`
-    + `<div style="font-size:14px;line-height:20px;font-weight:600;color:${WARN}">${heading}</div>`
+  return `<p style="margin:0 0 8px;font-size:15px;line-height:25px;color:${TEXT}">${heading}</p>`
+    + `<ul style="margin:0 0 16px;padding-left:20px">`
     + lines.map((line) =>
-        `<div style="margin-top:4px;font-size:14px;line-height:21px;color:${TEXT_2}">${line}</div>`).join('')
-    + `</div>`;
+        `<li style="margin:0 0 6px;font-size:15px;line-height:24px;color:${TEXT_2}">${line}</li>`).join('')
+    + `</ul>`;
 }
 
 /** A single quiet line when there is nothing to show. */

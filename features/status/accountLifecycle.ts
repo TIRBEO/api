@@ -441,13 +441,17 @@ export function consumeDeletionCode(userId: string, code: string): Promise<boole
     }
     const ok = await verifyOtpHash(otp.otpHash, `${code}|${userId}`);
     if (ok) {
-      await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
-    } else {
-      const next = (otp.attempts ?? 0) + 1;
-      if (next >= MAX_OTP_ATTEMPTS) await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
-      else await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
+      // Count-checked spend (same contract as consumeSensitiveCode): two
+      // concurrent verifies of one deletion code schedule the deletion once,
+      // not twice.
+      const spent = await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => ({ count: 0 }));
+      return spent.count === 1;
     }
-    return ok;
+    // A miss costs an attempt, and the row self-destructs at the limit.
+    const next = (otp.attempts ?? 0) + 1;
+    if (next >= MAX_OTP_ATTEMPTS) await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
+    else await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
+    return false;
   })();
 }
 

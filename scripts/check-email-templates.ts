@@ -89,7 +89,7 @@ async function check(
   }
 
   for (const name of names) {
-    await check(`EMAIL_TEMPLATES.${name}`, () => EMAIL_TEMPLATES[name](LOGO));
+    await check(`EMAIL_TEMPLATES.${name}`, () => EMAIL_TEMPLATES[name](LOGO, name));
   }
 
   if (problems.length) {

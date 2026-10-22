@@ -89,7 +89,11 @@ vi.mock('@/infrastructure/db/prisma', () => ({
     },
     otp: {
       findFirst: vi.fn(async ({ where }: any) =>
-        mocks.otpRows.find((r) => r.userId === where?.userId && r.kind === where?.kind) || null),
+        mocks.otpRows.find((r) => {
+          if (r.userId !== where?.userId || r.kind !== where?.kind) return false;
+          if (where?.address?.not === null && !r.address) return false;
+          return true;
+        }) || null),
       update: vi.fn(async ({ where, data }: any) => {
         const row = mocks.otpRows.find((r) => r.id === where?.id);
         if (row) Object.assign(row, data);
@@ -99,7 +103,18 @@ vi.mock('@/infrastructure/db/prisma', () => ({
         mocks.otpRows = mocks.otpRows.filter((r) => r.id !== where?.id);
         return { id: where?.id };
       }),
-      deleteMany: vi.fn(async () => ({ count: 0 })),
+      deleteMany: vi.fn(async ({ where }: any) => {
+        // Behave like the real table: remove the rows the filter matches and
+        // report how many went — count-checked code spends depend on it.
+        const before = mocks.otpRows.length;
+        mocks.otpRows = mocks.otpRows.filter((r) => {
+          if (where?.id !== undefined && r.id !== where.id) return true;
+          if (where?.userId !== undefined && r.userId !== where.userId) return true;
+          if (where?.kind !== undefined && r.kind !== where.kind) return true;
+          return false;
+        });
+        return { count: before - mocks.otpRows.length };
+      }),
     },
     userRestriction: {
       findFirst: vi.fn(async ({ where }: any) =>
@@ -144,6 +159,7 @@ function seedOtp(code: string) {
     id: 'otp-1',
     userId: 'u-closed',
     kind: 'email',
+    address: CLOSED.toLowerCase(),
     otpHash: `hash:${code}`,
     attempts: 0,
     expiresAt: new Date(Date.now() + 10 * 60 * 1000),

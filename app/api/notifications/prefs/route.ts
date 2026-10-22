@@ -10,20 +10,26 @@ export const runtime = 'nodejs';
 const ALLOWED_FIELDS = [
   // Global channels
   'email', 'push',
-  // Category toggles (forms, product, support)
-  'forms', 'product', 'support',
+  // The tips master is the one category-level switch a send path still reads
+  // (emailPrefs tips gate). The forms/product/support/offers masters were
+  // writable but read by nothing — screens decide through the channel keys
+  // below, so those dead keys are no longer accepted here.
+  'tips',
   // Per-category x channel matrix
   'formsEmail', 'formsPush',
   'productEmail', 'productPush',
   'supportEmail', 'supportPush',
-  'offers', 'offersEmail', 'offersPush',
-  'tips', 'tipsEmail', 'tipsPush',
+  'offersEmail', 'offersPush',
+  'tipsEmail', 'tipsPush',
   // Periodic account recap: whether it comes at all, and how often
   'summaryEnabled', 'summaryFrequency',
   // Pause everything at once — codes and security alerts still get through.
   // `emailPausedUntil` is the epoch ms it lapses at, or null for "until I say
   // so", so an expired date reads as unpaused without anyone running a job.
   'emailPaused', 'emailPausedUntil',
+  // Quiet hours — the sender drops non-essential mail inside this window.
+  // Times are "HH:MM" on the account's own clock (appearance timezone).
+  'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
 ] as const;
 
 const SUMMARY_FREQUENCIES = new Set(['daily', 'weekly', 'monthly']);
@@ -71,6 +77,17 @@ export async function PUT(request: NextRequest) {
         && !(typeof data.emailPausedUntil === 'number' && Number.isFinite(data.emailPausedUntil))) {
       return NextResponse.json({ error: 'Invalid emailPausedUntil' }, { status: 400 });
     }
+    // A quiet window the clock math cannot read would either silently never
+    // suppress or silently always suppress — so it is a strict "HH:MM" or no.
+    if (data.quietHoursEnabled !== undefined && typeof data.quietHoursEnabled !== 'boolean') {
+      return NextResponse.json({ error: 'Invalid quietHoursEnabled' }, { status: 400 });
+    }
+    for (const key of ['quietHoursStart', 'quietHoursEnd'] as const) {
+      if (data[key] !== undefined
+          && !(typeof data[key] === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(data[key]))) {
+        return NextResponse.json({ error: `Invalid ${key}` }, { status: 400 });
+      }
+    }
 
     // Re-enabling mail globally means the person wants it back, so the category
     // emails that the global switch turned off come back too — unless this same
@@ -93,13 +110,16 @@ export async function PUT(request: NextRequest) {
       }
     }
 
-    const prefs = await saveNotificationPrefs(session.userId, clearUnsub ? { ...data, unsubscribed: clearUnsub } : data);
+    await saveNotificationPrefs(session.userId, clearUnsub ? { ...data, unsubscribed: clearUnsub } : data);
 
     if (clearUnsub) {
       console.log(`[NOTIFICATIONS] Cleared emailUnsub flags for user ${session.userId} (email re-enabled)`);
     }
 
-    return NextResponse.json(prefs);
+    // Answer with the same merged view a GET gives — the raw save result is
+    // the stored column, which lacks the view-only fields (the account's
+    // timezone) the quiet-hours copy on the screen reads.
+    return NextResponse.json(await loadNotificationPrefs(session.userId));
   } catch (err: any) {
     console.error('[NOTIFICATIONS] Update prefs error:', err?.message || err);
     return NextResponse.json({ error: 'Failed to update preferences' }, { status: 500 });

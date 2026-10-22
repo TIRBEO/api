@@ -123,26 +123,40 @@ export async function markRefreshSpent(hash: string, sessionId: string): Promise
   }
   try {
     const key = SPENT_KEY(hash);
-    await redis.setex(key, Math.ceil(REFRESH_TTL_MS / 1000), sessionId);
+    // The timestamp rides in the value so a replay can be told apart from a
+    // same-instant double refresh from two tabs (see rotateRefreshToken).
+    await redis.setex(key, Math.ceil(REFRESH_TTL_MS / 1000), `${sessionId}|${Date.now()}`);
     return true;
   } catch {
     return false;
   }
 }
 
-export async function isRefreshSpent(hash: string): Promise<string | null> {
+/** A recorded spend: which session burned the token, and when. */
+export type SpentRefresh = { sessionId: string; spentAt: number };
+
+export async function isRefreshSpent(hash: string): Promise<SpentRefresh | null> {
   const redis = getRedis();
   if (!redis) {
     try {
       const { prisma } = await import('@/infrastructure/db/prisma');
-      const row = await prisma.refreshTokenSpent.findUnique({ where: { tokenHash: hash }, select: { sessionId: true } });
-      return row?.sessionId ?? null;
+      const row = await prisma.refreshTokenSpent.findUnique({
+        where: { tokenHash: hash },
+        select: { sessionId: true, spentAt: true },
+      });
+      return row ? { sessionId: row.sessionId, spentAt: row.spentAt.getTime() } : null;
     } catch {
       return null;
     }
   }
   try {
-    return await redis.get(SPENT_KEY(hash));
+    const raw = await redis.get(SPENT_KEY(hash));
+    if (!raw) return null;
+    const bar = raw.indexOf('|');
+    // A record written before timestamps were kept gets spentAt 0 — old enough
+    // to never qualify for the race grace, which is the safe reading.
+    if (bar === -1) return { sessionId: raw, spentAt: 0 };
+    return { sessionId: raw.slice(0, bar), spentAt: Number(raw.slice(bar + 1)) || 0 };
   } catch {
     return null;
   }

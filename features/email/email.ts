@@ -3,7 +3,7 @@ import { after } from 'next/server';
 import type { Transporter } from 'nodemailer';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getBranding } from '@/features/branding/branding';
-import { getApiBaseUrl } from '@/config/app-urls';
+import { getApiBaseUrl, getDashboardBaseUrl } from '@/config/app-urls';
 import { createTtlCache } from '@/infrastructure/cache';
 import { unsubscribeSection } from '@/features/email/email-fragments';
 import {
@@ -309,6 +309,28 @@ export function findUnresolvedVars(html: string, known: Set<string> = new Set())
     found.add(key);
   }
   return [...found];
+}
+
+/**
+ * Last-resort cover for a variable a caller forgot to pass.
+ *
+ * Logging the miss is the right developer answer and the wrong reader answer:
+ * `Time {{loginTime}}` in a nicely designed mail reads as a broken product, or
+ * as a phish. So after the miss is logged, the token is replaced with plain
+ * words, and a missing *link* is pointed at the dashboard rather than left as
+ * a dead relative href. Only the names actually reported missing are touched,
+ * so a template that is rendering correctly is never rewritten.
+ */
+export function fillUnresolvedVars(markup: string, missing: string[]): string {
+  if (!missing.length) return markup;
+  const names = new Set(missing);
+  const fill = (key: string): string | null =>
+    names.has(key) && key !== 'managePreferencesUrl' ? 'Not available' : null;
+
+  return markup
+    .replace(/href="[^"]*\{\{\s*([a-zA-Z0-9_]+)\s*\}\}[^"]*"/g, (whole, key: string) =>
+      fill(key) ? `href="${getDashboardBaseUrl()}"` : whole)
+    .replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (whole, key: string) => fill(key) ?? whole);
 }
 
 export async function sendEmail(
@@ -629,7 +651,10 @@ async function sendViaResend(apiKey: string, to: string, fromEmail: string, from
     subject,
     html,
     text: htmlToText(html),
-    tracking: { click: { enable: false }, open: { enable: true } },
+    // No tracking pixel: an open-tracking 1x1 image is blocked by Gmail's
+    // default image settings and renders as a broken-image chip inside the
+    // mail — the artefact, not the metric, is what the reader sees.
+    tracking: { click: { enable: false }, open: { enable: false } },
   };
   // Explicitly ensure no CC/BCC leak — strip if somehow present
   delete (body as any).cc;
@@ -868,8 +893,9 @@ export async function sendTemplateEmail(
       console.log(`[EMAIL] Using built-in template: '${templateName}'`);
     }
     const subject = renderTemplate(chosen.subject, mergedVars, rawKeys);
-    const htmlBody = renderTemplate(chosen.html, mergedVars, rawKeys);
-    const missing = findUnresolvedVars(subject + htmlBody, rawKeys);
+    const rendered = renderTemplate(chosen.html, mergedVars, rawKeys);
+    const missing = findUnresolvedVars(subject + rendered, rawKeys);
+    const htmlBody = fillUnresolvedVars(rendered, missing);
     if (missing.length) {
       /* Log loudly and still send: a support email with one blank line beats
          an email that never arrives, and the caller can fix the argument. */
@@ -877,7 +903,7 @@ export async function sendTemplateEmail(
         `[EMAIL] Template '${templateName}' sent with unresolved variables: ${missing.join(', ')}`,
       );
     }
-    return sendEmail(to, subject, htmlBody, { ...finalOptions, templateName });
+    return sendEmail(to, fillUnresolvedVars(subject, missing), htmlBody, { ...finalOptions, templateName });
   }
 
   return { success: false, error: `Template '${templateName}' not found` };

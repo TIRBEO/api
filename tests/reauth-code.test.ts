@@ -236,10 +236,13 @@ describe('POST /api/auth/reauth/send-code', () => {
 // ─── Spending it through the guard ──────────────────────────────────
 
 describe('requireReauth — the emailed code proof', () => {
-  it('accepts the right code as method "code" and hands the body back', async () => {
+  /* The password account walks the whole chain now: the emailed code is a
+     link, not a standalone door, so every call here rides with the password
+     the guard checks first. */
+  it('accepts password + code as method "code" and hands the body back', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const body = { reauthCode: '424242', keep: 'me' };
+    const body = { password: 'right-password', reauthCode: '424242', keep: 'me' };
     const r = await requireReauth(fakeRequest(body), 'u1');
     expect(r.ok).toBe(true);
     if (r.ok) {
@@ -249,10 +252,25 @@ describe('requireReauth — the emailed code proof', () => {
     expect(mocks.rows).toHaveLength(0); // spent codes are gone, not marked used
   });
 
+  it('a code alone is not enough when the account also has a password', async () => {
+    passwordAccount();
+    await issueReauthCode('u1', 'alice@gmail.com');
+    const r = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    expect(r.ok).toBe(false);
+    if ('response' in r) {
+      expect(r.response.status).toBe(403);
+      const payload: any = await r.response.json();
+      expect(payload.error).toBe('REAUTH_REQUIRED');
+      expect(payload.methods).toEqual(['password', 'code']);
+    }
+    // Nothing was spent on a proof that never got to the code link.
+    expect(otpRows()).toHaveLength(1);
+  });
+
   it('rejects a wrong code with 400 INVALID_CODE and burns an attempt', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const r = await requireReauth(fakeRequest({ reauthCode: '111111' }), 'u1');
+    const r = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '111111' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) {
       expect(r.response.status).toBe(400);
@@ -263,12 +281,21 @@ describe('requireReauth — the emailed code proof', () => {
     expect(otpRows()[0].attempts).toBe(1);
   });
 
+  it('a wrong password never spends the live emailed code', async () => {
+    passwordAccount();
+    await issueReauthCode('u1', 'alice@gmail.com');
+    const r = await requireReauth(fakeRequest({ password: 'wrong', reauthCode: '424242' }), 'u1');
+    expect(r.ok).toBe(false);
+    if ('response' in r) expect(r.response.status).toBe(400);
+    expect(otpRows()).toHaveLength(1); // still live — links are checked in order
+  });
+
   it('a spent code cannot be replayed', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const first = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    const first = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '424242' }), 'u1');
     expect(first.ok).toBe(true);
-    const second = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    const second = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '424242' }), 'u1');
     expect(second.ok).toBe(false);
     if ('response' in second) expect(second.response.status).toBe(400);
   });
@@ -277,7 +304,7 @@ describe('requireReauth — the emailed code proof', () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
     otpRows()[0].expiresAt = new Date(Date.now() - 1000);
-    const r = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    const r = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '424242' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(400);
     expect(otpRows()).toHaveLength(0); // expired rows self-destruct
@@ -287,7 +314,7 @@ describe('requireReauth — the emailed code proof', () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
     otpRows()[0].attempts = 5;
-    const r = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    const r = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '424242' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(400);
   });
@@ -295,7 +322,7 @@ describe('requireReauth — the emailed code proof', () => {
   it('rejects a malformed code without touching the live one', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const r = await requireReauth(fakeRequest({ reauthCode: '42' }), 'u1');
+    const r = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '42' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(400);
     expect(otpRows()[0].attempts).toBe(0);
@@ -312,13 +339,15 @@ describe('requireReauth — the emailed code proof', () => {
     passwordAccount();
     const { issueDeletionCode } = await import('@/features/status/accountLifecycle');
     await issueDeletionCode('u1', 'alice@gmail.com');
-    const r = await requireReauth(fakeRequest({ reauthCode: '424242' }), 'u1');
+    const r = await requireReauth(fakeRequest({ password: 'right-password', reauthCode: '424242' }), 'u1');
     expect(r.ok).toBe(false);
     if ('response' in r) expect(r.response.status).toBe(400);
     expect(otpRows('account_delete')).toHaveLength(1); // untouched
   });
 
   it('works for an account with no password and no passkey — the case that was locked out', async () => {
+    // Its chain has exactly one link: the code. No password is owed, because
+    // there is no password to ask for.
     mocks.prismaUser = { passwordHash: null, totpSecret: null, email: 'bob@gmail.com', _count: { passkeys: 1 } };
     mocks.primaryEmail = 'bob@gmail.com';
     await issueReauthCode('u1', 'bob@gmail.com');
@@ -387,29 +416,33 @@ describe('REAUTH_REQUIRED lists the methods the account can actually use', () =>
     }
   });
 
-  it('passkey + password + totp + email — the whole menu', async () => {
-    mocks.prismaUser = { passwordHash: 'hash', totpSecret: 'secret', email: 'carol@gmail.com', _count: { passkeys: 2 } };
+  it('passkey + password + totp + email — the chain asks for what it demands', async () => {
+    // The 403 answers the ordered CHAIN the sheet must walk, not the whole
+    // menu of doors: the passkey is an alternative ceremony, and TOTP is only
+    // owed when the "require 2FA" policy is on with an app enrolled — here it
+    // isn't, so the chain is password then code.
+    mocks.prismaUser = { passwordHash: 'hash', totpSecret: 'secret', security: { totpSecret: 'secret', totpEnabled: true }, email: 'carol@gmail.com', _count: { passkeys: 2 } };
     mocks.primaryEmail = 'carol@gmail.com';
     const r = await requireReauth(fakeRequest({}), 'u1');
     if ('response' in r) {
       const payload: any = await r.response.json();
-      expect(payload.methods).toEqual(['passkey', 'password', 'totp', 'code']);
+      expect(payload.methods).toEqual(['password', 'code']);
     }
   });
 
-  it('an OAuth account with a lost passkey gets passkey + code — and code is its only real door', async () => {
+  it('an OAuth account with a lost passkey walks the one link it has: the code', async () => {
     mocks.prismaUser = { passwordHash: null, totpSecret: null, email: 'dave@gmail.com', _count: { passkeys: 1 } };
     mocks.primaryEmail = 'dave@gmail.com';
     expect(await availableReauthMethods('u1')).toEqual(['passkey', 'code']);
     const r = await requireReauth(fakeRequest({}), 'u1');
     if ('response' in r) {
       const payload: any = await r.response.json();
-      expect(payload.methods).toEqual(['passkey', 'code']);
+      expect(payload.methods).toEqual(['code']);
     }
   });
 
   it('no code, no email: code is not offered', async () => {
-    mocks.prismaUser = { passwordHash: null, totpSecret: 'secret', email: null, _count: { passkeys: 0 } };
+    mocks.prismaUser = { passwordHash: null, totpSecret: 'secret', security: { totpSecret: 'secret', totpEnabled: true }, email: null, _count: { passkeys: 0 } };
     expect(await availableReauthMethods('u1')).toEqual(['totp']);
     const r = await requireReauth(fakeRequest({}), 'u1');
     if ('response' in r) {
@@ -454,10 +487,10 @@ describe('REAUTH_REQUIRED lists the methods the account can actually use', () =>
 // ─── Pre-validating a proof without performing the action ───────────
 
 describe('reauthVerifyHandler with an emailed code', () => {
-  it('returns ok:true, method "code"', async () => {
+  it('returns ok:true, method "code" for a full chain', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const res = await reauthVerifyHandler(fakeRequest({ reauthCode: '424242' }));
+    const res = await reauthVerifyHandler(fakeRequest({ password: 'right-password', reauthCode: '424242' }));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, method: 'code' });
   });
@@ -465,7 +498,7 @@ describe('reauthVerifyHandler with an emailed code', () => {
   it('passes a wrong code straight through as 400', async () => {
     passwordAccount();
     await issueReauthCode('u1', 'alice@gmail.com');
-    const res = await reauthVerifyHandler(fakeRequest({ reauthCode: '000000' }));
+    const res = await reauthVerifyHandler(fakeRequest({ password: 'right-password', reauthCode: '000000' }));
     expect(res.status).toBe(400);
     const payload: any = await res.json();
     expect(payload.error).toBe('INVALID_CODE');

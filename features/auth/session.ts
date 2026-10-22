@@ -77,6 +77,9 @@ const REFRESH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
 // last-activity + 1h, so no request path and no refresh can extend it past an
 // hour of quiet.
 export const SAVE_LOGIN_IDLE_MS = 60 * 60 * 1000;
+/** How recently a token must have been spent for a replay to read as two tabs
+    refreshing the same shared cookie rather than as theft. */
+const REFRESH_RACE_GRACE_MS = 15_000;
 
 export const REFRESH_COOKIE_NAME = '__refresh';
 
@@ -274,14 +277,26 @@ export async function rotateRefreshToken(refreshToken: string) {
   const now = new Date();
 
   // Reuse detection (Redis-backed spent-token history).
-  const isSpent = await isRefreshSpent(presentedHash);
-  if (isSpent) {
-    // A presented token whose hash is ALREADY marked spent means it has been
-    // rotated before — i.e. at least two parties have held it, or a legit
-    // client is replaying it. Either way this is the theft signature: the
-    // secure response is to kill the whole session family, NOT to mint a
-    // fresh pair (that would let a stolen token replay forever).
-    await revokeSessionFamily(isSpent);
+  const spent = await isRefreshSpent(presentedHash);
+  if (spent) {
+    /* Every Tirbeo app on localhost shares ONE refresh cookie, so two tabs can
+       present the same token a heartbeat apart: the first rotates, the second
+       finds its own token already spent. That's a race, not theft. Inside a
+       short grace the live session is simply re-served (and the token the
+       first rotation minted is marked spent too, so that tab rides the same
+       grace on its next refresh). Past the grace — or on a record with no
+       trustworthy timestamp, or a dead session — it stays the theft
+       signature: kill the whole session family rather than mint a fresh pair
+       for a replayed token. */
+    const raced = Date.now() - spent.spentAt <= REFRESH_RACE_GRACE_MS;
+    const live = raced
+      ? await prisma.userSession.findUnique({
+          where: { id: spent.sessionId },
+          include: { user: { select: { security: { select: { saveLoginInfo: true } } } } },
+        }).catch(() => null)
+      : null;
+    if (live && !live.revokedAt && live.expiresAt >= now) return rotateFrom(live, now);
+    await revokeSessionFamily(spent.sessionId);
     return null;
   }
 
@@ -293,18 +308,26 @@ export async function rotateRefreshToken(refreshToken: string) {
   // Idle-capped accounts: an hour of quiet ends the session here too — the
   // sliding expiresAt is the idle deadline, and a refresh must NOT extend a
   // session that has gone idle past it (the check below revokes).
-  const saveLoginInfo = session.user?.security?.saveLoginInfo ?? true;
-
   if (session.revokedAt || session.expiresAt < now) {
     // An expired/revoked session is killed here and the caller gets a 401 —
     // rotation ALWAYS reuses the same session row and no refresh path ever
     // mints a brand-new session after expiry, which is why there are no
     // 'auth.session_extended' ledger rows by design.
     await revokeSession(session.id);
-    if (isSpent === null) await markRefreshSpent(presentedHash, session.id);
+    await markRefreshSpent(presentedHash, session.id);
     return null;
   }
 
+  return rotateFrom(session, now);
+}
+
+/** The rotation itself: a new refresh token on the same session row, the
+    presented hash recorded as spent, a freshly signed access token. */
+async function rotateFrom(
+  session: { id: string; userId: string; tokenHash: string; user?: { security?: { saveLoginInfo?: boolean } | null } | null },
+  now: Date,
+) {
+  const saveLoginInfo = session.user?.security?.saveLoginInfo ?? true;
   const newRefreshToken = generateRefreshToken();
   const newHash = await hashRefreshToken(newRefreshToken);
 
@@ -317,7 +340,7 @@ export async function rotateRefreshToken(refreshToken: string) {
 
   const [token] = await Promise.all([
     signToken(session.userId, session.id),
-    markRefreshSpent(presentedHash, session.id),
+    markRefreshSpent(session.tokenHash, session.id),
   ]);
   return { token, sessionId: session.id, refreshToken: newRefreshToken, saveLoginInfo };
 }
@@ -517,12 +540,16 @@ export async function getSessionFromToken(token: string) {
           where: { id: session.id },
           data: saveLoginInfo ? { lastUsedAt: new Date() } : { lastUsedAt: new Date(), expiresAt: new Date(Date.now() + SAVE_LOGIN_IDLE_MS) } })
         .catch(() => {});
-      // Throttled alongside the session row (same 5-minute window).
-      prisma.userDevice
-        .updateMany({
-          where: { userId: session.userId, status: 'active', deviceName: session.deviceName },
-          data: { lastUsedAt: new Date() } })
-        .catch(() => {});
+      // Throttled alongside the session row (same 5-minute window). Skipped
+      // when the session has no device name: matching on null would stamp
+      // every nameless device of the account instead of this one.
+      if (session.deviceName) {
+        prisma.userDevice
+          .updateMany({
+            where: { userId: session.userId, status: 'active', deviceName: session.deviceName },
+            data: { lastUsedAt: new Date() } })
+          .catch(() => {});
+      }
     }
 
     // Fast revocation check via Redis when available — bounded so a stalled

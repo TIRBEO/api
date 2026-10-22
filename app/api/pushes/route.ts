@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireSession } from '@/features/auth/http-guards';
-import { prisma } from '@/infrastructure/db/prisma';
+import { getUserPushSubscriptions } from '@/infrastructure/push/push-notifications';
 
 export const runtime = 'nodejs';
 
@@ -9,22 +9,18 @@ export async function GET(request: NextRequest) {
     const session = await requireSession(request);
     if (session instanceof NextResponse) return session;
 
-    // Push subscription bookkeeping lives in user_preferences.notif
-    const user = await prisma.userPreferences.findUnique({
-      where: { userId: session.userId },
-      select: { notif: true },
-    });
-
-    const prefs: any = (user?.notif as any) || {};
-    const subscriptions = prefs.pushSubscriptions || [];
+    // The PushSubscription table is where subscribeToPush actually records a
+    // browser; the prefs-blob key this used to read was never written, so the
+    // list was empty even while push was delivering.
+    const subscriptions = await getUserPushSubscriptions(session.userId);
 
     // Return sanitized list (no full subscription details for security)
-    const items = subscriptions.map((sub: any, i: number) => ({
-      id: i,
+    const items = subscriptions.map((sub: any) => ({
+      id: sub.id,
       endpoint: sub.endpoint ? `${sub.endpoint.slice(0, 30)}...` : 'unknown',
-      createdAt: sub.createdAt || null,
+      createdAt: sub.createdAt ? new Date(sub.createdAt).toISOString() : null,
+      lastUsedAt: sub.lastUsedAt ? new Date(sub.lastUsedAt).toISOString() : null,
       userAgent: sub.userAgent || null,
-      enabled: sub.enabled !== false,
     }));
 
     return NextResponse.json({ items, total: items.length });

@@ -56,17 +56,20 @@ export async function getUserPushSubscriptions(userId: string) {
 export async function subscribeToPush(userId: string, subscription: { endpoint: string; p256dh: string; auth: string }, userAgent?: string) {
   if (!subscription.endpoint || !subscription.p256dh || !subscription.auth) throw new Error('Missing subscription keys');
 
-  // Consent gate: check if user has opted into push notifications
+  // The opt-in that governs push is the notification-settings push switch
+  // (prefs.push). This used to consult the analytics-tracking consent — a
+  // different decision nobody made about push, default off — so turning push
+  // on registered nothing until an unrelated privacy switch flipped too.
   try {
-    const { hasConsent } = await import('@/features/users/consent');
-    const pushAllowed = await hasConsent(userId, 'analytics');
-    if (!pushAllowed) {
-      console.log(`[PUSH] Subscription blocked — user ${userId} has not consented to push notifications`);
-      throw new Error('Push notifications not enabled in your privacy settings');
+    const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
+    const prefs = await loadNotificationPrefs(userId);
+    if (prefs.push === false) {
+      console.log(`[PUSH] Subscription blocked — push is off in notification settings for ${userId}`);
+      throw new Error('Push notifications are turned off in your notification settings');
     }
   } catch (err: any) {
-    // Re-throw consent errors, ignore import errors
-    if (err?.message?.includes('not enabled')) throw err;
+    // Re-throw the settings error, ignore import errors
+    if (err?.message?.includes('turned off')) throw err;
   }
   const prisma = await getPrisma();
   if (prisma && (prisma as any).pushSubscription) {
@@ -106,13 +109,15 @@ export async function sendPushNotification(userIdOrSubscription: string | { endp
   if (!configured) return { sent: 0, failed: 0 };
   let subs: { endpoint: string; p256dh: string; auth: string; id?: string }[];
   if (typeof userIdOrSubscription === 'string') {
-    // Consent gate: check if user has opted into push notifications
+    // The push switch in notification settings is the gate — the same prefs
+    // value createNotification already consults. Analytics consent used to
+    // decide here, which is a different question entirely.
     try {
-      const { hasConsent } = await import('@/features/users/consent');
-      const pushAllowed = await hasConsent(userIdOrSubscription, 'analytics');
-      if (!pushAllowed) {
+      const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
+      const prefs = await loadNotificationPrefs(userIdOrSubscription);
+      if (prefs.push === false) {
         if (process.env.NODE_ENV === 'production') {
-          console.log(`[PUSH] Send blocked — user ${userIdOrSubscription} has not consented to push notifications`);
+          console.log(`[PUSH] Send skipped — push is off in notification settings for ${userIdOrSubscription}`);
         }
         return { sent: 0, failed: 0 };
       }

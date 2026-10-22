@@ -15,6 +15,18 @@ vi.mock('@/infrastructure/db/prisma', () => {
   // mock adapts the fixture into those lookups.
   const user = { findUnique: vi.fn() };
   const fixture = async () => (await user.findUnique({ where: { id: '__fixture__' } })) as any;
+  const userPreferences = {
+    findUnique: vi.fn(async () => {
+      const u = await fixture();
+      if (!u) return null;
+      const notif: Record<string, unknown> = { ...(u.notificationPreferences ?? {}) };
+      if (u.emailUnsubscribed && typeof u.emailUnsubscribed === 'object') {
+        notif.unsubscribed = u.emailUnsubscribed;
+      }
+      return { notif };
+    }),
+    upsert: vi.fn(async () => undefined),
+  };
   return {
     prisma: {
       user,
@@ -24,18 +36,10 @@ vi.mock('@/infrastructure/db/prisma', () => {
           return u ? { userId: u.id ?? 'u1' } : null;
         }),
       },
-      userPreferences: {
-        findUnique: vi.fn(async () => {
-          const u = await fixture();
-          if (!u) return null;
-          const notif: Record<string, unknown> = { ...(u.notificationPreferences ?? {}) };
-          if (u.emailUnsubscribed && typeof u.emailUnsubscribed === 'object') {
-            notif.unsubscribed = u.emailUnsubscribed;
-          }
-          return { notif };
-        }),
-        upsert: vi.fn(async () => undefined),
-      },
+      userPreferences,
+      // saveNotificationPrefs runs as one serialized read-modify-write pass;
+      // the fake hands the same table object to the transaction body.
+      $transaction: vi.fn(async (fn: any) => fn({ userPreferences })),
       $executeRaw: vi.fn(),
       $queryRaw: vi.fn(),
       // The platform-wide category switches live in one AppConfig row. These

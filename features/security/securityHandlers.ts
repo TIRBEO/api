@@ -1,4 +1,5 @@
 
+import { resolveLoginLocation } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
@@ -21,6 +22,7 @@ import { createNotification, describeDevice, NotifType } from '@/features/notifi
 import { bustProfileCache } from '@/features/auth/authHandlers';
 import { fetchLoginUserById, setRecoveryContact, readRecoveryContact } from '@/features/identity/tirbeo';
 import { eventRowRef, refFromRowId } from '@/features/users/refcode';
+import { answersAbout } from '@/features/users/change-answers';
 
 async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security', skipEmail = false) {
   try {
@@ -200,6 +202,18 @@ export async function totpSetupHandler(request: NextRequest) {
 
     const secret = generateSecret();
     const uri = generateTotpUri(secret, session.email || 'user');
+    // An enrolled factor is never replaced before its successor is verified:
+    // overwriting a live secret mid-setup silently breaks the app that still
+    // answers with the old one, and a half-finished re-setup would then read as
+    // a lockout. Turning 2FA off first is the supported way back to this step.
+    const enrolled = await prisma.userSecurity.findUnique({
+      where: { userId: session.userId },
+      select: { totpEnabled: true } });
+    if (enrolled?.totpEnabled) {
+      return NextResponse.json(
+        { error: 'Two-factor is already on. Turn it off before setting up a new app.' },
+        { status: 409 });
+    }
     // Save secret to DB immediately (totpEnabled stays false until verify)
     await prisma.userSecurity.upsert({
       where: { userId: session.userId },
@@ -265,8 +279,8 @@ export async function totpVerifyHandler(request: NextRequest) {
     if (session.email) {
       sendTemplateEmailAfter(session.email, 'login_alert', {
         name: session.email.split('@')[0],
-        location: 'Security Settings',
-        device: request.headers.get('user-agent') || 'Unknown device',
+        location: resolveLoginLocation(request.headers),
+        device: describeDevice(request.headers.get('user-agent')),
         loginTime: new Date().toLocaleString() });
     }
 
@@ -831,6 +845,11 @@ export async function sessionRevokeHandler(request: NextRequest, sessionId: stri
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     if (!sessionId) return NextResponse.json({ error: 'Session ID required' }, { status: 400 });
+    // The batch endpoint asks for an identity proof before it ends any
+    // session; ending one is the same act and gets the same gate. Without it a
+    // stolen cookie alone could silently sign the owner's other machines out.
+    const proof = await requireReauth(request, session.userId);
+    if ('response' in proof) return proof.response;
     await prisma.userSession.updateMany({
       where: { id: sessionId, userId: session.userId, revokedAt: null },
       data: { revokedAt: new Date() } });
@@ -879,6 +898,12 @@ export async function loginHistoryHandler(request: NextRequest) {
     const coords = await coordsByLoginAttempt(
       session.userId,
       rows.map((r) => ({ ip: r.ipAddress, at: r.createdAt })));
+    /* The owner's answer to "was this you", when they gave one about a sign-in.
+       The sign-in ledger has no review column of its own — the answer lives in
+       the account's answer store, keyed by the row it is about — so this is
+       where it comes back. Without it the page would show every sign-in as
+       never answered on every device but the one that answered it. */
+    const said = await answersAbout(session.userId, rows.map((r) => r.id));
     const logs = rows.map((row, i) => ({
       ...row,
       /* Sign-in rows live in a table with no metadata column, so their
@@ -886,6 +911,7 @@ export async function loginHistoryHandler(request: NextRequest) {
          for every row that ever existed, nothing to backfill. */
       ref: refFromRowId(row.id) ?? row.id,
       coords: coords[i],
+      said: said.get(row.id) ?? null,
       email: session.email }));
     return NextResponse.json({ logs });
   } catch (err: any) {

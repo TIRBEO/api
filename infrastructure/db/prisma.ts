@@ -3,9 +3,8 @@ import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Pool } from 'pg';
 import { createBoundedIpv4Lookup, BoundedLookupSocket } from './bounded-lookup';
-// Dependency-free (prisma is only ever lazily imported inside it), so this
-// static import creates no cycle while letting the write choke point stamp refs.
-import { generateEventId } from '@/features/users/refcode';
+// Dependency-free id generators; the feature layer re-exports these.
+import { generateEventId } from '@/infrastructure/ids/event-id';
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient; pgPool: Pool };
 

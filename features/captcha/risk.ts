@@ -40,20 +40,6 @@ export function hashString(value: string): string {
   return createHash('sha256').update(value || '').digest('hex');
 }
 
-export function computeDeviceFingerprint(input: {
-  ua: string;
-  lang?: string;
-  platform?: string;
-  screen?: string;
-  timezone?: string;
-  dpr?: number;
-  touch?: boolean;
-}): string {
-  return hashString(
-    [input.ua, input.lang, input.platform, input.screen, input.timezone, input.dpr, input.touch].join('|')
-  );
-}
-
 const AUTOMATION_PATTERNS: RegExp[] = [
   /\bheadless/i,
   /\bphantomjs\b/i,

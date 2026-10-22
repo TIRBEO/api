@@ -143,31 +143,10 @@ export function withRole(
 }
 
 /**
- * Shorthand for requiring super_admin role
- */
-export function withSuperAdmin(handler: ProtectedHandler) {
-  return withRole(handler, { minimumRole: 'super_admin' });
-}
-
-/**
  * Shorthand for requiring admin role (admin or super_admin)
  */
 export function withAdmin(handler: ProtectedHandler) {
   return withRole(handler, { minimumRole: 'admin' });
-}
-
-/**
- * Shorthand for requiring manager role or higher
- */
-export function withManager(handler: ProtectedHandler) {
-  return withRole(handler, { minimumRole: 'manager' });
-}
-
-/**
- * Shorthand for requiring editor role or higher
- */
-export function withEditor(handler: ProtectedHandler) {
-  return withRole(handler, { minimumRole: 'editor' });
 }
 
 /**

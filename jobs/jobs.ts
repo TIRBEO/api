@@ -339,6 +339,10 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
 
     const day = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const periodLabel = `${day(since)} – ${day(until)}`;
+    // The mail is named for the period the person chose — a daily recap that
+    // talks about "your week" is the bug people report as "wrong email".
+    const spanDays = (until.getTime() - since.getTime()) / 86_400_000;
+    const periodWord = spanDays <= 1.5 ? 'day' : spanDays <= 31 ? 'week' : 'month';
 
     const { fetchLoginUserById } = await import('@/features/identity/tirbeo');
     const user = await fetchLoginUserById(userId);
@@ -347,6 +351,7 @@ export async function sendAccountRecap(userId: string, since: Date, until: Date)
     const { sendTemplateEmail } = await import('@/features/email/email');
     const result = await sendTemplateEmail(user.email, 'weekly_summary', {
       name: user.name || user.email,
+      periodWord,
       periodLabel,
       statRows,
       suspiciousSection,

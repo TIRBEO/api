@@ -1,4 +1,5 @@
 import { prisma } from '@/infrastructure/db/prisma';
+import type { Prisma } from '@prisma/client';
 import { sendTemplateEmail, escapeHtml } from '@/features/email/email';
 import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
 import { isInQuietHours } from '@/features/email/emailPrefs';
@@ -343,6 +344,10 @@ export const DEFAULT_PREFS: Record<string, unknown> = {
   // `emailPausedUntil` is the epoch ms it lapses at, or null for "until I say
   // so" — an expired date reads as unpaused without anyone having to run a job.
   emailPaused: false, emailPausedUntil: null,
+  // Quiet hours: non-essential mail waits until the window closes. The gate
+  // (emailPrefs.isInQuietHours) reads the account's own clock (appearance
+  // timezone); off by default means mail flows until the person says otherwise.
+  quietHoursEnabled: false, quietHoursStart: '22:00', quietHoursEnd: '08:00',
   // Periodic account recap — the only recurring mail. Its cadence is the
   // person's choice; the send clock is written by jobs/jobs.ts alone.
   summaryEnabled: false, summaryFrequency: 'weekly',
@@ -392,27 +397,64 @@ const SERVER_OWNED_KEYS = ['lastSummarySentAt', 'lastDigestSentAt', 'lastWeeklyS
 export async function loadNotificationPrefs(userId: string): Promise<Record<string, any>> {
   const prefs = await prisma.userPreferences.findUnique({
     where: { userId },
-    select: { notif: true },
+    select: { notif: true, appearance: true },
   });
-  return { ...DEFAULT_PREFS, ...asObj(prefs?.notif) };
+  const notif = asObj(prefs?.notif);
+  const appearance = asObj(prefs?.appearance);
+  // The profile's timezone joins the view: quiet hours are the person's
+  // clock, not the server's. View-only — no writer puts it back in notif.
+  return {
+    ...DEFAULT_PREFS,
+    ...notif,
+    ...(appearance.timezone ? { timezone: appearance.timezone } : {}),
+  };
 }
 
 export async function saveNotificationPrefs(userId: string, patch: Record<string, unknown>): Promise<Record<string, any>> {
-  const merged = { ...(await loadNotificationPrefs(userId)), ...patch };
-  const chosen: Record<string, unknown> = { ...merged };
-  for (const key of SERVER_OWNED_KEYS) delete chosen[key];
-  // Keep the machine-owned bookkeeping fields living in notif.
-  const row = await prisma.userPreferences.findUnique({ where: { userId }, select: { notif: true } });
-  const current = asObj(row?.notif);
-  const nextNotif: Record<string, any> = { ...current };
-  for (const key of SERVER_OWNED_KEYS) if (key in current) nextNotif[key] = current[key];
-  Object.assign(nextNotif, chosen);
-  await prisma.userPreferences.upsert({
-    where: { userId },
-    create: { userId, notif: nextNotif as any },
-    update: { notif: nextNotif as any },
+  // The whole notif column is rewritten on every save, so the read and the
+  // write must not interleave with another writer's — two simultaneous
+  // settings changes used to silently drop one of them. Serializable gives
+  // Postgres the right to abort the loser; the retry makes it win on the
+  // rerun instead.
+  return serializedPrefsWrite(async (tx) => {
+    const row = await tx.userPreferences.findUnique({ where: { userId }, select: { notif: true } });
+    const current = asObj(row?.notif);
+    const merged = { ...DEFAULT_PREFS, ...current, ...patch };
+    const chosen: Record<string, unknown> = { ...merged };
+    for (const key of SERVER_OWNED_KEYS) delete chosen[key];
+    // Keep the machine-owned bookkeeping fields living in notif.
+    const nextNotif: Record<string, any> = { ...current };
+    for (const key of SERVER_OWNED_KEYS) if (key in current) nextNotif[key] = current[key];
+    Object.assign(nextNotif, chosen);
+    await tx.userPreferences.upsert({
+      where: { userId },
+      create: { userId, notif: nextNotif as any },
+      update: { notif: nextNotif as any },
+    });
+    return { ...nextNotif };
   });
-  return { ...nextNotif };
+}
+
+/**
+ * One read-modify-write pass over `user_preferences` at Serializable isolation,
+ * retried when Postgres aborts the loser of an overlap. Both bag writers
+ * (notif prefs and the misc.settings bag) go through this so two settings
+ * changes on one account can never each overwrite the other's column wholesale.
+ */
+export async function serializedPrefsWrite<T>(
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  let lastErr: any;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await prisma.$transaction(fn, { isolationLevel: 'Serializable' });
+    } catch (err: any) {
+      const code = err?.code ?? err?.cause?.code;
+      if (code === '40001' || code === 'P2034') { lastErr = err; continue; }
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 /** Read a user's notification preferences. */

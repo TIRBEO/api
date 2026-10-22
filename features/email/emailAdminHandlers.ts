@@ -143,61 +143,6 @@ export async function emailTemplatesHandler(request: NextRequest) {
   }
 }
 
-// GET /api/email/templates/[name] — get single template
-// PATCH /api/email/templates/[name] — update template
-// DELETE /api/email/templates/[name] — delete template
-export async function emailTemplateDetailHandler(request: NextRequest, name: string) {
-  try {
-    const session = await requireAdmin(request);
-    if (session instanceof NextResponse) return session;
-
-    const slug = name.trim().toLowerCase();
-    const existing = await prisma.emailTemplate.findUnique({ where: { slug } });
-    if (!existing) return NextResponse.json({ error: 'Template not found' }, { status: 404 });
-
-    if (request.method === 'GET') {
-      return NextResponse.json(templateForUi(existing));
-    }
-
-    if (request.method === 'PATCH') {
-      const body: any = await request.json();
-      const schema = z.object({
-        label: z.string().min(1).optional(),
-        subject: z.string().min(1).optional(),
-        htmlBody: z.string().min(1).optional(),
-        variables: z.any().optional(),
-        fromEmail: z.string().email().optional().nullable(),
-        fromName: z.string().optional().nullable(),
-      });
-      const parsed = schema.safeParse(body);
-      if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
-
-      const updated = await prisma.emailTemplate.update({
-        where: { slug },
-        data: {
-          ...(parsed.data.label !== undefined ? { label: parsed.data.label } : {}),
-          ...(parsed.data.subject !== undefined ? { subject: parsed.data.subject } : {}),
-          ...(parsed.data.htmlBody !== undefined ? { html: parsed.data.htmlBody } : {}),
-          ...(parsed.data.variables !== undefined ? { variables: parsed.data.variables as any } : {}),
-        },
-      });
-      await invalidateEmailTemplate(slug);
-      return NextResponse.json(templateForUi(updated));
-    }
-
-    if (request.method === 'DELETE') {
-      await prisma.emailTemplate.delete({ where: { slug } });
-      await invalidateEmailTemplate(slug);
-      return NextResponse.json({ error: 'Deleted' }, { status: 200 });
-    }
-
-    return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
-  } catch (err: any) {
-    console.error('[EMAIL TEMPLATE DETAIL]', err?.message || err);
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-  }
-}
-
 // POST /api/email/test — send a test email
 export async function emailTestHandler(request: NextRequest) {
   try {

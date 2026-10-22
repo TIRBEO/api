@@ -30,7 +30,9 @@ export function normalizeTotpCode(raw: unknown): string | null {
 export function generateRecoveryCodes(count = 8): string[] {
   const codes: string[] = [];
   for (let i = 0; i < count; i++) {
-    const buf = new Uint8Array(5);
+    // 8 bytes = 64 bits per code (was 40). A single-use code guarded by
+    // attempt limits still should not be guessable from a phone in a minute.
+    const buf = new Uint8Array(8);
     crypto.getRandomValues(buf);
     const hex = Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
     codes.push(hex.match(/.{1,4}/g)!.join('-'));

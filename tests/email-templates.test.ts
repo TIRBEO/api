@@ -50,6 +50,7 @@ const VARS: Record<string, string> = {
   reason: 'Possible spam content',
   count: '5',
   periodLabel: 'Last 7 days',
+  periodWord: 'week',
   daysSince: '21',
   ipAddress: '203.0.113.9',
   location: 'Berlin, Germany',
@@ -142,13 +143,15 @@ describe('template cache', () => {
     expect(second).toBe(first);
   });
 
-  it('keys the cache on logo so a branding change is not served stale', async () => {
+  it('keys the cache on logo without embedding it in the mail', async () => {
     clearTemplateCache();
     const a = await getTemplate('welcome', 'https://cdn.tirbeo.com/a.png');
     const b = await getTemplate('welcome', 'https://cdn.tirbeo.com/b.png');
     expect(a).not.toBe(b);
-    // Branding still affects rendered output (cache keying); just ensure different instances
-    expect(a!.html).not.toEqual(b!.html);
+    // Mail clients block remote images by default, so the letterhead is a text
+    // wordmark; the branding logo is deliberately nowhere in the HTML.
+    expect(a!.html).not.toContain('cdn.tirbeo.com');
+    expect(a!.html).not.toContain('<img');
   });
 
   it('does not let a single cached template masquerade as the full catalogue', async () => {

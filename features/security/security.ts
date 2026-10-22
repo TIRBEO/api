@@ -20,6 +20,12 @@ export function getClientIp(request: Request): string {
   );
 }
 
+/** `getClientIp` answers 'unknown' for a header-less hop; a row should store
+    no address rather than the word. */
+function dropUnknown(ip: string): string | undefined {
+  return ip === 'unknown' ? undefined : ip;
+}
+
 export function getRayId(request: Request): string {
   return (
     request.headers.get('cf-ray') ||
@@ -71,97 +77,10 @@ export function detectXss(value: unknown): string | null {
   return null;
 }
 
-export function scanForXss(values: unknown[]): string | null {
-  for (const v of values) {
-    const hit = detectXss(v);
-    if (hit) return hit;
-  }
-  return null;
-}
-
-export function stripXss(value: string): string {
-  return value
-    .replace(/<\s*\/?\s*(script|iframe|object|embed|svg|math|link|meta|form|template)[^>]*>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/(javascript|vbscript|data:text\/html)\s*:/gi, 'blocked:')
-    .trim();
-}
-
 export function sanitizeInput(value: string, maxLength = 5000): string {
   return value
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
     .slice(0, maxLength);
-}
-
-/**
- * Sanitize user-authored custom CSS for a form's <style> tag. Strips anything
- * that could escape the stylesheet (HTML/JS) while keeping valid CSS rules.
- */
-export function sanitizeCss(value: string, maxLength = 20000): string {
-  let css = String(value || '').slice(0, maxLength);
-  // No HTML or tag-closing tokens — CSS must never be able to break out.
-  css = css.replace(/[<>]/g, '');
-  // Block script-y constructs and dangerous url() based beacons (data:).
-  css = css.replace(/expression\s*\(/gi, 'none(');
-  css = css.replace(/(javascript|vbscript)\s*:/gi, 'blocked:');
-  css = css.replace(/@import\b/gi, '@noimport');
-  css = css.replace(/url\s*\(\s*['"]?(data|javascript|vbscript)\s*:/gi, 'url(blocked:');
-  return css;
-}
-
-/**
- * Sanitize user-authored custom HTML (the `custom-html` field type) to a safe
- * subset. Strips script-bearing tags and event handlers, blocks dangerous URL
- * schemes and only keeps an allow-list of tags/attributes. Never trusted on its
- * own — the renderer still escapes through React's dangerouslySetInnerHTML.
- */
-const SAFE_HTML_TAGS = new Set([
-  'p', 'br', 'strong', 'em', 'b', 'i', 'u', 's', 'a', 'ul', 'ol', 'li', 'h1', 'h2', 'h3',
-  'h4', 'h5', 'h6', 'blockquote', 'code', 'pre', 'span', 'img', 'hr', 'div', 'small',
-  'sub', 'sup', 'mark', 'del', 'ins', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
-]);
-const SAFE_HTML_ATTRS = new Set(['href', 'title', 'target', 'rel', 'src', 'alt', 'width', 'height', 'class', 'style', 'colspan', 'rowspan']);
-const SAFE_HTML_SCHEMES = new Set(['http', 'https', 'mailto', 'tel']);
-
-export function sanitizeHtml(value: string, maxLength = 50000): string {
-  let html = String(value || '').slice(0, maxLength);
-  // Remove script-bearing containers and anything that can leak JS entirely.
-  html = html.replace(/<\s*\/*\s*(script|iframe|frame|object|embed|style|link|meta|form|template|svg|math|noscript|base|input|button|textarea|select|option|source)[^>]*>/gi, ' ');
-  // Drop event handlers and null/obvious hooks.
-  html = html.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-  html = html.replace(/\s(style)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-  html = html.replace(/(javascript|vbscript|data:text\/html|data:image\/svg\+xml)\s*:/gi, 'blocked:');
-  // Re-tokenize tags and drop anything not on the allow-list.
-  html = html.replace(/<\s*(\/?)\s*([a-zA-Z][a-zA-Z0-9]*)([^>]*)>/g, (match, close, tag, attrs) => {
-    const name = tag.toLowerCase();
-    if (!SAFE_HTML_TAGS.has(name)) return '';
-    const cleaned = String(attrs).replace(/([a-zA-Z-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/g, (am, attrName, rawVal) => {
-      const n = attrName.toLowerCase();
-      if (!SAFE_HTML_ATTRS.has(n)) return '';
-      const v = String(rawVal).replace(/^["']|["']$/g, '');
-      if ((n === 'href' || n === 'src') && v) {
-        const scheme = v.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
-        if (scheme && !SAFE_HTML_SCHEMES.has(scheme[1].toLowerCase()) && !v.startsWith('/') && !v.startsWith('#')) return '';
-        if (n === 'src' && scheme && scheme[1].toLowerCase() !== 'https' && !v.startsWith('/')) return '';
-      }
-      return ` ${n}="${v.replace(/"/g, '&quot;')}"`;
-    });
-    return `<${close}${name}${cleaned}>`;
-  });
-  return html;
-}
-
-export function sanitizeJsonStrings<T>(value: T, maxLength = 5000): T {
-  if (typeof value === 'string') return sanitizeInput(value, maxLength) as unknown as T;
-  if (Array.isArray(value)) return value.map(v => sanitizeJsonStrings(v, maxLength)) as unknown as T;
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = sanitizeJsonStrings(v, maxLength);
-    }
-    return out as unknown as T;
-  }
-  return value;
 }
 
 // ─── Security event logging + admin notification ───
@@ -209,16 +128,43 @@ export async function notifyAdmins(input: {
       .map(l => `<p style="margin:2px 0;font-size:13px;color:#5f6368;">${l.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c])}</p>`)
       .join('');
 
-    await Promise.all(admins.map(admin =>
-      sendTemplateEmail(admin.email, 'admin_alert', {
-        subject: `[${input.severity || 'alert'}] ${input.subject}`,
-        message: input.message,
-        details: htmlDetails,
-        dashboardUrl,
-        brandName: branding.brandName,
-        logoUrl: branding.logoUrl,
-      }, { fromName: branding.emailFromName, rawVars: ['details'] }).catch(() => {})
-    ));
+    /* The alert is written down before the mail goes out, so the panel shows it
+       while the inbox is still catching up. Waiting for the mail to land made
+       the panel look quiet at exactly the moment it should have been loud: the
+       one screen an operator is watching is the one that was slowest. The two
+       run side by side, and a failed write never blocks the mail — the row is
+       the fast copy, the mail is the one that reaches a phone. */
+    const writeAlertRow = prisma.activityEvent.create({
+      data: {
+        kind: 'admin.alert',
+        title: input.subject,
+        detail: input.message,
+        severity: input.severity || 'warning',
+        metadata: {
+          message: input.message,
+          details: input.details,
+          severity: input.severity || 'warning',
+          notifiedAdmins: admins.length,
+          dashboardUrl,
+        } as never,
+      },
+    }).catch((e: unknown) => {
+      console.error('[SECURITY] Failed to record admin alert row:', e instanceof Error ? e.message : e);
+    });
+
+    await Promise.all([
+      writeAlertRow,
+      ...admins.map(admin =>
+        sendTemplateEmail(admin.email, 'admin_alert', {
+          subject: `[${input.severity || 'alert'}] ${input.subject}`,
+          message: input.message,
+          details: htmlDetails,
+          dashboardUrl,
+          brandName: branding.brandName,
+          logoUrl: branding.logoUrl,
+        }, { fromName: branding.emailFromName, rawVars: ['details'] }).catch(() => {})
+      ),
+    ]);
   } catch (e) {
     console.error('[SECURITY] Failed to notify admins:', e instanceof Error ? e.message : e);
   }
@@ -232,18 +178,42 @@ export async function logSecurityEvent(input: {
   details?: Record<string, unknown>;
   notifyAdmin?: boolean;
 }): Promise<string | null> {
-  const ip = input.request ? getClientIp(input.request) : currentRequestOrigin()?.ip ?? undefined;
+  /* The context wins over the raw request whenever one was set. That order is
+     the whole point of checking it first: for a call relayed through another of
+     our services, the request's own forwarding and geo headers belong to the
+     relay hop — preferring them wrote the relay's datacentre as the owner's
+     machine and city. The context has already applied the trust rules at the
+     door: a verified relay speaks for the browser it carried, an unverifiable
+     one for nobody, and once the door has answered, falling back to the raw
+     headers would only resurrect the hop's lie. */
+  const ctx = currentRequestOrigin();
+  const ip = ctx
+    ? ctx.ip ?? undefined
+    : input.request
+      ? dropUnknown(getClientIp(input.request))
+      : undefined;
   const rayId = input.request ? getRayId(input.request) : undefined;
-  const userAgent = input.request ? getUserAgent(input.request) : currentRequestOrigin()?.userAgent ?? undefined;
+  const userAgent = ctx
+    ? ctx.userAgent ?? undefined
+    : input.request
+      ? getUserAgent(input.request)
+      : undefined;
 
   const metadata: Record<string, unknown> = { ...(input.details || {}) };
   if (rayId) metadata.rayId = rayId;
   /* The address the edge saw, so a security event reads as "from Pokhara, Nepal"
      rather than as a bare IP. Whatever the caller passed in wins; a write from a
      job with no request at all leaves the place out instead of inventing one. */
-  const ctx = currentRequestOrigin();
-  const place = (input.request ? resolveLoginPlace(input.request.headers) : null) ?? ctx?.location ?? null;
-  const coords = (input.request ? resolveLoginCoords(input.request.headers) : null) ?? ctx?.coords ?? null;
+  const place = ctx
+    ? ctx.location
+    : input.request
+      ? resolveLoginPlace(input.request.headers)
+      : null;
+  const coords = ctx
+    ? ctx.coords
+    : input.request
+      ? resolveLoginCoords(input.request.headers)
+      : null;
   if (place && metadata.location === undefined) metadata.location = place;
   if (coords && metadata.coords === undefined) metadata.coords = coords;
 
@@ -590,6 +560,7 @@ export async function listSecurityEvents(options: {
   userId?: string;
   from?: string;
   to?: string;
+  q?: string;
   includeUser?: boolean;
 }) {
   const page = Math.max(1, options.page || 1);
@@ -620,6 +591,33 @@ export async function listSecurityEvents(options: {
   if (options.severity) where.severity = options.severity;
   if (options.ip) where.ipAddress = { contains: options.ip };
   if (options.userId) where.userId = options.userId;
+  /* One search box, the way an operator thinks: a fragment of an address, a
+     fragment of a kind, a piece of an account id, or the row's own id. The
+     console's search has always meant all four at once, and answering it with
+     only one of them would quietly narrow what an operator can find. */
+  if (options.q) {
+    const q = options.q.trim();
+    if (q) {
+      const parts: Record<string, unknown>[] = [
+        { kind: { contains: q } },
+        { ipAddress: { contains: q } },
+        { userId: { contains: q } },
+        { id: q },
+      ];
+      // A pasted ref code (xxxx-xxxx-xxxx) is not a uuid, so it is matched
+      // through the same candidate list the id filter uses.
+      const candidates = UUID_RE.test(q) ? [] : refCodeCandidates(q);
+      if (candidates.length) {
+        parts.push({ id: { in: candidates } });
+        parts.push({ metadata: { path: ['refCode'], equals: q } });
+      }
+      // A search widens the other filters rather than replacing them, so
+      // "severity: warning" plus a fragment still means both.
+      const narrowed = where.OR;
+      where.OR = parts;
+      if (narrowed) where.AND = [{ OR: narrowed }];
+    }
+  }
   if (options.from || options.to) {
     const createdAt: Record<string, Date> = {};
     if (options.from) createdAt.gte = new Date(options.from);
@@ -686,13 +684,29 @@ export async function recordLoginHistory(input: {
   method: string;
 }): Promise<void> {
   try {
+    /* Same order as logSecurityEvent: once the door has checked the trust
+       rules, its answer wins over the request's raw headers, because on a
+       relayed call those headers describe the relay, not the person signing
+       in. */
     const ctx = currentRequestOrigin();
-    const ip = input.request ? getClientIp(input.request) : ctx?.ip ?? undefined;
-    const userAgent = input.request ? getUserAgent(input.request) : ctx?.userAgent ?? undefined;
+    const rawIp = ctx
+      ? ctx.ip ?? undefined
+      : input.request
+        ? getClientIp(input.request)
+        : undefined;
+    const ip = rawIp === 'unknown' ? undefined : rawIp;
+    const userAgent = ctx
+      ? ctx.userAgent ?? undefined
+      : input.request
+        ? getUserAgent(input.request)
+        : undefined;
     /* The sign-in list reads this column, so a login has to say where it came
        from and not only from which address. */
-    const location = (input.request ? resolveLoginPlace(input.request.headers) : null)
-      ?? ctx?.location ?? null;
+    const location = ctx
+      ? ctx.location
+      : input.request
+        ? resolveLoginPlace(input.request.headers)
+        : null;
     await prisma.userLogin.create({
       data: {
         userId: input.userId,

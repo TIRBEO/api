@@ -25,8 +25,25 @@ async function userIdForAddress(address: string): Promise<string | null> {
   return row?.userId ?? null;
 }
 
+/** Minutes into the day, at the person's own zone — a "22:00" they chose in
+ *  Kathmandu must not be judged by a server clock in Virginia. Falls back to
+ *  server time when no zone is stored or the stored one is unrecognised. */
+function minutesOfDayInZone(now: Date, timezone?: string | null): number {
+  if (timezone) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(now);
+      const hour = Number(parts.find((p) => p.type === 'hour')?.value);
+      const minute = Number(parts.find((p) => p.type === 'minute')?.value);
+      if (Number.isFinite(hour) && Number.isFinite(minute)) return hour * 60 + minute;
+    } catch { /* fall through to server time */ }
+  }
+  return now.getHours() * 60 + now.getMinutes();
+}
+
 /** Check if current time is within user's quiet hours window. Shared with notifications.ts. */
-export function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quietHoursStart?: string | null; quietHoursEnd?: string | null } | null | undefined): boolean {
+export function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quietHoursStart?: string | null; quietHoursEnd?: string | null; timezone?: string | null } | null | undefined): boolean {
   try {
     if (!prefs?.quietHoursEnabled) return false;
     const now = new Date();
@@ -34,7 +51,7 @@ export function isInQuietHours(prefs: { quietHoursEnabled?: boolean | null; quie
     const endStr = prefs.quietHoursEnd || '08:00';
     const [startH, startM] = startStr.split(':').map(Number);
     const [endH, endM] = endStr.split(':').map(Number);
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const currentMinutes = minutesOfDayInZone(now, prefs.timezone);
     const startMinutes = startH * 60 + startM;
     const endMinutes = endH * 60 + endM;
     if (startMinutes > endMinutes) {
@@ -153,7 +170,11 @@ export function verifyUnsubscribeToken(token: string): { userId: string; categor
     if (isNaN(expiry) || Date.now() > expiry) return null;
     const payload = `${userId}:${category}:${expiry}`;
     const expected = hmac(payload);
-    if (sig !== expected) return null;
+    // Constant-time: `!==` leaks the HMAC's matching prefix byte by byte to
+    // anyone who can time the unsubscribe endpoint.
+    const given = Buffer.from(sig);
+    const want = Buffer.from(expected);
+    if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return null;
     return { userId, category };
   } catch {
     return null;

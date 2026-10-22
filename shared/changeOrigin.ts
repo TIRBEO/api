@@ -34,12 +34,30 @@ export function firstForwardedFor(headers: HeaderLike): string | null {
   return (headers.get('x-forwarded-for') || '').split(',')[0].trim() || null;
 }
 
+/**
+ * The address the hop itself was taken from.
+ *
+ * An edge in front of this service names the visitor in `x-forwarded-for`;
+ * Cloudflare also names it in `cf-connecting-ip` and plain proxies use
+ * `x-real-ip`. A tunnel that attaches none of them (a dev server reached on a
+ * bare address) leaves this null — and null is kept: an unknown address is
+ * recorded as unknown, never as whatever machine happened to relay the call.
+ */
+export function hopClientIp(headers: HeaderLike): string | null {
+  return (
+    firstForwardedFor(headers) ||
+    headers.get('cf-connecting-ip')?.trim() ||
+    headers.get('x-real-ip')?.trim() ||
+    null
+  );
+}
+
 /** The browser's own request: the edge headers and the client's UA are all here. */
 export function originFromRequest(headers: HeaderLike): ChangeOrigin {
   const country =
     cleanCountryCode(headers.get('x-vercel-ip-country')) ?? cleanCountryCode(headers.get('cf-ipcountry'));
   return {
-    ip: firstForwardedFor(headers),
+    ip: hopClientIp(headers),
     userAgent: headers.get('user-agent') || null,
     location: placeFromParts(cleanCityName(headers.get('x-vercel-ip-city')), country),
     coords: coordsFromParts(headers.get('x-vercel-ip-latitude'), headers.get('x-vercel-ip-longitude')),
@@ -51,10 +69,15 @@ export function originFromRequest(headers: HeaderLike): ChangeOrigin {
  * that hop belong to that service, so the browser's facts travel as the
  * `x-origin-*` set the profile service attaches — the local hop's own values
  * would record the datacentre, not the owner's phone.
+ *
+ * There is deliberately no fallback to the hop's `x-forwarded-for`: on a relayed
+ * call that header names the relay machine (its own edge rewrote it), which is
+ * exactly the lie this function exists to avoid. A relay that could not learn
+ * the visitor's address records no address.
  */
 export function originFromInternalHeaders(headers: HeaderLike): ChangeOrigin {
   return {
-    ip: headers.get('x-origin-ip') || firstForwardedFor(headers),
+    ip: headers.get('x-origin-ip')?.trim() || null,
     userAgent: headers.get('x-origin-user-agent') || null,
     location: placeFromParts(
       cleanCityName(headers.get('x-origin-city')),

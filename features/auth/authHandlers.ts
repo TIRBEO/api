@@ -1,3 +1,4 @@
+import { resolveLoginLocation } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/infrastructure/db/prisma';
@@ -12,7 +13,7 @@ import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLi
 
 import { verifyTotp } from '@/features/auth/totp';
 import { sendTemplateEmail, sendTemplateEmailAfter } from '@/features/email/email';
-import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf } from '@/features/security/security';
+import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf, notifyAdmins } from '@/features/security/security';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from '@/features/auth/password-reset';
 import { createAuditEvent } from '@/features/security/audit';
@@ -1370,8 +1371,8 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       const appDomain = getAppDomain();
       sendTemplateEmailAfter(alertEmail, 'login_alert', {
         name: alertEmail.split('@')[0],
-        location: 'Admin Panel',
-        device: userAgent || 'Unknown device',
+        location: resolveLoginLocation(request.headers),
+        device: describeDevice(userAgent),
         loginTime: new Date().toLocaleString(),
         revokeUrl: `https://myprofile.${appDomain}/settings/devices` });
     }
@@ -1914,7 +1915,10 @@ export async function signupHandler(request: NextRequest) {
 
     // Send verification OTP — unless the user already verified via signup-otp
     if (!preVerifiedEmail) {
-      const verifyCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
+      // Uniform 6-digit code (node crypto randomInt) — the old
+      // getRandomValues-then-%10 recipe skewed every digit: 256 is not a
+      // multiple of 10, so 0-5 were likelier than 6-9.
+      const verifyCode = generateOtpCode();
       const otpHash = hashOtpCode(verifyCode);
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
       await prisma.otp.deleteMany({ where: { kind: 'email', address: accountEmail } });
@@ -2899,14 +2903,32 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
       if (existing && existing.userId !== user.id) {
         return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
       }
-      // Re-point the account's default email row at the new, now-proven address.
-      const updated = await prisma.userEmail.updateMany({
-        where: { userId: user.id, kind: 'primary' },
-        data: { address: email, isDefault: true, verifiedAt: new Date() } });
-      if (updated.count === 0) {
-        await prisma.userEmail.create({
-          data: { userId: user.id, address: email, kind: 'primary', isDefault: true, verifiedAt: new Date() } });
-      }
+      // Re-point the account's default email row at the new, now-proven
+      // address. The target may already be a row of this account (a recovery
+      // address promoted to sign-in email is the ordinary case), and
+      // rewriting the primary row onto that address would collide with
+      // user_email (user_id, address) — so: promote the target row and drop
+      // the old primary, or rewrite the primary row when no target exists.
+      await prisma.$transaction(async (tx) => {
+        const target = await tx.userEmail.findUnique({
+          where: { userId_address: { userId: user.id, address: email } },
+          select: { id: true } });
+        if (target) {
+          await tx.userEmail.deleteMany({
+            where: { userId: user.id, kind: 'primary', id: { not: target.id } } });
+          await tx.userEmail.update({
+            where: { id: target.id },
+            data: { kind: 'primary', isDefault: true, verifiedAt: new Date() } });
+        } else {
+          const updated = await tx.userEmail.updateMany({
+            where: { userId: user.id, kind: 'primary' },
+            data: { address: email, isDefault: true, verifiedAt: new Date() } });
+          if (updated.count === 0) {
+            await tx.userEmail.create({
+              data: { userId: user.id, address: email, kind: 'primary', isDefault: true, verifiedAt: new Date() } });
+          }
+        }
+      });
       bustProfileCache(user.id);
     } else {
       await prisma.userEmail.updateMany({
@@ -2970,7 +2992,8 @@ export async function verifySignupEmailHandler(request: NextRequest) {
           extra: { message: 'Please wait before requesting another code.', retryAfterMs: cooldown.remainingMs },
         });
       }
-      const otpCode = Array.from(crypto.getRandomValues(new Uint8Array(6))).map(b => (b % 10).toString()).join('');
+      // Same uniform generator as every other OTP in the fleet (see above).
+      const otpCode = generateOtpCode();
       const otpHash = hashOtpCode(otpCode);
       const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
       await prisma.otp.upsert({
@@ -4378,6 +4401,10 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
 
 // ─── Suspicious Login ───────────────────────────────────────
 
+/** The ledger row a denied sign-in leaves behind. One per token window, so a
+    replayed link cannot turn one report into a stream of them. */
+const DENIED_KIND = 'auth.suspicious_login_denied';
+
 export async function suspiciousLoginConfirmHandler(request: NextRequest) {
   try {
     const { token } = (await request.json()) as any;
@@ -4424,13 +4451,58 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
 
     // Log the denied attempt
     const userId = await verifySuspiciousLoginToken(token);
-    if (userId) {
-      await createAuditEvent({
-        actorId: userId,
-        action: 'suspicious_login.denied',
-        targetType: 'user',
-        targetId: userId,
-        severity: 'warning' }).catch(() => {});
+    if (!userId) {
+      return NextResponse.json({ error: 'Invalid or expired token' }, { status: 401 });
+    }
+
+    await createAuditEvent({
+      actorId: userId,
+      action: 'suspicious_login.denied',
+      targetType: 'user',
+      targetId: userId,
+      severity: 'warning' }).catch(() => {});
+
+    /* "That wasn't me" is a report, so it reaches two people: the account
+       owner (an inbox row they can come back to, and the mail that goes with
+       it) and the admins (a stranger on someone's account is the one thing a
+       human should look at).
+
+       The token is a plain 15-minute JWT — replayable — so the report is
+       filed once per token window. Without that, one link opened twice would
+       mail every admin twice. */
+    const since = new Date(Date.now() - 15 * 60 * 1000);
+    const alreadyReported = await prisma.activityEvent.count({
+      where: { userId, kind: DENIED_KIND, createdAt: { gte: since } },
+    }).catch(() => 0);
+
+    if (alreadyReported === 0) {
+      await logSecurityEvent({
+        request,
+        userId,
+        eventType: DENIED_KIND,
+        severity: 'warning',
+        details: { reason: 'owner_denied_suspicious_login' },
+      }).catch(() => {});
+
+      await notifyAdmins({
+        subject: 'Account holder denied a sign-in',
+        message: 'The owner of an account said a sign-in was not them.',
+        details: [
+          `Account: ${userId}`,
+          `When: ${new Date().toISOString()}`,
+          'Owner said: "that wasn\'t me"',
+        ].join('\n'),
+        severity: 'warning',
+      }).catch(() => {});
+
+      await createNotification({
+        userId,
+        type: 'security',
+        title: 'You said a sign-in wasn\'t you',
+        body: 'We have told the team and marked the sign-in. Change your password and end the sessions you don\'t recognise.',
+        link: '/settings/login-activity',
+        metadata: { reason: 'suspicious_login_denied' },
+      }).catch(() => {});
     }
 
     return NextResponse.json({ ok: true });

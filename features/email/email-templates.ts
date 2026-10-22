@@ -1,4 +1,3 @@
-import { getApiOrigin } from '@/features/branding/branding';
 import { getDashboardBaseUrl, prodSafeEnvUrl } from '@/config/app-urls';
 import {
   BTN,
@@ -11,29 +10,26 @@ import {
   MONO,
   MUTED,
   PAGE,
-  RADIUS_CARD,
-  RADIUS_PILL,
   RADIUS_PLATE,
-  SUCCESS,
   TEXT,
   TEXT_2,
-  WASH,
-  WARN,
 } from '@/features/email/email-theme';
 
 /**
  * The built-in email catalogue.
  *
- * Plain string templates — no React, no component library, no table layouts and
- * no Outlook conditional comments. A mail is a heading, a few paragraphs, one
- * code or button, and a footer; a `div` with inline styles does all of it in
- * every client that matters. Dropping the render pass also drops the reason the
+ * Plain string templates — no React, no component library. The shell is a
+ * presentational table with fixed widths and `bgcolor` fallbacks, because a
+ * div-only mail collapses or loses its canvas in Outlook and the stricter
+ * clients; inside the card a `div` with inline styles does the rest in every
+ * client that matters. A mail is a heading, a few paragraphs, one
+ * code or button, and a footer. Dropping the render pass also drops the reason the
  * send path used to need a cache: building one of these is a string join.
  *
- * The layout is left-aligned at every width, because a centred mail reads as a
- * flyer and these are notices. The mail sits on a white 17px card over the
- * #f2f2f7 grouped canvas. Landing systemBlue marks anything pressable;
- * everything else is ink or grey.
+ * The brand, headline and code sit centred at the top; long-form copy stays
+ * left-aligned, because a notice is not a flyer. The mail sits on a white card
+ * with a #d1d1d6 hairline over the #f2f2f7 grouped canvas. Landing systemBlue
+ * marks anything pressable; everything else is ink or grey.
  *
  * Templates declare their values as `{{name}}` and leave substitution to
  * `renderTemplate` at send time, so the rendered text is cacheable per logo and
@@ -45,10 +41,10 @@ export type EmailTemplate = { subject: string; html: string };
 const DASHBOARD_URL = () => getDashboardBaseUrl();
 const SESSIONS_URL = () => `${getDashboardBaseUrl()}/settings/devices`;
 
-// Workspace / profile destination for email CTAs. Ops can point this at either
+// Account/settings destination for email CTAs. Ops can point this at either
 // host via NEXT_PUBLIC_MYPROFILE_URL (or NEXT_PUBLIC_WORKSPACE_URL); it falls
 // back to the dashboard address so no deployment is left with a broken "Open
-// your workspace" link.
+// my account" link.
 const WORKSPACE_URL = () => (
   prodSafeEnvUrl(process.env.NEXT_PUBLIC_MYPROFILE_URL) ||
   prodSafeEnvUrl(process.env.NEXT_PUBLIC_WORKSPACE_URL) ||
@@ -67,66 +63,59 @@ const esc = (text: string): string =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]!,
   );
 
+/** A link inside a sentence. The mail's actions are links, not buttons, so
+    they are underlined and carry no arrow. */
+const link = (url: string, label: string): string =>
+  `<a href="${esc(url)}" style="color:${LINK};text-decoration:underline">${esc(label)}</a>`;
+
+const mailto = (address: string, label: string): string =>
+  `<a href="mailto:${esc(address)}" style="color:${LINK};text-decoration:underline">${esc(label)}</a>`;
+
 /** Body copy. The argument is markup we control, already interpolated. */
 const para = (text: string): string =>
   `<p style="margin:0 0 16px;font-size:15px;line-height:24px;color:${TEXT_2}">${text}</p>`;
 
 /** Quiet helper copy: expiry rules, what to do if it wasn't you. */
 const note = (text: string): string =>
-  `<p style="margin:0 0 14px;font-size:13.5px;line-height:20px;color:${MUTED}">${text}</p>`;
+  `<p style="margin:0 0 14px;font-size:13px;line-height:20px;color:${MUTED}">${text}</p>`;
 
 /**
- * A plate: the one surface in the mail that is not the page itself.
+ * The one-time code: the digits themselves, centred, with nothing drawn
+ * around them. A plate or a border is decoration over the one line the reader
+ * actually came for.
  *
- * `{{code}}` and `{{secret}}` live on it, because a value you are meant to
- * transcribe must look separable from the prose around it.
+ * `text-indent` pays back half the trailing letter-spacing so the digits sit
+ * optically centred rather than a space to the right.
  */
-const plate = (inner: string): string =>
-  `<div style="margin:24px 0;padding:20px 22px;background:${WASH};border:1px solid ${LINE};border-radius:${RADIUS_PLATE}">${inner}</div>`;
-
-/** The one-time code — big, monospace, tracking wide enough to read in groups.
-    Left-aligned like everything else in the column; the plate is what marks it
-    as the object, centring it would just make it a poster. */
 const code = (value: string, hint?: string): string =>
-  plate(
-    `<div style="font-family:${MONO};font-size:26px;line-height:34px;font-weight:600;letter-spacing:5px;color:${TEXT}">${value}</div>`
-    + (hint ? `<div style="margin:10px 0 0;font-size:12.5px;line-height:18px;color:${MUTED}">${hint}</div>` : ''),
-  );
+  `<div style="margin:30px 0 26px"><div class="mail-code" style="font-family:${MONO};font-size:36px;line-height:44px;font-weight:bold;letter-spacing:6px;text-indent:3px;color:${TEXT};text-align:center">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED};text-align:center">${hint}</div>` : ''}</div>`;
 
-/** A secret that must be transcribed exactly: no tracking, selectable, and it
-    wraps on its own rather than running out of the plate. */
+/** A secret that has to be transcribed exactly — the code's shape, but small
+    enough to fit and left untracked so a double-click selects all of it. */
 const secret = (value: string, hint?: string): string =>
-  plate(
-    `<div style="font-family:${MONO};font-size:17px;line-height:26px;font-weight:600;color:${TEXT};word-break:break-all">${value}</div>`
-    + (hint ? `<div style="margin:10px 0 0;font-size:12.5px;line-height:18px;color:${MUTED}">${hint}</div>` : ''),
-  );
+  `<div style="margin:30px 0 26px"><div style="font-family:${MONO};font-size:22px;line-height:30px;font-weight:bold;color:${TEXT};text-align:center;word-break:break-all">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED};text-align:center">${hint}</div>` : ''}</div>`;
 
 type BtnVariant = 'primary' | 'ghost';
 
 /**
- * The action. Left-aligned, because the mail reads top-to-bottom in one column
- * and a centred button turns a notice into a brochure.
+ * The action — an underlined sentence, never a button. A pill needs
+ * `display:inline-block`, padding and a background on an anchor, which is
+ * exactly the styling weaker clients strip, and a link that was meant to look
+ * pressable but renders bare looks like a mistake. So the primary action is
+ * bold blue text and the secondary one the same line in grey.
  *
- * The landing's AA-checked solid blue (#0062cc) with white text and a 999px
- * pill for the one thing to do, and a bare blue link when the mail is only
- * pointing at a page. There is deliberately no red button: colour in this system marks
- * the *tone of a fact* (a callout rule), not the urgency of a click, and
- * "cancel deletion" is a save rather than a loss.
- *
- * A mail whose job is to deliver a code gets no `btn`. The reader's action is
- * transcribing digits into our app; a filled button in that mail is decoration
- * at best and, to anyone who has read a phishing kit, the exact shape of one.
- * Escape-hatch links in a code mail are `btnGhost`.
+ * A mail whose job is to deliver a code gets no `btn` at all — the reader's
+ * action is transcribing digits into our app, and a call-to-action link in a
+ * code mail is the exact shape of a phishing kit. Escape-hatch links in a code
+ * mail are `btnGhost`.
  */
 const button = (url: string, label: string, variant: BtnVariant = 'primary'): string => {
   const href = esc(url);
   const text = esc(label);
   if (variant === 'ghost') {
-    return `<p style="margin:18px 0 0">`
-      + `<a href="${href}" style="color:${LINK};font-size:15px;font-weight:500;text-decoration:none">${text} &rarr;</a></p>`;
+    return `<p style="margin:14px 0 0;font-size:14px;line-height:22px"><a href="${href}" style="color:${MUTED};text-decoration:underline">${text}</a></p>`;
   }
-  return `<p style="margin:24px 0 0">`
-    + `<a href="${href}" style="display:inline-block;padding:11px 22px;background:${BTN};border-radius:${RADIUS_PILL};color:#ffffff;font-size:14.5px;font-weight:600;line-height:20px;letter-spacing:-0.01em;text-decoration:none">${text}</a></p>`;
+  return `<p style="margin:22px 0 0;font-size:15px;line-height:24px"><a href="${href}" style="color:${LINK};font-weight:bold;text-decoration:underline">${text}</a></p>`;
 };
 
 const btn = (url: string, label: string): string => button(url, label, 'primary');
@@ -140,39 +129,33 @@ const btnGhost = (url: string, label: string): string => button(url, label, 'gho
  * and the hairlines carry the order without a second column of labels.
  */
 const well = (pairs: Array<[string, string]>): string =>
-  `<div style="margin:24px 0;border:1px solid ${LINE};border-radius:${RADIUS_PLATE};overflow:hidden">`
+  `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0;border-collapse:collapse">`
   + pairs.map(([key, value], i) =>
-      `<div style="padding:13px 16px;${i ? `border-top:1px solid ${LINE};` : ''}">`
-      + `<div style="font-size:13px;font-weight:600;color:${MUTED};line-height:18px">${key}</div>`
-      + `<div style="margin-top:3px;font-size:15px;line-height:20px;color:${TEXT};word-break:break-word">${value}</div>`
-      + `</div>`)
+      `<tr>`
+      + `<td width="120" align="left" valign="top" style="padding:9px 12px 9px 0;${i ? `border-top:1px solid ${LINE};` : ''}font-size:13px;line-height:20px;color:${MUTED}">${key}</td>`
+      + `<td align="left" valign="top" style="padding:9px 0;${i ? `border-top:1px solid ${LINE};` : ''}font-size:15px;line-height:20px;color:${TEXT};word-break:break-word">${value}</td>`
+      + `</tr>`)
     .join('')
-  + `</div>`;
+  + `</table>`;
 
 /**
  * A notice: what happened in one line, then the consequence.
  *
- * The rule on the left carries the tone — the only colour a block of prose is
- * allowed to be tinted with, and enough on its own.
+ * Plain prose with a bold lead-in — no plate, no coloured rule, no tinted
+ * heading. A warning that has to look alarming to be read is a warning that
+ * looks like a template, and the third row of decorated boxes in a mail is
+ * what makes a legitimate notice indistinguishable from a phish.
  */
-const callout = (heading: string, text: string, color = BTN): string =>
-  `<div style="margin:22px 0;padding:2px 0 2px 16px;border-left:2px solid ${color}">`
-  + `<div style="font-size:14px;line-height:20px;font-weight:600;color:${color}">${heading}</div>`
-  + `<div style="margin-top:4px;font-size:14px;line-height:21px;color:${TEXT_2}">${text}</div>`
-  + `</div>`;
+const callout = (heading: string, text: string): string =>
+  `<p style="margin:0 0 16px;font-size:15px;line-height:25px;color:${TEXT_2}"><strong style="color:${TEXT}">${heading}:</strong> ${text}</p>`;
 
 /** A slot that already holds finished markup. */
 const raw = (content: string): string => `<div style="margin:24px 0">${content}</div>`;
 
-const INFO = LINK;
-
-/* The standard "this did not come from us" warning. */
+/* The standard "this did not come from us" warning: one plain line, in the
+   same voice as the rest of the copy, on every mail that carries a code. */
 const safetyNote = (): string =>
-  callout(
-    'We will never ask for it',
-    'Tirbeo will not ask for your password or a verification code by email, phone or chat. Anything that does did not come from us.',
-    INFO,
-  );
+  note('Tirbeo will never ask for your password or a verification code by email, phone or chat. Anything that does did not come from us.');
 
 /* -------------------------------------------------------------------------- */
 /* Shell                                                                       */
@@ -187,64 +170,126 @@ type MailOpts = {
       `title` because the best preheader answers "why did I get this?" instead
       of repeating the headline. */
   preheader?: string;
+  /** The visual family of this mail. Absent means `info`. */
+  tone?: Tone;
+};
+
+/* -------------------------------------------------------------------------- */
+/* Tones — the category label under the wordmark                               */
+/* -------------------------------------------------------------------------- */
+
+export type Tone = 'otp' | 'security' | 'brand' | 'info' | 'welcome';
+
+/** The banner over the card — the colour is the category, so the mail is
+    recognisable in the thread list before a word of it is read. */
+const TONE_BAND: Record<Tone, string> = {
+  otp: BTN,
+  security: DANGER,
+  brand: TEXT,
+  info: MUTED,
+  welcome: BTN,
+};
+
+/** Every template's family, resolved by name at render time so no template
+    has to remember to declare it. Unknown names read as `info`. */
+const TEMPLATE_TONES: Record<string, Tone> = {
+  signup_otp: 'otp', login_otp: 'otp', reauth_otp: 'otp', verify_email: 'otp',
+  magic_link: 'otp', password_reset_otp: 'otp', password_reset_otp_recovery: 'otp',
+  password_reset_link: 'otp', delete_account_otp: 'otp', account_recovery: 'otp',
+
+  password_changed: 'security', suspicious_login: 'security',
+  two_factor_disabled: 'security', login_alert: 'security', security_tip: 'security',
+  account_suspended: 'security', account_deleted: 'security',
+  admin_alert: 'security', admin_test: 'security',
+
+  welcome: 'welcome',
+  product_update: 'brand', reactivation: 'brand',
+  tirbeo_account_onboarding: 'brand',
+
+  notification_digest: 'info', weekly_summary: 'info',
+  maintenance_notification: 'info', maintenance_complete: 'info',
+  export_ready: 'info',
+};
+
+/** Who signs off each family of mail, in the body's own voice. */
+const TONE_TEAM: Record<Tone, string> = {
+  otp: 'The Tirbeo Accounts team',
+  security: 'The Tirbeo Security team',
+  brand: 'The Tirbeo Team',
+  info: 'The Tirbeo Support team',
+  welcome: 'The Tirbeo Team',
 };
 
 /**
- * The shared shell: one left-aligned column, the brand, the headline, the blocks
- * and the footer. Templates hand over blocks only, so no template can forget the
- * footer — that is where the unsubscribe link lives.
+ * The shared shell, in the shape the big account-notification mails use: a
+ * 600px white card on the #F5F7FA page, the headline set in white inside a
+ * colour band across the top, the copy in the body below it, a sign-off, and
+ * the fine print outside the card.
  *
- * The Apple grouped surface: the page ground is #f2f2f7 and the mail itself is
- * a white card with 17px corners and a #d1d1d6 hairline — the same grouped
- * plate the landing uses — holding one column that stops at 560px so a line
- * stays a readable length on a desktop. Hairlines inside the card are #d1d1d6
- * and separate the letterhead from the letter and the letter from the signature.
+ * The band is the only decoration in the mail and it carries the whole
+ * category — blue for codes, red for security, ink for product, grey for
+ * notices — so no label has to say so as well. The footer lives outside the
+ * card because it is not part of the message; it is the machinery around it,
+ * and templates hand over body blocks only, so none of them can forget the
+ * unsubscribe link or the sign-off.
+ *
+ * Nothing in the mail is an image: mail clients block remote images by
+ * default. Actions are underlined text links — a filled button is decoration
+ * that weaker clients strip. The `logo` URL still flows through and still keys
+ * the template cache, but is not embedded anywhere in the HTML.
  */
 function mail(logo: string, opts: MailOpts): string {
   const { title, sub, blocks, preheader } = opts;
+  const tone = opts.tone ?? 'info';
   const pre = esc(preheader || sub || title);
-  const src = esc(logo || `${getApiOrigin()}/logo.png`);
   const support = esc(SUPPORT_EMAIL);
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="x-apple-disable-message-reformatting">
 <meta name="color-scheme" content="light">
 <meta name="supported-color-schemes" content="light">
 <title>${esc(title)}</title>
 <style>
-  /* Dark-mode clients invert the grey canvas and the blue button into
-     something nobody designed: pinned to light, the mail is what was drawn. */
-  :root { color-scheme: light; }
-  @media (max-width: 440px) {
-    body { padding: 24px 10px !important; }
-    .wrap { padding: 0 !important; }
-    .card { padding: 22px 18px !important; border-radius: 14px !important; }
+  body,table,td,h1,p{margin:0;padding:0}
+  body{-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;text-size-adjust:100%}
+  a{text-decoration:none}
+  @media only screen and (max-width:640px){
+    .mail-band{padding:26px 22px !important}
+    .mail-body{padding:22px 22px 26px !important}
+    .mail-foot{padding:18px 4px 0 !important}
+    .mail-code{font-size:28px !important;line-height:38px !important;letter-spacing:5px !important;text-indent:3px !important}
   }
 </style>
 </head>
-<body style="margin:0;padding:36px 16px;background:${PAGE};color:${TEXT};font-family:${FONT_STACK};font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased">
+<body style="margin:0;padding:0;background:${PAGE};color:${TEXT_2};font-family:${FONT_STACK};font-size:15px;line-height:1.7;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0" data-skip-in-text="true">${pre}&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;</div>
-<div class="wrap" style="max-width:560px;margin:0 auto;padding:0 4px">
-<div class="card" style="background:${CARD};border:1px solid ${LINE};border-radius:${RADIUS_CARD};padding:28px 30px">
-<div style="padding-bottom:22px;border-bottom:1px solid ${LINE}">
-<a href="${esc(WORKSPACE_URL())}" style="text-decoration:none"><img src="${src}" width="22" height="22" alt="" style="display:inline-block;vertical-align:middle;width:22px;height:22px"> <span style="vertical-align:middle;font-size:18px;font-weight:600;letter-spacing:-0.015em;color:${TEXT}">Tirbeo</span></a>
-</div>
-<h1 style="margin:26px 0 10px;font-size:24px;line-height:32px;font-weight:700;letter-spacing:-0.03em;color:${TEXT}">${title}</h1>
-${sub ? `<p style="margin:0 0 22px;font-size:15px;line-height:24px;color:${MUTED}">${sub}</p>` : ''}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${PAGE}" style="background:${PAGE};border-collapse:collapse">
+<tr><td align="center" style="padding:40px 12px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${CARD}" style="width:100%;max-width:600px;background:${CARD};border:1px solid ${LINE};border-collapse:collapse">
+<tr><td class="mail-band" bgcolor="${TONE_BAND[tone]}" align="left" style="background:${TONE_BAND[tone]};padding:34px 32px">
+<div style="font-size:24px;line-height:32px;color:#ffffff">${title}</div>
+</td></tr>
+<tr><td class="mail-body" align="left" style="padding:28px 32px 30px">
+${sub ? `<p style="margin:0 0 18px;font-size:15px;line-height:26px;color:${TEXT_2}">${sub}</p>` : ''}
 ${blocks.join('\n')}
-<div style="margin:34px 0 0;padding-top:18px;border-top:1px solid ${LINE}">
-<p style="margin:0 0 10px;font-size:13px;line-height:19px;color:${MUTED}">Questions? <a href="mailto:${support}" style="color:${LINK};text-decoration:none">${SUPPORT_EMAIL}</a></p>
-<p style="margin:0 0 10px;font-size:12.5px;line-height:18px;color:${FAINT}"><a href="https://tirbeo.com/privacy" style="color:${MUTED};text-decoration:none">Privacy</a> &middot; <a href="https://tirbeo.com/terms" style="color:${MUTED};text-decoration:none">Terms</a> &middot; <a href="https://tirbeo.com/accessibility" style="color:${MUTED};text-decoration:none">Accessibility</a> &middot; <a href="https://tirbeo.com/contact" style="color:${MUTED};text-decoration:none">Contact</a></p>
-<p style="margin:0;font-size:12.5px;line-height:18px;color:${FAINT}">Tirbeo Inc. &middot; Kathmandu, Nepal</p>
-<p style="margin:2px 0 0;font-size:12.5px;line-height:18px;color:${FAINT}">&copy; ${new Date().getFullYear()} Tirbeo Inc. All rights reserved.</p>
-<div style="margin:8px 0 0;font-size:12.5px;line-height:18px;color:${FAINT}">{{unsubscribeSection}}</div>
-</div>
-</div>
-</div>
+<p style="margin:30px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">Sincerely yours,</p>
+<p style="margin:2px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">${TONE_TEAM[tone]}</p>
+</td></tr>
+</table>
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse">
+<tr><td class="mail-foot" align="left" style="padding:20px 6px 0">
+<p style="margin:0 0 6px;font-size:12px;line-height:19px;color:${MUTED}">Need help? Visit the <a href="https://tirbeo.com/contact" style="color:${LINK};text-decoration:underline">Tirbeo Help Center</a> or write to <a href="mailto:${support}" style="color:${LINK};text-decoration:underline">${support}</a>.</p>
+<div style="margin:0 0 6px;font-size:12px;line-height:19px;color:${FAINT}">{{unsubscribeSection}}</div>
+<p style="margin:0;font-size:12px;line-height:19px;color:${FAINT}">&copy; ${new Date().getFullYear()} Tirbeo Inc. &nbsp;&nbsp;<a href="https://tirbeo.com/privacy" style="color:${FAINT};text-decoration:underline">Privacy</a> &nbsp;&nbsp;<a href="https://tirbeo.com/terms" style="color:${FAINT};text-decoration:underline">Terms</a></p>
+</td></tr>
+</table>
+</td></tr>
+</table>
 </body>
 </html>`;
 }
@@ -253,86 +298,89 @@ ${blocks.join('\n')}
 /* Templates                                                                   */
 /* -------------------------------------------------------------------------- */
 
-function t(subject: string, opts: MailOpts, logo: string): EmailTemplate {
-  return { subject, html: mail(logo, opts) };
+function t(subject: string, opts: MailOpts, logo: string, name: string): EmailTemplate {
+  return { subject, html: mail(logo, { ...opts, tone: TEMPLATE_TONES[name] ?? 'info' }) };
 }
 
-export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = {
-  signup_otp: (logo) =>
+export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => EmailTemplate> = {
+  signup_otp: (logo, name) =>
     t('Your Tirbeo verification code is {{otp}}', {
       title: 'Verify your email',
-      sub: 'Enter this code to activate your Tirbeo account.',
+      sub: 'Hello {{name}}, enter this code to activate your Tirbeo account.',
       preheader: 'It expires in 15 minutes and works once.',
       blocks: [
         code('{{otp}}', 'Expires in 15 minutes &middot; single use'),
         note("Didn’t sign up for Tirbeo? You can safely ignore this email — no account will be created."),
+        safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  login_otp: (logo) =>
+  login_otp: (logo, name) =>
     t('Your Tirbeo login code is {{otp}}', {
       title: 'Your login code',
-      sub: 'Enter this code to finish signing in to Tirbeo.',
+      sub: 'Hello {{name}}, enter this code to finish signing in to Tirbeo.',
       preheader: 'It expires in 15 minutes and works once.',
       blocks: [
         code('{{otp}}', 'Expires in 15 minutes &middot; single use'),
         note("Didn’t try to sign in? Change your password and review your active sessions — someone else has your code."),
         btnGhost(SESSIONS_URL(), 'Review active sessions'),
+        safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
   /* A code that confirms an action inside an already-signed-in account. Its own
      template because the login mail says "finish signing in", and this code
      expires on the sensitive-action clock, not the login one. */
-  reauth_otp: (logo) =>
+  reauth_otp: (logo, name) =>
     t('Your Tirbeo confirmation code is {{otp}}', {
       title: 'Confirm this change',
-      sub: 'Enter this code to confirm a change on your Tirbeo account.',
+      sub: 'Hello {{name}}, enter this code to confirm a change on your Tirbeo account.',
       preheader: 'One change, one code — it does not sign anyone in.',
       blocks: [
         code('{{otp}}', `Expires in {{lifetimeMinutes}} minutes &middot; single use`),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  verify_email: (logo) =>
+  verify_email: (logo, name) =>
     t('Verify your Tirbeo email: {{otp}}', {
       title: 'Confirm {{primaryEmail}}',
-      sub: 'Enter this code to confirm your email address.',
+      sub: 'Hello {{name}}, enter this code to confirm your email address.',
       preheader: 'It expires in 10 minutes and works once.',
       blocks: [
         code('{{otp}}', 'Expires in 10 minutes &middot; single use'),
         note("Didn’t request this code? You can safely ignore this email."),
+        safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  magic_link: (logo) =>
+  magic_link: (logo, name) =>
     t('Sign in to Tirbeo', {
-      title: 'One tap to sign in',
-      sub: 'Hello {{name}}, we received a request to sign you in to Tirbeo.',
+      title: 'Sign in to Tirbeo',
+      sub: 'Hello {{name}}, we received a request to sign your account in by email.',
       preheader: 'This link expires in 15 minutes and works once.',
       blocks: [
         btn('{{magicLink}}', 'Sign in to Tirbeo'),
         note('This link expires in 15 minutes and can only be used once. Didn’t request it? Ignore this email — nobody was signed in.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  password_reset_otp: (logo) =>
+  password_reset_otp: (logo, name) =>
     t('Your Tirbeo password reset code is {{otp}}', {
       title: 'Reset your password',
-      sub: 'Enter this code to continue resetting the password for {{primaryEmail}}.',
+      sub: 'Hello {{name}}, enter this code to continue resetting the password for {{primaryEmail}}.',
       preheader: 'Your password has not been changed yet.',
       blocks: [
         code('{{otp}}', 'Expires in 15 minutes &middot; single use'),
-        safetyNote(),
         note("Didn’t request a reset? Your password is still yours and nothing has changed."),
+        safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  password_reset_otp_recovery: (logo) =>
+  password_reset_otp_recovery: (logo, name) =>
     t('Password reset code for {{primaryEmail}}: {{otp}}', {
       title: 'Code sent to your recovery email',
-      sub: 'A password reset was requested for your account. This code went to your recovery address, not the address you sign in with.',
+      sub: 'Hello {{name}}, a password reset was requested for your account. This code went to your recovery address, not the address you sign in with.',
       preheader: 'Your password has not been changed yet.',
       blocks: [
         code('{{otp}}', 'Expires in 15 minutes &middot; single use'),
@@ -340,12 +388,12 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
           ['Account', '{{primaryEmail}}'],
           ['Code sent to', '{{recoveryEmail}}'],
         ]),
-        safetyNote(),
         note("Didn’t request this reset? Your password has not been changed."),
+        safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  delete_account_otp: (logo) =>
+  delete_account_otp: (logo, name) =>
     t('Confirm deleting your Tirbeo account: {{otp}}', {
       title: 'Confirm account deletion',
       sub: 'Hello {{name}}, enter this code to confirm that you want to delete {{primaryEmail}}.',
@@ -355,13 +403,12 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         callout(
           'What happens next',
           'Nothing is deleted by this email. Confirming starts a 30-day grace period, and you can cancel it by signing in at any time.',
-          WARN,
         ),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  password_reset_link: (logo) =>
+  password_reset_link: (logo, name) =>
     t('Reset your Tirbeo password', {
       title: 'Choose a new password',
       sub: 'Hello {{name}}, we received a request to reset your Tirbeo password.',
@@ -371,9 +418,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         note('This link expires in 15 minutes and can only be used once. Didn’t request a reset? Your password has not been changed.'),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  password_changed: (logo) =>
+  password_changed: (logo, name) =>
     t('Your Tirbeo password was changed', {
       title: 'Your password was changed',
       sub: 'Hello {{name}}, the password for {{primaryEmail}} was changed.',
@@ -387,12 +434,12 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         btn(`${DASHBOARD_URL()}/settings/security`, 'Secure my account'),
         btnGhost(SESSIONS_URL(), 'Review active sessions'),
       ],
-    }, logo),
+    }, logo, name),
 
-  suspicious_login: (logo) =>
+  suspicious_login: (logo, name) =>
     t('New sign-in to your Tirbeo account — was that you?', {
-      title: 'A sign-in we did not expect',
-      sub: 'Your Tirbeo account was just signed in to from a device we have not seen before.',
+      title: 'New sign-in from an unfamiliar device',
+      sub: 'Hello {{name}}, your Tirbeo account was signed in to from a device we have not seen before.',
       preheader: 'If that wasn’t you, change your password now.',
       blocks: [
         well([
@@ -403,17 +450,16 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         callout(
           "If this wasn't you",
           'Change your password right away and end the sessions you do not recognise. Anyone holding this session can read and change everything on your account.',
-          DANGER,
         ),
         btn(SESSIONS_URL(), 'Review my sessions'),
         note('Was it you? Nothing to do — this mail is informational, and it will not repeat for this device.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  two_factor_disabled: (logo) =>
+  two_factor_disabled: (logo, name) =>
     t('Two-step verification was turned off', {
       title: 'Two-step verification is off',
-      sub: 'Two-step verification was just turned off on {{primaryEmail}}. Your password is now the only thing protecting the account.',
+      sub: `Hello {{name}}, two-step verification was just turned off on {{primaryEmail}}. Your password is now the only thing protecting the account.`,
       preheader: 'Turn it back on if that wasn’t you.',
       blocks: [
         well([
@@ -423,17 +469,16 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         callout(
           'If this was not you',
           'Someone who could already sign in turned this off. Change your password first, then re-enable two-step — in that order, or they simply turn it off again.',
-          WARN,
         ),
         btn('{{twoFactorUrl}}', 'Turn two-step back on'),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  login_alert: (logo) =>
+  login_alert: (logo, name) =>
     t('New sign-in to your Tirbeo account', {
       title: 'New sign-in',
-      sub: 'Your Tirbeo account was just accessed.',
+      sub: 'Hello {{name}}, your Tirbeo account was signed in to.',
       preheader: 'Recognise this device? If not, revoke it.',
       blocks: [
         well([
@@ -444,21 +489,21 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         note("Don’t recognise this sign-in? Change your password, and revoke the session while you are there."),
         btnGhost(SESSIONS_URL(), 'Review active sessions'),
       ],
-    }, logo),
+    }, logo, name),
 
-  security_tip: (logo) =>
+  security_tip: (logo, name) =>
     t('{{tipTitle}}', {
       title: '{{tipTitle}}',
-      sub: 'Hello {{name}}, one thing on your account is still off.',
+      sub: 'Hello {{name}}, one security setting on your account is not turned on yet.',
       preheader: 'A single change that makes your account harder to break into.',
       blocks: [
         para('{{tipBody}}'),
         btn('{{actionUrl}}', '{{actionLabel}}'),
         note('We send one tip at a time, picked from what your account does not have set up yet.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  account_recovery: (logo) =>
+  account_recovery: (logo, name) =>
     t('Recover your Tirbeo account', {
       title: 'Recover your account',
       sub: 'Hello {{name}}, we received a request to recover {{primaryEmail}}.',
@@ -468,29 +513,26 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         note('This link expires in 15 minutes and can only be used once. Didn’t request it? Ignore this email — nothing has changed.'),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 
-  welcome: (logo) =>
+  welcome: (logo, name) =>
     t('Welcome to Tirbeo, {{name}}', {
-      title: 'Your workspace is ready',
-      sub: 'Hello {{name}}, your Tirbeo account is created and everything is set up.',
-      preheader: 'Three minutes of setup, and you are done.',
+      title: 'Welcome to Tirbeo',
+      sub: 'Hello {{name}}, your Tirbeo account has been created.',
+      preheader: 'What is in your settings, and what is worth changing first.',
       blocks: [
-        para('One place for your profile, your security settings and everything your workspace holds.'),
-        btn(WORKSPACE_URL(), 'Open your workspace'),
-        btnGhost(`${WORKSPACE_URL()}/settings`, 'Set up your profile'),
-        callout(
-          'First thing worth doing',
-          'Turn on two-step verification under <strong>Settings → Security</strong>. It is the one setting that makes a stolen password useless.',
-          SUCCESS,
-        ),
+        para(`This mail is a short guide to your account settings. Everything below is reachable from any device you sign in on, and none of it has a deadline.`),
+        para(`Your ${link(`${WORKSPACE_URL()}/settings`, 'profile')} holds the name, photo and details other people see when you take part in a form or a conversation. It is the only part of your account that is not private by default, so it is worth reading once and editing anything you would not want shown.`),
+        para(`${link(`${WORKSPACE_URL()}/settings/security`, 'Two-step verification')} is the setting that matters most. With it on, signing in from a device Tirbeo has not seen before asks for a one-time code from your authenticator app as well as your password, so a stolen password is no longer enough to get in. It takes about a minute to set up, and you will need an authenticator app on your phone.`),
+        para(`The rest of the settings page is straightforward: every device currently signed in to your account, a log of what changed and when, a downloadable copy of your data, and the option to close the account. All of it works without contacting anyone, and account closure starts a 30-day period in which you can change your mind by signing back in.`),
+        para(`If any of it does not behave as described, write to ${mailto(SUPPORT_EMAIL, 'our support address')} from the email address on your account and we will sort it out.`),
       ],
-    }, logo),
+    }, logo, name),
 
-  notification_digest: (logo) =>
+  notification_digest: (logo, name) =>
     t('Your Tirbeo digest — {{count}} updates', {
       title: '{{count}} new updates',
-      sub: 'Hello {{name}}, here is what has been waiting for you.',
+      sub: 'Hello {{name}}, these are the updates on your account since the last email.',
       preheader: 'Everything from the last few hours, in one place.',
       blocks: [
         raw('{{digestItems}}'),
@@ -498,49 +540,48 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         btn('{{dashboardUrl}}', 'View updates'),
         note('You get this because you turned periodic summaries on. Turn it off any time from your notification settings.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  product_update: (logo) =>
+  product_update: (logo, name) =>
     t('{{title}}', {
       title: '{{title}}',
-      sub: 'Hello {{name}}, a change you may want to know about.',
+      sub: 'Hello {{name}}, a change to how Tirbeo works.',
       preheader: '{{title}} — what it means for your account.',
       blocks: [
         para('{{message}}'),
         btn('{{ctaUrl}}', '{{ctaLabel}}'),
         note('These are the product notices on your account. The link at the bottom of this email turns them off.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  weekly_summary: (logo) =>
-    t('Your Tirbeo week — {{periodLabel}}', {
-      title: 'What happened this week',
-      sub: '{{periodLabel}}',
-      preheader: 'Your Tirbeo account, recapped in thirty seconds.',
+  weekly_summary: (logo, name) =>
+    t('Your Tirbeo {{periodWord}} — {{periodLabel}}', {
+      title: 'Your account this {{periodWord}}',
+      sub: `Hello {{name}}, this is your account summary for {{periodLabel}}.`,
+      preheader: 'Sign-ins, changes and security events in the period.',
       blocks: [
-        para('Hello {{name}}, here is the shape of your week.'),
         raw('{{statRows}}'),
         raw('{{suspiciousSection}}'),
         btn(`${DASHBOARD_URL()}/settings/your-activity`, 'View activity'),
       ],
-    }, logo),
+    }, logo, name),
 
-  reactivation: (logo) =>
-    t('Your Tirbeo workspace is still here, {{name}}', {
-      title: 'Nothing was lost',
-      sub: `It has been {{daysSince}} days since your last visit, {{name}}. Your workspace is exactly where you left it.`,
-      preheader: 'Your data, forms and settings are untouched.',
+  reactivation: (logo, name) =>
+    t('Your Tirbeo account is unchanged', {
+      title: 'Your account is unchanged',
+      sub: `Hello {{name}}, it has been {{daysSince}} days since your last visit. Everything is where you left it.`,
+      preheader: 'Nothing was deleted, and no setting was changed.',
       blocks: [
         raw('{{activitySummary}}'),
-        btn('{{dashboardUrl}}', 'Open Tirbeo'),
-        note('Inactivity reminders are one of the email categories you can turn off in notification settings.'),
+        btn('{{dashboardUrl}}', 'Open my account'),
+        note('You can turn reminders like this off under Settings &rarr; Emails.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  maintenance_notification: (logo) =>
+  maintenance_notification: (logo, name) =>
     t('Scheduled maintenance — {{maintenanceTitle}}', {
       title: '{{maintenanceTitle}}',
-      sub: '{{maintenanceMessage}}',
+      sub: 'Hello {{name}}, {{maintenanceMessage}}',
       preheader: 'What is affected, and when it should be back.',
       blocks: [
         well([
@@ -550,12 +591,12 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         ]),
         note('Some features may be briefly unavailable during this window. Nothing you have saved is affected.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  maintenance_complete: (logo) =>
+  maintenance_complete: (logo, name) =>
     t('Maintenance complete — {{maintenanceTitle}}', {
       title: '{{maintenanceTitle}} is complete',
-      sub: '{{completionMessage}}',
+      sub: 'Hello {{name}}, {{completionMessage}}',
       preheader: 'Everything is back and running.',
       blocks: [
         well([
@@ -564,9 +605,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         ]),
         btn('{{dashboardUrl}}', 'Open Tirbeo'),
       ],
-    }, logo),
+    }, logo, name),
 
-  account_suspended: (logo) =>
+  account_suspended: (logo, name) =>
     t('Your Tirbeo account has been {{statusType}}', {
       title: 'Your account is {{statusType}}',
       sub: 'Hello {{name}}, the status of {{primaryEmail}} has changed.',
@@ -580,14 +621,13 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         callout(
           'What this means for you',
           '{{suspendedNextStep}}',
-          WARN,
         ),
         btn('{{dashboardUrl}}/settings', 'Open my account'),
         note('Believe this was a mistake? Appeal it from your account and a person will read it.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  account_deleted: (logo) =>
+  account_deleted: (logo, name) =>
     t('Your Tirbeo account is scheduled for deletion', {
       title: 'Deletion scheduled',
       sub: 'Hello {{name}}, {{primaryEmail}} is scheduled for deletion.',
@@ -601,9 +641,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         btn('{{dashboardUrl}}/settings', 'Cancel deletion'),
         note('After the grace period the data is gone and cannot be recovered by anyone, including us.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  admin_alert: (logo) =>
+  admin_alert: (logo, name) =>
     t('[Admin] {{subject}}', {
       title: '{{subject}}',
       sub: '{{message}}',
@@ -613,9 +653,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         btn('{{dashboardUrl}}', 'Open dashboard'),
         note('Automated administrative alert from Tirbeo.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  export_ready: (logo) =>
+  export_ready: (logo, name) =>
     t('Your Tirbeo data export is ready', {
       title: 'Your export is ready',
       sub: 'Hello {{name}}, the export you requested for {{primaryEmail}} was generated.',
@@ -628,9 +668,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         btn(`${DASHBOARD_URL()}/settings`, 'Download from my account'),
         note('The archive stays downloadable from your account settings for a limited time. Nobody else can reach it.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  admin_test: (logo) =>
+  admin_test: (logo, name) =>
     t('Test email from Tirbeo', {
       title: 'Email is working',
       sub: 'This test confirms that delivery for <strong>{{sentFor}}</strong> is working.',
@@ -639,12 +679,12 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         para('If you can read this, the provider accepted the message and delivered it to this address.'),
         note('Nothing else was sent, and no user was mailed as part of this test.'),
       ],
-    }, logo),
+    }, logo, name),
 
-  tirbeo_account_onboarding: (logo) =>
+  tirbeo_account_onboarding: (logo, name) =>
     t('Your Tirbeo account is ready: {{username}}@tirbeo.com', {
       title: '{{username}}@tirbeo.com',
-      sub: 'Hello {{name}}, this is your Tirbeo identity: the address you sign in with, and the username that goes with it.',
+      sub: 'Hello {{name}}, your Tirbeo account is ready. This is the address you sign in with, and the username that goes with it.',
       preheader: 'Sign in with the temporary password, then replace it.',
       blocks: [
         para('Use this one-time temporary password to sign in:'),
@@ -653,7 +693,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string) => EmailTemplate> = 
         note('Your recovery email is {{recoveryEmail}}. It is used only for account recovery — it can never sign in.'),
         safetyNote(),
       ],
-    }, logo),
+    }, logo, name),
 };
 
 /* -------------------------------------------------------------------------- */
@@ -668,11 +708,18 @@ export type TemplateMap = Record<string, EmailTemplate>;
  * These templates are string concatenation, so the cache is no longer what
  * makes a send fast — it exists so `getTemplate` and `buildTemplates` hand back
  * the same object for the same branding, which callers and tests rely on.
+ *
+ * In development the cache is bypassed: it lives on `globalThis`, which
+ * hot-reload does not clear, so an edited template would keep being served in
+ * its stale form until the process restarted — mails silently rendered from
+ * yesterday's design.
  */
 const g = globalThis as typeof globalThis & {
   __tirbeoTemplateCache?: Map<string, TemplateMap>;
   __tirbeoFullCatalog?: Set<string>;
 };
+
+const cacheBypassed = () => process.env.NODE_ENV === 'development';
 
 function templateCache(): Map<string, TemplateMap> {
   if (!g.__tirbeoTemplateCache) g.__tirbeoTemplateCache = new Map();
@@ -695,12 +742,13 @@ function fullCatalogs(): Set<string> {
 function renderAllTemplates(logoUrl: string): TemplateMap {
   const result: TemplateMap = {};
   for (const [key, fn] of Object.entries(EMAIL_TEMPLATES)) {
-    result[key] = fn(logoUrl);
+    result[key] = fn(logoUrl, key);
   }
   return result;
 }
 
 export function buildTemplates(logoUrl: string = ''): TemplateMap {
+  if (cacheBypassed()) return renderAllTemplates(logoUrl);
   const cache = templateCache();
   const hit = cache.get(logoUrl);
   if (hit && fullCatalogs().has(logoUrl)) return hit;
@@ -717,6 +765,7 @@ export function buildTemplates(logoUrl: string = ''): TemplateMap {
  * mail, not twenty-eight.
  */
 export function getTemplate(name: string, logoUrl: string = ''): EmailTemplate | undefined {
+  if (cacheBypassed()) return EMAIL_TEMPLATES[name]?.(logoUrl, name);
   const cache = templateCache();
   const existing = cache.get(logoUrl)?.[name];
   if (existing) return existing;
@@ -724,7 +773,7 @@ export function getTemplate(name: string, logoUrl: string = ''): EmailTemplate |
   const factory = EMAIL_TEMPLATES[name];
   if (!factory) return undefined;
 
-  const template = factory(logoUrl);
+  const template = factory(logoUrl, name);
   const bucket = cache.get(logoUrl) || {};
   bucket[name] = template;
   cache.set(logoUrl, bucket);

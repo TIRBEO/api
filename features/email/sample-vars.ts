@@ -66,6 +66,7 @@ const PLAIN_VALUES: Record<string, string> = {
   reason: 'Possible spam content',
 
   periodLabel: '19–25 Aug 2026',
+  periodWord: 'week',
   daysSince: '21',
 
   title: 'Faster exports',

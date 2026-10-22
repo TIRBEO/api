@@ -1,9 +1,11 @@
 // Per-user event IDs shown on blocked/banned/suspended screens and in
-// security emails. Vercel/Stripe style: xxxx-xxxx-xxxx (12 hex chars, 3 blocks).
+// security emails. Vercel/Stripe style, widened to 64 bits of crypto
+// randomness so quoting one is unambiguous and guessing one is not a
+// project:
 //
-//   xxxx-xxxx-xxxx   →   a1b2-c3d4-e5f6
+//   xxxx-xxxx-xxxx-xxxx   →   a1b2-c3d4-e5f6-7a8b   (new, 16 hex)
+//   xxxx-xxxx-xxxx        →   a1b2-c3d4-e5f6        (legacy, 12 hex)
 //
-//   12 hex chars from crypto randomness (or deterministic fallback for legacy).
 //   No type prefix — the kind is inferred from context (ban/suspend/ratelimit/system).
 //
 // Codes are PERSISTED in user_status_events.metadata.refCode (set when an
@@ -18,8 +20,6 @@ export type EventKind = 'ban' | 'suspend' | 'ratelimit' | 'system';
 // (a self-serve pause) join it so every blocked-lifecycle screen can quote one.
 export type DisplayKind = EventKind | 'deleted' | 'delete' | 'deactivate';
 
-const HEX = '0123456789abcdef';
-
 function fnv1a(input: string, seed = 0x811c9dc5): number {
   let h = seed >>> 0;
   for (let i = 0; i < input.length; i++) {
@@ -29,29 +29,17 @@ function fnv1a(input: string, seed = 0x811c9dc5): number {
   return h;
 }
 
-function randomHex(len: number): string {
-  try {
-    const bytes = new Uint8Array(Math.ceil(len / 2));
-    (globalThis.crypto || (globalThis as any)?.crypto)?.getRandomValues?.(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').slice(0, len);
-  } catch { /* fall through to LCG */ }
-  let r = Math.random();
-  let out = '';
-  for (let i = 0; i < len; i++) {
-    r = (r * 1664525 + 1013904223) % 4294967296;
-    out += HEX[Math.floor((r / 4294967296) * 16)];
-  }
-  return out;
-}
+/** Crypto hex — the ONLY source of new codes. There is deliberately no
+    Math.random fallback: a "reference code" that a deterministic LCG could
+    generate is a code an attacker could generate, and every runtime this
+    module runs on (Node ≥ 19 route handlers, Edge middleware, browsers) has
+    Web Crypto. If it ever doesn't, failing loudly is correct — silently
+    downgrading to guessable ids is what we retired.
+    The generators live in infrastructure/ids/event-id so the DB write choke
+    point can stamp refs without importing features/. */
+import { randomHex, group16, group12, generateEventId } from '@/infrastructure/ids/event-id';
 
-// ─── New event IDs (crypto-backed) ───
-// Format: xxxx-xxxx-xxxx (12 hex chars, no type prefix)
-export function generateEventId(_kind: DisplayKind): string {
-  const part1 = randomHex(4);
-  const part2 = randomHex(4);
-  const part3 = randomHex(4);
-  return `${part1}-${part2}-${part3}`;
-}
+export { generateEventId } from '@/infrastructure/ids/event-id';
 
 /**
  * Deterministic fallback (legacy accounts without a stored code). Stable for
@@ -73,14 +61,15 @@ export function eventIdFor(userId: string, _kind: DisplayKind): string {
 /**
  * Short reference for any row whose id is (or contains) a uuid — login-ledger
  * rows have no metadata column, so their code is derived from the row id
- * itself: first 12 hex digits, grouped. Stable, unique per row, and nothing
- * has to be backfilled: every row that ever existed already resolves to the
- * same code.
+ * itself: first 16 hex digits, grouped. Stable, unique per row, and nothing
+ * has to be backfilled. (Rows displayed before the widening quoted the first
+ * 12; refCodeCandidates() still resolves those through the admin search.)
  */
 export function refFromRowId(id: string): string | null {
   const hex = (id || '').toLowerCase().replace(/[^0-9a-f]/g, '');
-  if (hex.length < 12) return null;
-  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}`;
+  if (hex.length >= 16) return group16(hex.slice(0, 16));
+  if (hex.length >= 12) return group12(hex.slice(0, 12));
+  return null;
 }
 
 /** The reference to show for one activity row: its stamped metadata.refCode
@@ -92,16 +81,6 @@ export function eventRowRef(row: { id: string; metadata?: unknown }): string {
     ? (meta as Record<string, unknown>).refCode : null;
   if (typeof stored === 'string' && stored.trim()) return stored.trim();
   return refFromRowId(row.id) ?? row.id;
-}
-
-// Best stored-or-generated code for a user row (current status kind).
-export function eventIdForUser(
-  userId: string,
-  kind: EventKind,
-  stored?: string | null
-): string {
-  if (stored && stored.trim()) return stored.trim();
-  return eventIdFor(userId, kind);
 }
 
 /** Collapse a raw error into a stable identity: ids, hashes and digits vary
@@ -146,7 +125,10 @@ export async function systemFaultRef(rawSignature: string): Promise<string> {
       select: { metadata: true } });
     const stored = (recent?.metadata as Record<string, unknown> | null)?.refCode;
     if (typeof stored === 'string' && stored.trim()) return stored.trim();
-    const code = `${group}-${randomHex(4)}`;
+    // The two deterministic groups carry the fault's identity (same ongoing
+    // failure → same prefix); eight fresh random hex per incident make the
+    // full code a standard xxxx-xxxx-xxxx-xxxx with 32 unpredictable bits.
+    const code = group16(`${group.replace(/-/g, '')}${randomHex(8)}`);
     await prisma.activityEvent.create({
       data: {
         kind: 'system.error',
@@ -156,7 +138,7 @@ export async function systemFaultRef(rawSignature: string): Promise<string> {
         metadata: { refCode: code, signature: sig, group } as never } });
     return code;
   } catch {
-    return `${group}-${randomHex(4)}`;
+    return group16(`${group.replace(/-/g, '')}${randomHex(8)}`);
   }
 }
 
@@ -228,13 +210,13 @@ export async function ensureRefCode(userId: string, kind: DisplayKind): Promise<
   }
 }
 
-// Canonical display form from a 12-char hex token.
+// Canonical display form from a hex token: 16 digits → four groups (the
+// current shape), 12 → three (codes stored before the widening), 8 → the
+// legacy form padded deterministically so old quotes still resolve.
 export function formatEventId(_kind: EventKind, token: string): string {
   const digits = (token || '').toLowerCase().replace(/[^0-9a-f]/g, '');
-  if (digits.length >= 12) {
-    const d = digits.slice(0, 12);
-    return `${d.slice(0, 4)}-${d.slice(4, 8)}-${d.slice(8, 12)}`;
-  }
+  if (digits.length >= 16) return group16(digits.slice(0, 16));
+  if (digits.length >= 12) return group12(digits.slice(0, 12));
   if (digits.length === 8) {
     // Legacy 8-char format — pad to 12 with deterministic hash
     const extra = fnv1a(digits, 0x12345678) & 0xffff;
@@ -245,12 +227,13 @@ export function formatEventId(_kind: EventKind, token: string): string {
 
 export interface ParsedEventId {
   kind: EventKind | null;   // cannot be determined from format alone
-  digits: string;           // full hex payload, lowercased (up to 12 chars)
-  token: string;            // full 12-char formatted token
+  digits: string;           // full hex payload, lowercased (up to 16 chars)
+  token: string;            // full grouped token (16-hex or legacy 12-hex)
 }
 
 // Normalize whatever the user typed into a parsed event ID.
-// Accepts: a1b2-c3d4-e5f6, a1b2c3d4e5f6, a1b2_c3d4_e5f6, and legacy forms.
+// Accepts: a1b2-c3d4-e5f6-7a8b, a1b2c3d4e5f67a8b, the legacy 3-group/12-char
+// forms, 8-char legacy, and SUS-/BAN- prefixes.
 // The input must be ENTIRELY hex (after stripping separators/prefixes).
 export function parseEventId(input: string): ParsedEventId | null {
   const raw = (input || '').trim();
@@ -262,10 +245,12 @@ export function parseEventId(input: string): ParsedEventId | null {
   if (!/^[0-9a-f]{4,16}$/.test(compact)) return null;
   const digits = compact;
 
-  // Determine token: prefer full 12-char, else pad 8-char to 12
+  // Determine token: the widest shape the typed digits actually fill.
   let token: string;
-  if (digits.length >= 12) {
-    token = formatEventId('suspend', digits.slice(0, 12)); // kind doesn't matter for formatting
+  if (digits.length >= 16) {
+    token = group16(digits.slice(0, 16));
+  } else if (digits.length >= 12) {
+    token = group12(digits.slice(0, 12));
   } else if (digits.length >= 8) {
     token = formatEventId('suspend', digits);
   } else {
@@ -280,20 +265,26 @@ export function parseEventId(input: string): ParsedEventId | null {
 }
 
 // Every stored shape the admin resolver should match for a typed-in code.
-// Covers canonical xxxx-xxxx-xxxx, plain 12-char, 8-char legacy, and SUS-/BAN- prefixes.
+// A 16-hex code typed in full also quotes its own first 12 digits — the
+// derived/legacy shape rows picked up before the widening — so one paste
+// finds the row whichever era stamped it. Covers canonical grouped forms,
+// plain hex, 8-char legacy, and SUS-/BAN- prefixes.
 export function refCodeCandidates(input: string): string[] {
   const parsed = parseEventId(input);
   if (!parsed) return [];
 
   const out = new Set<string>();
-  const { token } = parsed;
+  const { token, digits } = parsed;
 
-  // Canonical form
+  // Canonical form as typed (16-hex grouped, or legacy 12).
   out.add(token);
-  // Raw 12-char
-  if (parsed.digits.length >= 12) out.add(parsed.digits.slice(0, 12));
-  // 8-char legacy
-  if (parsed.digits.length >= 8) out.add(parsed.digits.slice(-8));
+  // Raw (undashed) storage.
+  if (digits.length >= 16) out.add(digits.slice(0, 16));
+  if (digits.length >= 12) out.add(digits.slice(0, 12));
+  // A 16-hex quote whose first 12 digits are the legacy derived code.
+  if (digits.length >= 16) out.add(group12(digits.slice(0, 12)));
+  // 8-char legacy.
+  if (digits.length >= 8) out.add(digits.slice(-8));
 
   // Legacy prefixed storage from the brief SUS-/BAN- era.
   out.add(`SUS-${token.slice(-8)}`);

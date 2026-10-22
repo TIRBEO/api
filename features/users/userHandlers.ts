@@ -9,7 +9,7 @@ import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/featur
 import { jsonUnauthorized } from '@/shared/response';
 import { imageBytesMatchType } from '@/features/media/imageSecurity';
 import { sendTemplateEmailAfter } from '@/features/email/email';
-import { createNotification, describeDevice, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs } from '@/features/notifications/notifications';
+import { createNotification, describeDevice, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs, serializedPrefsWrite } from '@/features/notifications/notifications';
 import { sanitizeInput } from '@/features/security/security';
 import { verifyMergeToken } from '@/features/auth/jwt';
 import { bustProfileCache, getOauthProviderConfig } from '@/features/auth/authHandlers';
@@ -18,7 +18,7 @@ import { logPerformance } from '@/infrastructure/observability/perf';
 import { trackQuery } from '@/infrastructure/observability/queryMonitor';
 import { createAuditEvent, humanTitle } from '@/features/security/audit';
 import { coordsByLoginAttempt } from '@/features/security/loginCoords';
-import { logSecurityEvent } from '@/features/security/security';
+import { logSecurityEvent, notifyAdmins } from '@/features/security/security';
 import { originFromRequest } from '@/features/activity/recordChange';
 import {
   FORBIDDEN_SETTINGS_KEYS, SETTINGS_LIMITS, containsForbiddenSettingsKey,
@@ -32,6 +32,11 @@ import {
   issueDeletionCode, consumeDeletionCode, scheduleDeletion, cancelDeletion,
   activeDeletionFor, OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
 import { ensureRefCode, eventRowRef, refFromRowId } from '@/features/users/refcode';
+import {
+  CHANGE_ANSWER_KIND as ANSWER_KIND,
+  answerIndex,
+  type ChangeAnswerValue,
+} from '@/features/users/change-answers';
 import {
   completeExportRequest,
   createExportRequest,
@@ -729,16 +734,29 @@ function validatePrefs(patch: Record<string, unknown>): string | null {
       && !(typeof patch.emailPausedUntil === 'number' && Number.isFinite(patch.emailPausedUntil))) {
     return 'Invalid emailPausedUntil';
   }
+  if (patch.quietHoursEnabled !== undefined && typeof patch.quietHoursEnabled !== 'boolean') {
+    return 'Invalid quietHoursEnabled';
+  }
+  for (const key of ['quietHoursStart', 'quietHoursEnd'] as const) {
+    if (patch[key] !== undefined
+        && !(typeof patch[key] === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(patch[key]))) {
+      return `Invalid ${key}`;
+    }
+  }
   return null;
 }
 
 export const notificationCategoriesHandler = prefsEndpoint([
-  'forms', 'product', 'support', 'tips', 'offers',
+  // Only the tips master survives here — it is the one category-level switch
+  // a send path reads. The forms/product/support/offers masters were stored
+  // and ignored; the screens decide through the channel keys.
+  'tips',
   'formsEmail', 'formsPush', 'productEmail', 'productPush', 'supportEmail', 'supportPush', 'tipsEmail', 'tipsPush',
   'offersEmail', 'offersPush',
   // "Pause everything at once" lives with the categories it quiets.
   'emailPaused', 'emailPausedUntil',
-]);
+  'quietHoursEnabled', 'quietHoursStart', 'quietHoursEnd',
+], { validate: validatePrefs });
 
 /** The account recap: whether it comes at all, and how often. */
 export const notificationSummaryHandler = prefsEndpoint(['summaryEnabled', 'summaryFrequency'], {
@@ -1087,6 +1105,74 @@ export async function userDailyActivityHandler(request: NextRequest) {
   }
 }
 
+/** The ledger kinds that record the owner having *asked* for something —
+ *  each row was written by the action it names. */
+const REQUEST_EVENT_KINDS = [
+  'account.deactivated',
+  'account.reactivated',
+  'account.delete-code',
+  'account.delete-request',
+  'account.deletion-cancelled',
+  'security.deletion_scheduled',
+  'security.deletion_cancelled',
+  'appeal.filed',
+  'account.merge',
+];
+
+/**
+ * GET /api/user/requests — every request the account has made, one list.
+ *
+ * The "Requests and history" screen used to show only what is in force now;
+ * this is the ledger behind it — downloads asked for, codes mailed, pauses,
+ * closings, appeals — merged from the two places requests are actually kept:
+ * the activity rows the actions write, and the export table (which carries a
+ * status the activity row doesn't). Newest first, capped, read-only.
+ */
+export async function userRequestsHandler(request: NextRequest) {
+  try {
+    const session = await getSession(request);
+    if (!session) return jsonUnauthorized();
+
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50') || 50, 100);
+
+    const [events, exports] = await Promise.all([
+      prisma.activityEvent.findMany({
+        where: { userId: session.userId, kind: { in: REQUEST_EVENT_KINDS } },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        select: { id: true, kind: true, title: true, detail: true, createdAt: true },
+      }),
+      prisma.dataExportRequest.findMany({
+        where: { userId: session.userId },
+        orderBy: { requestedAt: 'desc' },
+        take: limit,
+        select: { id: true, format: true, status: true, fileName: true, requestedAt: true },
+      }),
+    ]);
+
+    const requests = [
+      ...events.map((e) => ({
+        id: e.id, kind: e.kind, title: e.title, detail: e.detail ?? null,
+        status: null as string | null, at: e.createdAt.toISOString(),
+      })),
+      ...exports.map((e) => ({
+        id: e.id,
+        kind: 'data.download',
+        title: e.format === 'html' ? 'Data download (readable copy)' : 'Data download (JSON)',
+        detail: e.fileName,
+        status: e.status,
+        at: e.requestedAt.toISOString(),
+      })),
+    ].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, limit);
+
+    return NextResponse.json({ requests });
+  } catch (err: any) {
+    console.error('[USER REQUESTS]', err?.message || err);
+    return NextResponse.json({ requests: [] });
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // USER CHANGE HISTORY — the account's own record of what it edited
 // ═══════════════════════════════════════════════════════════════════
@@ -1094,8 +1180,10 @@ export async function userDailyActivityHandler(request: NextRequest) {
 /** The owner's answer to "was this you", written as an event of its own.
     Storing the answer in the same ledger it is about means it survives the
     device it was given on, is dated by the server, and can't be quietly
-    edited afterwards — which is the only reason an answer is worth keeping. */
-const CHANGE_ANSWER_KIND = 'account.change_answered';
+    edited afterwards — which is the only reason an answer is worth keeping.
+    The store itself lives in features/users/change-answers.ts so the security
+    feature can read the answers without importing this file. */
+const CHANGE_ANSWER_KIND = ANSWER_KIND;
 
 /** Sign-ins have their own page, and a bot check or a device sighting is not
     something anyone edited. Everything the account *did* stays. */
@@ -1171,28 +1259,8 @@ function changeView(
     said };
 }
 
-/** The newest answer given about each change. Answers are few, so the
-    newest-wins fold happens here rather than in SQL. The newest word can be a
-    clearing — "I take back what I said" — which has to stop an older answer
-    from resurfacing without becoming an answer of its own. */
-async function answerIndex(userId: string): Promise<Map<string, { answer: string; at: string }>> {
-  const rows = await prisma.activityEvent.findMany({
-    where: { userId, kind: CHANGE_ANSWER_KIND },
-    orderBy: { createdAt: 'desc' },
-    take: 500,
-    select: { metadata: true, createdAt: true } });
-  const index = new Map<string, { answer: string; at: string }>();
-  const settled = new Set<string>();
-  for (const row of rows) {
-    const meta = (row.metadata || {}) as Record<string, any>;
-    const about = typeof meta.about === 'string' ? meta.about : '';
-    if (!about || settled.has(about)) continue;
-    settled.add(about);
-    if (meta.answer !== 'not-me' && meta.answer !== 'recognised') continue;
-    index.set(about, { answer: meta.answer, at: row.createdAt.toISOString() });
-  }
-  return index;
-}
+/** The newest answer given about each change. Lives in
+    features/users/change-answers.ts — the sign-in ledger reads it too. */
 
 /**
  * GET /api/user/changes — every change this account recorded, newest first,
@@ -1255,37 +1323,128 @@ export async function userChangeDetailHandler(request: NextRequest, changeId: st
 /**
  * POST /api/user/changes/:id/answer — "this was me" / "that wasn't me".
  *
- * The change has to belong to the account answering, which is what the
- * lookup is for: an id from someone else's history is a 404, not a write.
+ * The row has to belong to the account answering, which is what the lookup is
+ * for: an id from someone else's history is a 404, not a write. Two kinds of
+ * row can be answered:
+ *
+ *   • a CHANGE — an activity_events row (the password changed, two-factor
+ *     turned on), addressed by its own id;
+ *   • a SIGN-IN — a user_logins row, addressed by its own id. The sign-in
+ *     ledger has no review column, so before this the answer to a sign-in was
+ *     kept on the phone that gave it and went nowhere else. The answer store
+ *     is keyed by the row it is about, so the ledger reads it back — the
+ *     answer follows the account instead of the device.
+ *
  * Clearing an answer writes another row rather than deleting one, so the
  * ledger shows that the answer changed, not that it never existed.
+ *
+ * "That wasn't me" is a report, not a note: the account owner is told (in-app
+ * and by mail — it is a security answer, so it is never held back by the
+ * notification toggles) and the admins are alerted, because a stranger on the
+ * account is exactly what a human should look at.
  */
 export async function changeAnswerHandler(request: NextRequest, changeId: string) {
   try {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
-    const owned = await findOwnedChange(session.userId, changeId);
-    if (!owned) return NextResponse.json({ error: 'That change is not in your history' }, { status: 404 });
-
     const body: any = await request.json().catch(() => null);
-    const answer = body?.answer;
+    const answer = body?.answer as ChangeAnswerValue;
     if (answer !== 'recognised' && answer !== 'not-me' && answer !== null) {
       return NextResponse.json({ error: 'Say either "recognised", "not-me", or null to clear it' }, { status: 400 });
     }
+
+    const owned = await findOwnedChange(session.userId, changeId);
+    const signIn = owned
+      ? null
+      : await prisma.userLogin.findFirst({
+          where: { id: changeId, userId: session.userId },
+          select: { id: true, ipAddress: true, userAgent: true, method: true, success: true, createdAt: true },
+        });
+    if (!owned && !signIn) return NextResponse.json({ error: 'That change is not in your history' }, { status: 404 });
 
     await logSecurityEvent({
       request,
       userId: session.userId,
       eventType: CHANGE_ANSWER_KIND,
       severity: answer === 'not-me' ? 'warning' : 'info',
-      details: { about: changeId, answer } });
+      details: { about: changeId, answer, aboutKind: owned ? 'change' : 'signin' } });
+
+    if (answer === 'not-me') {
+      await reportDisputedRow({
+        request,
+        userId: session.userId,
+        rowId: changeId,
+        kind: owned ? 'change' : 'signin',
+        signIn,
+      });
+    }
 
     return NextResponse.json({ ok: true, id: changeId, answer, answeredAt: new Date().toISOString() });
   } catch (err: any) {
     console.error('[CHANGE ANSWER]', err?.message || err);
     return NextResponse.json({ error: 'Failed to record the answer' }, { status: 500 });
   }
+}
+
+/**
+ * "That wasn't me" — the account says a row was not them.
+ *
+ * Two audiences, and neither of them is the browser that pressed the button:
+ *
+ *   • THE OWNER — the person who pressed it already knows; what they need is
+ *     the account's own answer to it: a notification that says the report is
+ *     in, what to do next (change the password, end the other sessions), and
+ *     where the record is. It is a security answer, so it is written as one:
+ *     in-app always, and by mail whatever the notification toggles say.
+ *
+ *   • THE ADMINS — a stranger on someone's account is the one thing a human
+ *     should look at. They get the alert with the row's own facts: when, from
+ *     where, on what, and the reference code to quote.
+ *
+ * Both are best-effort: a failure to alert is a failure to tell, not a reason
+ * to refuse the answer the account gave. The answer itself is already written.
+ */
+async function reportDisputedRow(input: {
+  request: NextRequest;
+  userId: string;
+  rowId: string;
+  kind: 'change' | 'signin';
+  signIn: { id: string; ipAddress: string | null; userAgent: string | null; method: string | null; success: boolean; createdAt: Date } | null;
+}) {
+  const { request, userId, rowId, kind } = input;
+  const ip = input.signIn?.ipAddress || null;
+  const device = describeDevice(input.signIn?.userAgent || null);
+  const when = (input.signIn?.createdAt || new Date()).toISOString();
+  const method = input.signIn?.method || (kind === 'change' ? 'account change' : 'sign-in');
+
+  const details = [
+    `Row: ${rowId}`,
+    `Kind: ${kind === 'signin' ? 'sign-in' : 'account change'}`,
+    `When: ${when}`,
+    `Method: ${method}`,
+    `Device: ${device}`,
+    `Address: ${ip || 'unknown'}`,
+    `Owner said: "that wasn't me"`,
+  ].join('\n');
+
+  // The admins first — it is the one that has a human waiting.
+  await notifyAdmins({
+    subject: 'Account holder disputed a sign-in',
+    message: 'The owner of an account marked a row as "that wasn\'t me".',
+    details,
+    severity: 'warning',
+  }).catch(() => {});
+
+  // Then the owner, in their own inbox.
+  await createNotification({
+    userId,
+    type: 'security',
+    title: 'You told us a sign-in wasn\'t you',
+    body: 'We have marked that record and told the team. Change your password and end the sessions you don\'t recognise.',
+    link: '/settings/login-activity',
+    metadata: { about: rowId, kind, ip, device, method, when, ref: refFromRowId(rowId) ?? rowId },
+  }).catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1684,38 +1843,47 @@ export async function settingsHandler(request: NextRequest) {
         return NextResponse.json({ ok: true, settings: { ...policy } });
       }
 
-      const row = await prisma.userPreferences.findUnique({
-        where: { userId: session.userId },
-        select: { misc: true } });
-      const misc = (row?.misc && typeof row.misc === 'object' ? row.misc : {}) as Record<string, any>;
-      const settings = { ...(misc.settings ?? {}) } as Record<string, unknown>;
-      for (const key of keys) settings[key] = incoming[key];
+      // Read, merge, validate, write as one serialized pass: the whole misc
+      // column is rewritten per save, and two overlapping settings changes
+      // used to silently drop one of them.
+      const outcome = await serializedPrefsWrite(async (tx) => {
+        const row = await tx.userPreferences.findUnique({
+          where: { userId: session.userId },
+          select: { misc: true } });
+        const misc = (row?.misc && typeof row.misc === 'object' ? row.misc : {}) as Record<string, any>;
+        const settings = { ...(misc.settings ?? {}) } as Record<string, unknown>;
+        for (const key of keys) settings[key] = incoming[key];
 
-      // The bound that matters is the MERGED bag, not this request: a client
-      // that sends 1 KB at a time can otherwise grow the row forever.
-      const bagBytes = settingsBagBytes(settings);
-      if (bagBytes === null) {
+        // The bound that matters is the MERGED bag, not this request: a client
+        // that sends 1 KB at a time can otherwise grow the row forever.
+        const bagBytes = settingsBagBytes(settings);
+        if (bagBytes === null) return { kind: 'invalid' as const, settings: null };
+        if (bagBytes > SETTINGS_LIMITS.totalBytes) return { kind: 'too-large' as const, settings: null, bagBytes };
+
+        const nextMisc = { ...misc, settings };
+        await tx.userPreferences.upsert({
+          where: { userId: session.userId },
+          create: { userId: session.userId, misc: nextMisc as any },
+          update: { misc: nextMisc as any } });
+        return { kind: 'saved' as const, settings };
+      });
+
+      if (outcome.kind === 'invalid') {
         return NextResponse.json(
           { error: 'These settings could not be stored as saved.', code: 'INVALID_SETTINGS_VALUE' },
           { status: 400 });
       }
-      if (bagBytes > SETTINGS_LIMITS.totalBytes) {
+      if (outcome.kind === 'too-large') {
         return NextResponse.json(
           {
             error: 'Your saved settings are too large to store. Remove some and try again.',
             code: 'SETTINGS_BAG_TOO_LARGE',
             limitBytes: SETTINGS_LIMITS.totalBytes,
-            actualBytes: bagBytes,
+            actualBytes: outcome.bagBytes,
           },
           { status: 413 });
       }
-
-      const nextMisc = { ...misc, settings };
-
-      await prisma.userPreferences.upsert({
-        where: { userId: session.userId },
-        create: { userId: session.userId, misc: nextMisc as any },
-        update: { misc: nextMisc as any } });
+      const settings = outcome.settings!;
 
       if (changedFields.length) {
         await createAuditEvent({
@@ -1786,6 +1954,17 @@ export async function setPasswordHandler(request: NextRequest) {
 // ═══════════════════════════════════════════════════════════════════
 // PROFILE EDIT OTP HANDLERS
 // ═══════════════════════════════════════════════════════════════════
+/**
+ * The OTP kind derives from a request-supplied field name, so it is
+ * normalised before it reaches the string `kind` column: unbounded values
+ * would let one session scatter arbitrary junk kinds across the OTP table,
+ * and both handlers must compute the same string for the same request.
+ */
+function profileEditOtpKind(field: unknown): string {
+  const raw = typeof field === 'string' ? field.trim().toLowerCase() : '';
+  return `profile-edit:${/^[a-z0-9_-]{1,32}$/.test(raw) ? raw : 'general'}`;
+}
+
 export async function requestProfileEditOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
@@ -1799,7 +1978,7 @@ export async function requestProfileEditOtpHandler(request: NextRequest) {
 
     const email = user.email;
     const code = generateOtpCode();
-    await storeOtp(session.userId, `profile-edit:${field || 'general'}` as any, code);
+    await storeOtp(session.userId, profileEditOtpKind(field) as any, code);
     await sendEmailOtp(email, code);
 
     return NextResponse.json({ ok: true, message: 'Verification code sent' });
@@ -1819,7 +1998,7 @@ export async function verifyProfileEditOtpHandler(request: NextRequest) {
 
     if (!code) return NextResponse.json({ error: 'Verification code required' }, { status: 400 });
 
-    const valid = await verifyOtpCode(session.userId, `profile-edit:${field || 'general'}` as any, code);
+    const valid = await verifyOtpCode(session.userId, profileEditOtpKind(field) as any, code);
     if (!valid) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
 
     return NextResponse.json({ ok: true, verified: true });
@@ -1858,7 +2037,10 @@ export async function avatarUploadHandler(request: NextRequest) {
           return NextResponse.json({ error: 'That file is not the image it claims to be.' }, { status: 400 });
         }
         const ext = file.type.split('/')[1] || 'jpeg';
-        const r2Key = `avatars/${session.userId}/${Date.now()}.${ext}`;
+        // Timestamp alone collided inside a second — a double-tap or two
+        // devices uploading together silently overwrote one another's file.
+        // The uuid slice makes every upload its own object.
+        const r2Key = `avatars/${session.userId}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${ext}`;
         try {
           const { storeMediaFile } = await import('@/features/media/mediaStorage');
           const stored = await storeMediaFile({ key: r2Key, body: buffer, contentType: file.type });
@@ -2409,7 +2591,7 @@ export async function exportDataHandler(request: NextRequest) {
 // 30-day window). The lifecycle itself lives in the account-lifecycle
 // module; this is the HTTP surface the settings screens call.
 //   POST { step:'request' }  → send the code (rate-limited like a password reset)
-//   POST { step:'verify', code, reason } → verify code + schedule deletion
+//   POST { step:'verify', deleteCode, reason, +proof } → verify + schedule deletion
 //   DELETE | POST ?cancel=1  → cancel inside the window
 //   GET                      → current deletion state
 // The code is sent to the SIGN-IN EMAIL and reuses the shared OTP machinery
@@ -2442,7 +2624,10 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
     }
 
     const body = await request.json().catch(() => ({}));
-    const { step, code, reason } = body as { step?: string; code?: string; reason?: string };
+    // `deleteCode`, not `code`: `code` is the field the re-auth guard reads as
+    // an authenticator proof, and a deletion typed into it would be checked
+    // as a TOTP and rejected as one.
+    const { step, deleteCode, reason } = body as { step?: string; deleteCode?: string; reason?: string };
 
     // Nothing can be re-requested while a deletion is already on the clock.
     if (await activeDeletionFor(session.userId)) {
@@ -2460,20 +2645,33 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
       }
 
       const { sendTemplateEmail } = await import('@/features/email/email');
-      // Awaited, and its answer believed. Telling someone to check an inbox
+      // Awaited — but only to a point. Telling someone to check an inbox
       // that the provider never accepted is how a wrong code gets typed three
-      // times — and the fifth wrong attempt burns the code for good.
+      // times, so the send's answer is worth waiting for; waiting forever is
+      // not. SMTP here has been taking 8–10s, and a screen that gives up mid-
+      // send shows "code sent" on the server and no code box on the phone.
+      // Past the wait the send keeps running in the background: the person
+      // gets the sheet with the box, the mail lands when it lands, and a late
+      // failure is answered by the resend link, not a dead end.
       // `name` and `lifetimeMinutes` are not decoration: a variable the render
       // step never sees stays in the mail as its literal `{{name}}`, and the
       // code's real life is the core's TTL, not a number typed into the copy.
       const row = await prisma.user.findUnique({ where: { id: session.userId }, select: { profile: { select: { name: true } } } });
-      const sent = await sendTemplateEmail(email, 'delete_account_otp', {
+      const sendP: Promise<{ success?: boolean; error?: string }> = sendTemplateEmail(email, 'delete_account_otp', {
         otp: issued.code,
         name: (row?.profile?.name || '').trim() || email.split('@')[0],
         lifetimeMinutes: String(OTP_TTL_MINUTES),
       }).catch((e: any) => ({ success: false, error: e?.message || 'mail send failed' }));
-      if (!sent.success) {
-        console.error('[DELETE OTP]', sent.error);
+      const waited = await Promise.race([
+        sendP,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 8_000)),
+      ]);
+      if (waited === null) {
+        sendP.then((late) => {
+          if (!late?.success) console.error('[DELETE OTP] late send failed:', late?.error);
+        }).catch(() => {});
+      } else if (!waited.success) {
+        console.error('[DELETE OTP]', waited.error);
         return NextResponse.json(
           { error: 'The verification code could not be sent right now. Please try again in a moment.' },
           { status: 502 },
@@ -2498,9 +2696,25 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
 
     // Step 2 — verify the code → open the 30-day window.
     if (step === 'verify') {
-      if (!code) return NextResponse.json({ error: 'Verification code is required' }, { status: 400 });
+      if (!deleteCode) {
+        // Names which fields actually arrived (never their values). A browser
+        // running a page chunk from before the `code` → `deleteCode` rename
+        // lands here with the deletion code under `code`, and this line is the
+        // one difference between "nobody typed it" and "the wrong door knocked".
+        console.warn('[DELETE ACCOUNT] verify without deleteCode — body keys:',
+          Object.keys(body).join(',') || '(none)');
+        return NextResponse.json({ error: 'Verification code is required' }, { status: 400 });
+      }
 
-      const valid = await consumeDeletionCode(session.userId, String(code));
+      // Deleting an account is the most sensitive thing this app does, so the
+      // session cookie alone doesn't do it: the request must also carry a
+      // fresh proof (password, authenticator, emailed code or passkey — the
+      // doors this account can open), and an account with "require 2FA for
+      // sensitive actions" on is held to that policy here like everywhere else.
+      const proof = await requireReauth(request, session.userId, { body });
+      if ('response' in proof) return proof.response;
+
+      const valid = await consumeDeletionCode(session.userId, String(deleteCode));
       if (!valid) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
 
       const { finalAt } = await scheduleDeletion(session.userId, { reason: reason ?? null, keepSessionId: session.sessionId ?? null });

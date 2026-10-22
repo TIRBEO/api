@@ -303,7 +303,10 @@ export async function passkeyRegisterVerifyHandler(request: NextRequest) {
 
     const { credential: regCredential } = verification.registrationInfo;
     const transports = credential.response?.transports || [];
-    const deviceNameStr = deviceName || parseDeviceName(request.headers.get('user-agent') || '');
+    // The name arrives from the client, so it is bounded like every other
+    // stored device label (session.ts caps at 120) rather than whatever string
+    // a caller posts.
+    const deviceNameStr = (deviceName || parseDeviceName(request.headers.get('user-agent') || '')).slice(0, 120);
 
     console.log(`[PASSKEY REGISTER VERIFY] Creating passkey with credentialId: ${regCredential.id}`);
 

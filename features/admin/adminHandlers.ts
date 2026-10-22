@@ -393,11 +393,25 @@ const createUserSchema = z.object({
 
 function generateTemporaryPassword(length = 16): string {
   const alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*';
-  const arr = new Uint32Array(length);
-  const rnd = typeof crypto !== 'undefined' && 'getRandomValues' in crypto
-    ? crypto.getRandomValues(arr)
-    : Array.from({ length }, () => Math.floor(Math.random() * 0xffffffff));
-  return Array.from({ length }, (_, i) => alphabet[Number(rnd[i]) % alphabet.length]).join('');
+  // Rejection sampling over Web Crypto only: `Math.random % alphabet.length`
+  // both leaked a non-crypto path and skewed the letter distribution (256 is
+  // not a multiple of 59). Every accepted value is uniform.
+  const out: string[] = [];
+  // The whole value space of a uint32 is 2^32, not 2^32 - 1: the largest
+  // value a uint32 can hold is one below it, but the space it can produce has
+  // 2^32 members. The cut-off is the largest whole number of alphabets that
+  // fits, so the accepted values divide evenly by the alphabet's length and
+  // every character is equally likely.
+  const range = 0x100000000;
+  const limit = range - (range % alphabet.length);
+  while (out.length < length) {
+    const batch = crypto.getRandomValues(new Uint32Array((length - out.length) * 2));
+    for (const v of batch) {
+      if (v < limit) out.push(alphabet[v % alphabet.length]);
+      if (out.length === length) break;
+    }
+  }
+  return out.join('');
 }
 
 export async function createUser(request: NextRequest) {
@@ -877,7 +891,7 @@ export async function resolveUserByRefCode(request: NextRequest) {
   const code = (request.nextUrl.searchParams.get('code') || '').trim();
   const candidates = refCodeCandidates(code);
   if (!candidates.length) {
-    return NextResponse.json({ error: 'Invalid reference code. Expected a format like 4155-7b96-49e0 or 524c-9f2d-4e1a.' }, { status: 400 });
+    return NextResponse.json({ error: 'Invalid reference code. Expected a format like a1b2-c3d4-e5f6-7a8b.' }, { status: 400 });
   }
 
   // Reference codes are no longer columns on users — they live in the
@@ -900,7 +914,12 @@ export async function resolveUserByRefCode(request: NextRequest) {
   let userIdFromLedger: string | null = null;
   if (!events.length) {
     const hex = code.toLowerCase().replace(/[^0-9a-f]/g, '');
-    const idPrefix = hex.length >= 12 ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-` : null;
+    // A derived ref is the row-id uuid's leading hex digits: 16 today, 12 for
+    // codes shown before the widening. Match as deep as the quote goes.
+    const idPrefix =
+      hex.length >= 16 ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-`
+        : hex.length >= 12 ? `${hex.slice(0, 8)}-${hex.slice(8, 12)}-`
+        : null;
     const [activityHit, loginHit] = await Promise.all([
       prisma.activityEvent.findFirst({
         where: {

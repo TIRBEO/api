@@ -99,6 +99,9 @@ export async function verifyTempPasswordChangeToken(token: string): Promise<stri
 export async function signPasswordResetToken(userId: string): Promise<string> {
   return new SignJWT({ sub: userId, purpose: 'password-reset' })    .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
+    // Every reset token carries its own id: unique per issue (no twins),
+    // traceable in logs, and one step closer to single-use enforcement.
+    .setJti(crypto.randomUUID())
     .setExpirationTime('15m')
     .sign(getSecret());
 }

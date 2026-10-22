@@ -4,6 +4,11 @@ import { addMinutes } from 'date-fns';
 import { randomInt } from 'crypto';
 
 const OTP_TTL_MINUTES = 15;
+/** A wrong guess costs an attempt and the row dies at the limit, so a 6-digit
+    code can be hunted a handful of times rather than for its full 15-minute
+    life. Mirrors the self-destruct in consumeSensitiveCode / consumeDeletionCode;
+    five is generous for a real mistype and hopeless for a brute force. */
+const MAX_OTP_ATTEMPTS = 5;
 
 const bindTo = (code: string, bind?: string | null) => (bind ? `${code} ${bind.trim().toLowerCase()}` : code);
 
@@ -29,7 +34,10 @@ export async function storeOtp(userId: string, type: 'email' | 'email_verify', c
   });
 }
 
-/** Verify OTP and delete it */
+/** Verify OTP and delete it. Every miss burns an attempt and the row
+    self-destructs at the limit, so a wrong guess can't be retried freely for
+    the code's whole TTL. The delete is the spend: counting what it removed
+    turns two concurrent verifies of one code into one success, not two. */
 export async function verifyOtpCode(userId: string, type: 'email' | 'email_verify', code: string, bind?: string | null): Promise<boolean> {
   const otp = await prisma.otp.findFirst({
     where: { userId, kind: type },
@@ -39,16 +47,22 @@ export async function verifyOtpCode(userId: string, type: 'email' | 'email_verif
   if (!otp) {
     return false;
   }
-  if (otp.expiresAt < new Date()) {
-    await prisma.otp.deleteMany({ where: { id: otp.id } });
+  if (otp.expiresAt < new Date() || (otp.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
     return false;
   }
   const ok = await verifyOtpHash(otp.otpHash, bindTo(code, bind));
-  if (!ok) return false;
-  // The delete is the spend: counting what it removed means two concurrent
-  // verifies of one code produce one success, not two.
-  const spent = await prisma.otp.deleteMany({ where: { id: otp.id } });
-  return spent.count === 1;
+  if (ok) {
+    const spent = await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => ({ count: 0 }));
+    return spent.count === 1;
+  }
+  const next = (otp.attempts ?? 0) + 1;
+  if (next >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
+  } else {
+    await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
+  }
+  return false;
 }
 
 /** Send OTP via configured email provider (Resend) */

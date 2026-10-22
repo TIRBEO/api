@@ -14,12 +14,13 @@ export async function GET(request: NextRequest) {
   const severity = url.searchParams.get('severity') || undefined;
   const ip = url.searchParams.get('ip') || undefined;
   const userId = url.searchParams.get('userId') || undefined;
+  const q = url.searchParams.get('q') || undefined;
   const from = url.searchParams.get('from') || undefined;
   const to = url.searchParams.get('to') || undefined;
   const includeUser = url.searchParams.get('includeUser') !== 'false';
 
   const [data, stats] = await Promise.all([
-    listSecurityEvents({ page, limit, id, eventType, severity, ip, userId, from, to, includeUser }),
+    listSecurityEvents({ page, limit, id, eventType, severity, ip, userId, q, from, to, includeUser }),
     getSecurityStats(),
   ]);
 

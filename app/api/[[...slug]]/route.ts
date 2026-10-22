@@ -65,6 +65,7 @@ import {
   integrationsHandler,
   mergeAccountsHandler,
   userActivityHandler,
+  userRequestsHandler,
   userAppsHandler,
   userOverviewHandler,
   preferencesHandler,
@@ -92,7 +93,6 @@ import { feedbackHandler, adminFeedbackHandler } from '@/features/feedback/feedb
 import {
   emailConfigHandler,
   emailTemplatesHandler,
-  emailTemplateDetailHandler,
   emailTestHandler,
   adminEmailsHandler,
   adminEmailReplyHandler,
@@ -237,23 +237,17 @@ const INTERNAL_ROUTES = [
   'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/summary', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'preferences/data-usage', 'settings', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
-  'emails', 'emails/unsubscribe', 'emails/preferences', 'pushes',
-  'districts',
-  'user/activity', 'user/apps', 'user/overview', 'user/account-status', 'user/account-checks',
-  'admin/reserved-addresses',
-  'admin/groups',
+  'emails', 'emails/unsubscribe', 'emails/preferences',
+  'user/activity', 'user/requests', 'user/apps', 'user/overview', 'user/account-status', 'user/account-checks',
   'admin/account-status',
-  'admin/ous', 'admin/security/score',
-  'admin/settings', 'admin/analytics/overview', 'admin/analytics/consented-users', 'admin/maintenance',
+  'admin/security/score',
+  'admin/analytics/overview', 'admin/analytics/consented-users', 'admin/maintenance',
   // connected-accounts removed — OAuth IDs stored on users table directly
   'user/export-data', 'user/delete-account', 'profile/public',
-  'content/incident-events', 'content/health', 'content/jobs', 'content/jobs/create', 'content/retry-job',
-  'support/tickets/[id]/read', 'support/tickets/[id]/attachments', 'support/tickets/[id]/attachments/[attachmentId]',
+  'content/health',
     'auth/cli-token',
-   'waitlist',
    'feedback',
    'chat',
-   'admin/subscribers',
    'admin/feedback',    'health',
     'health/pool',
     'debug/cache',
@@ -315,44 +309,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
   }
 
 
-  // Handle admin/reserved-addresses/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'admin' && slug[1] === 'reserved-addresses') {
-    const addressId = slug[2];
-    if (method.toUpperCase() === 'DELETE') {
-      return { path: 'admin/reserved-addresses/[id]', method, internal: true, allowedRoles: ['guest'], meta: { addressId } };
-    }
-  }
-
 // connected-accounts routes removed (LinkedAccount model removed)
-
-  // Handle content/retry-job/{id} dynamic route
-  if (slug.length === 3 && slug[0] === 'content' && slug[1] === 'retry-job') {
-    return { path: 'content/retry-job/[id]', method: 'POST', internal: true, allowedRoles: ['guest'], meta: { retryJobId: slug[2] } };
-  }
-
-  // Handle support/tickets/{id} dynamic route (GET/PATCH/PUT/DELETE)
-  // 'appeals' is a collection name, not a ticket id — it resolves through the
-  // static methodMap below to the appeals list handler.
-  if (slug.length === 3 && slug[0] === 'support' && slug[1] === 'tickets' && slug[2] !== 'appeals') {
-    const ticketId = slug[2];
-    const allowed = ['GET', 'PATCH', 'PUT', 'DELETE'];
-    if (allowed.includes(method.toUpperCase())) {
-      return { path: 'support/tickets/[id]', method, internal: true, allowedRoles: ['guest'], meta: { ticketId } };
-    }
-  }
-
-  // Handle support/tickets/{id}/attachments/{attachmentId} — signed download (auth + Content-Disposition)
-  if (slug.length === 5 && slug[0] === 'support' && slug[1] === 'tickets' && slug[3] === 'attachments') {
-    return { path: 'support/tickets/[id]/attachments/[attachmentId]', method, internal: true, allowedRoles: ['guest'], meta: { ticketId: slug[2], attachmentId: slug[4] } };
-  }
-
-  // Handle support/tickets/{id}/messages, reply, read, assign, close, reopen, attachments
-  if (slug.length === 4 && slug[0] === 'support' && slug[1] === 'tickets') {
-    const action = slug[3];
-    if (['messages', 'reply', 'read', 'assign', 'close', 'reopen', 'attachments'].includes(action)) {
-      return { path: `support/tickets/[id]/${action}`, method, internal: true, allowedRoles: ['guest'], meta: { ticketId: slug[2] } };
-    }
-  }
 
   // Handle profile/oauth/{provider} dynamic route (unlink OAuth account)
   if (slug.length === 3 && slug[0] === 'profile' && slug[1] === 'oauth') {
@@ -445,6 +402,7 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'integrations/merge': ['POST'],
 
       'user/activity': ['GET'],
+      'user/requests': ['GET'],
       'preferences': ['GET', 'PATCH'],
       'preferences/data-usage': ['GET', 'PUT', 'PATCH'],
       'settings': ['GET', 'PATCH'],
@@ -460,18 +418,12 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'emails': ['GET'],
       'emails/preferences': ['GET', 'POST'],
       'emails/unsubscribe': ['GET', 'POST'],
-      'pushes': ['GET'],
-      'districts': ['GET'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'user/overview': ['GET'],
       'user/account-status': ['GET'],
       'user/account-checks': ['GET'],
       'admin/account-status': ['PUT'],
-      'admin/reserved-addresses': ['GET', 'POST'],
-      'admin/groups': ['GET', 'POST'],
-      'admin/ous': ['GET', 'POST'],
       'admin/security/score': ['GET'],
-      'admin/settings': ['GET', 'PATCH'],
       'admin/maintenance': ['GET', 'POST'],
       'admin/analytics/overview': ['GET'],
       'admin/analytics/consented-users': ['GET'],
@@ -479,10 +431,8 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'user/export-data': ['GET', 'POST'],
       'user/delete-account': ['GET', 'POST', 'DELETE'],
       'profile/public': ['GET'],       'auth/cli-token': ['POST'],
-       'waitlist': ['POST'],
       'feedback': ['POST', 'GET'],
       'chat': ['POST'],
-      'admin/subscribers': ['GET'],
       'admin/feedback': ['GET'],
       'health': ['GET'],
       'health/pool': ['GET'],
@@ -495,17 +445,10 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       // Content
 
       'content/health': ['GET'],
-      'content/incident-events': ['GET', 'POST'],
-      'content/jobs': ['GET'],
-      'content/jobs/create': ['POST'],
-      'content/retry-job': ['POST'],
       // Support
       'support/tickets': ['GET', 'POST'],
       'support/tickets/create': ['POST'],
       'support/appeal': ['POST'],
-      'support/tickets/[id]/read': ['POST'],
-      'support/tickets/[id]/attachments': ['GET', 'POST'],
-      'support/tickets/[id]/attachments/[attachmentId]': ['GET'],
       'support/tickets/appeals': ['GET'] };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
@@ -908,6 +851,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
       case 'integrations/merge':
         resp = await mergeAccountsHandler(request);
         break;
+      case 'user/requests':
+        resp = await userRequestsHandler(request);
+        break;
       case 'user/activity':
         resp = await userActivityHandler(request);
         break;
@@ -1131,56 +1077,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         }
         break;
       }
-      case 'pushes': {
-        const psSession = await requireSession(request);
-        if (psSession instanceof NextResponse) { resp = psSession; break; }
-        // Push registrations ride in the notification-preference blob; read them
-        // through the merged view so they show up whichever store the write landed in.
-        const { loadNotificationPrefs } = await import('@/features/notifications/notifications');
-        const psPrefs: any = await loadNotificationPrefs(psSession.userId);
-        const psSubs = psPrefs.pushSubscriptions || [];
-        const psItems = psSubs.map((sub: any, i: number) => ({
-          id: i, endpoint: sub.endpoint ? `${sub.endpoint.slice(0, 30)}...` : 'unknown',
-          createdAt: sub.createdAt || null, userAgent: sub.userAgent || null, enabled: sub.enabled !== false }));
-        resp = NextResponse.json({ items: psItems, total: psItems.length });
-        break;
-      }
-      case 'public/help-config':
-      case 'public/faq':
-        resp = NextResponse.json({ articles: [] });
-        break;
-      case 'districts':
-        resp = NextResponse.json({ districts: [] });
-        break;
-      case 'admin/reserved-addresses/[id]':
-        resp = NextResponse.json({ error: 'Not implemented' }, { status: 501 });
-        break;
-
-      case 'admin/oauth/apps':
-      case 'admin/oauth/apps/[id]':
-      case 'admin/oauth/clients':
-      case 'admin/oauth/clients/[id]':
-      case 'admin/oauth/clients/[id]/secret':
-      case 'admin/help-articles':
-      case 'admin/help-articles/[id]':
-      case 'admin/integrations':
-      case 'admin/settings':
-      case 'auth/oauth/authorize':
-      case 'auth/oauth/token':
-      case 'auth/oauth/revoke':
-      case 'oidc/userinfo':
-      case 'content/settings':
-      case 'content/settings/update':
-      case 'content/feature-flags':
-      case 'content/feature-flags/update':
-      case 'content/jobs':
-      case 'content/jobs/create':
-      case 'content/retry-job/[id]':
-      case 'support/queues':
-      case 'support/queues/create':
-        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
-        break;
-
       case 'admin/analytics/overview':
         resp = await adminAnalyticsOverviewHandler(request);
         break;
@@ -1208,17 +1104,11 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         resp = await chatHandler(request);
         break;
 
-      case 'waitlist':
-        resp = NextResponse.json({ ok: true, message: 'Waitlist feature coming soon' });
-        break;
       case 'feedback':
         resp = await feedbackHandler(request);
         break;
       case 'admin/feedback':
         resp = await adminFeedbackHandler(request);
-        break;
-      case 'admin/subscribers':
-        resp = NextResponse.json({ subscribers: [] });
         break;
       case 'user/apps':
         resp = await userAppsHandler(request);
@@ -1230,13 +1120,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         resp = await verifyHandler(request);
         break;
 
-      case 'email/templates/[name]':
-        resp = await emailTemplateDetailHandler(request, (route as any).meta.templateName);
-        break;
       case 'admin/emails/[id]':
         resp = await adminEmailDetailHandler(request, (route as any).meta.emailId);
         break;
-      case 'content/incident-events':
       case 'support/tickets':
       case 'support/tickets/create':
       case 'support/appeal':
@@ -1244,17 +1130,6 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/tickets/appeals':
         resp = await appealsListHandler(request);
-        break;
-      case 'support/tickets/[id]':
-      case 'support/tickets/[id]/messages':
-      case 'support/tickets/[id]/reply':
-      case 'support/tickets/[id]/read':
-      case 'support/tickets/[id]/assign':
-      case 'support/tickets/[id]/close':
-      case 'support/tickets/[id]/reopen':
-      case 'support/tickets/[id]/attachments':
-      case 'support/tickets/[id]/attachments/[attachmentId]':
-        resp = NextResponse.json({ error: 'Feature removed' }, { status: 410 });
         break;
       case 'health':
         resp = await publicHealthHandler();

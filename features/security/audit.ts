@@ -162,8 +162,11 @@ export async function listAuditEvents(options: {
       const candidates = refCodeCandidates(options.id);
       const idPrefix = options.id.toLowerCase().replace(/[^0-9a-f]/g, '');
       const or: Record<string, unknown>[] = candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } }));
-      // A code derived from a row id (first 12 hex) matches a uuid prefix.
-      if (idPrefix.length >= 12) {
+      // A code derived from a row id (leading hex of the uuid) matches a
+      // uuid prefix — as deep as the typed quote carries digits.
+      if (idPrefix.length >= 16) {
+        or.push({ id: { startsWith: `${idPrefix.slice(0, 8)}-${idPrefix.slice(8, 12)}-${idPrefix.slice(12, 16)}-` } });
+      } else if (idPrefix.length >= 12) {
         or.push({ id: { startsWith: `${idPrefix.slice(0, 8)}-${idPrefix.slice(8, 12)}-` } });
       }
       where.OR = or;

@@ -14,13 +14,18 @@ const MAX_OTP_ATTEMPTS = 5;
 const RESET_OTP_KIND = 'email';
 
 /**
- * Fetch the latest live reset OTP for a user, enforcing the
+ * Fetch the latest live reset/login OTP for a user, enforcing the
  * 5-attempt cap (mirrors signup-otp.ts). A code that has been guessed wrong
  * MAX_OTP_ATTEMPTS times is invalidated so a fresh code is required.
+ *
+ * Only mailbox-bound rows (address set) qualify: the reauth and recovery
+ * flows keep their emailed codes in the same `kind` with no address, and
+ * reading across that line would let a reauth code answer for a password
+ * reset — an elevation the reauth contract never promised.
  */
 async function findLiveResetOtp(userId: string) {
   const otp = await prisma.otp.findFirst({
-    where: { userId, kind: RESET_OTP_KIND },
+    where: { userId, kind: RESET_OTP_KIND, address: { not: null } },
     orderBy: { createdAt: 'desc' },
   });
   if (!otp) return null;
@@ -225,9 +230,16 @@ export async function verifyPasswordReset(
     } else {
       const ok = await verifyOtpCode(otp.otpHash, params.code);
       if (ok) {
-        verified = true;
-        // Delete ALL OTPs for this user (expires the other method)
-        await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
+        // The delete of that one row is the spend: two concurrent verifies of
+        // one code answer once, not twice.
+        const spent = await prisma.otp.deleteMany({ where: { id: otp.id } });
+        if (spent.count === 1) {
+          verified = true;
+          // Expire the sibling mailbox codes (the other method's live code).
+          await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND, address: { not: null } } });
+        } else {
+          codeError = 'That code has already been used. Please request a new one.';
+        }
       } else {
         const used = (otp.attempts ?? 0) + 1;
         await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
@@ -244,8 +256,9 @@ export async function verifyPasswordReset(
     const tokenUserId = await verifyPasswordResetToken(params.token);
     if (tokenUserId === user.id) {
       verified = true;
-      // Delete ALL OTPs for this user (expires the other method)
-      await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
+      // Expire every mailbox code — but only the mailbox-bound ones: reauth
+      // and recovery codes live in this same kind without an address.
+      await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND, address: { not: null } } });
     }
   }
 
@@ -304,21 +317,24 @@ export async function confirmPasswordReset(
 
   const { hashPassword } = await import('@/features/auth/password');
   const hash = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { passwordHash: hash },
-  });
-  await prisma.userSecurity.upsert({
-    where: { userId: user.id },
-    create: { userId: user.id, mustChangePw: false },
-    update: { mustChangePw: false },
-  });
+  // One transaction: a password that changed while its sessions kept working
+  // (or the reverse) is the half-state this step used to be able to ship.
+  await prisma.$transaction([
+    prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash: hash },
+    }),
+    prisma.userSecurity.upsert({
+      where: { userId: user.id },
+      create: { userId: user.id, mustChangePw: false },
+      update: { mustChangePw: false },
+    }),
+    // Invalidate all sessions (they need to re-authenticate with new password)
+    prisma.userSession.deleteMany({ where: { userId: user.id } }),
+  ]);
 
-  // Clean up any remaining OTPs
-  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
-
-  // Invalidate all sessions (they need to re-authenticate with new password)
-  await prisma.userSession.deleteMany({ where: { userId: user.id } });
+  // Clean up any remaining mailbox-bound reset/login codes
+  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND, address: { not: null } } });
 
   // Notify user that their password was changed (skipEmail — Email Brain sends dedicated template)
   try {
@@ -374,6 +390,10 @@ export async function quickLoginWithOtp(
     await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
     return { success: false, error: 'Invalid or expired code' };
   }
+  // The delete of that one row is the spend: two concurrent logins carrying
+  // one code open one session, not two.
+  const spent = await prisma.otp.deleteMany({ where: { id: otp.id } });
+  if (spent.count !== 1) return { success: false, error: 'Invalid or expired code' };
 
   /* The account's lifecycle state is spoken only to someone who just produced
      the code that its verified mailbox received. Answering here before the
@@ -386,8 +406,8 @@ export async function quickLoginWithOtp(
     return { success: false, error, block, userId: user.id, email: user.email } as any;
   }
 
-  // Delete all OTPs for this user
-  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND } });
+  // Delete the account's other mailbox-bound codes (spent or superseded)
+  await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND, address: { not: null } } });
 
   // Create a session (short-term session, same as login OTP / magic link)
   const { createSession } = await import('@/features/auth/session');
