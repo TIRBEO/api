@@ -211,6 +211,9 @@ const CSRF_EXEMPT_PATHS = [
   '/api/auth/email-otp/request', '/api/auth/email-otp/verify',
   '/api/auth/phone-otp/request', '/api/auth/phone-otp/verify',
   '/api/admin/login', '/api/admin/verify-2fa', '/api/admin/change-password',
+  // Signing out is the request a browser makes when its session is already
+  // broken; demanding a token it may no longer hold would keep the cookies.
+  '/api/admin/logout',
   '/api/admin/passkey/options', '/api/admin/passkey/verify',
   '/api/auth/passkey/auth-options', '/api/auth/passkey/verify',
   '/api/public/', '/api/newsletter/',

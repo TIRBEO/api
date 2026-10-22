@@ -1176,11 +1176,19 @@ export async function userRequestsHandler(request: NextRequest) {
       return (typeof code === 'string' && code.trim()) ? code.trim() : (refFromRowId(id) ?? id);
     };
     /** The newest answer per reference, so an answered thread says when. */
-    const answers = new Map<string, { at: string; detail: string | null; title: string }>();
+    const answers = new Map<string, { at: string; detail: string | null; title: string; text: string | null }>();
     for (const e of events) {
       if (e.kind !== 'support.reply') continue;
       const code = refOf(e.metadata, e.id);
-      const found = { at: e.createdAt.toISOString(), detail: e.detail ?? null, title: e.title };
+      const meta = (e.metadata || {}) as Record<string, any>;
+      const found = {
+        at: e.createdAt.toISOString(),
+        detail: e.detail ?? null,
+        title: e.title,
+        // The words, not the row's summary line: an answer that reads "Answered
+        // xxxx by mail" tells the person nothing they did not already know.
+        text: typeof meta.message === 'string' && meta.message ? meta.message : null,
+      };
       if (!answers.has(code) || found.at > (answers.get(code) as { at: string }).at) answers.set(code, found);
     }
     /** Which references have their question on this page. A reply whose
@@ -1203,7 +1211,9 @@ export async function userRequestsHandler(request: NextRequest) {
             id: e.id, kind: e.kind, ref, title: e.title, detail: e.detail ?? null,
             status,
             answeredAt: answer?.at ?? (e.kind === 'support.reply' ? e.createdAt.toISOString() : null),
-            answer: answer ? { at: answer.at, detail: answer.detail, title: answer.title } : null,
+            answer: answer
+              ? { at: answer.at, detail: answer.detail, title: answer.title, text: answer.text }
+              : null,
             at: e.createdAt.toISOString(),
             subject: typeof meta.subject === 'string' ? meta.subject : null,
           };

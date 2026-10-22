@@ -313,6 +313,10 @@ export async function adminEmailReplyHandler(request: NextRequest) {
               select: { id: true },
             })
             .catch(() => null);
+          /* What was said, as text. The mail's markup is not readable anywhere
+             but a mail client, and both screens that show this thread — the
+             panel's and the account's own request record — need the words. */
+          const said = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
           await prisma.activityEvent
             .create({
               data: {
@@ -321,7 +325,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
                 title: subject,
                 detail: `Answered ${refCode} by mail.`,
                 severity: 'info',
-                metadata: { refCode, to, byAdmin: session.userId } as never,
+                metadata: { refCode, to, byAdmin: session.userId, message: said.slice(0, 2000) } as never,
               },
             })
             .catch(() => {});
@@ -335,7 +339,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
               userId: recipient.id,
               type: 'support',
               title: 'The team replied to your request',
-              body: html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180),
+              body: said.slice(0, 180),
               link: '/settings/account-status/history',
               metadata: { refCode, subject },
             }).catch(() => {});

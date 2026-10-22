@@ -18,10 +18,12 @@ import { eventRowRef, refCodeCandidates } from '@/features/users/refcode';
    ═══════════════════════════════════════════════════════════════════ */
 
 const THREAD_KINDS = ['support.request', 'support.reply'];
-/** The mail templates this thread could have sent, newest first. Read for the
-    record, not to re-send: an operator needs to know whether the account was
-    ever told anything, and whether that mail was accepted. */
-const THREAD_EMAIL_EVENTS = ['support_request_received', 'support_request_admin', 'support_reply'];
+/** The mail this thread could have sent. The delivery log files a template
+    under `event_key` as `legacy.<template>` — its `event` column holds the
+    outcome ('sent'/'failed'), not the name, so matching on `event` would find
+    nothing and read as "no mail was ever sent". */
+const THREAD_EMAIL_KEYS = ['support_request_received', 'support_request_admin', 'support_reply']
+  .map((t) => `legacy.${t}`);
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ ref: string }> }) {
   try {
@@ -68,13 +70,39 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const userId = asked.userId ?? rows.find((r) => r.userId)?.userId ?? null;
 
     const [emails, primary] = await Promise.all([
+      /* The send log for this thread. Two doors reach the same rows: a job
+         stamped with this reference as its thread id (which is how the staff
+         copy is filed, whatever mailbox it went to), and any support mail
+         addressed to one of this account's own addresses (the confirmation and
+         the answer). A delivery row that cannot be read is not a reason to
+         lose the thread, so the whole read falls back to nothing. */
       userId
-        ? prisma.email_deliveries.findMany({
-            where: { userId, event: { in: THREAD_EMAIL_EVENTS } },
-            orderBy: { createdAt: 'desc' },
-            take: 10,
-            select: { toEmail: true, event: true, subject: true, status: true, createdAt: true, openedAt: true },
-          }).catch(() => [])
+        ? (async () => {
+            const [jobs, mailboxRows] = await Promise.all([
+              prisma.email_jobs.findMany({
+                where: { payload: { path: ['threadId'], equals: ref } },
+                select: { id: true },
+                take: 40,
+              }),
+              prisma.userEmail.findMany({ where: { userId }, select: { address: true } }),
+            ]);
+            const recipients = [...new Set([
+              ...(asked.user?.email ? [asked.user.email.toLowerCase()] : []),
+              ...mailboxRows.map((m) => m.address.toLowerCase()),
+            ])];
+            return prisma.email_deliveries.findMany({
+              where: {
+                eventKey: { in: THREAD_EMAIL_KEYS },
+                OR: [
+                  ...(jobs.length ? [{ jobId: { in: jobs.map((j) => j.id) } }] : []),
+                  ...(recipients.length ? [{ toEmail: { in: recipients } }] : []),
+                ],
+              },
+              orderBy: { createdAt: 'desc' },
+              take: 12,
+              select: { toEmail: true, eventKey: true, subject: true, status: true, createdAt: true, openedAt: true },
+            });
+          })().catch(() => [])
         : Promise.resolve([]),
       // The address an answer reaches is the account service's decision, not
       // this screen's guess — so it is read through the same function the
@@ -122,7 +150,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         })),
         emails: emails.map((e) => ({
           to: e.toEmail,
-          event: e.event,
+          event: e.eventKey.replace(/^legacy\./, ''),
           subject: e.subject,
           status: e.status,
           at: e.createdAt.toISOString(),
