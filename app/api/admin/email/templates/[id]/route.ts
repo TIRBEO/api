@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { invalidateEmailTemplate } from '@/features/email/emailCache';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'email.read');
   if (session instanceof NextResponse) return session;
 
   const { id } = await params;
@@ -14,7 +14,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 }
 
 export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'email.configure');
   if (session instanceof NextResponse) return session;
 
   const { id } = await params;
@@ -33,7 +33,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
 }
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const sess = await requireAdmin(request);
+  const sess = await requirePermission(request, 'email.configure');
   if (sess instanceof NextResponse) return sess;
 
   const { id } = await params;

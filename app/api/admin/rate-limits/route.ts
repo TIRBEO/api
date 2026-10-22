@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { getRateLimitMetrics, ROUTE_LIMITS, getRateLimitConfigForExport, getBlockRateAlerts } from '@/features/auth/rate-limit';
 import { prisma } from '@/infrastructure/db/prisma';
 import { unblockTarget } from '@/features/security/security';
 
 // GET /api/admin/rate-limits - Get rate limit metrics
 export async function GET(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'limits.read');
   if (session instanceof NextResponse) return session;
 
   const metrics = getRateLimitMetrics();
@@ -30,7 +30,7 @@ export async function GET(request: NextRequest) {
 
 // POST /api/admin/rate-limits/clear - Reset attempts for email/ip (DB + Blocklist)
 export async function POST(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'limits.manage');
   if (session instanceof NextResponse) return session;
   const body: any = await request.json().catch(()=> ({}));
   const email = typeof body.email === 'string' ? body.email.toLowerCase().trim() : '';

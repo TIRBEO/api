@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { withAdmin } from '@/features/auth/role-guard';
+import { withPermission } from '@/features/auth/permission-guard';
 import { eventRowRef } from '@/features/users/refcode';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -60,7 +60,7 @@ function account(row: Row) {
   };
 }
 
-export const GET = withAdmin(async (request) => {
+export const GET = withPermission('tickets.read', async (request) => {
   try {
     const sp = request.nextUrl.searchParams;
     const status = (sp.get('status') || 'all').toLowerCase();

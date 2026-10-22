@@ -1,16 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { prisma } from '@/infrastructure/db/prisma';
 
 export async function GET(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'limits.read');
   if (session instanceof NextResponse) return session;
   const limits = await (prisma as any).verificationLimit.findMany().catch(()=>[]);
   return NextResponse.json({ limits });
 }
 
 export async function PUT(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'limits.manage');
   if (session instanceof NextResponse) return session;
   const body:any = await request.json().catch(()=>({}));
   const { method, max, windowMs } = body;

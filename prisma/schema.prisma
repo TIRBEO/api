@@ -63,11 +63,41 @@ model User {
   pushSubscriptions  PushSubscription[]
   tipLogs            UserTipLog[]
   tirbeoIdentities   TirbeoIdentity[]
+  staffRole          StaffRole?         @relation("StaffRoleHolder")
+  grantedRoles       StaffRole[]        @relation("StaffRoleGranter")
 
   @@index([status], map: "idx_users_status")
   @@index([createdAt], map: "idx_users_created")
   @@index([lastActiveAt], map: "idx_users_last_active")
   @@map("users")
+}
+
+/**
+ * Which kind of staff an account is.
+ *
+ * `is_admin` says a person may open the console; this says what they may do in
+ * it. The role names are validated in code against the registry in
+ * `features/auth/roles.ts` rather than by a database CHECK, because adding a
+ * role is a code change anyway — a new screen has to be written for it to be
+ * worth having.
+ *
+ * One row per person, one role each. Overlapping roles would need a second
+ * table and an answer to "what does the union of these two do" that nobody has
+ * asked yet.
+ */
+model StaffRole {
+  userId    String   @id @map("user_id")
+  role      String
+  grantedBy String?  @map("granted_by")
+  note      String?
+  grantedAt DateTime @default(now()) @map("granted_at") @db.Timestamptz(6)
+
+  user          User  @relation("StaffRoleHolder", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  grantedByUser User? @relation("StaffRoleGranter", fields: [grantedBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([role], map: "idx_staff_roles_role")
+  @@index([grantedBy], map: "idx_staff_roles_granted_by")
+  @@map("staff_roles")
 }
 
 // ═══ user.profile ══════════════════════════════════════════════════

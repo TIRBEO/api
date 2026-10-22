@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { setMaintenanceMode, getMaintenanceState } from '@/infrastructure/realtime/ws/server';
 import { sendMaintenanceNotification, sendMaintenanceCompleteNotification } from '@/jobs/maintenance-notifications';
 import { createAuditEvent } from '@/features/security/audit';
 
 // GET /api/admin/maintenance - Get current maintenance status
 export async function GET(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'console.read');
   if (session instanceof NextResponse) return session;
   
   const state = getMaintenanceState();
@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
 
 // PUT /api/admin/maintenance - Update maintenance mode or schedule
 export async function PUT(request: NextRequest) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requirePermission(request, 'maintenance.manage');
   if (session instanceof NextResponse) return session;
   
   try {
@@ -180,7 +180,7 @@ export async function PUT(request: NextRequest) {
 
 // DELETE /api/admin/maintenance - Disable maintenance mode
 export async function DELETE(request: NextRequest) {
-  const session = await requireRole(request, 'super_admin');
+  const session = await requirePermission(request, 'maintenance.manage');
   if (session instanceof NextResponse) return session;
   
   const state = getMaintenanceState();

@@ -35,7 +35,7 @@ vi.mock('@/infrastructure/db/prisma', () => ({
 
 vi.mock('@/features/auth/http-guards', () => ({
   getSession: vi.fn(async () => state.session),
-  requireRole: vi.fn(async () => {
+  requirePermission: vi.fn(async () => {
     if (!state.role) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     return { userId: 'staff-1', email: 'staff@tirbeo.com', adminRole: state.role };
   }),

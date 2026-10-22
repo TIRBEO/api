@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 
 export async function analyticsHandler(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'analytics.read');
   if (session instanceof NextResponse) return session;
 
   const now = new Date();
@@ -77,7 +77,7 @@ export async function analyticsHandler(request: NextRequest) {
 
 // ─── Admin: Get users who consented to analytics + their data ─────
 export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'analytics.read');
   if (session instanceof NextResponse) return session;
 
   const url = new URL(request.url);

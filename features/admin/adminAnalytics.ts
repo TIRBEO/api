@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 
 /** GET /api/admin/analytics/overview — platform-wide counters */
 export async function adminAnalyticsOverviewHandler(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'analytics.read');
   if (session instanceof NextResponse) return session;
 
   const now = new Date();

@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { listSecurityEvents, getSecurityStats } from '@/features/security/security';
 
 export async function GET(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'security.read');
   if (session instanceof NextResponse) return session;
 
   const url = request.nextUrl;
@@ -28,7 +28,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'security.read');
   if (session instanceof NextResponse) return session;
 
   const { prisma } = await import('@/infrastructure/db/prisma');

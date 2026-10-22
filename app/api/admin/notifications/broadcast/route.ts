@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
 import { prisma } from '@/infrastructure/db/prisma';
-import { withAdmin } from '@/features/auth/role-guard';
+import { withPermission } from '@/features/auth/permission-guard';
 import { createNotification } from '@/features/notifications/notifications';
 import { sendBroadcastWs } from '@/infrastructure/realtime/ws-deliver';
 
@@ -25,7 +25,7 @@ const emailedScope = Prisma.sql`
     AND e."verified_at" IS NOT NULL`;
 
 /** Recipient count for the composer preview. */
-export const GET = withAdmin(async () => {
+export const GET = withPermission('notifications.read', async () => {
   const rows = await prisma.$queryRaw<Array<{ n: bigint }>>`
     SELECT COUNT(*)::bigint AS n ${emailedScope}`;
   return NextResponse.json({ recipients: Number(rows[0]?.n ?? 0) });
@@ -47,7 +47,7 @@ const BROADCAST_MAX = 200;
 const BROADCAST_CONCURRENCY = 8;
 const BROADCAST_DEADLINE_MS = 8_000;
 
-export const POST = withAdmin(async (request: NextRequest) => {
+export const POST = withPermission('notifications.send', async (request: NextRequest) => {
   const body: any = await request.json();
   const title = String(body.title || '').trim();
   const message = String(body.message || '').trim();

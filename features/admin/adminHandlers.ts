@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin, requireRole, canManageRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
+import { grantStaffRole, revokeStaffRole, StaffGuardError } from '@/features/auth/staff';
+import { isRoleKey, LEGACY_ROLE, ROLE_KEYS, type RoleKey } from '@/features/auth/roles';
 import { hashPassword } from '@/features/auth/password';
 import { cachedJson, jsonForbidden } from '@/shared/response';
 import { createAuditEvent } from '@/features/security/audit';
@@ -103,6 +105,17 @@ async function loadEnforcement(userIds: string[]) {
 }
 
 /**
+ * The role an account holds, read from `staff_roles` rather than from the
+ * `is_admin` switch. An account the switch made staff but nobody has assigned
+ * a kind for is still staff, and the honest label for it is the legacy role —
+ * the roster screen is where it gets named or removed.
+ */
+function staffRoleOf(u: { isAdmin?: boolean; staffRole?: { role: string } | null }): string | null {
+  if (u.staffRole && isRoleKey(u.staffRole.role)) return u.staffRole.role;
+  return u.isAdmin ? LEGACY_ROLE : null;
+}
+
+/**
  * Flatten a user row (profile/preferences/status) plus its enforcement rows
  * into the shape the admin console has always consumed — keeping the legacy
  * field names (name, photoUrl, adminRole, isBanned, isSuspended, banRefCode,
@@ -126,13 +139,14 @@ async function shapeUserRow(
   const rest = restrictions.find((r) => r.userId === u.id) || null;
   const consents = (u.preferences?.misc as any)?.consents ?? null;
   const notif = (u.preferences?.notif as any) ?? {};
+  const role = staffRoleOf(u);
   return {
     id: u.id,
     email: u.email,
     username: u.username ?? null,
     name: u.profile?.name ?? null,
     photoUrl: u.profile?.photoUrl ?? null,
-    adminRole: u.isAdmin ? 'admin' : null,
+    adminRole: role,
     isBanned: u.status === 'banned',
     isSuspended: u.status === 'suspended',
     status: statusLabel(u.status),
@@ -150,7 +164,7 @@ async function shapeUserRow(
     lastLoginAt: u.lastLoginAt,
     consents,
     notificationPreferences: notif,
-    roles: [] as string[],
+    roles: role ? [role] : [],
     signupConsent: (consents as Record<string, any> | null)?.signupConsent ?? null,
     emailOptIns: emailOptIns(notif),
   };
@@ -163,6 +177,7 @@ const ADMIN_USER_SELECT = {
   username: true,
   status: true,
   isAdmin: true,
+  staffRole: { select: { role: true } },
   createdAt: true,
   updatedAt: true,
   lastActiveAt: true,
@@ -172,7 +187,7 @@ const ADMIN_USER_SELECT = {
 } as const;
 
 export async function listUsers(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'people.read');
   if (session instanceof NextResponse) return session;
 
 
@@ -266,7 +281,7 @@ function buildUserFilters(request: NextRequest, _session: { adminRole?: string |
  * Exports ALL matching users (no pagination). Row order: last active desc.
  */
 export async function exportUsersCsv(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'people.read');
   if (session instanceof NextResponse) return session;
 
   const { findWhere } = buildUserFilters(request, session);
@@ -319,8 +334,14 @@ export async function exportUsersCsv(request: NextRequest) {
 }
 
 export async function getUserDetail(request: NextRequest, userId: string) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'people.read');
   if (session instanceof NextResponse) return session;
+
+  /* "Sessions" on an operator's own screen reads as *tokens that can act as
+     you*, so a revoked or expired row does not belong in it — and the count
+     has to be measured with the same filter, or the header says 48 while the
+     list underneath shows six. */
+  const liveSession = { revokedAt: null, expiresAt: { gt: new Date() } };
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -337,9 +358,16 @@ export async function getUserDetail(request: NextRequest, userId: string) {
       profile: { select: { name: true, photoUrl: true } },
       preferences: { select: { notif: true, misc: true } },
       security: { select: { totpEnabled: true } },
+      staffRole: {
+        select: {
+          role: true,
+          grantedAt: true,
+          note: true,
+          grantedByUser: { select: { email: true } } } },
       emails: { select: { kind: true, verifiedAt: true, isDefault: true } },
-      _count: { select: { sessions: true, notifications: true } },
+      _count: { select: { sessions: { where: liveSession }, notifications: true } },
       sessions: {
+        where: liveSession,
         select: { id: true, userAgent: true, ipAddress: true, createdAt: true, expiresAt: true },
         orderBy: { createdAt: 'desc' },
         take: 10 } } });
@@ -371,15 +399,31 @@ export async function getUserDetail(request: NextRequest, userId: string) {
     status: shaped.status,
     statusKind: shaped.statusKind,
     eventId: shaped.eventId,
-    roles: [],
+    roles: shaped.roles,
+    // Who decided this account is staff, and when. An account can only be
+    // safely changed by someone who knows whether the role on it was assigned
+    // deliberately or inherited from the old single switch.
+    staff: user.staffRole
+      ? {
+          assigned: true,
+          role: user.staffRole.role,
+          grantedAt: user.staffRole.grantedAt,
+          grantedBy: user.staffRole.grantedByUser?.email ?? null,
+          note: user.staffRole.note }
+      : { assigned: false, role: shaped.adminRole, grantedAt: null, grantedBy: null, note: null },
     signupConsent: shaped.signupConsent,
     emailOptIns: shaped.emailOptIns,
     roleAssignments: undefined });
 }
 
+/** The role half of an account write. `null` means "take it off the roster",
+ *  absent means "leave the roster alone" — the two are different answers and
+ *  the people screen sends whichever the operator actually chose. */
+const roleField = z.enum(ROLE_KEYS as [RoleKey, ...RoleKey[]]).nullable().optional();
+
 const updateUserSchema = z.object({
   displayName: z.string().min(1).optional(),
-  adminRole: z.enum(['super_admin', 'admin', 'manager', 'editor']).nullable().optional(),
+  adminRole: roleField,
   status: z.enum(['ACTIVE', 'SUSPENDED', 'BANNED']).optional() });
 
 const createUserSchema = z.object({
@@ -389,7 +433,7 @@ const createUserSchema = z.object({
   lastName: z.string().min(1).max(60).optional(),
   username: z.string().min(1).max(64).optional(),
   recoveryEmail: z.string().email().optional(),
-  adminRole: z.enum(['super_admin', 'admin', 'manager', 'editor']).nullable().optional(),
+  adminRole: roleField,
   sendEmail: z.boolean().optional() }).refine((d) => !!d.email || !!d.username, { message: 'An email or Tirbeo username is required' });
 
 function generateTemporaryPassword(length = 16): string {
@@ -416,7 +460,7 @@ function generateTemporaryPassword(length = 16): string {
 }
 
 export async function createUser(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -426,11 +470,10 @@ export async function createUser(request: NextRequest) {
   const { username, recoveryEmail, firstName, lastName, adminRole, sendEmail = true } = parsed.data;
   const name = parsed.data.name || `${firstName || ''} ${lastName || ''}`.trim() || null;
 
-  if (adminRole === 'super_admin' && session.adminRole !== 'super_admin') {
-    return jsonForbidden();
-  }
-  if (adminRole && !canManageRole(session.adminRole, adminRole)) {
-    return jsonForbidden();
+  if (adminRole) {
+    if (session.permissions['staff.manage'] !== true || session.staff.role !== 'owner') {
+      return jsonForbidden('Only an owner can create an account that is staff.');
+    }
   }
 
   // Tirbeo identity flow: username -> username@tirbeo.com is the account's
@@ -479,6 +522,14 @@ export async function createUser(request: NextRequest) {
           where: { userId_address: { userId: u.id, address: addr } },
           create: { userId: u.id, address: addr, kind: 'recovery', verifiedAt: new Date() },
           update: { kind: 'recovery', verifiedAt: new Date() } });
+      }
+      // Both halves of "this account is staff" in one transaction: the switch
+      // the rest of the product reads, and the row that says what kind. A
+      // created account with one and not the other is a role nobody can use or
+      // an unassigned admin, and neither should be possible from here.
+      if (adminRole) {
+        await tx.staffRole.create({
+          data: { userId: u.id, role: adminRole, grantedBy: session.userId, note: 'Created as staff from the people screen.' } });
       }
       return { ...u, name: name || userName, adminRole: adminRole || null };
     });
@@ -579,6 +630,10 @@ export async function createUser(request: NextRequest) {
     await tx.userEmail.create({
       data: { userId: u.id, address: email, kind: 'primary', verifiedAt: new Date(), isDefault: true } });
     await tx.userSecurity.create({ data: { userId: u.id, mustChangePw: true } });
+    if (adminRole) {
+      await tx.staffRole.create({
+        data: { userId: u.id, role: adminRole, grantedBy: session.userId, note: 'Created as staff from the people screen.' } });
+    }
     return { ...u, name: name || null, adminRole: adminRole || null };
   });
 
@@ -611,32 +666,52 @@ export async function createUser(request: NextRequest) {
 }
 
 export async function updateUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { staffRole: { select: { role: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
   const body: any = await request.json();
   const parsed = updateUserSchema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
+  // Changing which kind of staff an account is goes through the roster
+  // service, not through this handler's own update: that is where the last
+  // owner cannot be removed, and where only an owner may write at all. A
+  // `null` here means "take it off the roster", which is a different action
+  // from the field being absent.
   if (parsed.data.adminRole !== undefined) {
-    if (!canManageRole(session.adminRole, existing.isAdmin ? 'admin' : null)) {
-      return NextResponse.json({ error: 'Cannot change role of this user' }, { status: 403 });
+    if (session.permissions['staff.manage'] !== true || session.staff.role !== 'owner') {
+      return jsonForbidden('Only an owner can change who is staff and what kind.');
+    }
+    try {
+      if (parsed.data.adminRole === null) {
+        await revokeStaffRole({ userId, actorId: session.userId });
+      } else {
+        await grantStaffRole({
+          userId,
+          role: parsed.data.adminRole,
+          actorId: session.userId,
+          note: 'Changed from the people screen.' });
+      }
+    } catch (e) {
+      if (e instanceof StaffGuardError) return jsonForbidden(e.message);
+      throw e;
     }
   }
 
-  // SEC: BAN/SUSPEND is a privileged action — never let an admin act on another
-  // admin account.
+  // SEC: BAN/SUSPEND is a privileged action — one staff account is not
+  // enforced by another unless an owner says so.
   if (parsed.data.status === 'BANNED' || parsed.data.status === 'SUSPENDED') {
-    if (existing.isAdmin) {
-      return NextResponse.json({ error: 'Cannot ban or suspend a super admin' }, { status: 403 });
+    if (existing.isAdmin && session.staff.role !== 'owner') {
+      return NextResponse.json({ error: 'Only an owner can ban or suspend a staff account.' }, { status: 403 });
     }
   }
 
   const userData: any = {};
-  if (parsed.data.adminRole !== undefined) userData.isAdmin = parsed.data.adminRole != null;
   if (parsed.data.status !== undefined) {
     userData.status =
       parsed.data.status === 'BANNED' ? 'banned' :
@@ -661,6 +736,7 @@ export async function updateUser(request: NextRequest, userId: string) {
       email: true,
       status: true,
       isAdmin: true,
+      staffRole: { select: { role: true } },
       profile: { select: { name: true, photoUrl: true } } } });
 
   await createAuditEvent({
@@ -668,27 +744,41 @@ export async function updateUser(request: NextRequest, userId: string) {
     action: 'user.updated',
     targetType: 'user',
     targetId: userId,
-    metadata: { changes: parsed.data, previous: { adminRole: existing.isAdmin ? 'admin' : null } } });
+    metadata: { changes: parsed.data, previous: { adminRole: staffRoleOf(existing) } } });
 
   return NextResponse.json({
     id: updated!.id,
     email: updated!.email,
     name: updated!.profile?.name ?? null,
     photoUrl: updated!.profile?.photoUrl ?? null,
-    adminRole: updated!.isAdmin ? 'admin' : null,
+    adminRole: staffRoleOf(updated!),
     isBanned: updated!.status === 'banned',
     isSuspended: updated!.status === 'suspended',
     status: statusLabel(updated!.status) });
 }
 
 export async function deleteUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.delete');
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({
     where: { id: userId },
-    select: { email: true, profile: { select: { name: true } } } });
+    select: {
+      email: true,
+      isAdmin: true,
+      profile: { select: { name: true } },
+      staffRole: { select: { role: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+  // A staff account is a roster entry as well as a person, so removing one is
+  // an owner's call — and removing the last owner is nobody's, because the
+  // platform would then have no way to appoint anybody again.
+  if (existing.isAdmin && session.staff.role !== 'owner') {
+    return NextResponse.json({ error: 'Only an owner can delete a staff account.' }, { status: 403 });
+  }
+  if (existing.staffRole?.role === 'owner' && (await prisma.staffRole.count({ where: { role: 'owner' } })) <= 1) {
+    return NextResponse.json({ error: 'This is the last owner. Appoint another before deleting this account.' }, { status: 409 });
+  }
 
   await prisma.user.delete({ where: { id: userId } });
 
@@ -697,7 +787,11 @@ export async function deleteUser(request: NextRequest, userId: string) {
     action: 'user.deleted',
     targetType: 'user',
     targetId: userId,
-    metadata: { email: existing.email, displayName: existing.profile?.name ?? null } });
+    metadata: {
+      email: existing.email,
+      displayName: existing.profile?.name ?? null,
+      wasStaff: existing.isAdmin,
+      role: staffRoleOf(existing) } });
 
   return NextResponse.json({ error: 'User deleted' }, { status: 200 });
 }
@@ -775,14 +869,16 @@ async function liftEnforcement(userId: string, fromStatus: string, reason: strin
 }
 
 export async function banUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({
     where: { id: userId },
     select: { email: true, status: true, isAdmin: true, profile: { select: { name: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  if (existing.isAdmin) return NextResponse.json({ error: 'Cannot ban a super admin' }, { status: 403 });
+  if (existing.isAdmin && session.staff.role !== 'owner') {
+    return NextResponse.json({ error: 'Only an owner can ban a staff account.' }, { status: 403 });
+  }
 
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
@@ -814,7 +910,7 @@ export async function banUser(request: NextRequest, userId: string) {
 }
 
 export async function unbanUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
@@ -834,14 +930,16 @@ export async function unbanUser(request: NextRequest, userId: string) {
 }
 
 export async function suspendUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({
     where: { id: userId },
     select: { email: true, status: true, isAdmin: true, profile: { select: { name: true } } } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-  if (existing.isAdmin) return NextResponse.json({ error: 'Cannot suspend a super admin' }, { status: 403 });
+  if (existing.isAdmin && session.staff.role !== 'owner') {
+    return NextResponse.json({ error: 'Only an owner can suspend a staff account.' }, { status: 403 });
+  }
 
   const body: any = await request.json().catch(() => ({}));
   const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : 'No reason provided';
@@ -878,7 +976,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
 }
 
 export async function unsuspendUser(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
@@ -898,7 +996,7 @@ export async function unsuspendUser(request: NextRequest, userId: string) {
 }
 
 export async function resolveUserByRefCode(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'people.read');
   if (session instanceof NextResponse) return session;
 
   const code = (request.nextUrl.searchParams.get('code') || '').trim();
@@ -983,7 +1081,7 @@ export async function resolveUserByRefCode(request: NextRequest) {
 
 export async function seedAdminHandler(request: NextRequest) {
   // SEC: gate the seed account behind an admin session.
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'staff.manage');
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -991,6 +1089,9 @@ export async function seedAdminHandler(request: NextRequest) {
 
   if (!email || !adminRole) {
     return NextResponse.json({ error: 'email and adminRole required' }, { status: 400 });
+  }
+  if (!isRoleKey(adminRole)) {
+    return NextResponse.json({ error: `Unknown role. Expected one of: ${ROLE_KEYS.join(', ')}` }, { status: 400 });
   }
 
   if (!process.env.ADMIN_SEED_EMAIL) {
@@ -1000,31 +1101,52 @@ export async function seedAdminHandler(request: NextRequest) {
     return jsonForbidden();
   }
 
+  /* Writing a role is an owner's act everywhere else in this file, and the
+     exception is the first one: an installation that has never had staff has
+     no owner to ask, and without a door that will open unowned it can never
+     get one. The environment guard above is what makes that safe to allow —
+     the address has to be the one an operator put in the deploy config. */
+  const existingStaff = await prisma.user.count({ where: { isAdmin: true } });
+  if (existingStaff > 0 && session.staff.role !== 'owner') {
+    return jsonForbidden('Only an owner can seed a staff account.');
+  }
+
   const { hashPassword: hashPw } = await import('@/features/auth/password');
   const passwordHash = password ? await hashPw(password) : undefined;
-  const isAdmin = adminRole != null;
 
-  const existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  const existing = await prisma.user.findUnique({
+    where: { email },
+    select: { id: true, staffRole: { select: { role: true } } } });
+
   if (!existing) {
     if (!passwordHash) {
       return NextResponse.json({ error: 'A password is required when creating the seed admin' }, { status: 400 });
     }
     await prisma.$transaction(async (tx) => {
-      const u = await tx.user.create({ data: { email, passwordHash: passwordHash!, isAdmin } });
+      const u = await tx.user.create({ data: { email, passwordHash: passwordHash!, isAdmin: true } });
       await tx.userProfile.create({ data: { userId: u.id, name: email.split('@')[0] } });
+      await tx.staffRole.create({
+        data: { userId: u.id, role: adminRole, grantedBy: session.userId, note: 'Seeded from ADMIN_SEED_EMAIL.' } });
     });
-    return NextResponse.json({ message: `User ${email} created with role ${adminRole}` });
+    return NextResponse.json({ message: `User ${email} created as ${adminRole}` });
   }
 
-  await prisma.user.update({
-    where: { email },
-    data: { isAdmin, ...(passwordHash ? { passwordHash } : {}) } });
+  const userData: any = { isAdmin: true };
+  if (passwordHash) userData.passwordHash = passwordHash;
+  await prisma.$transaction([
+    prisma.user.update({ where: { email }, data: userData }),
+    prisma.staffRole.upsert({
+      where: { userId: existing.id },
+      create: { userId: existing.id, role: adminRole, grantedBy: session.userId, note: 'Seeded from ADMIN_SEED_EMAIL.' },
+      update: { role: adminRole, grantedBy: session.userId, grantedAt: new Date() } }),
+  ]);
 
-  return NextResponse.json({ message: `User ${email} promoted to ${adminRole}${password ? ' with new password' : ''}` });
+  return NextResponse.json({
+    message: `User ${email} set to ${adminRole}${existing.staffRole && existing.staffRole.role !== adminRole ? ' (was ' + existing.staffRole.role + ')' : ''}${password ? ' with new password' : ''}` });
 }
 
 export async function resetUserPassword(request: NextRequest, userId: string) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'people.manage');
   if (session instanceof NextResponse) return session;
 
   const body: any = await request.json();
@@ -1033,8 +1155,15 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
     return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
   }
 
-  const existing = await prisma.user.findUnique({ where: { id: userId } });
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, isAdmin: true } });
   if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+  // Whoever can set a staff account's password can sign in as that role, so
+  // this is the roster's business and not the people screen's.
+  if (existing.isAdmin && session.staff.role !== 'owner') {
+    return jsonForbidden('Only an owner can reset a staff account’s password.');
+  }
 
   const { hashPassword } = await import('@/features/auth/password');
   const passwordHash = await hashPassword(password);
@@ -1047,7 +1176,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
     action: 'password.reset',
     targetType: 'user',
     targetId: userId,
-    metadata: { from: 'admin_panel', resetBy: 'super_admin' } });
+    metadata: { from: 'admin_panel', resetBy: session.adminRole } });
 
   // Notify the user that their password was reset by an admin
   const { createNotification } = await import('@/features/notifications/notifications');
@@ -1068,7 +1197,7 @@ export async function resetUserPassword(request: NextRequest, userId: string) {
 
 
 export async function getStats(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'dashboard.read');
   if (session instanceof NextResponse) return session;
 
   const [userCount, auditCount, blocklistCount] = await Promise.all([
@@ -1079,9 +1208,14 @@ export async function getStats(request: NextRequest) {
 
   const adminUsers = await prisma.user.findMany({
     where: { isAdmin: true },
-    select: { id: true, email: true, profile: { select: { name: true } } } });
+    select: {
+      id: true,
+      email: true,
+      isAdmin: true,
+      staffRole: { select: { role: true } },
+      profile: { select: { name: true } } } });
 
   return cachedJson({
     counts: { users: userCount, auditEvents: auditCount, blocked: blocklistCount },
-    adminUsers: adminUsers.map(u => ({ id: u.id, email: u.email, name: u.profile?.name ?? null, adminRole: 'admin' })) }, { ttl: 15, swr: 120 });
+    adminUsers: adminUsers.map(u => ({ id: u.id, email: u.email, name: u.profile?.name ?? null, adminRole: staffRoleOf(u) })) }, { ttl: 15, swr: 120 });
 }

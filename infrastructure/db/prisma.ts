@@ -26,6 +26,13 @@ const POOL_MIN = parseInt(process.env.DATABASE_POOL_MIN || '', 10) || (process.e
 // ours), and production logs showed warm-up attempts burning 101–210s on a
 // wedged resolver before the late error was wrapped as "connection timeout".
 const boundedPoolLookup = createBoundedIpv4Lookup();
+
+/* Is there a database this process was told about at all? Warm-up, keep-alive
+ * and the pool monitor are all "make the next request faster" — with no
+ * connection string there is no next request to make faster, and their timers
+ * would be the only reason the process stays alive. */
+const DB_URL_CONFIGURED = !!(process.env.DATABASE_URL || process.env.DIRECT_DATABASE_URL);
+
 const POOL_CONFIG = {
   // Maximum number of clients in the pool.
   max: POOL_MAX,
@@ -63,6 +70,25 @@ function createPool(): Pool {
   // runtime always lives there. Migrations use DIRECT_DATABASE_URL and never
   // come through this function, so DDL is unaffected.
   let base = process.env.DATABASE_URL || process.env.DIRECT_DATABASE_URL || '';
+
+  /* A missing connection string used to become a hostname called "base".
+   *
+   * With `base` empty the assembled string was `?uselibpqcompat=true&…`, which
+   * pg reads as a *host* named `base`, so every process that imported this file
+   * — a build script included — spent its life resolving `base`, failing with
+   * ENOTFOUND, retrying, and never exiting. Vercel's 45-minute build cap was
+   * the only thing that noticed.
+   *
+   * Now: an absent URL says so once, plainly, and the pool is left to pg's own
+   * defaults with nobody knocking at the door on a timer. */
+  if (!base) {
+    console.warn(
+      '[DB-POOL] DATABASE_URL is not set in this process, so no database is reachable from it. ' +
+        'Queries will fail until it is provided (the dev server loads .env.local; a bare `npx tsx` ' +
+        'or `prisma` invocation does not).',
+    );
+  }
+
   const poolerMatch = base.match(/pooler\.supabase\.com:(\d+)/);
   if (poolerMatch && poolerMatch[1] === '5432') {
     base = base.replace('pooler.supabase.com:5432', 'pooler.supabase.com:6543');
@@ -75,7 +101,9 @@ function createPool(): Pool {
   //     mode (5432) and direct connections keep a real backend per client.
   const isTransactionPooler = /pooler\.supabase\.com:6543/.test(base);
   const pgbouncer = isTransactionPooler ? '&pgbouncer=true' : '';
-  const connectionString = `${base}${sep}uselibpqcompat=true&sslmode=require${pgbouncer}`;
+  const connectionString = base
+    ? `${base}${sep}uselibpqcompat=true&sslmode=require${pgbouncer}`
+    : undefined;
 
   const pool = new Pool({
     connectionString,
@@ -360,7 +388,7 @@ function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
   globalForPrisma.pgPool = pool;
 
   // Warm up the pool immediately (non-blocking)
-  warmPool(pool);
+  if (DB_URL_CONFIGURED) warmPool(pool);
 
   // Keep-alive: Supabase (and its pooler) closes idle connections aggressively.
   // A lightweight ping every 20s keeps the warm connections alive so requests

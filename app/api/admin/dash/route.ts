@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { getRateLimitMetrics, getBlockRateAlerts } from '@/features/auth/rate-limit';
 import { getQueryPerformanceStats } from '@/infrastructure/observability/queryMonitor';
 import { publicHealthHandler } from '@/features/observability/health';
@@ -72,7 +72,7 @@ if (!g.__adminDashCache) g.__adminDashCache = {};
 
 /** GET /api/admin/dash — full-platform realtime telemetry for the M3 dashboard */
 export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'dashboard.read');
   if (session instanceof NextResponse) return session;
 
   const rawDays = Number(request.nextUrl.searchParams.get('days')) || 14;

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { sendEmail, sendTemplateEmail } from '@/features/email/email';
 import { EMAIL_CACHE_KEYS, invalidateConfigCache, invalidateEmailTemplate } from '@/features/email/emailCache';
 import { z } from 'zod';
@@ -17,7 +17,7 @@ async function readEmailConfig(): Promise<Record<string, any>> {
 // GET /api/email/config — get current email config
 export async function emailConfigHandler(request: NextRequest) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, request.method === 'GET' ? 'email.read' : 'email.configure');
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'GET') {
@@ -97,7 +97,7 @@ function templateForUi(t: any) {
 // POST /api/email/templates — create new template
 export async function emailTemplatesHandler(request: NextRequest) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, request.method === 'GET' ? 'email.read' : 'email.configure');
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'GET') {
@@ -146,7 +146,7 @@ export async function emailTemplatesHandler(request: NextRequest) {
 // POST /api/email/test — send a test email
 export async function emailTestHandler(request: NextRequest) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, 'email.configure');
     if (session instanceof NextResponse) return session;
 
     const body: any = await request.json();
@@ -181,7 +181,7 @@ export async function emailTestHandler(request: NextRequest) {
 // GET /api/admin/emails — list sent emails (email_jobs + delivery events)
 export async function adminEmailsHandler(request: NextRequest) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, 'email.read');
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'GET') {
@@ -262,7 +262,7 @@ export async function adminEmailsHandler(request: NextRequest) {
 // POST /api/admin/emails/reply — send a reply to an existing thread
 export async function adminEmailReplyHandler(request: NextRequest) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, 'tickets.answer');
     if (session instanceof NextResponse) return session;
 
     if (request.method === 'POST') {
@@ -360,7 +360,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
 // GET /api/admin/emails/[id] — get single email details
 export async function adminEmailDetailHandler(request: NextRequest, id: string) {
   try {
-    const session = await requireAdmin(request);
+    const session = await requirePermission(request, 'email.read');
     if (session instanceof NextResponse) return session;
 
     const job = await prisma.email_jobs.findUnique({ where: { id } }).catch(() => null);

@@ -1,14 +1,14 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { listBlocks, blockTarget, unblockTarget } from '@/features/security/security';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
-  const session = await requireRole(request, 'editor');
-  if (session instanceof NextResponse) return session;
-
   const { action = [] } = await params;
   const [first] = action;
+  const session = await requirePermission(request, first === 'logs' ? 'activity.read' : 'blocklist.read');
+  if (session instanceof NextResponse) return session;
+
   if (first === 'logs') {
     const limit = Math.min(Number(request.nextUrl.searchParams.get('limit')) || 200, 1000);
     const logs = await prisma.activityEvent.findMany({ orderBy: { createdAt: 'desc' }, take: limit });
@@ -22,7 +22,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 }
 
 export async function POST(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'blocklist.manage');
   if (session instanceof NextResponse) return session;
 
   const { action = [] } = await params;
@@ -44,7 +44,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 }
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ action?: string[] }> }) {
-  const session = await requireRole(request, 'admin');
+  const session = await requirePermission(request, 'blocklist.manage');
   if (session instanceof NextResponse) return session;
 
   const { action = [] } = await params;

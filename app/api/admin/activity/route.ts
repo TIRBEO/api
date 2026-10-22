@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { withAdmin } from '@/features/auth/role-guard';
+import { withPermission } from '@/features/auth/permission-guard';
 import { eventRowRef } from '@/features/users/refcode';
 
-export const GET = withAdmin(async (request, _session) => {
+export const GET = withPermission('activity.read', async (request, _session) => {
 
   const limit = Math.min(200, Math.max(10, Number(request.nextUrl.searchParams.get('limit')) || 20));
   // Severity is a filter the console offers, so the ledger answers it here

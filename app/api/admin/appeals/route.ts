@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { withAdmin } from '@/features/auth/role-guard';
+import { withPermission } from '@/features/auth/permission-guard';
 
 /* Appeals inbox — the other side of POST /api/support/appeal.
 
@@ -20,7 +20,7 @@ import { withAdmin } from '@/features/auth/role-guard';
 
 const DECISIONS = new Set(['upheld', 'overturned']);
 
-export const GET = withAdmin(async (request) => {
+export const GET = withPermission('appeals.read', async (request) => {
   const sp = request.nextUrl.searchParams;
   const decision = (sp.get('decision') || '').trim();
   const q = (sp.get('q') || '').trim();
@@ -94,7 +94,7 @@ export const GET = withAdmin(async (request) => {
   );
 });
 
-export const PUT = withAdmin(async (request, session) => {
+export const PUT = withPermission('appeals.manage', async (request, session) => {
   const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
   const id = typeof body.id === 'string' ? body.id.trim() : '';
   const decision = typeof body.decision === 'string' ? body.decision.trim() : '';

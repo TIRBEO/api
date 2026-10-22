@@ -89,18 +89,28 @@ export function sanitizeInput(value: string, maxLength = 5000): string {
 const notificationTimestamps: Record<string, number> = {};
 const NOTIFY_THROTTLE_MS = 60_000;
 
-export async function getAdminUsers() {
-  const admins = await prisma.user.findMany({
-    where: { isAdmin: true },
-    select: {
-      id: true, username: true,
-      profile: { select: { name: true } },
-      emails: { where: { kind: 'primary' }, select: { address: true }, take: 1 },
-    },
-  });
-  return admins
-    .map(a => ({ ...a, email: a.emails[0]?.address ?? null, name: a.profile?.name ?? null, roleName: 'admin' }))
-    .filter(u => u.email);
+/**
+ * The staff an alert may go to — everyone on the roster by default, or, when a
+ * `permission` is given, only the ones whose role actually holds it.
+ *
+ * With one admin the two are indistinguishable; with five they are not, and a
+ * mail to all of them about something four of them cannot act on is how a
+ * security inbox becomes noise nobody opens. The capability, not the count,
+ * decides the recipient list.
+ */
+export async function getAdminUsers(permission?: string) {
+  // A dynamic import, not a top-level one: `features/auth/staff` pulls in the
+  // audit writer, which reaches back here for the security-event shape.
+  const { listStaff, listStaffWithPermission } = await import('@/features/auth/staff');
+  const staff = permission ? await listStaffWithPermission(permission) : await listStaff();
+  return staff
+    .filter((s) => !!s.email)
+    .map((s) => ({
+      id: s.userId,
+      email: s.email as string,
+      username: s.username,
+      name: s.name,
+      roleName: s.role ?? 'admin' }));
 }
 
 export type AdminAlert = {
@@ -215,10 +225,29 @@ export async function alertAdminPanelAttempt(
   });
 }
 
+/**
+ * Who a staff mail goes to: every account whose role holds `permission`, plus
+ * the shared mailbox this installation reads alerts in, when it named one.
+ *
+ * The shared address exists because a team of four does not want four copies of
+ * one page in four inboxes. What it must not become is the *only* address: a
+ * mailbox one person owns is undeliverable the day that person leaves, cannot be
+ * scoped to whoever is able to act, and is not a domain this platform can verify
+ * as a sender. So the alias is a copy everyone on the team can see, and the role
+ * is still what decides who is on the team.
+ */
+export async function staffRecipients(permission: string): Promise<string[]> {
+  const staff = await getAdminUsers(permission);
+  const shared = (process.env.STAFF_ALERT_EMAIL || '').trim().toLowerCase();
+  const out = new Set<string>(staff.map((s) => s.email.toLowerCase()));
+  if (shared) out.add(shared);
+  return [...out];
+}
+
 export async function notifyAdmins(input: AdminAlert): Promise<void> {
   try {
-    const admins = await getAdminUsers();
-    if (admins.length === 0) return;
+    const emails = await staffRecipients('security.read');
+    if (emails.length === 0) return;
 
     const dedupeKey = `${input.subject}:${input.details.slice(0, 80)}`;
     const now = Date.now();
@@ -227,7 +256,7 @@ export async function notifyAdmins(input: AdminAlert): Promise<void> {
     }
     notificationTimestamps[dedupeKey] = now;
 
-    const alert = await buildAdminAlert(input, admins.length);
+    const alert = await buildAdminAlert(input, emails.length);
 
     /* The alert is written down before the mail goes out, so the panel shows it
        while the inbox is still catching up. Waiting for the mail to land made
@@ -239,8 +268,8 @@ export async function notifyAdmins(input: AdminAlert): Promise<void> {
       prisma.activityEvent.create({ data: alert.row as never }).catch((e: unknown) => {
         console.error('[SECURITY] Failed to record admin alert row:', e instanceof Error ? e.message : e);
       }),
-      ...admins.map(admin =>
-        sendTemplateEmail(admin.email, 'admin_alert', alert.vars, alert.options).catch(() => {})
+      ...emails.map(email =>
+        sendTemplateEmail(email, 'admin_alert', alert.vars, alert.options).catch(() => {})
       ),
     ]);
   } catch (e) {
@@ -274,8 +303,10 @@ export async function notifyAdminsOfSupportRequest(input: {
   ip: string | null;
 }): Promise<void> {
   try {
-    const admins = await getAdminUsers();
-    if (admins.length === 0) return;
+    // Whoever can answer a request, not whoever can open the console: a
+    // moderator on holiday should not decide whether this one gets a reply.
+    const recipients = await staffRecipients('tickets.answer');
+    if (recipients.length === 0) return;
 
     const { supportSender } = await import('@/features/email/email');
     const { getApiOrigin } = await import('@/features/branding/branding');
@@ -292,8 +323,8 @@ export async function notifyAdminsOfSupportRequest(input: {
        all three, so this button goes there and quotes the code it is about. */
     const replyHref = `${dashboardUrl}/admin/tickets/${encodeURIComponent(input.refCode)}`;
 
-    await Promise.all(admins.map(admin =>
-      sendTemplateEmail(admin.email, 'support_request_admin', {
+    await Promise.all(recipients.map(email =>
+      sendTemplateEmail(email, 'support_request_admin', {
         subject: input.subject,
         senderName: input.senderName,
         contact,
@@ -870,6 +901,21 @@ export async function listSecurityEvents(options: {
     take: limit,
   };
   queryOptions.select = { id: true, userId: true, kind: true, title: true, detail: true, severity: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true };
+
+  /* `includeUser` was read by the route and then dropped on the floor, so every
+     caller that asked who an event happened to was handed a user id and nothing
+     else. An operator reading a queue of bare uuids cannot act on it, so the
+     parameter now does what its name says. */
+  if (options.includeUser !== false) {
+    queryOptions.select.user = {
+      select: {
+        email: true,
+        username: true,
+        isAdmin: true,
+        profile: { select: { name: true } },
+      },
+    };
+  }
 
   const [rows, total] = await Promise.all([
     prisma.activityEvent.findMany(queryOptions),

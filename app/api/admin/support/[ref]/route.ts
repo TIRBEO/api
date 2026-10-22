@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { eventRowRef, refCodeCandidates } from '@/features/users/refcode';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -27,7 +27,7 @@ const THREAD_EMAIL_KEYS = ['support_request_received', 'support_request_admin', 
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ ref: string }> }) {
   try {
-    const admin = await requireAdmin(request);
+    const admin = await requirePermission(request, 'tickets.read');
     if (admin instanceof NextResponse) return admin;
 
     const { ref: raw } = await params;

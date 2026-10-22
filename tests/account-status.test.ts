@@ -33,6 +33,10 @@ vi.mock('@/infrastructure/db/prisma', () => {
 vi.mock('@/features/auth/http-guards', () => ({
   getSession: vi.fn(async () => ({ userId: 'u1', email: 'e@u.dev' })),
   requireAdmin: vi.fn(async () => ({ userId: 'admin1', email: 'a@u.dev', adminRole: 'admin' })),
+  requirePermission: vi.fn(async (_request: unknown, permission: string) => ({
+    userId: 'admin1', email: 'a@u.dev', adminRole: 'admin',
+    staff: { userId: 'admin1', role: 'admin', assigned: true },
+    permissions: { [permission]: true } })),
 }));
 
 import { prisma } from '@/infrastructure/db/prisma';

@@ -8,7 +8,7 @@ import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/f
 import { createSession, setSessionCookie, clearSessionCookie, clearCsrfCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
 import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, TIRBEO_MAIL_DOMAIN, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
-import { getSession, requireRole } from '@/features/auth/http-guards';
+import { getSession, requirePermission } from '@/features/auth/http-guards';
 import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken, verifyPasswordResetToken } from '@/features/auth/jwt';
 
 import { verifyTotp } from '@/features/auth/totp';
@@ -2039,7 +2039,7 @@ export async function limitsHandler(request: NextRequest) {
       const { method, max, windowMs } = body;
       if (!method || typeof max !== 'number') return NextResponse.json({ error: 'method and max required' }, { status: 400 });
       // Admin only for PUT
-      const session = await requireRole(request as any, 'admin');
+      const session = await requirePermission(request as any, 'limits.manage');
       if (session instanceof Response) return session as any;
       const r = getRedis();
       if (!r) return NextResponse.json({ error: 'Redis unavailable' }, { status: 503 });

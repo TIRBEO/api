@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireRole } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { listBlocks, blockTarget } from '@/features/security/security';
 import { createAuditEvent } from '@/features/security/audit';
 
 export async function GET(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'blocklist.read');
   if (session instanceof NextResponse) return session;
 
   const url = request.nextUrl;
@@ -19,7 +19,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await requireRole(request, 'manager');
+  const session = await requirePermission(request, 'blocklist.manage');
   if (session instanceof NextResponse) return session;
 
   let body: {

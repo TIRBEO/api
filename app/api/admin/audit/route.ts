@@ -1,9 +1,15 @@
 import { NextResponse } from 'next/server';
-import { withAdmin } from '@/features/auth/role-guard';
-import { listAuditEvents, createAuditEvent } from '@/features/security/audit';
+import { withPermission } from '@/features/auth/permission-guard';
+import { listAuditEvents } from '@/features/security/audit';
 
-export const GET = withAdmin(async (request, _session) => {
-
+/* GET /api/admin/audit — the console's read of the trail.
+ *
+ * There is no POST here on purpose. An audit row is a record of something the
+ * platform did, written by the code that did it; a door that accepts
+ * `{action, actorId, targetId}` from the network would let any session put
+ * anything on behalf of any account, which is the one property this table
+ * exists to have. */
+export const GET = withPermission('activity.read', async (request) => {
   const sp = request.nextUrl.searchParams;
   const result = await listAuditEvents({
     limit: Number(sp.get('limit')) || 50,
@@ -16,17 +22,4 @@ export const GET = withAdmin(async (request, _session) => {
     from: sp.get('from') || undefined,
     to: sp.get('to') || undefined });
   return NextResponse.json(result);
-});
-
-export const POST = withAdmin(async (request, session) => {
-
-  const body: any = await request.json();
-  await createAuditEvent({
-    actorId: session.userId,
-    action: body.action,
-    targetType: body.targetType,
-    targetId: body.targetId,
-    metadata: body.metadata,
-    severity: body.severity });
-  return NextResponse.json({ ok: true });
 });

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { getSession, requireAdmin } from '@/features/auth/http-guards';
+import { getSession, requirePermission } from '@/features/auth/http-guards';
 import { jsonUnauthorized } from '@/shared/response';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -115,7 +115,7 @@ export async function accountStatusHandler(request: NextRequest) {
     let targetUserId = session.userId;
     const asked = new URL(request.url).searchParams.get('userId');
     if (asked && asked !== session.userId) {
-      const admin = await requireAdmin(request);
+      const admin = await requirePermission(request, 'people.read');
       if (admin instanceof NextResponse) return admin;
       targetUserId = asked;
     }
@@ -132,7 +132,7 @@ export async function accountStatusHandler(request: NextRequest) {
     return to 0). The person's own screen has no path to this value. */
 export async function adminAccountStatusHandler(request: NextRequest) {
   try {
-    const admin = await requireAdmin(request);
+    const admin = await requirePermission(request, 'people.read');
     if (admin instanceof NextResponse) return admin;
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;

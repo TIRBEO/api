@@ -196,8 +196,28 @@ export async function listAuditEvents(options: {
     prisma.activityEvent.count({ where: where as any }),
   ]);
 
+  /* The trail names an actor by id, which is the right thing to store and the
+     wrong thing to show: a console row that reads "1005d8d1-523f-…" answers
+     "who" for nobody. One batched read turns the page's distinct ids into
+     people; a null means the account is gone, and the id stays on the row so
+     the link still reaches the record. */
+  const actorIds = [...new Set(events.map((e: any) => e.userId).filter(Boolean))] as string[];
+  const actors = actorIds.length
+    ? await prisma.user.findMany({
+        where: { id: { in: actorIds } },
+        select: { id: true, email: true, username: true, profile: { select: { name: true } } } })
+    : [];
+  const actorById = new Map(actors.map((a: any) => [
+    a.id, { email: a.email, username: a.username, name: a.profile?.name ?? null }]));
+
   return {
     total, limit, offset,
-    events: events.map((e: any) => ({ ...e, ref: eventRowRef(e), action: e.kind, actorId: e.userId })),
+    events: events.map((e: any) => ({
+      ...e,
+      ref: eventRowRef(e),
+      action: e.kind,
+      actorId: e.userId,
+      actor: e.userId ? actorById.get(e.userId) ?? null : null,
+    })),
   };
 }

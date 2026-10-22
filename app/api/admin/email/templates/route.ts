@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { invalidateEmailTemplate } from '@/features/email/emailCache';
 
 export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'email.read');
   if (session instanceof NextResponse) return session;
 
   const templates = await prisma.emailTemplate.findMany({ orderBy: { slug: 'asc' } });
@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'email.configure');
   if (session instanceof NextResponse) return session;
 
   const payload: any = await request.json();

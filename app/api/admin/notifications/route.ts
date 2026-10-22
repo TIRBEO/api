@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requireAdmin, requirePermission } from '@/features/auth/http-guards';
 import { listNotifications, getUnreadCount, markAsRead, createNotification } from '@/features/notifications/notifications';
 
 export async function GET(request: NextRequest) {
@@ -27,7 +27,7 @@ export async function PUT(request: NextRequest) {
 
 // POST /api/admin/notifications — broadcast an alert to one or many users.
 export async function POST(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'notifications.send');
   if (session instanceof NextResponse) return session;
 
   let body: any;

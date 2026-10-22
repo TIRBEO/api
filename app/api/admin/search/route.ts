@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAdmin } from '@/features/auth/http-guards';
+import { requirePermission } from '@/features/auth/http-guards';
 import { prisma } from '@/infrastructure/db/prisma';
 
 const SEARCHABLE_PAGES = [
@@ -23,7 +23,7 @@ const SEARCHABLE_PAGES = [
 ];
 
 export async function GET(request: NextRequest) {
-  const session = await requireAdmin(request);
+  const session = await requirePermission(request, 'console.read');
   if (session instanceof NextResponse) return session;
 
   const q = (request.nextUrl.searchParams.get('q') || '').trim().toLowerCase();

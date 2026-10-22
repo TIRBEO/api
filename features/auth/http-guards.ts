@@ -1,19 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/infrastructure/db/prisma';
 import { createSession, revokeSession, setSessionCookie, clearSessionCookie, getSessionFromToken, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf, isSessionUnavailable } from '@/features/auth/session';
 import { COOKIE_NAME } from '@/features/auth/jwt';
 import { jsonUnauthorized, jsonForbidden, jsonSessionUnavailable } from '@/shared/response';
-
-const ROLE_HIERARCHY: Record<string, number> = {
-  editor: 1,
-  manager: 2,
-  admin: 3,
-  super_admin: 4,
-};
+import { permissionLabel, resolveStaff, type Permission, type PermissionSet, type StaffIdentity } from '@/features/auth/roles';
 
 // IP-level blocking is delegated to Cloudflare (WAF / rate rules) — the API
 // only enforces account-status blocks, so a flagged network can never lock
 // a real user out of their own account.
+
+/** A session that was accepted because of what its account is allowed to do.
+ *  `adminRole` stays the role string for callers that only ever log it; the
+ *  powers themselves are in `permissions`, resolved once per request. */
+export type StaffSession = {
+  userId: string;
+  email: string;
+  adminRole: string;
+  staff: StaffIdentity;
+  permissions: PermissionSet;
+};
 
 export async function getSession(request: NextRequest) {
   // Try cookie auth first — wrapped in try/catch so DB errors don't prevent API key fallback
@@ -68,16 +72,11 @@ export async function requireSession(request: NextRequest): Promise<{ userId: st
   return getSessionOrResponse(request);
 }
 
+/** The role key an account holds, or null when it is not staff. A legacy
+ *  `is_admin` account with no role row reads as `admin` — see roles.ts. */
 export async function getAdminRole(userId: string): Promise<string | null> {
-  try {
-    // Consolidated schema: adminRole column gone → boolean isAdmin, mapped to
-    // the legacy 'admin' role string so callers keep the same API shape.
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } });
-    return user?.isAdmin ? 'admin' : null;
-  } catch (e: any) {
-    console.error('[SESSION] getAdminRole failed:', e?.message || e);
-    return null;
-  }
+  const staff = await resolveStaff(userId);
+  return staff?.staff.role ?? null;
 }
 
 export async function isAdmin(request: NextRequest) {
@@ -89,34 +88,50 @@ export async function isAdmin(request: NextRequest) {
   return role != null;
 }
 
-export async function requireAdmin(request: NextRequest): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
+/** Any staff role, whatever it may do. Use this for a screen whose only
+ *  question is "are you on the team"; use `requirePermission` when the request
+ *  changes something. */
+export async function requireAdmin(request: NextRequest): Promise<StaffSession | NextResponse> {
   const session = await getSessionOrResponse(request);
   if (session instanceof NextResponse) return session;
-  const role = await getAdminRole(session.userId);
-  if (!role) return jsonForbidden();
-  return { ...session, adminRole: role };
+  const staff = await resolveStaff(session.userId);
+  if (!staff) return jsonForbidden();
+  return { ...session, adminRole: staff.staff.role, staff: staff.staff, permissions: staff.permissions };
 }
 
-export function roleAtLeast(userRole: string, minimumRole: string): boolean {
-  const userLevel = ROLE_HIERARCHY[userRole] || 0;
-  const minLevel = ROLE_HIERARCHY[minimumRole] || 0;
-  return userLevel >= minLevel;
-}
-
-export async function requireRole(request: NextRequest, minimumRole: string): Promise<{ userId: string; email: string; adminRole: string } | NextResponse> {
+/**
+ * The gate the console is actually built on: this request needs this power.
+ *
+ * A refusal names the permission, because "forbidden" tells a staff member
+ * nothing about what to ask an owner for, and the catalogue is short enough
+ * that the sentence is useful rather than a leak. `console.read` is implied —
+ * an account with no role row at all has no powers, so every permission check
+ * is also a staff check.
+ */
+export async function requirePermission(
+  request: NextRequest,
+  permission: Permission,
+): Promise<StaffSession | NextResponse> {
   const session = await getSessionOrResponse(request);
   if (session instanceof NextResponse) return session;
-  const userRole = await getAdminRole(session.userId);
-  if (!userRole || !roleAtLeast(userRole, minimumRole)) {
-    return jsonForbidden();
+  const staff = await resolveStaff(session.userId);
+  if (!staff) return jsonForbidden();
+  if (staff.permissions[permission] !== true) {
+    return jsonForbidden(`This needs the "${permissionLabel(permission)}" permission, which your role does not have.`);
   }
-  return { ...session, adminRole: userRole };
+  return { ...session, adminRole: staff.staff.role, staff: staff.staff, permissions: staff.permissions };
 }
 
-export function canManageRole(actorRole: string, targetRole: string | null): boolean {
-  if (actorRole === 'super_admin') return true;
-  if (actorRole === 'admin') return targetRole !== 'super_admin';
-  return false;
+/** The one power that cannot be given out by an override: the roster. Ranks
+ *  decide this rather than the permission set so that a mis-edited delta in
+ *  `app_config` cannot make somebody an owner. */
+export async function requireOwner(request: NextRequest): Promise<StaffSession | NextResponse> {
+  const session = await requirePermission(request, 'staff.manage');
+  if (session instanceof NextResponse) return session;
+  if (session.staff.role !== 'owner') {
+    return jsonForbidden('Only an owner can change the staff roster.');
+  }
+  return session;
 }
 
 export { createSession, revokeSession, setSessionCookie, clearSessionCookie, COOKIE_NAME, generateCsrfToken, setCsrfCookie, clearCsrfCookie, validateCsrf, isSessionUnavailable };

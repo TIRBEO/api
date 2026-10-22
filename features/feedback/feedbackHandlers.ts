@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
-import { getSession, requireRole } from '@/features/auth/http-guards';
+import { getSession, requirePermission } from '@/features/auth/http-guards';
 import { humanTitle } from '@/features/security/audit';
 import { getClientIp, getUserAgent } from '@/features/security/security';
 
@@ -190,7 +190,7 @@ async function ownFeedback(request: NextRequest) {
 /** GET /api/admin/feedback — staff read, newest first, paged. */
 export async function adminFeedbackHandler(request: NextRequest) {
   try {
-    const guard = await requireRole(request, 'manager');
+    const guard = await requirePermission(request, 'tickets.read');
     if (guard instanceof NextResponse) return guard;
 
     const { page, limit, skip, take } = paging(request);
