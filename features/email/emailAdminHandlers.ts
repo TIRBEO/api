@@ -307,18 +307,39 @@ export async function adminEmailReplyHandler(request: NextRequest) {
            whoever reads it next. Best-effort: a failed write must not unsend a
            mail a person is waiting on. */
         if (refCode) {
-          const recipient = await prisma.user.findFirst({
-            where: { emails: { some: { address: to.toLowerCase() } } },
-            select: { id: true } }).catch(() => null);
-          await prisma.activityEvent.create({
-            data: {
-              userId: recipient?.id ?? null,
-              kind: 'support.reply',
-              title: subject,
-              detail: `Answered ${refCode} by mail.`,
-              severity: 'info',
-              metadata: { refCode, to, byAdmin: session.userId } as never,
-            } }).catch(() => {});
+          const recipient = await prisma.user
+            .findFirst({
+              where: { emails: { some: { address: to.toLowerCase() } } },
+              select: { id: true },
+            })
+            .catch(() => null);
+          await prisma.activityEvent
+            .create({
+              data: {
+                userId: recipient?.id ?? null,
+                kind: 'support.reply',
+                title: subject,
+                detail: `Answered ${refCode} by mail.`,
+                severity: 'info',
+                metadata: { refCode, to, byAdmin: session.userId } as never,
+              },
+            })
+            .catch(() => {});
+          /* The account is told in its own app, not only by mail. A reply that
+             only lands in an inbox is a reply the person may never see — and
+             the request record on their status screen would stay "waiting on
+             us" long after somebody answered it. */
+          if (recipient?.id) {
+            const { createNotification } = await import('@/features/notifications/notifications');
+            createNotification({
+              userId: recipient.id,
+              type: 'support',
+              title: 'The team replied to your request',
+              body: html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180),
+              link: '/settings/account-status/history',
+              metadata: { refCode, subject },
+            }).catch(() => {});
+          }
         }
         return NextResponse.json({ ...result, message: 'Reply sent successfully' });
       }

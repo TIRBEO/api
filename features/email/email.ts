@@ -198,15 +198,26 @@ function fallbackSender(): string {
 }
 
 // Resend refuses to send from any domain that has not completed DNS
-// verification (403), and tirbeo.com is the only one that has. Callers and the
-// admin config both carry addresses from other hosts — `support@tirbeo.app`
-// from the self-hosted Mailcow setup is one of them — so the sender is checked
-// at the one place every send passes through rather than at each call site.
+// verification (403). Callers and the admin config both carry addresses from
+// other hosts — `support@tirbeo.app` from the self-hosted Mailcow setup is one
+// of them — so the sender is checked at the one place every send passes
+// through rather than at each call site.
+//
+// The verified set is an env list, not a single domain: an identity space can
+// move to a subdomain (`users.tirbeo.com`) without stranding the apex's brand
+// mailboxes, by listing both once the subdomain clears verification.
+function verifiedSenderDomains(): string[] {
+  return (process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com')
+    .split(/[,\s]+/)
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 function verifiedSender(address: string): string {
   const domain = (address.split('@')[1] || '').toLowerCase();
-  const verified = (process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com').toLowerCase();
-  if (domain && domain !== verified && !domain.endsWith(`.${verified}`)) {
-    console.warn(`[EMAIL] Sender domain "${domain}" is not verified on Resend — sending as "${verified}"`);
+  const verified = verifiedSenderDomains();
+  if (domain && !verified.some((v) => domain === v || domain.endsWith(`.${v}`))) {
+    console.warn(`[EMAIL] Sender domain "${domain}" is not verified on Resend — sending as "${verified[0]}"`);
     return fallbackSender();
   }
   return address;
@@ -221,21 +232,21 @@ function verifiedSender(address: string): string {
  * address under the person's display name, with Reply-To still pointing at the
  * mailbox they actually read.
  *
- * The domain has to match exactly, not merely sit underneath it: Resend
- * verifies one domain at a time and answers 403 for `handle@users.tirbeo.com`
- * until that subdomain is verified on its own, and a support mail that never
- * arrives is worse than one that shows the shared mailbox. Moving
- * TIRBEO_MAIL_DOMAIN to a verified subdomain switches this on by itself.
+ * The domain has to match a verified entry exactly, not merely sit underneath
+ * one: Resend verifies one domain at a time and answers 403 for
+ * `handle@users.tirbeo.com` until that subdomain is verified on its own, and a
+ * support mail that never arrives is worse than one that shows the shared
+ * mailbox. Listing the subdomain in EMAIL_RESEND_DOMAIN once Resend verifies it
+ * — and pointing TIRBEO_MAIL_DOMAIN at it — switches this on by itself.
  */
 export function supportSender(identity?: string | null, displayName?: string | null): { fromEmail?: string; fromName?: string } {
   const address = (identity || '').trim().toLowerCase();
   const at = address.lastIndexOf('@');
   if (at <= 0 || at === address.length - 1) return {};
   const domain = address.slice(at + 1);
-  const verified = (process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com').trim().toLowerCase();
   // Mailcow's postfix pins MAIL FROM to the authenticated mailbox and answers
   // 553 for anything else, so a per-account sender only exists in provider mode.
-  if (emailIsSmtp() || domain !== verified) return {};
+  if (emailIsSmtp() || !verifiedSenderDomains().includes(domain)) return {};
   // A display name travels into a header, and a header is where an injected
   // newline stops being a typo and starts being a second message.
   const name = (displayName || '').replace(/[\r\n"<>]/g, '').trim().slice(0, 80);

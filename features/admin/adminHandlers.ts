@@ -452,7 +452,7 @@ export async function createUser(request: NextRequest) {
       return NextResponse.json({ error: 'A user already exists for this Tirbeo email' }, { status: 409 });
     }
     if (parsed.data.email && parsed.data.email.toLowerCase() !== tirbeoEmail) {
-      return NextResponse.json({ error: 'Tirbeo accounts use username@tirbeo.com — the email is derived from the username.' }, { status: 400 });
+      return NextResponse.json({ error: `Tirbeo accounts use ${tirbeoEmailFor('username')} — the email is derived from the username.` }, { status: 400 });
     }
     const recovery = recoveryEmail ? recoveryEmail.toString().trim().toLowerCase() : undefined;
 

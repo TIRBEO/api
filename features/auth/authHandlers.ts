@@ -5,7 +5,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/features/auth/otp';
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from '@/features/auth/signup-otp';
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/features/auth/password';
-import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
+import { createSession, setSessionCookie, clearSessionCookie, clearCsrfCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
 import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, TIRBEO_MAIL_DOMAIN, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getSession, requireRole } from '@/features/auth/http-guards';
@@ -2716,14 +2716,19 @@ export async function logoutHandler(request: NextRequest) {
       logSecurityEvent({ request, userId: session.userId, eventType: 'auth.logout', severity: 'info', details: { sessionId: session.sessionId, email: session.email } }).catch(() => {});
     }
     const res = NextResponse.json({ ok: true }, { status: 200 });
-    // Pass `request` so cookies are cleared for the SAME domain they were set
-    // on (prod: .tirbeo.com). Without it the clear-cookie is host-only and the
-    // session cookie survives on other subdomains → half-logged-out state.
+    /* Pass `request` so cookies are cleared for the SAME domain they were set
+       on (prod: .tirbeo.com). Without it the clear-cookie is host-only and the
+       session cookie survives on other subdomains → half-logged-out state.
+       The CSRF token is cleared with them: it is a companion of the session,
+       and a signed-out browser that still carries one is a browser that looks
+       halfway in. A later sign-in writes a fresh token anyway. */
     clearSessionCookie(res, request);
+    clearCsrfCookie(res, request);
     return res;
   } catch {
     const res = NextResponse.json({ error: 'Logout failed' }, { status: 400 });
     clearSessionCookie(res, request);
+    clearCsrfCookie(res, request);
     return res;
   }
 }

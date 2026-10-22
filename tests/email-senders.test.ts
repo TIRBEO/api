@@ -187,4 +187,18 @@ describe('the sender line, per kind of mail', () => {
     const sender = supportSender('ada@tirbeo.com', 'Ada\r\nBcc: everyone@example.com');
     expect(sender.fromName).toBe('AdaBcc: everyone@example.com');
   });
+
+  /* The identity space can move to a subdomain without stranding the apex
+     mailboxes: the verified set is a list, and a handle becomes the sender on
+     the day Resend clears that subdomain — no sooner. */
+  it('a verified subdomain joins the list without stranding the apex mailboxes', async () => {
+    process.env.EMAIL_RESEND_DOMAIN = 'tirbeo.com,users.tirbeo.com';
+    expect(await senderOf('password_changed', { changedAt: 'today', ipAddress: '1.2.3.4' }))
+      .toBe('Tirbeo Security <security@tirbeo.com>');
+    expect(supportSender('ada@users.tirbeo.com', 'Ada L')).toEqual({ fromEmail: 'ada@users.tirbeo.com', fromName: 'Ada L' });
+  });
+
+  it('a handle on a subdomain the list does not carry yet is not a sender', async () => {
+    expect(supportSender('ada@users.tirbeo.com', 'Ada L')).toEqual({});
+  });
 });

@@ -285,9 +285,12 @@ export async function notifyAdminsOfSupportRequest(input: {
     // An account with no address on file still deserves an answer, so the one
     // action in the mail changes shape rather than going dead.
     const contact = input.replyTo || 'an address we cannot see';
-    const replyHref = input.replyTo
-      ? `mailto:${input.replyTo}?subject=${encodeURIComponent(`Re: ${input.subject} (${input.refCode})`)}`
-      : `${dashboardUrl}/support`;
+    /* Not a mailto. A reply typed into whatever mail client the alert happened
+       to be opened in answers the person but writes nothing down: no row
+       beside the request, no notification on the account, no record of the
+       answer on either side. The panel's reply box is the one door that does
+       all three, so this button goes there and quotes the code it is about. */
+    const replyHref = `${dashboardUrl}/admin/tickets/${encodeURIComponent(input.refCode)}`;
 
     await Promise.all(admins.map(admin =>
       sendTemplateEmail(admin.email, 'support_request_admin', {
@@ -302,7 +305,7 @@ export async function notifyAdminsOfSupportRequest(input: {
         message: input.message,
         dashboardUrl,
         replyHref,
-        replyLabel: input.replyTo ? `Reply to ${input.replyTo}` : 'Open the account record',
+        replyLabel: 'Answer in the admin panel',
       }, {
         ...sender,
         ...(input.replyTo ? { replyTo: input.replyTo } : {}),

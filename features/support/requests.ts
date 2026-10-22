@@ -69,7 +69,17 @@ export async function supportRequestHandler(request: NextRequest) {
     /* The ledger row is the request. The write choke point stamps its
        metadata.refCode, and reading it back from the created row — rather than
        deriving a second code — is what lets the confirmation mail, the admin
-       alert, and the account's own inbox row all quote ONE handle. */
+       alert, and the account's own inbox row all quote ONE handle.
+
+       The device and the place are written beside the message on purpose. The
+       admin screen reads this row, not the mail, so a fact that only ever
+       existed in one of them is a fact the panel can't show — which is how a
+       ticket ends up saying "an unknown device" about a message that arrived
+       from a phone in Kathmandu. */
+    const { describeDevice } = await import('@/features/notifications/notifications');
+    const { resolveLoginPlace } = await import('@/shared/geo');
+    const device = describeDevice(request.headers.get('user-agent'));
+    const place = resolveLoginPlace(request.headers);
     const row = await prisma.activityEvent.create({
       data: {
         userId: session.userId,
@@ -79,62 +89,32 @@ export async function supportRequestHandler(request: NextRequest) {
         severity: 'info',
         ipAddress: ip === 'unknown' ? null : ip,
         userAgent: request.headers.get('user-agent') || null,
-        metadata: { message, subject, channel: 'in-app' } as never,
+        metadata: {
+          message, subject, channel: 'in-app',
+          ...(device ? { device } : {}),
+          ...(place ? { location: place } : {}),
+        } as never,
       },
     });
     const { eventRowRef } = await import('@/features/users/refcode');
     const ref = eventRowRef(row);
     const receivedAt = row.createdAt ?? new Date();
-    const receivedLabel = receivedAt.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
 
-    // The account's copy: an in-app row, and the mail that carries the code.
-    const { createNotification, primaryEmailForUser } = await import('@/features/notifications/notifications');
-    await createNotification({
+    /* The answer the person is waiting for is the code, and the code exists the
+       moment the row does. Everything below — the inbox row, the confirmation
+       mail, the staff copy — answers to the record, not to the request, so it
+       runs after the reply is on its way. The provider is free to take a second
+       over a mail; the Send button is not free to wait for it. */
+    void deliverSupportRequest({
       userId: session.userId,
-      type: 'support',
-      title: subject,
-      body: message.slice(0, 180),
-      link: '/support',
-      skipEmail: true,
-      metadata: { ref, subject, channel: 'in-app' },
-    }).catch(() => {});
-
-    const email = await primaryEmailForUser(session.userId).catch(() => null);
-    if (email) {
-      const { sendTemplateEmailAfter } = await import('@/features/email/email');
-      sendTemplateEmailAfter(email, 'support_request_received', {
-        primaryEmail: email,
-        refCode: ref,
-        message,
-        ticketSubject: subject,
-        receivedAt: receivedLabel,
-      });
-    }
-
-    /* And the people on the other end of it — the same code the account was
-       just given, so one quote opens both sides. Staff read the account's own
-       identity as the sender and reply into the mailbox the person checks,
-       which for most accounts are two different addresses. */
-    const { notifyAdminsOfSupportRequest } = await import('@/features/security/security');
-    const { fetchLoginUserById, tirbeoEmailFor } = await import('@/features/identity/tirbeo');
-    const { describeDevice } = await import('@/features/notifications/notifications');
-    const { resolveLoginPlace } = await import('@/shared/geo');
-    const who = await fetchLoginUserById(session.userId).catch(() => null);
-    // The handle is the account's name here — an admin reading `gmail-address`
-    // has to open the record to find out who it belongs to.
-    const identity = who?.username ? tirbeoEmailFor(who.username) : (who?.email || null);
-    await notifyAdminsOfSupportRequest({
-      refCode: ref,
+      ref,
       subject,
       message,
-      replyTo: email || who?.email || '',
-      identity,
-      senderName: (who?.name || '').trim() || (who?.username || email || 'An account').split('@')[0],
       receivedAt,
-      device: describeDevice(request.headers.get('user-agent')),
-      location: resolveLoginPlace(request.headers),
       ip: ip === 'unknown' ? null : ip,
-    }).catch(() => {});
+      device,
+      place,
+    }).catch((err: any) => console.error('[SUPPORT/DELIVER]', err?.message || err));
 
     return NextResponse.json({
       ok: true,
@@ -146,4 +126,71 @@ export async function supportRequestHandler(request: NextRequest) {
     console.error('[SUPPORT/REQUEST]', err?.message || err);
     return NextResponse.json({ error: 'Failed to send the message' }, { status: 500 });
   }
+}
+
+/** The three copies one filing lives in, all off the response path. A failure
+    here loses a mail, never the record — the ledger row is already on file. */
+async function deliverSupportRequest(filing: {
+  userId: string;
+  ref: string;
+  subject: string;
+  message: string;
+  receivedAt: Date;
+  ip: string | null;
+  /** The two facts the row was written with, handed over rather than
+      re-derived: the mail and the ledger record must never disagree. */
+  device: string | null;
+  place: string | null;
+}) {
+  const { ref, subject, message, userId } = filing;
+  const receivedLabel = filing.receivedAt.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+
+  // The account's copy: an in-app row, and the mail that carries the code.
+  const { createNotification, primaryEmailForUser } = await import('@/features/notifications/notifications');
+  createNotification({
+    userId,
+    type: 'support',
+    title: subject,
+    body: message.slice(0, 180),
+    link: '/support',
+    skipEmail: true,
+    metadata: { ref, subject, channel: 'in-app' },
+  }).catch(() => {});
+
+  const [{ email }, who] = await Promise.all([
+    primaryEmailForUser(userId).then((e) => ({ email: e })).catch(() => ({ email: null as string | null })),
+    import('@/features/identity/tirbeo').then((m) => m.fetchLoginUserById(userId).catch(() => null)),
+  ]);
+  if (email) {
+    const { sendTemplateEmailAfter } = await import('@/features/email/email');
+    sendTemplateEmailAfter(email, 'support_request_received', {
+      primaryEmail: email,
+      refCode: ref,
+      message,
+      ticketSubject: subject,
+      receivedAt: receivedLabel,
+    });
+  }
+
+  /* And the people on the other end of it — the same code the account was
+     just given, so one quote opens both sides. Staff read the account's own
+     identity as the sender and reply into the mailbox the person checks,
+     which for most accounts are two different addresses. */
+  const { notifyAdminsOfSupportRequest } = await import('@/features/security/security');
+  const { tirbeoEmailFor } = await import('@/features/identity/tirbeo');
+  // The handle is the account's name here — an admin reading `gmail-address`
+  // has to open the record to find out who it belongs to.
+  const identity = who?.username ? tirbeoEmailFor(who.username) : (who?.email || null);
+  await notifyAdminsOfSupportRequest({
+    refCode: ref,
+    subject,
+    message,
+    replyTo: email || who?.email || '',
+    identity,
+    senderName: (who?.name || '').trim() || (who?.username || email || 'An account').split('@')[0],
+    receivedAt: filing.receivedAt,
+    device: filing.device,
+    location: filing.place,
+    ip: filing.ip,
+  });
 }

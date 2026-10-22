@@ -765,7 +765,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
         messageBlock('{{message}}', 'Their message'),
         well([
           ['Account', '{{account}}'],
-          ['Reply to', '{{contact}}'],
+          ['Answer goes to', '{{contact}}'],
           ['Received', '{{receivedAt}}'],
           ['Device', '{{device}}'],
           ['Reached from', '{{origin}}'],
@@ -773,7 +773,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
         ]),
         btn('{{replyHref}}', '{{replyLabel}}'),
         btnGhost('{{dashboardUrl}}', 'Open the dashboard'),
-        note('Quote the reference on the reply — the account sees the same code, so both sides read one record instead of two.'),
+        note('Answer from the panel — the reply writes the record beside the request and tells the account it was answered. Replying from your own mail client answers the person and leaves both screens silent.'),
       ],
     }, logo, name),
 

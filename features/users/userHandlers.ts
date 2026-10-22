@@ -1110,7 +1110,10 @@ export async function userDailyActivityHandler(request: NextRequest) {
 }
 
 /** The ledger kinds that record the owner having *asked* for something —
- *  each row was written by the action it names. */
+ *  each row was written by the action it names. A message to staff
+ *  (support.request) and the answer back (support.reply) belong here too: a
+ *  request is not an edit to the account, so it lives on the request record,
+ *  not in the change log. */
 const REQUEST_EVENT_KINDS = [
   'account.deactivated',
   'account.reactivated',
@@ -1121,6 +1124,8 @@ const REQUEST_EVENT_KINDS = [
   'security.deletion_cancelled',
   'appeal.filed',
   'account.merge',
+  'support.request',
+  'support.reply',
 ];
 
 /**
@@ -1128,9 +1133,14 @@ const REQUEST_EVENT_KINDS = [
  *
  * The "Requests and history" screen used to show only what is in force now;
  * this is the ledger behind it — downloads asked for, codes mailed, pauses,
- * closings, appeals — merged from the two places requests are actually kept:
- * the activity rows the actions write, and the export table (which carries a
- * status the activity row doesn't). Newest first, capped, read-only.
+ * closings, appeals, and messages to staff — merged from the two places
+ * requests are actually kept: the activity rows the actions write, and the
+ * export table (which carries a status the activity row doesn't). Newest
+ * first, capped, read-only.
+ *
+ * A support thread is the one kind that arrives in pairs — the question and
+ * the answer — so each is folded into one row under the reference code both
+ * mails quote. That code, not the row id, is the handle the account sees.
  */
 export async function userRequestsHandler(request: NextRequest) {
   try {
@@ -1145,7 +1155,7 @@ export async function userRequestsHandler(request: NextRequest) {
         where: { userId: session.userId, kind: { in: REQUEST_EVENT_KINDS } },
         orderBy: { createdAt: 'desc' },
         take: limit,
-        select: { id: true, kind: true, title: true, detail: true, createdAt: true },
+        select: { id: true, kind: true, title: true, detail: true, metadata: true, createdAt: true },
       }),
       prisma.dataExportRequest.findMany({
         where: { userId: session.userId },
@@ -1155,18 +1165,53 @@ export async function userRequestsHandler(request: NextRequest) {
       }),
     ]);
 
+    /* Whether a message to staff has an answer yet is decided from the ledger
+       itself, not a flag on the request: a support.reply under the same
+       reference is the answer. One thread reads as one row — the question,
+       marked answered, quoting the answer — because two rows for one
+       conversation is how a person ends up re-asking something that was
+       already replied to. */
+    const refOf = (metadata: unknown, id: string): string => {
+      const code = (metadata as Record<string, any> | null)?.refCode;
+      return (typeof code === 'string' && code.trim()) ? code.trim() : (refFromRowId(id) ?? id);
+    };
+    /** The newest answer per reference, so an answered thread says when. */
+    const answers = new Map<string, { at: string; detail: string | null; title: string }>();
+    for (const e of events) {
+      if (e.kind !== 'support.reply') continue;
+      const code = refOf(e.metadata, e.id);
+      const found = { at: e.createdAt.toISOString(), detail: e.detail ?? null, title: e.title };
+      if (!answers.has(code) || found.at > (answers.get(code) as { at: string }).at) answers.set(code, found);
+    }
+    /** Which references have their question on this page. A reply whose
+        request is here rides inside that row; a reply whose request fell out
+        of the window stays a row of its own, so no answer is ever dropped. */
+    const asked = new Set(
+      events.filter((e) => e.kind === 'support.request').map((e) => refOf(e.metadata, e.id)));
+
     const requests = [
-      ...events.map((e) => ({
-        id: e.id, kind: e.kind, title: e.title, detail: e.detail ?? null,
-        status: null as string | null, at: e.createdAt.toISOString(),
-      })),
+      ...events
+        .filter((e) => !(e.kind === 'support.reply' && asked.has(refOf(e.metadata, e.id))))
+        .map((e) => {
+          const meta = (e.metadata || {}) as Record<string, any>;
+          const ref = refOf(e.metadata, e.id);
+          const answer = e.kind === 'support.request' ? (answers.get(ref) ?? null) : null;
+          const status = e.kind === 'support.request'
+            ? (answer ? 'answered' : 'open')
+            : e.kind === 'support.reply' ? 'answered' : null;
+          return {
+            id: e.id, kind: e.kind, ref, title: e.title, detail: e.detail ?? null,
+            status,
+            answeredAt: answer?.at ?? (e.kind === 'support.reply' ? e.createdAt.toISOString() : null),
+            answer: answer ? { at: answer.at, detail: answer.detail, title: answer.title } : null,
+            at: e.createdAt.toISOString(),
+            subject: typeof meta.subject === 'string' ? meta.subject : null,
+          };
+        }),
       ...exports.map((e) => ({
-        id: e.id,
-        kind: 'data.download',
+        id: e.id, kind: 'data.download', ref: refFromRowId(e.id) ?? e.id,
         title: e.format === 'html' ? 'Data download (readable copy)' : 'Data download (JSON)',
-        detail: e.fileName,
-        status: e.status,
-        at: e.requestedAt.toISOString(),
+        detail: e.fileName, status: e.status, answeredAt: null, at: e.requestedAt.toISOString(),
       })),
     ].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, limit);
 
@@ -1190,12 +1235,16 @@ export async function userRequestsHandler(request: NextRequest) {
 const CHANGE_ANSWER_KIND = ANSWER_KIND;
 
 /** Sign-ins have their own page, and a bot check or a device sighting is not
-    something anyone edited. Everything the account *did* stays. */
+    something anyone edited. A message to staff is not an edit either — it is a
+    request, and it belongs on the account's own request record, where reading
+    it says "you asked us this", not "you changed this field". Everything the
+    account *did* stays. */
 const NOT_A_CHANGE = {
   NOT: [
     { kind: { startsWith: 'auth.' } },
     { kind: { startsWith: 'request.' } },
     { kind: { startsWith: 'device.' } },
+    { kind: { startsWith: 'support.' } },
     { kind: { contains: 'login' } },
     { kind: { contains: 'logout' } },
     { kind: CHANGE_ANSWER_KIND },

@@ -60,6 +60,22 @@ import { supportRequestHandler } from '@/features/support/requests';
 
 const LONG = 'I cannot sign in from my laptop since this morning and the recovery link never arrives.';
 
+/* The reply goes out the moment the row exists; the in-app copy, the
+   confirmation mail and the staff copy travel after it. A test that reads
+   those three has to let the delivery chain land first — waiting on the last
+   hop waits on all of them. */
+async function delivered() {
+  await vi.waitFor(() => {
+    expect(mocks.notifyAdminsOfSupportRequest).toHaveBeenCalled();
+  }, { timeout: 2000 });
+}
+
+async function file(body: unknown) {
+  const res = await supportRequestHandler(req(body));
+  await delivered();
+  return res;
+}
+
 function req(body: unknown) {
   return new Request('http://localhost/api/support/request', {
     method: 'POST',
@@ -84,7 +100,7 @@ beforeEach(() => {
 
 describe('the request', () => {
   it('files a ledger row and answers with its code', async () => {
-    const res = await supportRequestHandler(req({ subject: 'Cannot sign in', message: LONG }));
+    const res = await file({ subject: 'Cannot sign in', message: LONG });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({
@@ -102,7 +118,7 @@ describe('the request', () => {
       ...args?.data,
       metadata: { ...args?.data?.metadata, refCode: 'a1b2-c3d4-e5f6-7a8b' },
     }));
-    await supportRequestHandler(req({ message: LONG }));
+    await file({ message: LONG });
     const vars = mocks.sendTemplateEmailAfter.mock.calls[0][2] as Record<string, string>;
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(vars.refCode).toBe('a1b2-c3d4-e5f6-7a8b');
@@ -110,7 +126,7 @@ describe('the request', () => {
   });
 
   it('sends the account a confirmation that names the code and the subject', async () => {
-    await supportRequestHandler(req({ subject: 'Billing', message: LONG }));
+    await file({ subject: 'Billing', message: LONG });
     expect(mocks.sendTemplateEmailAfter).toHaveBeenCalledTimes(1);
     const [to, template, vars] = mocks.sendTemplateEmailAfter.mock.calls[0] as unknown as [string, string, Record<string, string>];
     expect(to).toBe('ada@example.com');
@@ -119,7 +135,7 @@ describe('the request', () => {
   });
 
   it('keeps the in-app copy and the staff copy under the same handle', async () => {
-    const res = await supportRequestHandler(req({ subject: 'Cannot sign in', message: LONG }));
+    const res = await file({ subject: 'Cannot sign in', message: LONG });
     const body = await res.json();
     const note = mocks.createNotification.mock.calls[0][0] as any;
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
@@ -133,7 +149,7 @@ describe('the request', () => {
      answer has to reach a mailbox — which for most accounts is not the address
      they sign in with. */
   it('hands staff the mailbox to answer into and the identity it came from', async () => {
-    await supportRequestHandler(req({ subject: 'Cannot sign in', message: LONG }));
+    await file({ subject: 'Cannot sign in', message: LONG });
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(staff.replyTo).toBe('ada@example.com');
     expect(staff.identity).toBe('ada@tirbeo.com');
@@ -142,7 +158,7 @@ describe('the request', () => {
 
   it('greets staff by the name on the account, not the address prefix', async () => {
     mocks.fetchLoginUserById.mockResolvedValueOnce({ email: 'ada@gmail.com', username: 'ada', name: null } as any);
-    await supportRequestHandler(req({ message: LONG }));
+    await file({ message: LONG });
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(staff.senderName).toBe('ada');
   });
@@ -150,14 +166,14 @@ describe('the request', () => {
   /* An admin reading `someone@gmail.com` learns nothing about the account; the
      handle is the name it goes by here, and the two are not the same row. */
   it('names the account by its handle, and the answer by its mailbox', async () => {
-    await supportRequestHandler(req({ message: LONG }));
+    await file({ message: LONG });
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(staff.identity).toBe('ada@tirbeo.com');
     expect(staff.replyTo).toBe('ada@example.com');
   });
 
   it('carries what the request arrived on, so a suspicious one can be read', async () => {
-    await supportRequestHandler(req({ message: LONG }));
+    await file({ message: LONG });
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(staff.device).toBe('device<Mozilla Chrome>');
     expect(staff.location).toBe('Kathmandu, Nepal');
@@ -166,14 +182,14 @@ describe('the request', () => {
   });
 
   it('will not let a pasted newline turn the subject into a second header', async () => {
-    await supportRequestHandler(req({ subject: 'Help\r\nBcc: everyone@example.com', message: LONG }));
+    await file({ subject: 'Help\r\nBcc: everyone@example.com', message: LONG });
     const staff = mocks.notifyAdminsOfSupportRequest.mock.calls[0][0] as any;
     expect(staff.subject).toBe('Help Bcc: everyone@example.com');
     expect(staff.subject).not.toMatch(/[\r\n]/);
   });
 
   it('defaults the subject when the message arrives without one', async () => {
-    await supportRequestHandler(req({ message: LONG }));
+    await file({ message: LONG });
     const vars = mocks.sendTemplateEmailAfter.mock.calls[0][2] as Record<string, string>;
     expect(vars.ticketSubject).toBe('A question about my account');
   });
@@ -181,7 +197,7 @@ describe('the request', () => {
   it('still files when the account has no reachable address', async () => {
     mocks.primaryEmailForUser.mockResolvedValue(null as any);
     mocks.fetchLoginUserById.mockResolvedValueOnce(null as any);
-    const res = await supportRequestHandler(req({ message: LONG }));
+    const res = await file({ message: LONG });
     expect(res.status).toBe(200);
     expect(mocks.sendTemplateEmailAfter).not.toHaveBeenCalled();
     expect(mocks.notifyAdminsOfSupportRequest).toHaveBeenCalledTimes(1);
