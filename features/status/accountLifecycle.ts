@@ -3,6 +3,7 @@ import { generateOtpCode } from '@/features/auth/otp';
 import { hashOtpCode, verifyOtpCode as verifyOtpHash } from '@/features/auth/password';
 import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
 import { addMinutes } from 'date-fns';
+import { forgetUserStatus } from '@/features/auth/user-status-cache';
 
 /**
  * Account lifecycle — the three things a person can do to their own account
@@ -262,6 +263,7 @@ export async function deactivateAccount(userId: string, opts: { keepSessionId?: 
   if (!current) throw new Error('User not found');
 
   await prisma.user.update({ where: { id: userId }, data: { status: 'deactivated' } });
+  forgetUserStatus(userId);
 
   await prisma.userDeactivation.upsert({
     where: { userId },
@@ -293,6 +295,7 @@ export async function reactivateAccount(userId: string) {
   if (!current) throw new Error('User not found');
 
   await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
+  forgetUserStatus(userId);
 
   const deactivation = await prisma.userDeactivation.findUnique({ where: { userId } }).catch(() => null);
   if (deactivation) {
@@ -479,6 +482,7 @@ export async function scheduleDeletion(userId: string, opts: { reason?: string |
   const finalAt = new Date(Date.now() + DELETION_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
   await prisma.user.update({ where: { id: userId }, data: { status: 'deletion_pending' } });
+  forgetUserStatus(userId);
 
   await prisma.userDeletionRequest.upsert({
     where: { userId },
@@ -514,6 +518,7 @@ export async function cancelDeletion(userId: string): Promise<{ ok: boolean; err
 
   await prisma.userDeletionRequest.updateMany({ where: { userId }, data: { cancelledAt: new Date() } });
   await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
+  forgetUserStatus(userId);
 
   await prisma.userStatusEvent.create({
     data: { userId, fromStatus: 'deletion_pending', toStatus: 'active', reason: 'user_cancelled_deletion', actor: 'user', metadata: {} },
@@ -596,6 +601,16 @@ export async function readAccountState(userId: string): Promise<AccountState> {
       ? { finalAt: deletionRequest.finalAt }
       : null;
 
+  /* A status the rows behind it no longer back is not a closure. Cancelling a
+     deletion and coming back from a pause each write two rows, and a read that
+     lands between them — or a status some older path left behind — would paint
+     the lock screen over an account that is open, which is what makes a
+     cancellation look like it did nothing. The clock row owns the answer. */
+  const stale =
+    (status === 'deletion_pending' && !active) ||
+    (status === 'deactivated' && (!deactivation || deactivation.resumedAt));
+  const effectiveStatus = stale ? 'active' : status;
+
   /* The closure's own facts — reason, end date, reference, the decision row —
      come from the single source of truth (features/auth/blockFacts), the same
      one the sign-in answered from, so the settings screen can never describe
@@ -604,14 +619,14 @@ export async function readAccountState(userId: string): Promise<AccountState> {
      again. For a status that is not a closure it answers null without a query,
      which is almost every account and the whole point of this round. */
   const { blockFactsFor } = await import('@/features/auth/blockFacts');
-  const facts = await blockFactsFor(userId, status, { deactivation, deletionRequest, restriction });
+  const facts = await blockFactsFor(userId, effectiveStatus, { deactivation, deletionRequest, restriction });
 
-  const deactivated = status === 'deactivated' && !!deactivation && !deactivation.resumedAt;
-  const deletionPending = status === 'deletion_pending' && !!active;
+  const deactivated = effectiveStatus === 'deactivated' && !!deactivation && !deactivation.resumedAt;
+  const deletionPending = effectiveStatus === 'deletion_pending' && !!active;
   const appealFiled = !!facts?.decisionId && appealRows.some((a) => a.restrictionId === facts.decisionId);
 
   return {
-    status,
+    status: effectiveStatus,
     blocked: !!facts,
     reason: facts?.reason ?? null,
     until: facts?.until ?? null,

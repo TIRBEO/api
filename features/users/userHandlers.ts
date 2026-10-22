@@ -9,7 +9,7 @@ import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/featur
 import { jsonUnauthorized } from '@/shared/response';
 import { imageBytesMatchType } from '@/features/media/imageSecurity';
 import { sendTemplateEmailAfter } from '@/features/email/email';
-import { createNotification, describeDevice, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs, serializedPrefsWrite } from '@/features/notifications/notifications';
+import { createNotification, describeDevice, deviceDetail, primaryEmailForUser, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs, serializedPrefsWrite } from '@/features/notifications/notifications';
 import { sanitizeInput } from '@/features/security/security';
 import { verifyMergeToken } from '@/features/auth/jwt';
 import { bustProfileCache, getOauthProviderConfig } from '@/features/auth/authHandlers';
@@ -476,7 +476,11 @@ export async function changePasswordHandler(request: NextRequest) {
       where: { userId: session.userId, NOT: { id: session.sessionId } } });
     logSecurityEvent({ request, userId: session.userId, eventType: 'security.password_changed', details: { method: 'password' } }).catch(() => {});
 
-    const userEmail = (await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } }))?.email || '';
+    /* The account's own mailbox, not its login name: for a handle account
+       `user.email` is `<handle>@tirbeo.com`, and a "your password changed"
+       warning that lands there warns nobody. */
+    const userEmail = (await primaryEmailForUser(session.userId).catch(() => null))
+      || (await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } }))?.email || '';
     if (userEmail) {
       const ip = request.headers.get('x-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
       sendTemplateEmailAfter(userEmail, 'password_changed', {
@@ -1359,7 +1363,7 @@ export async function changeAnswerHandler(request: NextRequest, changeId: string
       ? null
       : await prisma.userLogin.findFirst({
           where: { id: changeId, userId: session.userId },
-          select: { id: true, ipAddress: true, userAgent: true, method: true, success: true, createdAt: true },
+          select: { id: true, ipAddress: true, userAgent: true, method: true, location: true, success: true, createdAt: true },
         });
     if (!owned && !signIn) return NextResponse.json({ error: 'That change is not in your history' }, { status: 404 });
 
@@ -1374,9 +1378,10 @@ export async function changeAnswerHandler(request: NextRequest, changeId: string
       await reportDisputedRow({
         request,
         userId: session.userId,
+        email: session.email || null,
         rowId: changeId,
         kind: owned ? 'change' : 'signin',
-        signIn,
+        about: owned ?? signIn,
       });
     }
 
@@ -1408,31 +1413,59 @@ export async function changeAnswerHandler(request: NextRequest, changeId: string
 async function reportDisputedRow(input: {
   request: NextRequest;
   userId: string;
+  email: string | null;
   rowId: string;
   kind: 'change' | 'signin';
-  signIn: { id: string; ipAddress: string | null; userAgent: string | null; method: string | null; success: boolean; createdAt: Date } | null;
+  /** The row being disputed, from whichever ledger holds it. Everything an
+      investigator needs is on it: where it came from, when, and what it was. */
+  about: {
+    ipAddress?: string | null;
+    userAgent?: string | null;
+    location?: string | null;
+    method?: string | null;
+    title?: string | null;
+    createdAt?: Date | null;
+  } | null;
 }) {
-  const { request, userId, rowId, kind } = input;
-  const ip = input.signIn?.ipAddress || null;
-  const device = describeDevice(input.signIn?.userAgent || null);
-  const when = (input.signIn?.createdAt || new Date()).toISOString();
-  const method = input.signIn?.method || (kind === 'change' ? 'account change' : 'sign-in');
+  const { userId, rowId, kind, about } = input;
+  const ip = about?.ipAddress || null;
+  const device = deviceDetail(about?.userAgent || null);
+  const location = about?.location || null;
+  const when = (about?.createdAt || new Date()).toISOString();
+  // What the row actually was, not the kind of ledger it lives in. "Kind:
+  // account change" told an admin nothing; "Updated your profile" tells them
+  // which event to go and read.
+  const what = about?.title
+    || (kind === 'signin'
+      ? `Signed in${about?.method ? ` with ${about.method.charAt(0).toUpperCase()}${about.method.slice(1)}` : ''}`
+      : 'An account change');
 
+  // The handle a person can quote. A row id is a query parameter, not a fact
+  // about an event, and it is the code the owner's own mail already shows — the
+  // two must match or the thread cannot be joined.
+  const ref = refFromRowId(rowId) ?? rowId;
+
+  // Only the facts that exist. A line reading "Address: unknown" is not an
+  // absence of information, it is a claim that the address is the word
+  // "unknown" — and it pushes the two lines that matter off the screen.
   const details = [
-    `Row: ${rowId}`,
-    `Kind: ${kind === 'signin' ? 'sign-in' : 'account change'}`,
+    `Account: ${input.email || userId}`,
+    `What: ${what}`,
     `When: ${when}`,
-    `Method: ${method}`,
-    `Device: ${device}`,
-    `Address: ${ip || 'unknown'}`,
+    device ? `Device: ${device}` : '',
+    location ? `Location: ${location}` : '',
+    ip ? `Address: ${ip}` : '',
     `Owner said: "that wasn't me"`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
-  // The admins first — it is the one that has a human waiting.
+  // The admins first — it is the one that has a human waiting. The disputed
+  // row's own code leads the alert, because that is the code the owner was
+  // shown and the one the two of them will be quoting at each other.
   await notifyAdmins({
     subject: 'Account holder disputed a sign-in',
     message: 'The owner of an account marked a row as "that wasn\'t me".',
     details,
+    refCode: ref,
     severity: 'warning',
   }).catch(() => {});
 
@@ -1443,7 +1476,7 @@ async function reportDisputedRow(input: {
     title: 'You told us a sign-in wasn\'t you',
     body: 'We have marked that record and told the team. Change your password and end the sessions you don\'t recognise.',
     link: '/settings/login-activity',
-    metadata: { about: rowId, kind, ip, device, method, when, ref: refFromRowId(rowId) ?? rowId },
+    metadata: { about: rowId, kind, ip, device, location, when, ref },
   }).catch(() => {});
 }
 
@@ -2564,10 +2597,14 @@ export async function exportDataHandler(request: NextRequest) {
     }
     try {
       // The archive is already gathered; the notice about it must not be part of
-      // how long the download takes to start.
-      sendTemplateEmailAfter(user.email, 'export_ready', {
-        name: user.profile?.name || user.email,
-        exportedAt: exportedAt.toLocaleString() });
+      // how long the download takes to start, so the mailbox lookup rides the
+      // same deferred chain instead of awaiting before the response.
+      void primaryEmailForUser(session.userId)
+        .then((mailbox) => mailbox || user.email)
+        .then((to) => sendTemplateEmailAfter(to, 'export_ready', {
+          name: user.profile?.name || to,
+          exportedAt: exportedAt.toLocaleString() }))
+        .catch(() => {});
     } catch (err: any) {
       console.error('[EXPORT NOTICE]', err?.message || err);
     }
@@ -2724,8 +2761,11 @@ export async function deleteAccountRequestHandler(request: NextRequest) {
 
       if (email) {
         const { getDashboardBaseUrl } = await import('@/config/app-urls');
+        // No `name`: the greeting is the account's display name (or the address
+        // prefix when it has none), and the sentence below names the mailbox.
+        // Passing the address as the name greeted people with their own email.
         sendTemplateEmailAfter(email, 'account_deleted', {
-          name: email,
+          primaryEmail: email,
           dateLabel: finalAt.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
           dashboardUrl: getDashboardBaseUrl() });
       }

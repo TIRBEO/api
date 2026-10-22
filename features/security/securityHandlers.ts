@@ -1,5 +1,4 @@
 
-import { resolveLoginLocation } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
@@ -18,7 +17,7 @@ import { scorePassword, strengthLabel } from '@/features/security/password-stren
 import { generateOtpCode, storeOtp, verifyOtpCode } from '@/features/auth/otp';
 import { checkWindowLimitDB } from '@/features/captcha/risk';
 import { sendTemplateEmailAfter } from '@/features/email/email';
-import { createNotification, describeDevice, NotifType } from '@/features/notifications/notifications';
+import { createNotification, describeDevice, primaryEmailForUser, NotifType } from '@/features/notifications/notifications';
 import { bustProfileCache } from '@/features/auth/authHandlers';
 import { fetchLoginUserById, setRecoveryContact, readRecoveryContact } from '@/features/identity/tirbeo';
 import { eventRowRef, refFromRowId } from '@/features/users/refcode';
@@ -276,12 +275,18 @@ export async function totpVerifyHandler(request: NextRequest) {
     logSecurityEvent({ request, userId: session.userId, eventType: 'security.2fa_enabled', details: { method: 'totp' } }).catch(() => {});
     await notify(session.userId, 'Two-step verification enabled', 'Authenticator app two-factor is now active on your account.', undefined, 'security', true).catch(() => {});
 
-    if (session.email) {
-      sendTemplateEmailAfter(session.email, 'login_alert', {
-        name: session.email.split('@')[0],
-        location: resolveLoginLocation(request.headers),
+    /* Say what actually happened, to the address the person reads. This used to
+       send `login_alert` — a "somebody signed in" warning — to the login
+       identity, so turning the second factor on reported a stranger at the
+       door, and a handle account's mail could land where nobody sees it. */
+    const mailbox = (await primaryEmailForUser(session.userId).catch(() => null)) || session.email;
+    if (mailbox) {
+      const { getDashboardBaseUrl } = await import('@/config/app-urls');
+      sendTemplateEmailAfter(mailbox, 'two_factor_enabled', {
+        name: mailbox.split('@')[0],
         device: describeDevice(request.headers.get('user-agent')),
-        loginTime: new Date().toLocaleString() });
+        loginTime: new Date().toLocaleString(),
+        twoFactorUrl: `${getDashboardBaseUrl()}/settings/two-factor` });
     }
 
     return NextResponse.json({ ok: true, backupCodes: recoveryCodes });
@@ -368,15 +373,16 @@ export async function totpDisableHandler(request: NextRequest) {
     await notify(session.userId, 'Two-step verification disabled', 'Two-factor authentication was turned off for your account.', undefined, 'security', true).catch(() => {});
 
     const loginUser = await fetchLoginUserById(session.userId);
-    if (loginUser?.email) {
+    const offMailbox = (await primaryEmailForUser(session.userId).catch(() => null)) || loginUser?.email;
+    if (offMailbox) {
       // This used to send 'suspicious_login' — a mail that says an unfamiliar
       // device just signed in. Nobody signed in; the person changed their own
       // setting from a session they were already in. Telling somebody a stranger
       // reached their account when that is not what happened is worse than
       // staying quiet about it.
       const { getDashboardBaseUrl } = await import('@/config/app-urls');
-      sendTemplateEmailAfter(loginUser.email, 'two_factor_disabled', {
-        name: loginUser.name || loginUser.email.split('@')[0],
+      sendTemplateEmailAfter(offMailbox, 'two_factor_disabled', {
+        name: loginUser?.name || offMailbox.split('@')[0],
         device: describeDevice(request.headers.get('user-agent')),
         loginTime: new Date().toLocaleString(),
         twoFactorUrl: `${getDashboardBaseUrl()}/settings/two-factor` });

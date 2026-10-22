@@ -4,7 +4,6 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { createSession, setSessionCookie } from '@/features/auth/http-guards';
 import { verifyTemp2faToken } from '@/features/auth/jwt';
 import { verifyTotp } from '@/features/auth/totp';
-import { sendTemplateEmail } from '@/features/email/email';
 import { createNotification } from '@/features/notifications/notifications';
 
 const verifySchema = z.object({
@@ -40,12 +39,8 @@ export async function POST(request: NextRequest) {
 
     const adminRole = user.isAdmin ? 'admin' : null;
     if (!adminRole) {
-      sendTemplateEmail(user.email, 'admin_alert', {
-        subject: 'Unauthorized Admin Access Attempt',
-        message: 'A user without admin privileges attempted to access the admin panel.',
-        details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
-        dashboardUrl: (await import('@/config/app-urls')).getAdminBaseUrl(),
-      }, { rawVars: ['details'] }).catch(() => {});
+      const { alertAdminPanelAttempt } = await import('@/features/security/security');
+      void alertAdminPanelAttempt(request.headers, user.email);
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 

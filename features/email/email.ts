@@ -212,6 +212,36 @@ function verifiedSender(address: string): string {
   return address;
 }
 
+/**
+ * The address a support conversation reaches its readers from.
+ *
+ * A desk that signs every message `support@` hides the one fact the reader
+ * wants before opening it — who wrote. So when the account's own identity lives
+ * on the domain the provider accepts mail from, the request goes out as that
+ * address under the person's display name, with Reply-To still pointing at the
+ * mailbox they actually read.
+ *
+ * The domain has to match exactly, not merely sit underneath it: Resend
+ * verifies one domain at a time and answers 403 for `handle@users.tirbeo.com`
+ * until that subdomain is verified on its own, and a support mail that never
+ * arrives is worse than one that shows the shared mailbox. Moving
+ * TIRBEO_MAIL_DOMAIN to a verified subdomain switches this on by itself.
+ */
+export function supportSender(identity?: string | null, displayName?: string | null): { fromEmail?: string; fromName?: string } {
+  const address = (identity || '').trim().toLowerCase();
+  const at = address.lastIndexOf('@');
+  if (at <= 0 || at === address.length - 1) return {};
+  const domain = address.slice(at + 1);
+  const verified = (process.env.EMAIL_RESEND_DOMAIN || 'tirbeo.com').trim().toLowerCase();
+  // Mailcow's postfix pins MAIL FROM to the authenticated mailbox and answers
+  // 553 for anything else, so a per-account sender only exists in provider mode.
+  if (emailIsSmtp() || domain !== verified) return {};
+  // A display name travels into a header, and a header is where an injected
+  // newline stops being a typo and starts being a second message.
+  const name = (displayName || '').replace(/[\r\n"<>]/g, '').trim().slice(0, 80);
+  return { fromEmail: address, fromName: name || address };
+}
+
 // The emailConfig table is gone in the consolidated schema — config now lives
 // in the AppConfig row `email.config` (JSON), with env vars as the fallback.
 export async function getEmailConfig() {
@@ -331,6 +361,28 @@ export function fillUnresolvedVars(markup: string, missing: string[]): string {
     .replace(/href="[^"]*\{\{\s*([a-zA-Z0-9_]+)\s*\}\}[^"]*"/g, (whole, key: string) =>
       fill(key) ? `href="${getDashboardBaseUrl()}"` : whole)
     .replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (whole, key: string) => fill(key) ?? whole);
+}
+
+/**
+ * The subject line, in the text a person reads rather than the markup a body
+ * needs.
+ *
+ * `renderTemplate` escapes every value because it is filling HTML, and that
+ * left `Can't sign in` arriving as `Can&#39;t sign in` — an entity is meaningless
+ * in a header, where there is no parser to undo it. Undoing exactly the five
+ * entities `esc` can produce is safe by construction; collapsing newlines is not
+ * cosmetic, since a subject that reaches a header raw is a header-injection
+ * hole.
+ */
+function subjectLine(value: string): string {
+  return value
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/[\r\n]+/g, ' ')
+    .trim();
 }
 
 export async function sendEmail(
@@ -809,24 +861,51 @@ export async function sendTemplateEmail(
   // but every address must live on the verified domain until the subdomains
   // are actually verified there.
   const SECURITY_TEMPLATES = new Set([
+    'password_changed', 'suspicious_login', 'two_factor_disabled', 'two_factor_enabled', 'login_alert',
+    'account_suspended', 'account_deleted', 'account_deactivated', 'export_ready',
+  ]);
+  // A code and a warning about the account are different problems, and they
+  // read differently in an inbox before anyone opens them.
+  const CODE_TEMPLATES = new Set([
     'signup_otp', 'login_otp', 'verify_email', 'password_reset_otp', 'password_reset_otp_recovery',
-    'password_reset_link', 'magic_link', 'account_recovery', 'delete_account_otp', 'password_changed',
-    'reauth_otp', 'suspicious_login', 'two_factor_disabled', 'login_alert', 'account_suspended',
-    'account_deleted', 'export_ready',
+    'password_reset_link', 'magic_link', 'account_recovery', 'delete_account_otp', 'reauth_otp',
   ]);
   const ADMIN_TEMPLATES = new Set(['admin_alert', 'admin_test']);
+  // A conversation reads differently from a notice, and so does its sender:
+  // "Tirbeo Support" answering beats an automated name answering.
+  const SUPPORT_TEMPLATES = new Set(['support_request_received', 'support_reply', 'support_request_admin']);
   const humanMailboxTemplates = ['welcome'];
 
   const adminFrom = process.env.ADMIN_FROM_EMAIL || fallbackSender();
 
+  /* One mailbox per kind of mail, so the reader can tell what a message is
+     before opening it and a reply lands somewhere a person actually reads.
+     Env-overridable, because which mailboxes exist is a deployment question.
+
+     Only when the provider can claim them: Resend verifies a DOMAIN, so any
+     local part on it sends, while Mailcow's postfix pins MAIL FROM to the
+     authenticated mailbox and answers 553 for any other address — so in SMTP
+     mode every category collapses back to the one address we own. */
+  const alias = (envName: string, address: string): string =>
+    emailIsSmtp() ? fallbackSender() : verifiedSender(process.env[envName] || address);
+
   const DOMAIN_FROM = {
-    casual: { email: fallbackSender(), name: branding.brandName || 'Tirbeo' },
-    security: { email: fallbackSender(), name: 'Tirbeo Security' },
-    admin: { email: adminFrom, name: 'Tirbeo Admin' },
+    casual: { email: alias('EMAIL_HELLO_FROM', 'hello@tirbeo.com'), name: branding.brandName || 'Tirbeo' },
+    code: { email: alias('EMAIL_CODE_FROM', 'no-reply@tirbeo.com'), name: 'Tirbeo' },
+    security: { email: alias('EMAIL_SECURITY_FROM', 'security@tirbeo.com'), name: 'Tirbeo Security' },
+    support: { email: alias('EMAIL_SUPPORT_FROM', 'support@tirbeo.com'), name: 'Tirbeo Support' },
+    // An alert about the admin panel is a security matter with a different
+    // reader, so it comes from the same mailbox security mail does.
+    admin: { email: alias('EMAIL_ADMIN_FROM', 'security@tirbeo.com'), name: 'Tirbeo Security' },
+    // Mail a named person signs off — a welcome — carries the address the
+    // admin configured as their own, not an automated one.
+    human: { email: adminFrom, name: branding.emailFromName || branding.brandName || 'Tirbeo' },
   };
   const category = ADMIN_TEMPLATES.has(templateName) ? 'admin'
+    : SUPPORT_TEMPLATES.has(templateName) ? 'support'
+    : CODE_TEMPLATES.has(templateName) ? 'code'
     : SECURITY_TEMPLATES.has(templateName) ? 'security'
-    : humanMailboxTemplates.includes(templateName) ? 'admin'
+    : humanMailboxTemplates.includes(templateName) ? 'human'
     : 'casual';
 
   const config = await getEmailConfig();
@@ -834,7 +913,7 @@ export async function sendTemplateEmail(
   let defaultFromEmail = DOMAIN_FROM[category].email;
   let defaultFromName = DOMAIN_FROM[category].name;
 
-  if (config && category === 'security') {
+  if (config && (category === 'security' || category === 'code')) {
     // Explicit DB overrides still win when set (per-type sender customization)
     const otpSet = ['signup_otp', 'login_otp', 'verify_email'];
     const resetSet = ['password_reset_otp', 'password_reset_otp_recovery', 'password_reset_link'];
@@ -855,7 +934,12 @@ export async function sendTemplateEmail(
   const finalOptions = {
     fromEmail: options?.fromEmail || defaultFromEmail,
     fromName: options?.fromName || defaultFromName,
-    replyTo: options?.replyTo || (humanMailboxTemplates.includes(templateName) ? adminFrom : undefined),
+    // A support mail invites a reply, and the reply has to reach the mailbox a
+    // person actually reads — not whatever noreply address sent it.
+    replyTo: options?.replyTo
+      || (category === 'support' ? (process.env.SUPPORT_EMAIL || adminFrom)
+        : humanMailboxTemplates.includes(templateName) ? adminFrom
+        : undefined),
     threadId: options?.threadId,
     categoryOverride: options?.categoryOverride,
     userId: options?.userId,
@@ -903,7 +987,7 @@ export async function sendTemplateEmail(
         `[EMAIL] Template '${templateName}' sent with unresolved variables: ${missing.join(', ')}`,
       );
     }
-    return sendEmail(to, fillUnresolvedVars(subject, missing), htmlBody, { ...finalOptions, templateName });
+    return sendEmail(to, subjectLine(fillUnresolvedVars(subject, missing)), htmlBody, { ...finalOptions, templateName });
   }
 
   return { success: false, error: `Template '${templateName}' not found` };

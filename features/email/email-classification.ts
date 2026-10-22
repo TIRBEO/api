@@ -24,12 +24,21 @@ export const ESSENTIAL_TEMPLATES = new Set([
   'login_alert',
   'suspicious_login',
   'two_factor_disabled',
+  'two_factor_enabled',
   // Account
   'account_recovery',
   'account_suspended',
   'account_deleted',
+  'account_deactivated',
   'delete_account_otp',
   // Admin
   'export_ready',
   'admin_alert',
+  // Support — a conversation the reader started. Suppressing it on a switch
+  // would answer their question with silence. `support_request_admin` is the
+  // staff side of that same conversation, and an admin who muted product mail
+  // still has to see what they are being asked to answer.
+  'support_request_received',
+  'support_reply',
+  'support_request_admin',
 ]);

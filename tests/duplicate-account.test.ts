@@ -169,6 +169,7 @@ vi.mock('@/features/email/email', () => ({
 vi.mock('@/features/notifications/notifications', () => ({
   createNotification: vi.fn(async () => ({})),
   describeDevice: vi.fn(() => 'a browser'),
+  deviceDetail: vi.fn(() => 'a browser'),
   NEW_ACCOUNT_PREFS: { email: true },
 }));
 vi.mock('@/features/auth/supabase-admin', () => ({

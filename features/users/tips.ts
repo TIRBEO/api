@@ -229,8 +229,12 @@ export async function sendNextTipForUser(userId: string): Promise<boolean> {
 
     const { sendTemplateEmail } = await import('@/features/email/email');
     const { getDashboardBaseUrl } = await import('@/config/app-urls');
-    const result = await sendTemplateEmail(user.email, 'security_tip', {
-      name: user.profile?.name || user.email,
+    const { primaryEmailForUser } = await import('@/features/notifications/notifications');
+    // The mailbox the person reads, when the account has one — a tip mailed to
+    // a login handle is a tip nobody sees.
+    const to = (await primaryEmailForUser(userId).catch(() => null)) || user.email;
+    const result = await sendTemplateEmail(to, 'security_tip', {
+      name: user.profile?.name || to,
       tipTitle: tip.title,
       tipBody: tip.body,
       actionUrl: `${getDashboardBaseUrl()}${tip.path}`,
@@ -239,7 +243,7 @@ export async function sendNextTipForUser(userId: string): Promise<boolean> {
     if (!result.success) return false;
 
     await prisma.userTipLog.create({ data: { userId, tipId: tip.id } }).catch(() => {});
-    console.log(`[TIPS] Sent '${tip.id}' to ${user.email}`);
+    console.log(`[TIPS] Sent '${tip.id}' to ${to}`);
     return true;
   } catch (err: any) {
     console.error('[TIPS] sendNextTipForUser failed:', err?.message);

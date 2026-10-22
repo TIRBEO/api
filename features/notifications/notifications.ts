@@ -52,22 +52,33 @@ interface CreateNotifInput {
 
 const on = (v: boolean | null | undefined) => v !== false; // default ON
 
-/** Human-readable device string from a raw user-agent, e.g. "Chrome on Windows". */
-export function describeDevice(ua?: string | null): string {
-  if (!ua) return 'an unknown device';
+/** What a raw user-agent actually identifies, e.g. "Chrome on Windows".
+ *  `null` when it identifies nothing — an alert line built on this drops the
+ *  row instead of printing "unknown" for a fact the request never carried. */
+export function deviceDetail(ua?: string | null): string | null {
+  if (!ua) return null;
   const browser = /edg\//i.test(ua) ? 'Edge'
     : /opr\/|opera/i.test(ua) ? 'Opera'
     : /chrome|crios/i.test(ua) ? 'Chrome'
     : /firefox|fxios/i.test(ua) ? 'Firefox'
     : /safari/i.test(ua) ? 'Safari'
-    : 'Browser';
+    : '';
   const os = /windows/i.test(ua) ? 'Windows'
     : /android/i.test(ua) ? 'Android'
     : /iphone|ipad|ipod/i.test(ua) ? 'iOS'
     : /mac os x|macintosh/i.test(ua) ? 'macOS'
+    : /cros/i.test(ua) ? 'ChromeOS'
     : /linux/i.test(ua) ? 'Linux'
-    : 'Unknown OS';
-  return `${browser} on ${os}`;
+    : '';
+  if (browser && os) return `${browser} on ${os}`;
+  if (browser) return browser;
+  if (os) return `${os} device`;
+  return null;
+}
+
+/** Same words, but always sayable — for a sentence a person reads. */
+export function describeDevice(ua?: string | null): string {
+  return deviceDetail(ua) ?? 'an unrecognized device';
 }
 
 export function getClientIpFromRequest(request: { headers: Headers }): string {
@@ -77,18 +88,26 @@ export function getClientIpFromRequest(request: { headers: Headers }): string {
   try { return request.headers.get('cf-connecting-ip') || ''; } catch { return ''; }
 }
 
-/** The user's best contact email: their Tirbeo identity when they have one,
- *  otherwise the primary/default row from user_email (mirrors the
- *  userEmailForSession pattern in features/auth/session.ts). */
+/** Where a mail to this person actually lands.
+ *
+ *  The identity address (`<handle>@tirbeo.com`) is a login name first and a
+ *  mailbox second — so sending a security notice or a support answer there
+ *  means sending it to whatever the mail system happens to do with that name,
+ *  not to the person. The account's own mailbox row wins: the default,
+ *  verified address they signed up with and read. The identity address stays
+ *  as the fallback, because for an account with no external row it is the only
+ *  address there is. */
 export async function primaryEmailForUser(userId: string): Promise<string | null> {
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { username: true } }).catch(() => null);
-  if (user?.username) return tirbeoEmailFor(user.username);
-  const row = await prisma.userEmail.findFirst({
+  const rows = await prisma.userEmail.findMany({
     where: { userId },
     orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }],
-    select: { address: true },
-  }).catch(() => null);
-  return row?.address || null;
+    select: { address: true, verifiedAt: true },
+    take: 5,
+  }).catch(() => [] as Array<{ address: string; verifiedAt: Date | null }>);
+  const mailbox = rows.find((r) => r.verifiedAt) ?? rows[0];
+  if (mailbox?.address) return mailbox.address;
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { username: true } }).catch(() => null);
+  return user?.username ? tirbeoEmailFor(user.username) : null;
 }
 
 /** Per-user notification rate-limit: 10/min via Redis `notif:${userId}:` (Upstash). Falls back to allow if Redis unavailable. */

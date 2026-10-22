@@ -5,7 +5,8 @@ import { sendTemplateEmail } from '@/features/email/email';
 import { getBranding } from '@/features/branding/branding';
 import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { resolveLoginPlace, resolveLoginCoords } from '@/shared/geo';
-import { refCodeCandidates } from '@/features/users/refcode';
+import { refCodeCandidates, generateEventId, refFromRowId } from '@/features/users/refcode';
+import { factPlate } from '@/features/email/email-fragments';
 
 export type SecuritySeverity = 'info' | 'warning' | 'error' | 'critical';
 
@@ -102,12 +103,119 @@ export async function getAdminUsers() {
     .filter(u => u.email);
 }
 
-export async function notifyAdmins(input: {
+export type AdminAlert = {
   subject: string;
   message: string;
   details: string;
   severity?: SecuritySeverity;
-}): Promise<void> {
+  /** The incident's own handle, when one exists — the code the account was
+     shown, the reference on the request being reported. Passing it means the
+     alert row carries that code too, so one quote answers with both sides of
+     the same incident instead of opening a second, unrelated one. */
+  refCode?: string | null;
+};
+
+/**
+ * The mail's variables and the log row's metadata, built once from an alert.
+ *
+ * The reference is minted here and goes into BOTH — that is the whole point of
+ * it. A code a mail shows that the log does not carry is a code nobody can look
+ * up, and the details are rendered from the caller's `Label: value` lines into
+ * the plate the admin reads, so what lands in the inbox is the same set of facts
+ * the row keeps.
+ */
+async function buildAdminAlert(input: AdminAlert, recipients: number) {
+  const { getApiOrigin } = await import('@/features/branding/branding');
+  const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
+  const branding = await getBranding();
+  const refCode = input.refCode?.trim() || generateEventId('system');
+  const severity = input.severity || 'warning';
+
+  return {
+    refCode,
+    vars: {
+      // The severity is the log's business, not the subject line's. A reader
+      // opening `[warning] Account holder disputed a sign-in` has to parse a
+      // label before the sentence, and every alert is a warning to somebody.
+      subject: input.subject,
+      refCode,
+      message: input.message,
+      details: factPlate(await detailRows(input.details)),
+      dashboardUrl,
+      brandName: branding.brandName,
+      logoUrl: branding.logoUrl,
+    },
+    // No sender override here: an admin alert is security mail, and the
+    // mailbox and name the security category gives it (security@tirbeo.com,
+    // "Tirbeo Security") is exactly what should show in the admin's inbox.
+    options: { rawVars: ['details'] },
+    row: {
+      kind: 'admin.alert',
+      title: input.subject,
+      detail: input.message,
+      severity,
+      metadata: {
+        message: input.message,
+        details: input.details,
+        severity,
+        refCode,
+        notifiedAdmins: recipients,
+        dashboardUrl,
+      },
+    },
+  };
+}
+
+/**
+ * One admin-facing mail to one named address — the alert's shape for a mail that
+ * goes to a person rather than to the whole admin list. The row is written with
+ * the code, so the address it was sent to can quote something findable.
+ */
+export async function sendAdminAlert(to: string, input: AdminAlert): Promise<void> {
+  try {
+    const alert = await buildAdminAlert(input, 1);
+    await Promise.all([
+      prisma.activityEvent.create({ data: alert.row as never })
+        .catch((e: unknown) => console.error('[SECURITY] Failed to record admin alert row:', e instanceof Error ? e.message : e)),
+      sendTemplateEmail(to, 'admin_alert', alert.vars, alert.options).catch(() => {}),
+    ]);
+  } catch (e) {
+    console.error('[SECURITY] Failed to send admin alert:', e instanceof Error ? e.message : e);
+  }
+}
+
+/**
+ * Someone reached the admin panel without the right to be there.
+ *
+ * Three doors can refuse that way — the password step, the 2FA step, and the
+ * session refresh — and each had written its own list of facts, so one said the
+ * device and another said only an IP. One builder means every refusal arrives
+ * with the same thing an admin needs to decide: whose account, when, on what,
+ * from where.
+ */
+export async function alertAdminPanelAttempt(
+  headers: Headers,
+  email: string,
+): Promise<void> {
+  const { deviceDetail } = await import('@/features/notifications/notifications');
+  const ip = (headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  const device = deviceDetail(headers.get('user-agent'));
+  const place = resolveLoginPlace(headers);
+  await sendAdminAlert(email, {
+    subject: 'Admin panel access attempt',
+    message: 'An account without admin rights reached the admin panel and was refused.',
+    details: [
+      `Account: ${email}`,
+      `When: ${new Date().toISOString()}`,
+      device ? `Device: ${device}` : '',
+      place ? `Location: ${place}` : '',
+      ip ? `Address: ${ip}` : '',
+    ].filter(Boolean).join('\n'),
+    severity: 'warning',
+  });
+}
+
+export async function notifyAdmins(input: AdminAlert): Promise<void> {
   try {
     const admins = await getAdminUsers();
     if (admins.length === 0) return;
@@ -119,14 +227,7 @@ export async function notifyAdmins(input: {
     }
     notificationTimestamps[dedupeKey] = now;
 
-    const { getApiOrigin } = await import('@/features/branding/branding');
-    const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
-    const branding = await getBranding();
-
-    const htmlDetails = input.details
-      .split('\n')
-      .map(l => `<p style="margin:2px 0;font-size:13px;color:#5f6368;">${l.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c])}</p>`)
-      .join('');
+    const alert = await buildAdminAlert(input, admins.length);
 
     /* The alert is written down before the mail goes out, so the panel shows it
        while the inbox is still catching up. Waiting for the mail to land made
@@ -134,39 +235,86 @@ export async function notifyAdmins(input: {
        one screen an operator is watching is the one that was slowest. The two
        run side by side, and a failed write never blocks the mail — the row is
        the fast copy, the mail is the one that reaches a phone. */
-    const writeAlertRow = prisma.activityEvent.create({
-      data: {
-        kind: 'admin.alert',
-        title: input.subject,
-        detail: input.message,
-        severity: input.severity || 'warning',
-        metadata: {
-          message: input.message,
-          details: input.details,
-          severity: input.severity || 'warning',
-          notifiedAdmins: admins.length,
-          dashboardUrl,
-        } as never,
-      },
-    }).catch((e: unknown) => {
-      console.error('[SECURITY] Failed to record admin alert row:', e instanceof Error ? e.message : e);
-    });
-
     await Promise.all([
-      writeAlertRow,
+      prisma.activityEvent.create({ data: alert.row as never }).catch((e: unknown) => {
+        console.error('[SECURITY] Failed to record admin alert row:', e instanceof Error ? e.message : e);
+      }),
       ...admins.map(admin =>
-        sendTemplateEmail(admin.email, 'admin_alert', {
-          subject: `[${input.severity || 'alert'}] ${input.subject}`,
-          message: input.message,
-          details: htmlDetails,
-          dashboardUrl,
-          brandName: branding.brandName,
-          logoUrl: branding.logoUrl,
-        }, { fromName: branding.emailFromName, rawVars: ['details'] }).catch(() => {})
+        sendTemplateEmail(admin.email, 'admin_alert', alert.vars, alert.options).catch(() => {})
       ),
     ]);
   } catch (e) {
     console.error('[SECURITY] Failed to notify admins:', e instanceof Error ? e.message : e);
+  }
+}
+
+/**
+ * Staff's copy of a support request — a conversation, not an alert.
+ *
+ * The request already has its record: the ledger row the handler wrote, under
+ * the code the account was just quoted. What the mail has to do is make the
+ * answer possible from the inbox — the message in full, whose account it is,
+ * where a reply reaches them, and what it arrived on — so it goes out on the
+ * request's own template and writes no second row. The generic alert made this
+ * mail a blob of `Label:` lines under somebody else's headline.
+ */
+export async function notifyAdminsOfSupportRequest(input: {
+  refCode: string;
+  subject: string;
+  message: string;
+  /** Where an answer has to go — the mailbox the person actually reads. */
+  replyTo: string;
+  /** The address the account signs in with: the sender when the provider will
+      accept it, the Account row when it will not. */
+  identity: string | null;
+  senderName: string;
+  receivedAt: Date;
+  device: string | null;
+  location: string | null;
+  ip: string | null;
+}): Promise<void> {
+  try {
+    const admins = await getAdminUsers();
+    if (admins.length === 0) return;
+
+    const { supportSender } = await import('@/features/email/email');
+    const { getApiOrigin } = await import('@/features/branding/branding');
+    const sender = supportSender(input.identity, input.senderName);
+    const origin = [input.ip, input.location].filter(Boolean).join(' · ');
+    const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
+    // An account with no address on file still deserves an answer, so the one
+    // action in the mail changes shape rather than going dead.
+    const contact = input.replyTo || 'an address we cannot see';
+    const replyHref = input.replyTo
+      ? `mailto:${input.replyTo}?subject=${encodeURIComponent(`Re: ${input.subject} (${input.refCode})`)}`
+      : `${dashboardUrl}/support`;
+
+    await Promise.all(admins.map(admin =>
+      sendTemplateEmail(admin.email, 'support_request_admin', {
+        subject: input.subject,
+        senderName: input.senderName,
+        contact,
+        account: input.identity || contact,
+        receivedAt: input.receivedAt.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+        device: input.device || 'Not recorded',
+        origin: origin || 'Not recorded',
+        refCode: input.refCode,
+        message: input.message,
+        dashboardUrl,
+        replyHref,
+        replyLabel: input.replyTo ? `Reply to ${input.replyTo}` : 'Open the account record',
+      }, {
+        ...sender,
+        ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+        threadId: input.refCode,
+        // Staff's own queue is not a marketing channel: an admin who muted
+        // product mail still has to see the message they are being asked to
+        // answer.
+        skipSuppression: true,
+      }).catch(() => {}),
+    ));
+  } catch (e) {
+    console.error('[SECURITY] Failed to notify admins of a support request:', e instanceof Error ? e.message : e);
   }
 }
 
@@ -316,8 +464,95 @@ export function humanizeEventType(type: string): string {
 function buildDetailsString(parts: Record<string, unknown>): string {
   return Object.entries(parts)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
-    .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+    .map(([k, v]) => `${k}: ${stringify(v)}`)
     .join('\n');
+}
+
+function stringify(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'object') {
+    // A JSON dump reads as noise at mail width. Flatten one level into pairs,
+    // which is what the alert plate renders anyway.
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.length ? entries.map(([k, v]) => `${k}=${stringify(v)}`).join(', ') : '';
+  }
+  return String(value);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// THE ADMIN'S READ — labels, values, and what is worth showing at all
+// ═══════════════════════════════════════════════════════════════════
+//
+// An alert mail is one screen a person scans on a phone in a corridor. The row
+// in the log keeps every raw field; the mail shows what a human can act on:
+// labelled lines, a date a date looks like, an address instead of an id, and
+// nothing where the log had nothing.
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ISO_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const NOT_A_VALUE = new Set(['unknown', 'an unknown device', 'an unrecognized device', 'anonymous', 'null', 'undefined', 'n/a', 'none', 'not given', '-']);
+
+/** `user_agent` → `User agent`, `ipAddress` → `Ip address`, and a line that
+    was never labelled gets no label rather than a invented one. */
+function labelize(key: string): string {
+  const spaced = key
+    .replace(/[_-]+/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!spaced) return '';
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+function humanizeValue(raw: string): string {
+  const value = raw.trim();
+  if (!value) return '';
+  if (NOT_A_VALUE.has(value.toLowerCase())) return '';
+  if (ISO_SHAPE.test(value) || /^\d{13}$/.test(value)) {
+    const when = new Date(value);
+    if (!Number.isNaN(when.getTime())) {
+      return when.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+    }
+  }
+  if (value === 'true' || value === 'false') return value === 'true' ? 'yes' : 'no';
+  return value;
+}
+
+/** A uuid is a handle for a query, not a fact about a person. Name the account
+    it belongs to when one exists; otherwise the code the panel shows for the
+    row, which is at least short enough to read aloud. */
+async function readableId(value: string, cache: Map<string, string>): Promise<string> {
+  if (cache.has(value)) return cache.get(value)!;
+  let out = '';
+  try {
+    const found = await prisma.user.findUnique({
+      where: { id: value },
+      select: {
+        profile: { select: { name: true } },
+        emails: { where: { kind: 'primary' }, select: { address: true }, take: 1 },
+      } });
+    const address = found?.emails?.[0]?.address;
+    if (address) out = found?.profile?.name ? `${found.profile.name} (${address})` : address;
+  } catch { /* fall through to the row-code form */ }
+  if (!out) out = refFromRowId(value) ?? value;
+  cache.set(value, out);
+  return out;
+}
+
+async function detailRows(details: string): Promise<Array<[string, string]>> {
+  const cache = new Map<string, string>();
+  const rows: Array<[string, string]> = [];
+  for (const line of String(details || '').split('\n')) {
+    if (!line.trim()) continue;
+    const at = line.indexOf(':');
+    const label = at === -1 ? '' : labelize(line.slice(0, at));
+    const raw = at === -1 ? line : line.slice(at + 1);
+    const value = UUID_SHAPE.test(raw.trim())
+      ? humanizeValue(await readableId(raw.trim(), cache))
+      : humanizeValue(raw);
+    if (value) rows.push([label || 'Detail', value]);
+  }
+  return rows;
 }
 
 // ─── Blocklist management (IP / user / target blocks) ───

@@ -7,8 +7,15 @@ import type { UserStatusKind } from '@prisma/client';
 //   - user_email (primary)    the login address (username@tirbeo.com or an
 //                             external email for accounts without a handle)
 //   - user_email (recovery)   contact/recovery address — NEVER a login identity
+//
+// The domain is one environment value (TIRBEO_MAIL_DOMAIN) because it is a
+// property of the mail system, not of the product: moving handles to
+// username@users.tirbeo.com is a DNS/Mailcow decision, and every identity,
+// login parse and mailbox derivation below follows it from here. It must be set
+// to the same value in every app that reads a handle.
 
-export const TIRBEO_MAIL_DOMAIN = 'tirbeo.com';
+export const TIRBEO_MAIL_DOMAIN = (process.env.TIRBEO_MAIL_DOMAIN || 'tirbeo.com')
+  .trim().toLowerCase().replace(/^@+/, '');
 export const TIRBEO_MAIL_DOMAIN_LITE = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?$/;
 export const USERNAME_RE = /^[a-z0-9](?:[a-z0-9._-]*[a-zA-Z0-9])?$/;
 

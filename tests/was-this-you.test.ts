@@ -53,7 +53,8 @@ vi.mock('@/features/security/security', () => ({
 }));
 vi.mock('@/features/notifications/notifications', () => ({
   createNotification: mocks.createNotification,
-  describeDevice: (ua?: string | null) => (ua ? `device<${ua}>` : 'an unknown device'),
+  describeDevice: (ua?: string | null) => (ua ? `device<${ua}>` : 'an unrecognized device'),
+  deviceDetail: (ua?: string | null) => (ua ? `device<${ua}>` : null),
   getClientIpFromRequest: () => null,
   loadNotificationPrefs: vi.fn(async () => ({})),
   saveNotificationPrefs: vi.fn(async () => {}),
@@ -243,8 +244,11 @@ describe('POST /api/user/changes/:id/answer', () => {
     expect(mocks.notifyAdmins).toHaveBeenCalledTimes(1);
     const alert = mocks.notifyAdmins.mock.calls[0][0] as any;
     expect(alert.severity).toBe('warning');
-    expect(alert.details).toContain('login-9');
+    // The handle travels as the alert's own reference, not as a line of the
+    // dump — one code, matching the one already shown to the owner.
+    expect(alert.refCode).toBe('login-9');
     expect(alert.details).toContain('203.0.113.9');
+    expect(alert.details).not.toContain('Row:');
     // The owner: in their own inbox, as a security answer.
     expect(mocks.createNotification).toHaveBeenCalledTimes(1);
     const note = mocks.createNotification.mock.calls[0][0] as any;

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin } from '@/features/auth/http-guards';
-import { sendEmail } from '@/features/email/email';
+import { sendEmail, sendTemplateEmail } from '@/features/email/email';
 import { EMAIL_CACHE_KEYS, invalidateConfigCache, invalidateEmailTemplate } from '@/features/email/emailCache';
 import { z } from 'zod';
 
@@ -273,20 +273,53 @@ export async function adminEmailReplyHandler(request: NextRequest) {
         html: z.string().min(1),
         threadId: z.string().optional(),
         replyTo: z.string().email().optional(),
+        /* The request this answers, quoted the way the person quoted it. With a
+           reference the reply is the support mail — the same shape the
+           confirmation was, so the thread reads as one thing; without one it is
+           a plain mail from the same address. */
+        refCode: z.string().max(40).optional(),
+        receivedAt: z.string().max(60).optional(),
       });
       const parsed = schema.safeParse(body);
       if (!parsed.success) return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
 
-      const { to, subject, html, threadId, replyTo } = parsed.data;
-      const result = await sendEmail(to, subject, html, {
-        replyTo: replyTo || 'noreply@tirbeo.com',
-        threadId,
-        templateName: 'admin_reply',
-        fromEmail: 'noreply@tirbeo.com',
-        fromName: 'Tirbeo Support',
-      });
+      const { to, subject, html, threadId, replyTo, refCode, receivedAt } = parsed.data;
+      const result = refCode
+        ? await sendTemplateEmail(to, 'support_reply', {
+            subject,
+            refCode,
+            replyHtml: html,
+            receivedAt: receivedAt
+              ? new Date(receivedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })
+              : 'today',
+          }, { replyTo, threadId, fromName: 'Tirbeo Support' })
+        : await sendEmail(to, subject, html, {
+            replyTo: replyTo || 'noreply@tirbeo.com',
+            threadId,
+            templateName: 'admin_reply',
+            fromEmail: 'noreply@tirbeo.com',
+            fromName: 'Tirbeo Support',
+          });
 
       if (result.success) {
+        /* The answer belongs in the ledger beside the question, under the same
+           reference — that is what makes one code describe the whole thread for
+           whoever reads it next. Best-effort: a failed write must not unsend a
+           mail a person is waiting on. */
+        if (refCode) {
+          const recipient = await prisma.user.findFirst({
+            where: { emails: { some: { address: to.toLowerCase() } } },
+            select: { id: true } }).catch(() => null);
+          await prisma.activityEvent.create({
+            data: {
+              userId: recipient?.id ?? null,
+              kind: 'support.reply',
+              title: subject,
+              detail: `Answered ${refCode} by mail.`,
+              severity: 'info',
+              metadata: { refCode, to, byAdmin: session.userId } as never,
+            } }).catch(() => {});
+        }
         return NextResponse.json({ ...result, message: 'Reply sent successfully' });
       }
       return NextResponse.json({ error: result.error || 'Failed to send reply' }, { status: 500 });

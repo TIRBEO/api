@@ -268,37 +268,22 @@ async function sendBlockRateAlert(alert: BlockRateAlert): Promise<void> {
   } catch { /* prisma import failed — skip ledger write */ }
 
   try {
-    // Send email notification to admins
-    const { sendTemplateEmail } = await import('@/features/email/email');
-    const { prisma } = await import('@/infrastructure/db/prisma');
-
-    // Get admin emails (consolidated schema: isAdmin flag; emails live in
-    // user_email, names in user_profile)
-    const admins = await prisma.user.findMany({
-      where: { isAdmin: true },
-      select: {
-        id: true,
-        profile: { select: { name: true } },
-        emails: { where: { isDefault: true }, select: { address: true } } },
-      take: 10 });
-
-    for (const admin of admins) {
-      const appUrls = await import('@/config/app-urls');
-      const adminEmail = admin.emails[0]?.address;
-      if (!adminEmail) continue;
-      await sendTemplateEmail(adminEmail, 'admin_alert', {
-        name: admin.profile?.name || 'Admin',
-        subject: 'Rate Limit Alert: High Block Rate Detected',
-        message: alert.message,
-        details: `<div style="padding:16px;border:2px solid #17150f;border-radius:0;box-shadow:3px 3px 0 0 #17150f;">
-          <p style="margin:0;font-size:14px;color:#17150f;"><strong>Block Rate:</strong> ${alert.blockRate}%</p>
-          <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Threshold:</strong> ${alert.threshold}%</p>
-          <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Total Requests:</strong> ${alert.totalHits}</p>
-          <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Total Blocked:</strong> ${alert.totalBlocked}</p>
-          <p style="margin:8px 0 0;font-size:14px;color:#17150f;"><strong>Time:</strong> ${new Date(alert.timestamp).toLocaleString()}</p>
-        </div>`,
-        dashboardUrl: appUrls.prodSafeEnvUrl(process.env.NEXT_PUBLIC_ADMIN_URL) || appUrls.getAdminBaseUrl() }, { rawVars: ['details'] }).catch(() => {});
-    }
+    /* One path for every admin mail: the alert is recorded with its own
+       reference and mailed to the admin list, so the inbox copy and the panel
+       row quote the same code. */
+    const { notifyAdmins } = await import('@/features/security/security');
+    await notifyAdmins({
+      subject: 'Rate limit alert: high block rate',
+      message: alert.message,
+      details: [
+        `Block rate: ${alert.blockRate}%`,
+        `Threshold: ${alert.threshold}%`,
+        `Total requests: ${alert.totalHits}`,
+        `Total blocked: ${alert.totalBlocked}`,
+        `When: ${new Date(alert.timestamp).toISOString()}`,
+      ].join('\n'),
+      severity: 'warning',
+    });
   } catch (err) {
     console.error('[RATE-LIMIT-ALERT] Failed to send alert email:', err);
   }

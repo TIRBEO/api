@@ -1,4 +1,5 @@
 import { getDashboardBaseUrl, prodSafeEnvUrl } from '@/config/app-urls';
+import { TIRBEO_MAIL_DOMAIN } from '@/features/identity/tirbeo';
 import {
   BTN,
   CARD,
@@ -11,6 +12,7 @@ import {
   MUTED,
   PAGE,
   RADIUS_PLATE,
+  SUPPORT,
   TEXT,
   TEXT_2,
 } from '@/features/email/email-theme';
@@ -51,7 +53,9 @@ const WORKSPACE_URL = () => (
   getDashboardBaseUrl()
 ).replace(/\/+$/, '');
 
-const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'admin@tirbeo.com';
+/** The address a customer writes to. It matches the support sender below, so
+ *  the reply lands in the mailbox the question came out of. */
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@tirbeo.com';
 
 /* -------------------------------------------------------------------------- */
 /* Blocks                                                                      */
@@ -95,8 +99,31 @@ const code = (value: string, hint?: string): string =>
 const secret = (value: string, hint?: string): string =>
   `<div style="margin:30px 0 26px"><div style="font-family:${MONO};font-size:22px;line-height:30px;font-weight:bold;color:${TEXT};text-align:center;word-break:break-all">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED};text-align:center">${hint}</div>` : ''}</div>`;
 
-type BtnVariant = 'primary' | 'ghost';
+/**
+ * A reference code: the short handle a person quotes and staff search by.
+ *
+ * One quiet line, at the end of the mail. It used to be a plate — mono, bold,
+ * 20px, first thing in the body — and that read as the mail's headline, which
+ * is wrong twice over: the reader came for the news, and the code is only
+ * needed once, when they reply. Bold also broke the one thing it is for: a
+ * bolded code in a coloured plate looks like the digits a phishing mail wants
+ * you to type somewhere.
+ */
+const refLine = (value: string, label = 'Reference'): string =>
+  `<p style="margin:18px 0 0;font-size:13px;line-height:20px;color:${MUTED}">${label} `
+  + `<span style="font-family:${MONO};font-size:13px;color:${TEXT_2}">${value}</span></p>`;
 
+/**
+ * Something a person wrote, shown as what it is: their own words inside the
+ * machine's mail. The panel and the pre-wrap are the point — a quote that
+ * reflows into one grey soup of a paragraph is a quote nobody trusts.
+ */
+const messageBlock = (text: string, label = 'Your message'): string =>
+  `<div style="margin:24px 0;padding:16px 18px;background:${PAGE};border:1px solid ${LINE}">`
+  + `<div style="font-size:13px;line-height:19px;color:${MUTED}">${label}</div>`
+  + `<div style="margin-top:8px;font-size:15px;line-height:24px;color:${TEXT};white-space:pre-wrap;word-break:break-word">${text}</div></div>`;
+
+type BtnVariant = 'primary' | 'ghost';
 /**
  * The action — an underlined sentence, never a button. A pill needs
  * `display:inline-block`, padding and a background on an anchor, which is
@@ -178,7 +205,7 @@ type MailOpts = {
 /* Tones — the category label under the wordmark                               */
 /* -------------------------------------------------------------------------- */
 
-export type Tone = 'otp' | 'security' | 'brand' | 'info' | 'welcome';
+export type Tone = 'otp' | 'security' | 'brand' | 'info' | 'welcome' | 'support';
 
 /** The banner over the card — the colour is the category, so the mail is
     recognisable in the thread list before a word of it is read. */
@@ -188,6 +215,7 @@ const TONE_BAND: Record<Tone, string> = {
   brand: TEXT,
   info: MUTED,
   welcome: BTN,
+  support: SUPPORT,
 };
 
 /** Every template's family, resolved by name at render time so no template
@@ -198,8 +226,9 @@ const TEMPLATE_TONES: Record<string, Tone> = {
   password_reset_link: 'otp', delete_account_otp: 'otp', account_recovery: 'otp',
 
   password_changed: 'security', suspicious_login: 'security',
-  two_factor_disabled: 'security', login_alert: 'security', security_tip: 'security',
+  two_factor_disabled: 'security', two_factor_enabled: 'security', login_alert: 'security', security_tip: 'security',
   account_suspended: 'security', account_deleted: 'security',
+  account_deactivated: 'info',
   admin_alert: 'security', admin_test: 'security',
 
   welcome: 'welcome',
@@ -209,6 +238,12 @@ const TEMPLATE_TONES: Record<string, Tone> = {
   notification_digest: 'info', weekly_summary: 'info',
   maintenance_notification: 'info', maintenance_complete: 'info',
   export_ready: 'info',
+
+  // A conversation, not a notice: its own band so it never reads as another
+  // automated alert in a full inbox.
+  support_request_received: 'support', support_reply: 'support',
+  // Staff's side of the same conversation wears the same band.
+  support_request_admin: 'support',
 };
 
 /** Who signs off each family of mail, in the body's own voice. */
@@ -218,6 +253,7 @@ const TONE_TEAM: Record<Tone, string> = {
   brand: 'The Tirbeo Team',
   info: 'The Tirbeo Support team',
   welcome: 'The Tirbeo Team',
+  support: 'Tirbeo Support',
 };
 
 /**
@@ -475,6 +511,26 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       ],
     }, logo, name),
 
+  /* Enabling two-step is the account getting safer, so the mail says that and
+     nothing else. It used to reuse `login_alert`, which tells the reader their
+     account was signed in to — a stranger-warning sent for a change the person
+     made themselves, from the session they were already in. */
+  two_factor_enabled: (logo, name) =>
+    t('Two-step verification is on', {
+      title: 'Two-step verification is on',
+      sub: 'Hello {{name}}, {{primaryEmail}} now needs a second factor to sign in.',
+      preheader: 'Your password is no longer the only thing protecting the account.',
+      blocks: [
+        well([
+          ['When', '{{loginTime}}'],
+          ['Device', '{{device}}'],
+        ]),
+        para('One-time backup codes were created with it. They are shown once and cannot be emailed, so keep them somewhere outside this account — they are the way back in if you lose the authenticator.'),
+        btn('{{twoFactorUrl}}', 'Check two-step settings'),
+        safetyNote(),
+      ],
+    }, logo, name),
+
   login_alert: (logo, name) =>
     t('New sign-in to your Tirbeo account', {
       title: 'New sign-in',
@@ -617,6 +673,9 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
           ['Status', '{{statusType}}'],
           ['Reason', '{{reason}}'],
           ['Until', '{{suspendedUntil}}'],
+          // Last, not first: the decision is the news, the code is only what
+          // they quote when they write about it.
+          ['Reference', '{{refCode}}'],
         ]),
         callout(
           'What this means for you',
@@ -637,21 +696,100 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
           ['Scheduled date', '{{dateLabel}}'],
           ['Grace period', '30 days'],
         ]),
-        para('You can stop this at any time before the scheduled date by signing in.'),
+        para('Signing in any time before that date keeps the account open, and the cancellation button is on the delete screen. Nothing is deleted while the window is running.'),
         btn('{{dashboardUrl}}/settings', 'Cancel deletion'),
         note('After the grace period the data is gone and cannot be recovered by anyone, including us.'),
       ],
     }, logo, name),
 
+  account_deactivated: (logo, name) =>
+    t('Your Tirbeo account is deactivated', {
+      title: 'Account deactivated',
+      sub: 'Hello {{name}}, {{primaryEmail}} is deactivated.',
+      preheader: 'Nothing was deleted. Signing back in brings it all back.',
+      blocks: [
+        para('The profile is hidden and every other device was signed out. Nothing was deleted and no setting was changed.'),
+        well([
+          ['Deactivated', '{{dateLabel}}'],
+          ['Reason', '{{reason}}'],
+        ]),
+        para('Signing in again brings the account back exactly as you left it — this browser can do it from the account screen, and the button there says "Reactivate".'),
+        btn('{{accountsUrl}}', 'Sign back in'),
+      ],
+    }, logo, name),
+
   admin_alert: (logo, name) =>
-    t('[Admin] {{subject}}', {
+    t('{{subject}}', {
       title: '{{subject}}',
       sub: '{{message}}',
-      preheader: '{{subject}} — details inside.',
+      preheader: 'Something on Tirbeo needs a person.',
       blocks: [
         raw('{{details}}'),
         btn('{{dashboardUrl}}', 'Open dashboard'),
         note('Automated administrative alert from Tirbeo.'),
+        // Last, because it is only needed when someone replies — and the same
+        // code the account was shown, so both sides of this quote one thing.
+        refLine('{{refCode}}', 'Reference'),
+      ],
+    }, logo, name),
+
+  support_request_received: (logo, name) =>
+    t('We have your message', {
+      title: 'We have your message',
+      sub: 'Hello {{name}}, this confirms support received what you sent about {{ticketSubject}}.',
+      preheader: 'A person reads these in the order they arrive.',
+      blocks: [
+        messageBlock('{{message}}'),
+        para('A person reads these in the order they arrive, and we answer to this address. Nothing is needed from you in the meantime — if something has to be checked first, the reply will say exactly what.'),
+        well([
+          ['Subject', '{{ticketSubject}}'],
+          ['Received', '{{receivedAt}}'],
+          ['Account', '{{primaryEmail}}'],
+        ]),
+        note('Replying to this email keeps the whole thread together.'),
+        refLine('{{refCode}}'),
+      ],
+    }, logo, name),
+
+  /* Staff's copy of a request — a different mail from the account's receipt on
+     purpose. The reader is the person who has to answer, so the message is
+     quoted in full at the top, the facts a ticket system would hide behind five
+     tabs sit under it in one plate, and the reply is a single click that opens
+     already-addressed to the account. */
+  support_request_admin: (logo, name) =>
+    t('Support · {{subject}}', {
+      title: '{{subject}}',
+      sub: '<strong>{{senderName}}</strong> wrote in from {{contact}}.',
+      preheader: 'A person is waiting on an answer to this one.',
+      blocks: [
+        messageBlock('{{message}}', 'Their message'),
+        well([
+          ['Account', '{{account}}'],
+          ['Reply to', '{{contact}}'],
+          ['Received', '{{receivedAt}}'],
+          ['Device', '{{device}}'],
+          ['Reached from', '{{origin}}'],
+          ['Reference', '{{refCode}}'],
+        ]),
+        btn('{{replyHref}}', '{{replyLabel}}'),
+        btnGhost('{{dashboardUrl}}', 'Open the dashboard'),
+        note('Quote the reference on the reply — the account sees the same code, so both sides read one record instead of two.'),
+      ],
+    }, logo, name),
+
+  support_reply: (logo, name) =>
+    t('Re: {{subject}}', {
+      title: 'A reply from Tirbeo Support',
+      sub: 'Hello {{name}}, there is an answer on your request.',
+      preheader: 'The reply is inside.',
+      blocks: [
+        raw('{{replyHtml}}'),
+        well([
+          ['Subject', '{{subject}}'],
+          ['Answered', '{{receivedAt}}'],
+        ]),
+        note('Reply to this email to keep the thread. This address is monitored by a person, so the answer you just read can be questioned directly.'),
+        refLine('{{refCode}}'),
       ],
     }, logo, name),
 
@@ -682,8 +820,8 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
     }, logo, name),
 
   tirbeo_account_onboarding: (logo, name) =>
-    t('Your Tirbeo account is ready: {{username}}@tirbeo.com', {
-      title: '{{username}}@tirbeo.com',
+    t(`Your Tirbeo account is ready: {{username}}@${TIRBEO_MAIL_DOMAIN}`, {
+      title: `{{username}}@${TIRBEO_MAIL_DOMAIN}`,
       sub: 'Hello {{name}}, your Tirbeo account is ready. This is the address you sign in with, and the username that goes with it.',
       preheader: 'Sign in with the temporary password, then replace it.',
       blocks: [
@@ -807,6 +945,9 @@ export const RAW_HTML_VARS = new Set([
   'suspiciousSection',
   'activitySummary',
   'details',
+  // The admin support composer writes markup; the shell wraps it, it is not
+  // rebuilt from plain text.
+  'replyHtml',
 ]);
 
 export function renderTemplate(

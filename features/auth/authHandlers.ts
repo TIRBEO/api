@@ -1,4 +1,4 @@
-import { resolveLoginLocation } from '@/shared/geo';
+import { resolveLoginLocation, resolveLoginPlace } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/infrastructure/db/prisma';
@@ -6,21 +6,21 @@ import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/featur
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from '@/features/auth/signup-otp';
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/features/auth/password';
 import { createSession, setSessionCookie, clearSessionCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
-import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, type LoginUser } from '@/features/identity/tirbeo';
+import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, TIRBEO_MAIL_DOMAIN, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getSession, requireRole } from '@/features/auth/http-guards';
 import { signTemp2faToken, verifyTemp2faToken, signMagicLinkToken, verifyMagicLinkToken, signOauthStateToken, verifyOauthStateToken, verifySuspiciousLoginToken, verifySessionRevokeToken, signTempPasswordChangeToken, signMergeToken, verifyMergeToken, signPendingSignupToken, verifyPendingSignupToken, signConsentToken, verifyConsentToken, verifyPasswordResetToken } from '@/features/auth/jwt';
 
 import { verifyTotp } from '@/features/auth/totp';
 import { sendTemplateEmail, sendTemplateEmailAfter } from '@/features/email/email';
-import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf, notifyAdmins } from '@/features/security/security';
+import { sanitizeInput, logSecurityEvent, recordLoginHistory, logRateLimited, emailDomainOf, notifyAdmins, alertAdminPanelAttempt } from '@/features/security/security';
 import { notifySuspiciousLogin } from '@/features/security/suspiciousLoginAlert';
 import { requestPasswordReset, requestPasswordResetOtp, requestPasswordResetMagicLink, requestPasswordResetRecovery, verifyPasswordReset, confirmPasswordReset } from '@/features/auth/password-reset';
 import { createAuditEvent } from '@/features/security/audit';
 import { enforceResendCooldown, RESEND_COOLDOWN_MS } from '@/features/auth/resend-cooldown';
 import { checkPasswordBreach } from '@/features/auth/breach';
 import { jsonUnauthorized, jsonSessionUnavailable } from '@/shared/response';
-import { createNotification, describeDevice, NEW_ACCOUNT_PREFS } from '@/features/notifications/notifications';
+import { createNotification, describeDevice, deviceDetail, NEW_ACCOUNT_PREFS } from '@/features/notifications/notifications';
 import { createTtlCache } from '@/infrastructure/cache';
 import { logPerformance } from '@/infrastructure/observability/perf';
 import { SignJWT } from 'jose';
@@ -29,14 +29,15 @@ import { logAuthJson, logOtpJson, logLinkJson } from '@/features/auth/auth-log';
 import { getUserWarningCount, requireCaptchaGate } from '@/features/captcha/gate';
 import { getTurnstileSiteKey } from '@/features/auth/turnstile';
 import { recordRateLimitHit, clearRateLimitHits } from '@/features/auth/suspicious-activity';
-import { getAccountsBaseUrl, getAdminBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
-import { systemFaultRef } from '@/features/users/refcode';
+import { getAccountsBaseUrl, getDashboardBaseUrl, getAppDomain, isHostAllowed, prodSafeEnvUrl } from '@/config/app-urls';
+import { systemFaultRef, refForEventRow } from '@/features/users/refcode';
 import { consumeVerifyAttempt, getVerifyStatus, getGlobalEmailStatus, getAllVerifyMaxes, getVerifyMax, peekGenericWindow, VERIFY_WINDOW_MS, windowResetAt } from '@/features/auth/verify-limits';
 import { checkPtr, issuePtr, releasePtr, ptrDeviceId, ptrErrorBody } from '@/features/auth/ptr';
 import { getRedis, setCachedProfile, deleteCachedProfile } from '@/features/auth/redis';
 import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
 import { normalizeWorkFields } from '@/features/auth/profile-work';
 import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/blockFacts';
+import { forgetUserStatus } from '@/features/auth/user-status-cache';
 
 // Cache email existence lookups (login/signup fire these on every debounced
 // keystroke). Results are almost never changed mid-session, so a 30s TTL is
@@ -486,15 +487,29 @@ function isAllowedRedirect(url: string): boolean {
  * the URL (and signed state/JWT) grew without bound. Follow the chain
  * inward until the target is no longer one of our own handoff screens.
  */
-function normalizeOAuthRedirect(url: string | null | undefined): string | undefined {
+export function normalizeOAuthRedirect(url: string | null | undefined): string | undefined {
   let current = url || undefined;
   for (let depth = 0; depth < 5; depth++) {
     if (!current || !isAllowedRedirect(current)) return undefined;
     const u = new URL(current);
+    // The marketing site is never a post-sign-in destination: a "Log in" click
+    // on tirbeo.com sends the visitor to the accounts app, and answering its
+    // own origin bounced them back to the landing page instead of their
+    // dashboard. A deep marketing path (tirbeo.com/pricing) still passes.
+    if (isMarketingHome(u)) return undefined;
     if (!/(?:^|\/)oauth-complete$/.test(u.pathname)) return current;
     current = u.searchParams.get('redirect_to') || `${u.origin}/`;
   }
   return undefined;
+}
+
+/** True for the bare marketing origin — tirbeo.com (or tirbeo.app) itself. */
+function isMarketingHome(u: URL): boolean {
+  if (u.pathname !== '/' && u.pathname !== '') return false;
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1') return false;
+  const parent = getAppDomain().replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase();
+  return host === parent;
 }
 
 /**
@@ -1148,6 +1163,7 @@ export async function loginHandler(request: NextRequest) {
         if (until && until < new Date()) {
           // Suspension expired — lift it on first hit and let the sign in.
           await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } });
+          forgetUserStatus(user.id);
           logSecurityEvent({ request, userId: user.id, eventType: 'security.account_suspension_expired', details: { until: until.toISOString() } }).catch(() => {});
         } else {
           return blockedAccountResponse(user, request);
@@ -1304,11 +1320,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
 
     if (!user.isAdmin) {
       logSecurityEvent({ request, userId: user.id, eventType: 'auth.admin_login_failed', details: { reason: 'not_admin' } }).catch(() => {});
-      if (user.email) sendTemplateEmailAfter(user.email, 'admin_alert', {
-        subject: 'Unauthorized Admin Access Attempt',
-        message: 'A user without admin privileges attempted to access the admin panel.',
-        details: `<p>Email: ${user.email}</p><p>Time: ${new Date().toLocaleString()}</p>`,
-        dashboardUrl: getAdminBaseUrl() });
+      if (user.email) void alertAdminPanelAttempt(request.headers, user.email);
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
@@ -1559,7 +1571,7 @@ const signupSchema = z.object({
 // account's login email is the user's real address; a username@tirbeo.com
 // identity alias is always provisioned alongside it.
 const ALLOWED_SIGNUP_EMAIL_DOMAINS = new Set([
-  'tirbeo.com', 'tirbeo.app',
+  TIRBEO_MAIL_DOMAIN, 'tirbeo.com', 'tirbeo.app',
   'gmail.com', 'googlemail.com',
   'outlook.com', 'hotmail.com', 'live.com', 'msn.com', 'office.com',
   'yahoo.com', 'ymail.com', 'rocketmail.com', 'yahoo.co.in',
@@ -1714,10 +1726,10 @@ export async function signupHandler(request: NextRequest) {
     const emailDomain = normalizedEmail.split('@')[1]?.toLowerCase() || '';
     if (!ALLOWED_SIGNUP_EMAIL_DOMAINS.has(emailDomain)) {
       return NextResponse.json({
-        error: 'Please use your @tirbeo.com address or a major email provider (Gmail, Outlook, Yahoo, iCloud, Proton, etc.).' }, { status: 400 });
+        error: `Please use your @${TIRBEO_MAIL_DOMAIN} address or a major email provider (Gmail, Outlook, Yahoo, iCloud, Proton, etc.).` }, { status: 400 });
     }
     const accountEmail = normalizedEmail;
-    const isTirbeoLogin = emailDomain === 'tirbeo.com' || emailDomain === 'tirbeo.app';
+    const isTirbeoLogin = emailDomain === TIRBEO_MAIL_DOMAIN || emailDomain === 'tirbeo.com' || emailDomain === 'tirbeo.app';
 
 
 
@@ -1895,9 +1907,7 @@ export async function signupHandler(request: NextRequest) {
     // Send welcome email — scheduled after the response, so the signup answer
     // does not wait on the mail provider and the send still runs if this
     // function is frozen the moment the response is out.
-    sendTemplateEmailAfter(accountEmail, 'welcome', { name: name || accountEmail.split('@')[0] }, {
-      fromEmail: 'noreply@tirbeo.com',
-      fromName: 'Tirbeo' });
+    sendTemplateEmailAfter(accountEmail, 'welcome', { name: name || accountEmail.split('@')[0] });
 
     // Create welcome notification — STRICTLY per-user, no broadcast, no CC.
     // This notification must ONLY be visible to the newly created account
@@ -1924,9 +1934,7 @@ export async function signupHandler(request: NextRequest) {
       await prisma.otp.deleteMany({ where: { kind: 'email', address: accountEmail } });
       await prisma.otp.create({
         data: { userId: user.id, kind: 'email', address: accountEmail, otpHash, expiresAt } });
-      sendTemplateEmailAfter(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] }, {
-        fromEmail: 'noreply@tirbeo.com',
-        fromName: 'Tirbeo' });
+      sendTemplateEmailAfter(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] });
       // The verification OTP is an auth artifact like every other one — log its
       // generation (truncated, never the plain code).
       logOtpJson(accountEmail, 'signup-verify', verifyCode.slice(0, 3) + '***', ip, { userId: user.id }, 'signup_otp').catch(() => {});
@@ -2470,9 +2478,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       redirect_to: normalizeOAuthRedirect(data.redirect) || getDashboardBase() });
     setSessionCookie(res, sessionToken, refreshToken, request);
 
-    sendTemplateEmailAfter(email, 'welcome', { name: (data.name || email.split('@')[0]) }, {
-      fromEmail: 'noreply@tirbeo.com',
-      fromName: 'Tirbeo' });
+    sendTemplateEmailAfter(email, 'welcome', { name: (data.name || email.split('@')[0]) });
 
     return res;
   } catch (err: any) {
@@ -3000,9 +3006,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
         where: { kind_address: { kind: 'email', address: email.toLowerCase() } },
         create: { userId: user.id, kind: 'email', address: email.toLowerCase(), otpHash, expiresAt },
         update: { userId: user.id, otpHash, expiresAt, attempts: 0 } });
-      sendTemplateEmailAfter(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] }, {
-        fromEmail: 'noreply@tirbeo.com',
-        fromName: 'Tirbeo' });
+      sendTemplateEmailAfter(email, 'verify_email', { otp: otpCode, name: user.name || email.split('@')[0] });
       return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
     }
 
@@ -4476,22 +4480,36 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
     }).catch(() => 0);
 
     if (alreadyReported === 0) {
-      await logSecurityEvent({
+      /* The row and the mail are the same report; the row is what makes the
+         code in the mail mean something. Read its reference back from the write
+         so an admin quoting it lands on this event, not a guess. */
+      const eventId = await logSecurityEvent({
         request,
         userId,
         eventType: DENIED_KIND,
         severity: 'warning',
         details: { reason: 'owner_denied_suspicious_login' },
-      }).catch(() => {});
+      }).catch(() => null);
 
+      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+      const place = resolveLoginPlace(request.headers);
+      const account = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { email: true },
+      }).catch(() => null);
+      const device = deviceDetail(request.headers.get('user-agent'));
       await notifyAdmins({
         subject: 'Account holder denied a sign-in',
         message: 'The owner of an account said a sign-in was not them.',
+        refCode: eventId ? await refForEventRow(eventId) : null,
         details: [
-          `Account: ${userId}`,
+          `Account: ${account?.email || userId}`,
           `When: ${new Date().toISOString()}`,
+          device ? `Device: ${device}` : '',
+          place ? `Location: ${place}` : '',
+          ip ? `Address: ${ip}` : '',
           'Owner said: "that wasn\'t me"',
-        ].join('\n'),
+        ].filter(Boolean).join('\n'),
         severity: 'warning',
       }).catch(() => {});
 

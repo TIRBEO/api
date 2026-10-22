@@ -89,6 +89,17 @@ const VARS: Record<string, string> = {
   url: 'https://tirbeo.com/errors/err_1',
   sentFor: 'admin test',
   subject: 'Unhandled error in export worker',
+  refCode: 'a1b2-c3d4-e5f6-7a8b',
+  ticketSubject: 'A sign-in I don’t recognise',
+  receivedAt: '28 Feb 2026, 14:02',
+  replyHtml: '<p style="margin:0">We found the session you asked about and ended it.</p>',
+  // …and the staff copy of the same request.
+  senderName: 'Bishnu',
+  contact: 'bishnu@tirbeo.com',
+  account: 'bishnu@tirbeo.com',
+  origin: '203.0.113.9 · Berlin, Germany',
+  replyHref: 'mailto:bishnu@tirbeo.com?subject=Re%3A%20a1b2',
+  replyLabel: 'Reply to bishnu@tirbeo.com',
 };
 
 describe('renderTemplate escaping', () => {

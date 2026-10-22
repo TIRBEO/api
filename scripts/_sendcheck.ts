@@ -11,6 +11,7 @@
 require('dotenv').config({ path: '.env.local' });
 import { sendTemplateEmail } from './../features/email/email';
 import { prisma } from './../infrastructure/db/prisma';
+import { factPlate } from './../features/email/email-fragments';
 
 /**
  * Fixtures for every variable any template asks for.
@@ -69,7 +70,25 @@ const fixture = (to: string): Record<string, string> => {
     statRows: rows([['Sign-ins', '6'], ['Form responses', '12'], ['Profile views', '31']]),
     suspiciousSection: rows([['Unusual sign-ins', '1 — review it']]),
     activitySummary: rows([['Last visit', '24 days ago']]),
-    details: rows([['Severity', 'warning'], ['Actor', 'system']]),
+    details: factPlate([
+      ['Account', 'someone@example.com'],
+      ['Reference', 'a1b2-c3d4-e5f6-7a8b'],
+      ['When', when],
+      ['Device', ua],
+      ['Address', '203.0.113.42'],
+    ]),
+    refCode: 'a1b2-c3d4-e5f6-7a8b',
+    ticketSubject: 'A sign-in I don’t recognise',
+    receivedAt: new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+    // The staff copy of a request: who wrote, where the answer goes, and the
+    // one action the mail offers.
+    senderName: 'Bishnu',
+    contact: to,
+    account: 'bishnu@tirbeo.com',
+    origin: '203.0.113.42 · San Francisco, CA',
+    replyHref: `mailto:${to}?subject=Re%3A%20a1b2-c3d4-e5f6-7a8b`,
+    replyLabel: `Reply to ${to}`,
+    replyHtml: '<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:#344054">We found the session you asked about — it was you, on a phone, in Kathmandu. Nothing on the account was changed, and we have left it signed in.</p><p style="margin:0;font-size:15px;line-height:25px;color:#344054">If that was not you, turn on two-step verification and end the other sessions from the security screen.</p>',
     subject: 'Three failed admin sign-ins in one minute',
     message: 'The same IP tried four administrator accounts in 60 seconds and failed every one of them.',
     title: 'Two-step verification is now on by default',

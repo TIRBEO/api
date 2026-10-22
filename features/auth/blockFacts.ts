@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { ensureRefCode } from '@/features/users/refcode';
+import { cachedUserStatus, forgetUserStatus } from '@/features/auth/user-status-cache';
 import { activeDeletionFor, liveRestrictionRow, type RestrictionRow } from '@/features/status/accountLifecycle';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -191,8 +192,10 @@ export async function blockedAccountResponse(
    ═══════════════════════════════════════════════════════════════════ */
 
 /** The doors every closed account keeps, whatever the closure: the read that
- *  feeds the settings screen, the appeal, and signing out. */
-const CLOSED_ACCOUNT_DOORS = ['/api/user/account-state', '/api/support/appeal'];
+ *  feeds the settings screen, the appeal, a message to support, and signing
+ *  out. A shut-out is precisely when the message is needed, so being closed
+ *  never closes the door that asks about the closure. */
+const CLOSED_ACCOUNT_DOORS = ['/api/user/account-state', '/api/support/appeal', '/api/support/request'];
 
 /** A pause and a scheduled deletion are the person's own doing, so the session
  *  stays read-only and keeps the one write that undoes it. A ban, a suspension
@@ -221,6 +224,31 @@ async function liftExpiredClosure(userId: string): Promise<boolean> {
     .catch(() => null);
   if (!latest?.endsAt || latest.endsAt > new Date()) return false;
   await prisma.user.update({ where: { id: userId }, data: { status: 'active' } }).catch(() => {});
+  forgetUserStatus(userId);
+  return true;
+}
+
+/** A status the rows no longer back.
+ *
+ *  The person cancelled the deletion or came back from the pause, and the
+ *  `User` row is the only thing still saying otherwise — one write behind the
+ *  request that undid it, or restored by a sweep that never ran. Asking the row
+ *  that carries the clock fixes the answer, and the status is written back so
+ *  the next door (and the next process) agrees. An executed deletion is NOT
+ *  healed here: that closure is real and its own status owns it. */
+async function healStaleClosure(userId: string, kind: BlockKind): Promise<boolean> {
+  if (kind === 'deletion_pending') {
+    if (await activeDeletionFor(userId)) return false;
+  } else if (kind === 'deactivated') {
+    const pause = await prisma.userDeactivation
+      .findUnique({ where: { userId }, select: { resumedAt: true } })
+      .catch(() => null);
+    if (pause && !pause.resumedAt) return false;
+  } else {
+    return false;
+  }
+  await prisma.user.update({ where: { id: userId }, data: { status: 'active' } }).catch(() => {});
+  forgetUserStatus(userId);
   return true;
 }
 
@@ -237,34 +265,15 @@ export async function closedAccountBody(
   const kind = status as BlockKind;
   if (isClosedAccountDoor(kind, pathname, method)) return null;
   if ((kind === 'banned' || kind === 'suspended') && await liftExpiredClosure(userId)) return null;
+  if ((kind === 'deletion_pending' || kind === 'deactivated') && await healStaleClosure(userId, kind)) return null;
   const facts = await blockFactsFor(userId, kind);
   return facts ? blockBody(facts) : null;
 }
 
-/* The status decides the whole gate, so one read serves a whole minute of
-   requests for that account instead of a lookup per call. Shared by the edge
-   and the dispatcher so the two ask the same account the same question. */
-const STATUS_TTL = 60_000;
-const statusCache = new Map<string, { status: string | null; ts: number }>();
-
-export async function cachedUserStatus(userId: string): Promise<string | null> {
-  const hit = statusCache.get(userId);
-  if (hit && Date.now() - hit.ts < STATUS_TTL) return hit.status;
-  try {
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
-    const status = user?.status ?? null;
-    statusCache.set(userId, { status, ts: Date.now() });
-    if (statusCache.size > 2000) {
-      const now = Date.now();
-      for (const [k, v] of statusCache) { if (now - v.ts >= STATUS_TTL) statusCache.delete(k); }
-    }
-    return status;
-  } catch {
-    // A lookup that did not answer must not close an open account — nor, once
-    // it is known the account IS closed, must it open a closed one.
-    return hit?.status ?? null;
-  }
-}
+/* The status itself, and the minute-long cache in front of it, live in
+   features/auth/user-status-cache — the lifecycle writes invalidate through
+   the same door, and neither side imports the other. */
+export { cachedUserStatus, forgetUserStatus } from '@/features/auth/user-status-cache';
 
 /** The one question every door asks: may this session reach this path? */
 export async function closedAccountGate(

@@ -1,6 +1,6 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import { sendTemplateEmailAfter } from '@/features/email/email';
-import { describeDevice } from '@/features/notifications/notifications';
+import { describeDevice, primaryEmailForUser } from '@/features/notifications/notifications';
 import { recordDeviceSeen } from '@/features/captcha/risk';
 import { resolveLoginLocation } from '@/shared/geo';
 
@@ -167,11 +167,16 @@ export async function sendSuspiciousLoginAlert(input: SuspiciousLoginAlertInput)
     }
 
     const location = resolveLoginLocation(input.headers ?? { get: () => null });
+    /* Deliver to the mailbox the person actually reads. The address a caller
+       hands in is the account's login identity, and `<handle>@tirbeo.com` may
+       be a name nobody checks — a "was that you?" sent there is a warning that
+       never reaches the one person who can act on it. */
+    const mailbox = (await primaryEmailForUser(input.userId).catch(() => null)) || input.email;
     // Off the sign-in path: whoever is signing in has their session back before
     // the mail provider has answered, and the alert is scheduled rather than
     // merely started, so a frozen function cannot lose it.
-    sendTemplateEmailAfter(input.email, 'suspicious_login', {
-      name: input.name || input.email.split('@')[0],
+    sendTemplateEmailAfter(mailbox, 'suspicious_login', {
+      name: input.name || mailbox.split('@')[0],
       loginTime: new Date().toLocaleString(),
       device: describeDevice(input.userAgent),
       location,

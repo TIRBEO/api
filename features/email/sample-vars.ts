@@ -21,12 +21,14 @@ export type SampleVarResolver = () => {
 import {
   attentionPanel,
   cardItem,
+  factPlate,
   listGroup,
   listPlate,
   listRow,
   moreRow,
   unsubscribeSection,
 } from '@/features/email/email-fragments';
+import { TEXT_2 } from '@/features/email/email-theme';
 import { ESSENTIAL_TEMPLATES } from '@/features/email/email-classification';
 
 const URL = 'https://tirbeo.com';
@@ -39,7 +41,13 @@ const SECTION_VALUES: Record<string, string> = {
     + cardItem('A reply landed on your ticket', '“We are looking into this now.”'),
   activitySection: cardItem('3 sign-ins this week', 'Last one from Chrome on Linux.'),
   activitySummary: cardItem('You signed in 4 times this week', 'And created 2 projects.'),
-  details: cardItem('Signed in from a device we have not seen before'),
+  details: factPlate([
+    ['Account', 'john@example.com'],
+    ['Reference', 'a1b2-c3d4-e5f6-7a8b'],
+    ['When', '28 Feb 2026, 14:02'],
+    ['Device', 'Chrome on macOS'],
+    ['Address', '203.0.113.9'],
+  ]),
   statRows: listPlate(
       listGroup('Sign-ins', 12, listRow('Signed in with Password', '28 Feb 2026, 14:02 · Chrome on macOS'))
     + listGroup('Changes', 47, listRow('Updated your profile', '27 Feb 2026, 09:15 · myprofile'))
@@ -101,6 +109,22 @@ const PLAIN_VALUES: Record<string, string> = {
 
   sentFor: 'admin preview',
   subject: 'Unhandled error in export worker',
+
+  /* The support thread: one code the person quotes, the message they sent, and
+     the answer that came back. */
+  refCode: 'a1b2-c3d4-e5f6-7a8b',
+  ticketSubject: 'A sign-in I don’t recognise',
+  receivedAt: '28 Feb 2026, 14:02 UTC',
+  // …and the staff copy of the same request, addressed to the person who has
+  // to answer it.
+  senderName: 'John Doe',
+  contact: 'john@example.com',
+  account: 'johndoe@tirbeo.com',
+  origin: '203.0.113.9 · Berlin, Germany',
+  replyHref: 'mailto:john@example.com?subject=Re%3A%20A%20sign-in',
+  replyLabel: 'Reply to john@example.com',
+  replyHtml: `<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:${TEXT_2}">We found the session you asked about — it was you, on a phone, in Kathmandu. Nothing was changed on the account, and we have left it signed in.</p>`
+    + `<p style="margin:0;font-size:15px;line-height:25px;color:${TEXT_2}">If that was not you, turn on two-step verification and end the other sessions from the security screen.</p>`,
 };
 
 export const SAMPLE_VAR_NAMES = [

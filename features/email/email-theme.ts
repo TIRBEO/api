@@ -21,6 +21,11 @@ export const LINK = '#2563EB';
 export const DANGER = '#DC2626';
 export const WARN = '#B54708';
 export const SUCCESS = '#067647';
+/** The band for a support conversation. Deliberately outside the family the
+    transactional mail uses (blue codes, red security, ink product, grey
+    notices) so a reply from a person — not a robot — is recognisable in the
+    thread list on colour alone. */
+export const SUPPORT = '#0F766E';
 
 export const RADIUS_CARD = '12px';
 export const RADIUS_PILL = '999px';

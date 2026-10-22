@@ -11,6 +11,7 @@ import { generateEventId, refCodeCandidates, ensureRefCode } from '@/features/us
 import { isValidTirbeoUsername, tirbeoEmailFor, upsertMailAccount, recordProvisioning } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
 import { getAccountsBaseUrl } from '@/config/app-urls';
+import { forgetUserStatus } from '@/features/auth/user-status-cache';
 
 /**
  * Summarize a user's email opt-ins from their notification_preferences jsonb.
@@ -731,6 +732,7 @@ async function writeEnforcement(opts: {
   const detail = opts.reason || 'No reason provided';
 
   await prisma.user.update({ where: { id: opts.userId }, data: { status: opts.toStatus } });
+  forgetUserStatus(opts.userId);
   await prisma.userRestriction.create({
     data: {
       userId: opts.userId,
@@ -761,6 +763,7 @@ async function writeEnforcement(opts: {
 /** Lift an enforcement: status back to active + a status event, no restriction. */
 async function liftEnforcement(userId: string, fromStatus: string, reason: string): Promise<void> {
   await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
+  forgetUserStatus(userId);
   await prisma.userStatusEvent.create({
     data: {
       userId,
@@ -783,7 +786,7 @@ export async function banUser(request: NextRequest, userId: string) {
 
   const { reason } = (await request.json().catch(() => ({}))) as any;
 
-  await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'banned', title: 'Account banned', reason: reason || 'No reason provided', until: null, refKind: 'ban' });
+  const refCode = await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'banned', title: 'Account banned', reason: reason || 'No reason provided', until: null, refKind: 'ban' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -792,15 +795,19 @@ export async function banUser(request: NextRequest, userId: string) {
     targetType: 'user',
     targetId: userId,
     metadata: { email: existing.email, reason: reason || 'No reason provided' } });
-  logSecurityEvent({ request, userId, eventType: 'security.account_banned', severity: 'critical', details: { reason: reason || 'No reason provided', byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
+  logSecurityEvent({ request, userId, eventType: 'security.account_banned', severity: 'critical', details: { reason: reason || 'No reason provided', byAdmin: session.userId, reference: refCode, account: existing.email }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('@/features/email/email');
-  sendTemplateEmail(existing.email, 'account_suspended', {
-    name: existing.profile?.name || existing.email,
+  const { primaryEmailForUser } = await import('@/features/notifications/notifications');
+  const mailTo = (await primaryEmailForUser(userId).catch(() => null)) || existing.email;
+  if (mailTo) sendTemplateEmail(mailTo, 'account_suspended', {
+    refCode,
+    primaryEmail: mailTo,
+    name: existing.profile?.name || mailTo,
     statusType: 'permanently banned',
     reason: reason || 'No reason provided',
     suspendedUntil: 'No end date',
-    suspendedNextStep: 'Contact support@tirbeo.com if you believe this is a mistake',
+    suspendedNextStep: 'Contact support@tirbeo.com if you believe this is a mistake, and quote the reference above.',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }, { rawVars: [] }).catch(() => {});
 
   return NextResponse.json({ message: 'User banned' });
@@ -841,7 +848,7 @@ export async function suspendUser(request: NextRequest, userId: string) {
   const days = Number.isFinite(body.days) ? Math.max(1, Math.min(365, Number(body.days))) : null;
   const until = days ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
-  await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'suspended', title: 'Account suspended', reason, until, refKind: 'suspend' });
+  const refCode = await writeEnforcement({ request, userId, fromStatus: existing.status, toStatus: 'suspended', title: 'Account suspended', reason, until, refKind: 'suspend' });
   await prisma.userSession.deleteMany({ where: { userId } });
 
   await createAuditEvent({
@@ -850,15 +857,21 @@ export async function suspendUser(request: NextRequest, userId: string) {
     targetType: 'user',
     targetId: userId,
     metadata: { email: existing.email, reason, days } });
-  logSecurityEvent({ request, userId, eventType: 'security.account_suspended', severity: 'warning', details: { reason, days, until: until?.toISOString() || null, byAdmin: session.userId }, notifyAdmin: true }).catch(() => {});
+  logSecurityEvent({ request, userId, eventType: 'security.account_suspended', severity: 'warning', details: { reason, days, until: until?.toISOString() || null, byAdmin: session.userId, reference: refCode, account: existing.email }, notifyAdmin: true }).catch(() => {});
 
   const { sendTemplateEmail } = await import('@/features/email/email');
-  sendTemplateEmail(existing.email, 'account_suspended', {
-    name: existing.profile?.name || existing.email,
+  const { primaryEmailForUser } = await import('@/features/notifications/notifications');
+  // A decision about the account has to reach a person, and an account's login
+  // handle is a name, not necessarily a mailbox.
+  const mailTo = (await primaryEmailForUser(userId).catch(() => null)) || existing.email;
+  if (mailTo) sendTemplateEmail(mailTo, 'account_suspended', {
+    refCode,
+    primaryEmail: mailTo,
+    name: existing.profile?.name || mailTo,
     statusType: days ? `suspended for ${days} day${days > 1 ? 's' : ''}` : 'suspended indefinitely',
     reason: reason || 'No reason provided',
     suspendedUntil: until ? until.toUTCString() : 'Until support restores it',
-    suspendedNextStep: 'You cannot sign in or use Tirbeo services until then',
+    suspendedNextStep: 'You cannot sign in or use Tirbeo services until then. Quote the reference above if you write about it.',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }).catch(() => {});
 
   return NextResponse.json({ message: 'User suspended', until: until?.toISOString() || null });

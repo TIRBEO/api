@@ -83,6 +83,22 @@ export function eventRowRef(row: { id: string; metadata?: unknown }): string {
   return refFromRowId(row.id) ?? row.id;
 }
 
+/**
+ * The code to quote for one event row, read back after the write so a mail
+ * never shows a number that does not exist in the log. Falls through to the
+ * row id's own derived code, and only to the bare id when even that is short.
+ */
+export async function refForEventRow(id: string): Promise<string> {
+  try {
+    const { prisma } = await import('@/infrastructure/db/prisma');
+    const row = await prisma.activityEvent.findUnique({
+      where: { id },
+      select: { id: true, metadata: true } });
+    if (row) return eventRowRef(row);
+  } catch { /* the id-derived code below still resolves */ }
+  return refFromRowId(id) ?? id;
+}
+
 /** Collapse a raw error into a stable identity: ids, hashes and digits vary
     per occurrence but the fault does not, so `load failed after 1234ms [uuid]`
     and `load failed after 99ms [other-uuid]` must share one signature. */

@@ -152,6 +152,7 @@ import {
 import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBaseUrl, getAdminBaseUrl, getCdnBaseUrl, getMyprofileBaseUrl, getApiBaseUrl, getAppDomain } from '@/config/app-urls';
 import { accountChecksHandler } from '@/features/status/accountChecks';
 import { appealFileHandler, appealsListHandler } from '@/features/support/appeals';
+import { supportRequestHandler } from '@/features/support/requests';
 
 const appUrl = (subdomain: string, path: string) => {
   const base = (() => {
@@ -258,6 +259,7 @@ const INTERNAL_ROUTES = [
     'debug/rate-limits/reset',
   // Support
   'support/tickets', 'support/tickets/create',  'support/tickets/appeals', 'support/appeal',
+  'support/request',
 
 
 ];
@@ -449,7 +451,8 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'support/tickets': ['GET', 'POST'],
       'support/tickets/create': ['POST'],
       'support/appeal': ['POST'],
-      'support/tickets/appeals': ['GET'] };
+      'support/tickets/appeals': ['GET'],
+      'support/request': ['POST'] };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
       return { path: pathPart, method, internal: true, allowedRoles: ['guest'] };
@@ -562,6 +565,13 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
           accounts: `https://accounts.${appDomain}` });
       }
       const target = `${dashboardBase}/${pathStr}`;
+      /* Only a navigation gets sent to the dashboard. A 307 keeps the method on
+         the follow-up, so a write to an unconfigured path (a support request,
+         say) came back as a 405 from a settings *page* — a status that describes
+         the page rather than the missing route, and a body nobody can read. */
+      if (method.toUpperCase() !== 'GET') {
+        return jsonError(`Route not configured: ${method} ${pathStr}`, 404);
+      }
       return NextResponse.redirect(target);
     }
   }
@@ -1130,6 +1140,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/tickets/appeals':
         resp = await appealsListHandler(request);
+        break;
+      case 'support/request':
+        resp = await supportRequestHandler(request);
         break;
       case 'health':
         resp = await publicHealthHandler();

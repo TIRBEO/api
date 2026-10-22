@@ -21,6 +21,8 @@ const mocks = vi.hoisted(() => ({
   activityCreate: vi.fn(async () => ({})),
   sendTemplateEmail: vi.fn(async (..._args: unknown[]) => ({ success: true })),
   recordDeviceSeen: vi.fn(async () => {}),
+  // What the account's real mailbox is, as the identity registry answers it.
+  primaryEmailForUser: vi.fn(async (_userId?: string) => null as string | null),
 }));
 
 vi.mock('@/infrastructure/db/prisma', () => ({
@@ -52,7 +54,10 @@ vi.mock('@/features/captcha/risk', () => ({ recordDeviceSeen: mocks.recordDevice
 // Real describeDevice lives in a module with Prisma/branding side effects; keep
 // the suite hermetic with a faithful-but-trivial stub.
 vi.mock('@/features/notifications/notifications', () => ({
-  describeDevice: (ua?: string | null) => (ua ? `device<${ua}>` : 'an unknown device'),
+  describeDevice: (ua?: string | null) => (ua ? `device<${ua}>` : 'an unrecognized device'),
+  // The mailbox lookup answers "nothing known" so every case below is delivered
+  // to the address the caller passed, exactly as it always was.
+  primaryEmailForUser: mocks.primaryEmailForUser,
 }));
 
 import {
@@ -74,6 +79,7 @@ beforeEach(() => {
   mocks.misc = undefined;
   mocks.activityCreate.mockResolvedValue({} as any);
   mocks.sendTemplateEmail.mockResolvedValue({ success: true } as any);
+  mocks.primaryEmailForUser.mockImplementation(async () => null);
 });
 
 // ─── The gate: device-based, so a moving IP never spams ─────────────
@@ -136,6 +142,31 @@ describe('sendSuspiciousLoginAlert', () => {
     expect(mocks.recordDeviceSeen).toHaveBeenCalledWith(expect.objectContaining({ userId: 'u1', fingerprint: FP }));
     // an audit/cooldown row was written
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: 'auth.suspicious_login_alert' }) }));
+  });
+
+  /* A handle account signs in as `ada@tirbeo.com`, which is a name on our own
+     domain and may not be a mailbox anybody reads. The warning has to reach the
+     address behind the account, not the identity used to log in. */
+  it('mails the registered mailbox rather than the handle it signed in with', async () => {
+    mocks.deviceSeenCount = 0;
+    mocks.primaryEmailForUser.mockImplementation(async () => 'ada@real-mail.example');
+    const sent = await sendSuspiciousLoginAlert({
+      userId: 'u1', email: 'ada@tirbeo.com', ip: '1.2.3.4', fingerprint: FP, headers: headers({}),
+    });
+    expect(sent).toBe(true);
+    const [to, , vars] = mocks.sendTemplateEmail.mock.calls[0] as unknown as [string, string, Record<string, string>];
+    expect(to).toBe('ada@real-mail.example');
+    // no display name was passed, so it falls back to the real mailbox's local part
+    expect(vars.name).toBe('ada');
+  });
+
+  it('falls back to the sign-in address when no mailbox is registered', async () => {
+    mocks.deviceSeenCount = 0;
+    mocks.primaryEmailForUser.mockRejectedValue(new Error('db down'));
+    await sendSuspiciousLoginAlert({
+      userId: 'u1', email: 'ada@tirbeo.com', fingerprint: FP, headers: headers({}),
+    });
+    expect(mocks.sendTemplateEmail.mock.calls[0][0]).toBe('ada@tirbeo.com');
   });
 
   it('does NOT mail a known device (and records nothing)', async () => {
