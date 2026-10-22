@@ -51,6 +51,7 @@ const ENV_KEYS = [
   'EMAIL_PROVIDER', 'RESEND_API_KEY', 'EMAIL_RESEND_DOMAIN', 'ADMIN_FROM_EMAIL',
   'SUPPORT_EMAIL', 'EMAIL_HELLO_FROM', 'EMAIL_CODE_FROM', 'EMAIL_SECURITY_FROM',
   'EMAIL_SUPPORT_FROM', 'EMAIL_ADMIN_FROM', 'EMAIL_ALERT_FROM', 'EMAIL_NOTICE_FROM',
+  'EMAIL_ACCOUNT_FROM',
 ] as const;
 
 const saved: Record<string, string | undefined> = {};
@@ -111,6 +112,16 @@ describe('the sender line, per kind of mail', () => {
     expect(await senderOf('suspicious_login', {
       device: 'Chrome on Linux', location: 'Kathmandu, Nepal', ipAddress: '1.2.3.4', loginTime: 'today',
     })).toBe('Tirbeo Security <security@tirbeo.com>');
+  });
+
+  /* The three verified domains each carry their share: no kind of mail is
+     pinned to the apex just because it was there first. */
+  it('mail about one account comes from the account domain, not the apex', async () => {
+    expect(await senderOf('account_suspended', {
+      statusType: 'suspended', reason: 'Reports of abuse', suspendedUntil: '30 days',
+      refCode: 'a1b2-c3d4-e5f6-7a8b', suspendedNextStep: 'Sign-in is paused.',
+      dashboardUrl: 'https://myprofile.tirbeo.com', primaryEmail: 'ada@tirbeo.com',
+    })).toBe('Tirbeo Accounts <account@users.tirbeo.com>');
   });
 
   it('an alert to the team is ops mail — nobody outside replies to it', async () => {

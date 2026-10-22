@@ -681,7 +681,12 @@ const PREF_FREQUENCIES = ['daily', 'weekly', 'monthly'];
  */
 function prefsEndpoint(
   keys: string[],
-  options: { validate?: (patch: Record<string, unknown>) => string | null } = {},
+  options: {
+    validate?: (patch: Record<string, unknown>) => string | null;
+    /** Extra fields the server writes alongside a patch, given what the person
+        asked for and what was stored before. */
+    stamp?: (patch: Record<string, unknown>, current: Record<string, any>) => Record<string, unknown>;
+  } = {},
 ) {
   const allowed = new Set(keys);
   return async function handlePrefs(request: NextRequest) {
@@ -705,15 +710,17 @@ function prefsEndpoint(
       if (problem) return NextResponse.json({ error: problem }, { status: 400 });
 
       let finalPatch: Record<string, unknown> = patch;
+      const needsCurrent = options.stamp !== undefined || patch.email === true;
+      const current = needsCurrent ? await loadNotificationPrefs(session.userId) : null;
       // Re-enabling mail is also the moment the one-click unsubscribe from an
       // earlier email stops applying.
       if (patch.email === true) {
-        const current = await loadNotificationPrefs(session.userId);
-        const eu: any = (current.unsubscribed && typeof current.unsubscribed === 'object' && !Array.isArray(current.unsubscribed)) ? current.unsubscribed : {};
+        const eu: any = (current!.unsubscribed && typeof current!.unsubscribed === 'object' && !Array.isArray(current!.unsubscribed)) ? current!.unsubscribed : {};
         if (eu.all || eu.product || eu.forms || eu.support) {
-          finalPatch = { ...patch, unsubscribed: { ...eu, all: false, product: false, forms: false, support: false } };
+          finalPatch = { ...finalPatch, unsubscribed: { ...eu, all: false, product: false, forms: false, support: false } };
         }
       }
+      if (options.stamp) finalPatch = { ...finalPatch, ...options.stamp(patch, current!) };
       const saved = await saveNotificationPrefs(session.userId, finalPatch);
       return NextResponse.json(shape(saved));
     } catch (err: any) {
@@ -769,7 +776,19 @@ export const notificationSummaryHandler = prefsEndpoint(['summaryEnabled', 'summ
     if (problem) return problem;
     if (patch.summaryEnabled !== undefined && typeof patch.summaryEnabled !== 'boolean') return 'Invalid summaryEnabled';
     return null;
-  } });
+  },
+  /* The period is measured from the moment the choice was made, not from the
+     last send. Switching weekly → daily on Tuesday afternoon means the first
+     daily recap covers Tuesday afternoon onward — a person who asks for more
+     mail should not wait out the tail of the cycle they just left, and one who
+     changes their mind mid-window restarts the clock they are now on. */
+  stamp: (patch, current) => {
+    const changed =
+      (patch.summaryFrequency !== undefined && patch.summaryFrequency !== current.summaryFrequency)
+      || (patch.summaryEnabled === true && current.summaryEnabled !== true);
+    return changed ? { summaryChosenAt: new Date().toISOString() } : {};
+  },
+});
 
 export const notificationTipsHandler = prefsEndpoint(['tips', 'tipsEmail', 'tipsPush']);
 
@@ -980,6 +999,14 @@ export async function mergeAccountsHandler(request: NextRequest) {
 // ═══════════════════════════════════════════════════════════════════
 // USER ACTIVITY HANDLER
 // ═══════════════════════════════════════════════════════════════════
+
+/** Ledger rows that record the platform tidying itself rather than anything
+    the account did or had done to it. They exist in databases written before
+    the backfill stopped filing them, so every account-facing read still
+    excludes them; the writers are already gone. */
+const BOOKKEEPING_KINDS = ['security.ref_code_assigned'];
+const NOT_BOOKKEEPING = { kind: { notIn: BOOKKEEPING_KINDS } };
+
 export async function userActivityHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
@@ -998,12 +1025,12 @@ export async function userActivityHandler(request: NextRequest) {
     const fetchLimit = Math.min(limit + offset, 200); // hard cap to prevent abuse
     const [auditEvents, securityEvents, loginHistoryRecords, totalCounts] = await Promise.all([
       trackQuery('audit_events_by_actor_created', () => prisma.activityEvent.findMany({
-        where: { userId: session.userId },
+        where: { userId: session.userId, ...NOT_BOOKKEEPING },
         orderBy: { createdAt: 'desc' },
         take: fetchLimit,
         select: { id: true, kind: true, detail: true, metadata: true, severity: true, createdAt: true } })),
       trackQuery('security_events_by_user_created', () => prisma.activityEvent.findMany({
-        where: { userId: session.userId, kind: { startsWith: 'security.' } },
+        where: { userId: session.userId, kind: { startsWith: 'security.', notIn: BOOKKEEPING_KINDS } },
         orderBy: { createdAt: 'desc' },
         take: fetchLimit,
         select: { id: true, kind: true, metadata: true, severity: true, createdAt: true } })),
@@ -1015,8 +1042,8 @@ export async function userActivityHandler(request: NextRequest) {
         select: { id: true, kind: true, ipAddress: true, userAgent: true, metadata: true, createdAt: true } })),
       // Run all 3 count queries in parallel inside a single Promise.all
       Promise.all([
-        trackQuery('activity_total_count', () => prisma.activityEvent.count({ where: { userId: session.userId } })),
-        trackQuery('activity_total_security', () => prisma.activityEvent.count({ where: { userId: session.userId, kind: { startsWith: 'security.' } } })),
+        trackQuery('activity_total_count', () => prisma.activityEvent.count({ where: { userId: session.userId, ...NOT_BOOKKEEPING } })),
+        trackQuery('activity_total_security', () => prisma.activityEvent.count({ where: { userId: session.userId, kind: { startsWith: 'security.', notIn: BOOKKEEPING_KINDS } } })),
         trackQuery('activity_total_login', () => prisma.activityEvent.count({ where: { userId: session.userId, kind: { contains: 'login' } } })),
       ]),
     ]);
@@ -1091,6 +1118,7 @@ export async function userDailyActivityHandler(request: NextRequest) {
                kind, count(*)::int as count
         from "public".activity_events
         where user_id = ${session.userId} and created_at >= ${since}
+          and kind <> 'security.ref_code_assigned'
         group by 1, 2
         order by 1`,
       prisma.$queryRaw<{ day: string; kind: string; count: number }[]>`
@@ -1258,6 +1286,9 @@ const NOT_A_CHANGE = {
     { kind: { contains: 'login' } },
     { kind: { contains: 'logout' } },
     { kind: CHANGE_ANSWER_KIND },
+    // Rows the old reference-code backfill wrote for itself. Assigning a code
+    // is bookkeeping the account never asked for and cannot act on.
+    { kind: 'security.ref_code_assigned' },
   ] };
 
 /** The same row a list would show, by id — or nothing. The answer records are
@@ -1623,10 +1654,10 @@ export async function userOverviewHandler(request: NextRequest) {
       trackQuery('overview_notif_unread', () => prisma.notification.count({ where: { userId, isRead: false } })),
       trackQuery('overview_sessions_active', () => prisma.userSession.count({ where: { userId, status: 'active' } })),
       trackQuery('overview_recent_audit', () => prisma.activityEvent.findMany({
-        where: { userId: userId }, orderBy: { createdAt: 'desc' }, take: 6,
+        where: { userId: userId, ...NOT_BOOKKEEPING }, orderBy: { createdAt: 'desc' }, take: 6,
         select: { id: true, kind: true, detail: true, metadata: true, severity: true, createdAt: true } })),
       trackQuery('overview_recent_security', () => prisma.activityEvent.findMany({
-        where: { userId, kind: { startsWith: 'security.' } }, orderBy: { createdAt: 'desc' }, take: 6,
+        where: { userId, kind: { startsWith: 'security.', notIn: BOOKKEEPING_KINDS } }, orderBy: { createdAt: 'desc' }, take: 6,
         select: { id: true, kind: true, metadata: true, severity: true, createdAt: true } })),
       trackQuery('overview_recent_login', () => prisma.activityEvent.findMany({
         where: { userId, kind: { contains: 'login' } }, orderBy: { createdAt: 'desc' }, take: 6,

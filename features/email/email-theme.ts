@@ -1,17 +1,25 @@
 /**
- * The mail's palette — the Tirbeo email design system: a #F5F7FA page, a
- * 600px white card with #E5E7EB hairlines, ink #172033 text, #344054 body
- * copy, #667085 secondary, brand blue #2563EB, and a pale-blue #EFF6FF
- * detail panel for codes and facts. Arial per the spec — the one web-safe
- * stack every mail client renders identically.
+ * The mail's palette — the Tirbeo email design system.
+ *
+ * Pure white, top to bottom. The canvas and the card are the same #FFFFFF, the
+ * copy is set in near-black ink (#172033) with grey only for the lines that
+ * explain rather than say, and hairlines (#E5E7EB) do the separating that a
+ * coloured band used to do. The one place a fill is allowed inside the mail is
+ * `PLATE` — a quote, a code, a fact block — and it is the only grey left.
+ *
+ * Arial per the spec: the one web-safe stack every mail client renders the same.
  */
 
-export const PAGE = '#F5F7FA';
+/** The canvas behind the mail. White, because a grey page makes a white card
+    look like a box someone else put there. */
+export const PAGE = '#FFFFFF';
 export const CARD = '#FFFFFF';
+/** The only fill inside the card: a quoted message, a code, a plate of facts. */
+export const PLATE = '#F5F7FA';
 
-export const TEXT = '#172033'; // headings, the wordmark, codes
-export const TEXT_2 = '#344054'; // body copy
-export const MUTED = '#667085'; // secondary information
+export const TEXT = '#172033'; // headings, the wordmark, body copy, codes
+export const TEXT_2 = '#344054'; // secondary body copy
+export const MUTED = '#667085'; // labels and asides
 export const FAINT = '#98A2B3'; // footer fine print
 
 export const LINE = '#E5E7EB';
@@ -21,10 +29,9 @@ export const LINK = '#2563EB';
 export const DANGER = '#DC2626';
 export const WARN = '#B54708';
 export const SUCCESS = '#067647';
-/** The band for a support conversation. Deliberately outside the family the
-    transactional mail uses (blue codes, red security, ink product, grey
-    notices) so a reply from a person — not a robot — is recognisable in the
-    thread list on colour alone. */
+/** The category a mail belongs to. No longer painted across the top of the
+    card — it is the small word above the headline, so the colour still tells
+    the reader what kind of mail this is without the mail becoming a banner. */
 export const SUPPORT = '#0F766E';
 
 export const RADIUS_CARD = '12px';

@@ -60,6 +60,10 @@ type RecapChoice = {
   summaryEnabled: boolean;
   summaryFrequency: string;
   lastSummarySentAt: string | null;
+  /** When the person last chose the cadence. The window is measured from
+      whichever of this and the last send is later, so changing from weekly to
+      daily starts a fresh day rather than finishing the week they left. */
+  summaryChosenAt: string | null;
   mailBlocked: boolean;
 };
 
@@ -100,6 +104,7 @@ export function recapChoice(notifRaw: unknown): RecapChoice {
     summaryEnabled: notif.summaryEnabled === true,
     summaryFrequency: SUMMARY_FREQUENCIES.includes(raw) ? raw : 'weekly',
     lastSummarySentAt: notif.lastSummarySentAt ?? null,
+    summaryChosenAt: typeof notif.summaryChosenAt === 'string' ? notif.summaryChosenAt : null,
     /* A paused account is not due for a recap, and saying so here is what saves
        the letter rather than losing it: the mailer answers a suppressed send
        with a plain "success", so a sweep that mailed into a pause would move the
@@ -187,9 +192,20 @@ export async function sendAccountSummaries() {
       const choice = recapChoice(row.preferences?.notif);
       if (!choice.summaryEnabled || choice.mailBlocked) continue;
       const periodMs = frequencyToMs(choice.summaryFrequency);
-      if (!isCadenceDue(choice.lastSummarySentAt, now, periodMs)) continue;
-      const since = choice.lastSummarySentAt
-        ? new Date(Math.max(new Date(choice.lastSummarySentAt).getTime(), now.getTime() - periodMs))
+      /* The window opens at whichever came later — the last mail that went out,
+         or the moment this person chose the cadence. Switching weekly → daily
+         on a Tuesday therefore does not owe them the rest of a week they no
+         longer asked for: the first daily recap covers Tuesday onward, and
+         changing one's mind again mid-window restarts the clock on the new
+         cadence rather than finishing the old one. */
+      const anchorMs = Math.max(
+        choice.lastSummarySentAt ? new Date(choice.lastSummarySentAt).getTime() : 0,
+        choice.summaryChosenAt ? new Date(choice.summaryChosenAt).getTime() : 0,
+      );
+      const anchor = anchorMs ? new Date(anchorMs) : null;
+      if (!isCadenceDue(anchor, now, periodMs)) continue;
+      const since = anchor
+        ? new Date(Math.max(anchor.getTime(), now.getTime() - periodMs))
         : new Date(now.getTime() - periodMs);
       await sendOnceClaimed(row.id, choice.lastSummarySentAt, now, () => sendAccountRecap(row.id, since, now));
     }

@@ -879,16 +879,24 @@ export async function sendTemplateEmail(
                             notices and staff alerts: mail nobody is expected to
                             answer, so nothing that needs the brand's best
                             address is spent on it.
-       users.tirbeo.com   — the accounts. A handle's own mailbox, and the
-                            sender on a support request, which is a person
-                            writing rather than the product announcing.
+       users.tirbeo.com   — the accounts. A handle's own mailbox, the sender on
+                            a support request (a person writing rather than the
+                            product announcing), and the address on mail about
+                            one account's own status — suspended, exported, back
+                            again. Nothing brand-wide is spent from here.
 
      Every one of them stays env-overridable, and `verifiedSender` drops any
      address whose domain Resend has not confirmed — a wrong default degrades to
      the working sender instead of failing the send. */
   const SECURITY_TEMPLATES = new Set([
     'password_changed', 'suspicious_login', 'two_factor_disabled', 'two_factor_enabled', 'login_alert',
-    'account_suspended', 'account_deleted', 'account_deactivated', 'export_ready',
+  ]);
+  /* Mail about one account rather than one event on it: it was suspended, its
+     export finished, it is coming back. The account's own address is the
+     subject line, so the identity domain sends it — a reader who lives on
+     `handle@users.tirbeo.com` gets the mail about that handle from there. */
+  const ACCOUNT_TEMPLATES = new Set([
+    'account_suspended', 'account_deleted', 'account_deactivated', 'reactivation', 'export_ready',
   ]);
   // A code and a warning about the account are different problems, and they
   // read differently in an inbox before anyone opens them.
@@ -903,7 +911,7 @@ export async function sendTemplateEmail(
   // Scheduled, recurring, or "here is something worth knowing" — read when
   // convenient, never answered, and unsubscribable.
   const NOTICE_TEMPLATES = new Set([
-    'notification_digest', 'weekly_summary', 'product_update', 'reactivation',
+    'notification_digest', 'weekly_summary', 'product_update',
     'maintenance_notification', 'maintenance_complete', 'security_tip',
     'tirbeo_account_onboarding',
   ]);
@@ -927,6 +935,9 @@ export async function sendTemplateEmail(
     code: { email: alias('EMAIL_CODE_FROM', 'code@mails.tirbeo.com'), name: 'Tirbeo' },
     security: { email: alias('EMAIL_SECURITY_FROM', 'security@tirbeo.com'), name: 'Tirbeo Security' },
     support: { email: alias('EMAIL_SUPPORT_FROM', 'support@tirbeo.com'), name: 'Tirbeo Support' },
+    // Suspended, deleted, exported, reactivated — the account speaking about
+    // itself, on the domain the account's own address lives.
+    account: { email: alias('EMAIL_ACCOUNT_FROM', 'account@users.tirbeo.com'), name: 'Tirbeo Accounts' },
     notice: { email: alias('EMAIL_NOTICE_FROM', 'team@mails.tirbeo.com'), name: branding.brandName || 'Tirbeo' },
     // An alert about the admin panel is for the people who run it, never a
     // reader's inbox — so it costs the brand nothing to put it on the machines.
@@ -939,6 +950,7 @@ export async function sendTemplateEmail(
     : SUPPORT_TEMPLATES.has(templateName) ? 'support'
     : CODE_TEMPLATES.has(templateName) ? 'code'
     : SECURITY_TEMPLATES.has(templateName) ? 'security'
+    : ACCOUNT_TEMPLATES.has(templateName) ? 'account'
     : humanMailboxTemplates.includes(templateName) ? 'human'
     : NOTICE_TEMPLATES.has(templateName) ? 'notice'
     : 'casual';

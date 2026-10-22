@@ -915,7 +915,10 @@ export async function resolveUserByRefCode(request: NextRequest) {
   // finds its user.
   const events = await prisma.userStatusEvent.findMany({
     where: {
-      toStatus: { in: [...ENFORCE_STATUSES] },
+      // Every status, not only the enforced ones: a code backfilled for a
+      // deactivated or deleted account lives in the same column, and a staff
+      // member quoting one from that screen has to land on the same person.
+      toStatus: { in: [...USER_STATUSES] },
       OR: candidates.map((c) => ({ metadata: { path: ['refCode'], equals: c } })),
     },
     select: { userId: true },

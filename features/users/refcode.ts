@@ -209,17 +209,12 @@ export async function ensureRefCode(userId: string, kind: DisplayKind): Promise<
           actor: 'system',
           metadata: { refCode: code, backfilled: true } as never } });
     }
-    // Mirror the freshly persisted code into activity_events too, so an admin
-    // searching the event log by reference code finds backfilled codes exactly
-    // like codes minted by a ban/suspend (security.user_banned rows).
-    await prisma.activityEvent.create({
-      data: {
-        userId,
-        kind: 'security.ref_code_assigned',
-        title: 'Reference code assigned',
-        detail: `Code ${code} persisted for ${toStatus} account (first display).`,
-        severity: 'info',
-        metadata: { refCode: code, status: toStatus } as never } }).catch(() => {});
+    /* No mirror row in the activity ledger. It used to write one —
+       "Reference code assigned, code xxxx persisted for suspended account" —
+       and that row then appeared in the account's own change history as though
+       something had happened to it. Nothing had: a person opened a screen, and
+       bookkeeping ran. The code is on the status event above, which is where
+       the admin lookup reads it from, so the ledger keeps out of it. */
     return code;
   } catch {
     return eventIdFor(userId, kind);

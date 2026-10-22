@@ -11,7 +11,7 @@ import {
   MONO,
   MUTED,
   PAGE,
-  RADIUS_PLATE,
+  PLATE,
   SUPPORT,
   TEXT,
   TEXT_2,
@@ -28,14 +28,15 @@ import {
  * code or button, and a footer. Dropping the render pass also drops the reason the
  * send path used to need a cache: building one of these is a string join.
  *
- * The brand, headline and code sit centred at the top; long-form copy stays
- * left-aligned, because a notice is not a flyer. The mail sits on a white card
- * with a #d1d1d6 hairline over the #f2f2f7 grouped canvas. Landing systemBlue
- * marks anything pressable; everything else is ink or grey.
- *
  * Templates declare their values as `{{name}}` and leave substitution to
  * `renderTemplate` at send time, so the rendered text is cacheable per logo and
  * one template can be reused across many recipients.
+ *
+ * Everything is left-aligned on pure white and reads top-to-bottom like a
+ * document: the wordmark, one coloured word naming the category, an ink
+ * headline, the copy, a sign-off, fine print. The only fill inside the mail is
+ * the pale plate around a quoted message; every other division is a hairline.
+ * Landing systemBlue marks anything pressable; everything else is ink or grey.
  */
 
 export type EmailTemplate = { subject: string; html: string };
@@ -84,20 +85,18 @@ const note = (text: string): string =>
   `<p style="margin:0 0 14px;font-size:13px;line-height:20px;color:${MUTED}">${text}</p>`;
 
 /**
- * The one-time code: the digits themselves, centred, with nothing drawn
- * around them. A plate or a border is decoration over the one line the reader
- * actually came for.
- *
- * `text-indent` pays back half the trailing letter-spacing so the digits sit
- * optically centred rather than a space to the right.
+ * The one-time code: the digits themselves, with nothing drawn around them.
+ * A plate or a border is decoration over the one line the reader actually came
+ * for, and centring them would put the only non-left-aligned thing in a mail
+ * that reads top-to-bottom like a document.
  */
 const code = (value: string, hint?: string): string =>
-  `<div style="margin:30px 0 26px"><div class="mail-code" style="font-family:${MONO};font-size:36px;line-height:44px;font-weight:bold;letter-spacing:6px;text-indent:3px;color:${TEXT};text-align:center">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED};text-align:center">${hint}</div>` : ''}</div>`;
+  `<div style="margin:30px 0 26px"><div class="mail-code" style="font-family:${MONO};font-size:34px;line-height:42px;font-weight:bold;letter-spacing:5px;color:${TEXT}">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
 
 /** A secret that has to be transcribed exactly — the code's shape, but small
     enough to fit and left untracked so a double-click selects all of it. */
 const secret = (value: string, hint?: string): string =>
-  `<div style="margin:30px 0 26px"><div style="font-family:${MONO};font-size:22px;line-height:30px;font-weight:bold;color:${TEXT};text-align:center;word-break:break-all">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED};text-align:center">${hint}</div>` : ''}</div>`;
+  `<div style="margin:30px 0 26px"><div style="font-family:${MONO};font-size:22px;line-height:30px;font-weight:bold;color:${TEXT};word-break:break-all">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
 
 /**
  * A reference code: the short handle a person quotes and staff search by.
@@ -119,7 +118,7 @@ const refLine = (value: string, label = 'Reference'): string =>
  * reflows into one grey soup of a paragraph is a quote nobody trusts.
  */
 const messageBlock = (text: string, label = 'Your message'): string =>
-  `<div style="margin:24px 0;padding:16px 18px;background:${PAGE};border:1px solid ${LINE}">`
+  `<div style="margin:24px 0;padding:16px 18px;background:${PLATE}">`
   + `<div style="font-size:13px;line-height:19px;color:${MUTED}">${label}</div>`
   + `<div style="margin-top:8px;font-size:15px;line-height:24px;color:${TEXT};white-space:pre-wrap;word-break:break-word">${text}</div></div>`;
 
@@ -202,20 +201,27 @@ type MailOpts = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Tones — the category label under the wordmark                               */
+/* Tones — the category word above the headline                                */
 /* -------------------------------------------------------------------------- */
 
 export type Tone = 'otp' | 'security' | 'brand' | 'info' | 'welcome' | 'support';
 
-/** The banner over the card — the colour is the category, so the mail is
-    recognisable in the thread list before a word of it is read. */
-const TONE_BAND: Record<Tone, string> = {
-  otp: BTN,
-  security: DANGER,
-  brand: TEXT,
-  info: MUTED,
-  welcome: BTN,
-  support: SUPPORT,
+/**
+ * What the mail is, in one word and one colour.
+ *
+ * This used to be a band of colour across the top of the card with the headline
+ * painted white inside it. A band says "automated message" before the reader
+ * has seen a sentence, and every phish kit ships one, so the category moved to a
+ * small coloured word over an ink headline — the arrangement a mail client uses
+ * for its own labels, which reads as mail rather than as a flyer.
+ */
+const TONE_MARK: Record<Tone, { label: string; color: string }> = {
+  otp: { label: 'Verification', color: BTN },
+  security: { label: 'Account security', color: DANGER },
+  brand: { label: 'Tirbeo', color: TEXT },
+  info: { label: 'Notice', color: MUTED },
+  welcome: { label: 'Welcome', color: BTN },
+  support: { label: 'Support', color: SUPPORT },
 };
 
 /** Every template's family, resolved by name at render time so no template
@@ -239,10 +245,10 @@ const TEMPLATE_TONES: Record<string, Tone> = {
   maintenance_notification: 'info', maintenance_complete: 'info',
   export_ready: 'info',
 
-  // A conversation, not a notice: its own band so it never reads as another
+  // A conversation, not a notice: its own colour so it never reads as another
   // automated alert in a full inbox.
   support_request_received: 'support', support_reply: 'support',
-  // Staff's side of the same conversation wears the same band.
+  // Staff's side of the same conversation wears the same colour.
   support_request_admin: 'support',
 };
 
@@ -257,26 +263,28 @@ const TONE_TEAM: Record<Tone, string> = {
 };
 
 /**
- * The shared shell, in the shape the big account-notification mails use: a
- * 600px white card on the #F5F7FA page, the headline set in white inside a
- * colour band across the top, the copy in the body below it, a sign-off, and
- * the fine print outside the card.
+ * The shared shell. Pure white, one column, left-aligned, no decoration beyond
+ * hairlines: wordmark, category word, headline, the copy, a sign-off, and the
+ * fine print under a rule.
  *
- * The band is the only decoration in the mail and it carries the whole
- * category — blue for codes, red for security, ink for product, grey for
- * notices — so no label has to say so as well. The footer lives outside the
- * card because it is not part of the message; it is the machinery around it,
- * and templates hand over body blocks only, so none of them can forget the
- * unsubscribe link or the sign-off.
+ * The card used to be a white sheet with a border on a grey page and a colour
+ * band across its top. A mail client shows a message on the same white as the
+ * rest of the reading pane, and a bordered sheet on tinted canvas is the shape
+ * of a template — so the canvas, the card and the band all went, and what is
+ * left is the document. Categories stay recognisable in a full inbox through
+ * the coloured word over the headline and the sign-off line, neither of which a
+ * client has to be coaxed into rendering.
  *
  * Nothing in the mail is an image: mail clients block remote images by
- * default. Actions are underlined text links — a filled button is decoration
- * that weaker clients strip. The `logo` URL still flows through and still keys
- * the template cache, but is not embedded anywhere in the HTML.
+ * default, so the wordmark is letterspaced type. Actions are underlined text
+ * links — a filled button is decoration that weaker clients strip. The `logo`
+ * URL still flows through and still keys the template cache, but is not embedded
+ * anywhere in the HTML.
  */
 function mail(logo: string, opts: MailOpts): string {
   const { title, sub, blocks, preheader } = opts;
   const tone = opts.tone ?? 'info';
+  const mark = TONE_MARK[tone];
   const pre = esc(preheader || sub || title);
   const support = esc(SUPPORT_EMAIL);
 
@@ -295,26 +303,32 @@ function mail(logo: string, opts: MailOpts): string {
   body{-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;text-size-adjust:100%}
   a{text-decoration:none}
   @media only screen and (max-width:640px){
-    .mail-band{padding:26px 22px !important}
-    .mail-body{padding:22px 22px 26px !important}
-    .mail-foot{padding:18px 4px 0 !important}
-    .mail-code{font-size:28px !important;line-height:38px !important;letter-spacing:5px !important;text-indent:3px !important}
+    .mail-head{padding:24px 22px 0 !important}
+    .mail-body{padding:18px 22px 26px !important}
+    .mail-rule{padding:26px 22px 0 !important}
+    .mail-foot{padding:16px 4px 0 !important}
+    .mail-code{font-size:26px !important;line-height:36px !important;letter-spacing:4px !important}
   }
 </style>
 </head>
 <body style="margin:0;padding:0;background:${PAGE};color:${TEXT_2};font-family:${FONT_STACK};font-size:15px;line-height:1.7;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0" data-skip-in-text="true">${pre}&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${PAGE}" style="background:${PAGE};border-collapse:collapse">
-<tr><td align="center" style="padding:40px 12px">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${CARD}" style="width:100%;max-width:600px;background:${CARD};border:1px solid ${LINE};border-collapse:collapse">
-<tr><td class="mail-band" bgcolor="${TONE_BAND[tone]}" align="left" style="background:${TONE_BAND[tone]};padding:34px 32px">
-<div style="font-size:24px;line-height:32px;color:#ffffff">${title}</div>
+<tr><td align="center" style="padding:36px 12px">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${CARD}" style="width:100%;max-width:600px;background:${CARD};border-collapse:collapse">
+<tr><td class="mail-head" align="left" style="padding:32px 32px 0">
+<div style="font-size:12px;line-height:16px;font-weight:bold;letter-spacing:4px;color:${TEXT}">TIRBEO</div>
+<div style="margin-top:28px;font-size:12px;line-height:16px;font-weight:bold;letter-spacing:1px;text-transform:uppercase;color:${mark.color}">${mark.label}</div>
+<div style="margin-top:8px;font-size:24px;line-height:32px;font-weight:bold;color:${TEXT}">${title}</div>
 </td></tr>
-<tr><td class="mail-body" align="left" style="padding:28px 32px 30px">
+<tr><td class="mail-body" align="left" style="padding:20px 32px 32px">
 ${sub ? `<p style="margin:0 0 18px;font-size:15px;line-height:26px;color:${TEXT_2}">${sub}</p>` : ''}
 ${blocks.join('\n')}
 <p style="margin:30px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">Sincerely yours,</p>
 <p style="margin:2px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">${TONE_TEAM[tone]}</p>
+</td></tr>
+<tr><td class="mail-rule" style="padding:28px 32px 0">
+<div style="border-top:1px solid ${LINE}"></div>
 </td></tr>
 </table>
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse">
@@ -725,8 +739,10 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       preheader: 'Something on Tirbeo needs a person.',
       blocks: [
         raw('{{details}}'),
-        btn('{{dashboardUrl}}', 'Open dashboard'),
-        note('Automated administrative alert from Tirbeo.'),
+        // No dashboard link, no "automated alert from Tirbeo" line: the mail is
+        // addressed to someone whose whole job is reading it, and the facts
+        // above are the call to action. The route they take is in their
+        // bookmarks, not in a message that arrives forty times a day.
         // Last, because it is only needed when someone replies — and the same
         // code the account was shown, so both sides of this quote one thing.
         refLine('{{refCode}}', 'Reference'),
@@ -772,7 +788,6 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
           ['Reference', '{{refCode}}'],
         ]),
         btn('{{replyHref}}', '{{replyLabel}}'),
-        btnGhost('{{dashboardUrl}}', 'Open the dashboard'),
         note('Answer from the panel — the reply writes the record beside the request and tells the account it was answered. Replying from your own mail client answers the person and leaves both screens silent.'),
       ],
     }, logo, name),
