@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { verifyPassword } from '@/features/auth/password';
+import { consumeGenericWindow } from '@/features/auth/verify-limits';
+import { clientIp } from '@/shared/client-ip';
 import { jsonUnauthorized } from '@/shared/response';
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -25,6 +27,13 @@ import { jsonUnauthorized } from '@/shared/response';
 
 const NOTE_MIN = 40;
 const NOTE_MAX = 900;
+
+/** Ceilings on proving ownership with a password at the appeal door, in the same
+    15-minute window the send limits use. An appeal needs one correct password;
+    a guesser needs thousands. */
+const APPEAL_AUTH_WINDOW_MS = 15 * 60 * 1000;
+const APPEAL_AUTH_PER_ACCOUNT = 5;
+const APPEAL_AUTH_PER_IP = 10;
 
 type AppealRow = {
   id: string;
@@ -105,6 +114,25 @@ export async function appealFileHandler(request: NextRequest) {
       const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
       const password = typeof body.password === 'string' ? body.password : '';
       if (!email || !password) return jsonUnauthorized('Sign in, or include your email and password.');
+      /* A password check on a route anyone can reach, with no session behind it,
+         is a second sign-in screen whether it was meant to be one or not. So it
+         gets the same two ceilings the real sign-in has — per address and per
+         account — or the lockout on `/api/auth/login` is a door with a window
+         beside it. One filing is all an appeal needs, so a person who is locked
+         out of their account and appealing it never reaches these numbers;
+         somebody guessing a password reaches them in minutes. */
+      const ip = clientIp(request.headers) ?? 'unknown';
+      const [byAccount, byAddress] = await Promise.all([
+        consumeGenericWindow(`appeal:account:${email}`, APPEAL_AUTH_PER_ACCOUNT, APPEAL_AUTH_WINDOW_MS),
+        consumeGenericWindow(`appeal:ip:${ip}`, APPEAL_AUTH_PER_IP, APPEAL_AUTH_WINDOW_MS),
+      ]);
+      if (!byAccount.ok || !byAddress.ok) {
+        const mins = Math.max(1, Math.ceil((Math.max(byAccount.resetAt, byAddress.resetAt) - Date.now()) / 60000));
+        return NextResponse.json(
+          { error: `Too many tries with those details. Come back in ${mins} minute${mins === 1 ? '' : 's'}.` },
+          { status: 429 },
+        );
+      }
       const user = await prisma.user.findUnique({
         where: { email },
         select: { id: true, passwordHash: true, status: true },

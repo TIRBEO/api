@@ -23,9 +23,9 @@ export function setupQueryAlerts() {
     try {
       // Dynamic imports to avoid circular dependencies
       const { notifyAdmins } = await import('@/features/security/security');
-      const { getApiOrigin } = await import('@/features/branding/branding');
+      const { getAdminBaseUrl } = await import('@/config/app-urls');
 
-      const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
+      const dashboardUrl = getAdminBaseUrl();
       const severityIcon = alert.severity === 'critical' ? '🔴' : '🟡';
       const severityLabel = alert.severity.toUpperCase();
 

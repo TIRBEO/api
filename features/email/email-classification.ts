@@ -28,6 +28,7 @@ export const ESSENTIAL_TEMPLATES = new Set([
   // Account
   'account_recovery',
   'account_suspended',
+  'account_reinstated',
   'account_deleted',
   'account_deactivated',
   'delete_account_otp',

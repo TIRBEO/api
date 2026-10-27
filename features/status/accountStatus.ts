@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession, requirePermission } from '@/features/auth/http-guards';
 import { jsonUnauthorized } from '@/shared/response';
+import { serializableWrite } from '@/infrastructure/db/serializable-write';
 
 /* ═══════════════════════════════════════════════════════════════════
    Account status level — the number an admin decides, the person reads.
@@ -50,21 +51,23 @@ export function isValidStatusLevel(value: unknown): value is number {
 /** Merge-write the level into `misc.accountStatus`, preserving every other
     key in misc (the settings bag lives alongside it). */
 async function writeLevel(userId: string, level: number, updatedBy: string): Promise<void> {
-  const row = await prisma.userPreferences.findUnique({
-    where: { userId },
-    select: { misc: true },
-  });
-  const misc = asObj(row?.misc);
-  const accountStatus = {
-    ...asObj(misc.accountStatus),
-    level,
-    updatedBy,
-    updatedAt: new Date().toISOString(),
-  };
-  await prisma.userPreferences.upsert({
-    where: { userId },
-    create: { userId, misc: { ...misc, accountStatus } as any },
-    update: { misc: { ...misc, accountStatus } as any },
+  await serializableWrite(async (tx) => {
+    const row = await tx.userPreferences.findUnique({
+      where: { userId },
+      select: { misc: true },
+    });
+    const misc = asObj(row?.misc);
+    const accountStatus = {
+      ...asObj(misc.accountStatus),
+      level,
+      updatedBy,
+      updatedAt: new Date().toISOString(),
+    };
+    await tx.userPreferences.upsert({
+      where: { userId },
+      create: { userId, misc: { ...misc, accountStatus } as any },
+      update: { misc: { ...misc, accountStatus } as any },
+    });
   });
 }
 
@@ -128,11 +131,16 @@ export async function accountStatusHandler(request: NextRequest) {
   }
 }
 
-/** PUT /api/admin/account-status { userId, level } — admin-only raise (or
-    return to 0). The person's own screen has no path to this value. */
+/** PUT /api/admin/account-status { userId, level } — staff write (or
+    return to 0). The person's own screen has no path to this value.
+
+    `people.manage`, not `people.read`: this raises a level that restricts an
+    account, and the read permission is held by roles whose whole purpose is to
+    look without changing — an analyst who can ban is a misconfiguration nobody
+    configured on purpose. */
 export async function adminAccountStatusHandler(request: NextRequest) {
   try {
-    const admin = await requirePermission(request, 'people.read');
+    const admin = await requirePermission(request, 'people.manage');
     if (admin instanceof NextResponse) return admin;
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;

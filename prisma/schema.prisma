@@ -38,6 +38,9 @@ model User {
   lastLoginAt     DateTime?   @map("last_login_at") @db.Timestamptz(6)
   createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /** Which organisational unit the account belongs to. Nullable, and a delete
+      that leaves a unit is refused rather than clearing this — see OrgUnit. */
+  orgUnitId       String?     @map("org_unit_id")
 
   profile         UserProfile?
   preferences     UserPreferences?
@@ -65,10 +68,18 @@ model User {
   tirbeoIdentities   TirbeoIdentity[]
   staffRole          StaffRole?         @relation("StaffRoleHolder")
   grantedRoles       StaffRole[]        @relation("StaffRoleGranter")
+  orgUnit            OrgUnit?           @relation("OrgUnitMembership", fields: [orgUnitId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  groupMemberships   GroupMember[]      @relation("GroupMembership")
+  groupAdditions     GroupMember[]      @relation("GroupMemberAdder")
+  groupsCreated      UserGroup[]        @relation("GroupCreator")
+  orgUnitsCreated    OrgUnit[]          @relation("OrgUnitCreator")
+  apiKeysCreated     ApiKey[]           @relation("ApiKeyCreator")
+  apiKeysRevoked     ApiKey[]           @relation("ApiKeyRevoker")
 
   @@index([status], map: "idx_users_status")
   @@index([createdAt], map: "idx_users_created")
   @@index([lastActiveAt], map: "idx_users_last_active")
+  @@index([orgUnitId], map: "idx_users_org_unit")
   @@map("users")
 }
 
@@ -98,6 +109,153 @@ model StaffRole {
   @@index([role], map: "idx_staff_roles_role")
   @@index([grantedBy], map: "idx_staff_roles_granted_by")
   @@map("staff_roles")
+}
+
+// ═══ The directory: groups, units, keys ════════════════════════════
+
+/**
+ * A named collection of accounts — "Support rota", "Beta testers", "EU staff".
+ *
+ * A group is not an access rule and not a team: it changes nothing on its own
+ * and grants nothing. It exists so an operator can act on a set of accounts
+ * without pasting forty ids into a form, and so a screen can answer "who is in
+ * this". Enforcement still reads `users.status` and the role registry; nothing
+ * here is consulted when somebody signs in, which is why deleting a group is
+ * safe.
+ *
+ * Nesting is one group inside another. `parent_id` is nullable and a cycle is
+ * refused in the handler (`features/admin/groups.ts`) rather than by the
+ * database, because Postgres has no way to say "this tree must stay a tree" —
+ * a recursive CHECK is not available, and a depth cap alone would still let an
+ * A→B→A loop be written at depth two.
+ */
+model UserGroup {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String
+  description String?
+  parentId    String?  @map("parent_id")
+  createdBy   String?  @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   UserGroup?  @relation("UserGroupTree", fields: [parentId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  children UserGroup[] @relation("UserGroupTree")
+  members  GroupMember[] @relation("GroupContainer")
+  // This group sitting inside another one. Both sides of a membership row are
+  // optional, so a group that is only ever a container has zero of these.
+  nestedAs GroupMember[] @relation("GroupNesting")
+  addedBy  User?        @relation("GroupCreator", fields: [createdBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([parentId], map: "idx_user_groups_parent")
+  @@index([name], map: "idx_user_groups_name")
+  @@map("user_groups")
+}
+
+/**
+ * One account or one nested group inside one group.
+ *
+ * The two unique pairs are nullable *on purpose*, and that is what makes the
+ * table hold both kinds of member. Postgres treats a NULL as distinct from
+ * every other NULL, so `@@unique([groupId, userId])` says nothing about rows
+ * where `user_id` is NULL — those are the nested groups, and they are held to
+ * be unique by the *other* pair instead. Each row populates exactly one of the
+ * two, checked in the handler.
+ *
+ * A partial unique index would have been tidier, but `db push` does not create
+ * partial indexes from a schema, so a hand-written migration nobody wrote
+ * would be the only way to get one. Two nullable pairs is the same guarantee
+ * in the vocabulary the workflow has.
+ */
+model GroupMember {
+  id            String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  groupId       String   @map("group_id")
+  userId        String?  @map("user_id")
+  memberGroupId String?  @map("member_group_id")
+  note          String?
+  addedBy       String?  @map("added_by")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  group       UserGroup  @relation("GroupContainer", fields: [groupId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user        User?      @relation("GroupMembership", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  memberGroup UserGroup? @relation("GroupNesting", fields: [memberGroupId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  addedByUser User?      @relation("GroupMemberAdder", fields: [addedBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([groupId, userId], map: "uq_group_members_group_user")
+  @@unique([groupId, memberGroupId], map: "uq_group_members_group_child")
+  @@index([userId], map: "idx_group_members_user")
+  @@index([memberGroupId], map: "idx_group_members_child")
+  @@map("group_members")
+}
+
+/**
+ * Where an account sits in the organisation: a department, an office, a
+ * subsidiary. One unit per account, `users.org_unit_id`.
+ *
+ * Deliberately not the same thing as a group. A unit describes the company;
+ * membership is decided by HR and changes when somebody moves jobs. A group
+ * describes a decision an operator made this week. Collapsing them would make
+ * an org chart that grants nothing but looks like it does, so they are two
+ * tables that read differently on a screen.
+ *
+ * Deleting a unit that still has accounts or children is refused rather than
+ * cascaded — see `features/admin/orgUnits.ts`. A cascade here would quietly
+ * re-home thousands of accounts into "no unit", and the operator would find
+ * out from somebody's report six weeks later.
+ */
+model OrgUnit {
+  id          String   @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name        String
+  description String?
+  parentId    String?  @map("parent_id")
+  createdBy   String?  @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  parent   OrgUnit?  @relation("OrgUnitTree", fields: [parentId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  children OrgUnit[] @relation("OrgUnitTree")
+  users    User[]    @relation("OrgUnitMembership")
+  addedBy  User?     @relation("OrgUnitCreator", fields: [createdBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([parentId], map: "idx_org_units_parent")
+  @@index([name], map: "idx_org_units_name")
+  @@map("org_units")
+}
+
+/**
+ * A credential a machine can present instead of a person's session.
+ *
+ * There is no code path that accepts one yet — `getSession` reads the session
+ * cookie and a bearer JWT, and nothing reads this table. What exists here is
+ * the record and its lifecycle: mint, list, revoke. The console has to say
+ * exactly that, because a screen that offers a key with no consumer teaches an
+ * operator that the product has an API it does not have.
+ *
+ * Only the argon2id hash of the secret is stored, beside a short `prefix` to
+ * recognise it by, so the clear secret can be shown once at creation and never
+ * reconstructed. A prefix cannot authenticate anything: it is eight characters
+ * of a much longer string, stored so two keys can be told apart on a screen.
+ */
+model ApiKey {
+  id         String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name       String
+  prefix     String
+  secretHash String    @map("secret_hash")
+  scopes     Json      @default("[]")
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  lastUsedIp String?   @map("last_used_ip")
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedBy  String?   @map("revoked_by")
+  createdBy  String?   @map("created_by")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  creator User? @relation("ApiKeyCreator", fields: [createdBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  revoker User? @relation("ApiKeyRevoker", fields: [revokedBy], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([prefix], map: "uq_api_keys_prefix")
+  @@index([revokedAt], map: "idx_api_keys_revoked")
+  @@index([createdAt], map: "idx_api_keys_created")
+  @@map("api_keys")
 }
 
 // ═══ user.profile ══════════════════════════════════════════════════

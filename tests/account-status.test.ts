@@ -27,7 +27,7 @@ vi.mock('@/infrastructure/db/prisma', () => {
   const user = {
     findUnique: vi.fn(async ({ where }: any) => (rows.has(`user:${where.id}`) ? { id: where.id } : null)),
   };
-  return { prisma: { userPreferences, user }, __rows: rows };
+  return { prisma: { userPreferences, user, $transaction: vi.fn(async (fn: any) => fn({ userPreferences })) }, __rows: rows };
 });
 
 vi.mock('@/features/auth/http-guards', () => ({

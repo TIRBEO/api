@@ -21,7 +21,10 @@ const mocks = vi.hoisted(() => ({
     createdAt: new Date('2026-10-22T08:55:15.120Z'),
     ...args?.data,
   })),
-  checkWindowLimitDB: vi.fn(async () => true),
+  // The open-thread lookup. Empty by default: an account with nothing waiting
+  // is the case every existing test below is already about.
+  activityFindMany: vi.fn(async (_args: any) => [] as any[]),
+  checkWindowLimitDB: vi.fn(async (..._args: unknown[]) => true),
   sendTemplateEmailAfter: vi.fn(async (..._args: unknown[]) => ({ success: true })),
   createNotification: vi.fn(async (_args: any) => {}),
   primaryEmailForUser: vi.fn(async () => 'ada@example.com'),
@@ -37,7 +40,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@/infrastructure/db/prisma', () => ({
-  prisma: { activityEvent: { create: mocks.activityCreate } },
+  prisma: { activityEvent: { create: mocks.activityCreate, findMany: mocks.activityFindMany } },
 }));
 vi.mock('@/features/auth/http-guards', () => ({ getSession: mocks.getSession }));
 vi.mock('@/features/captcha/risk', () => ({ checkWindowLimitDB: mocks.checkWindowLimitDB }));
@@ -93,6 +96,7 @@ beforeEach(() => {
     ...args?.data,
   }));
   mocks.checkWindowLimitDB.mockResolvedValue(true as any);
+  mocks.activityFindMany.mockResolvedValue([] as any);
   mocks.primaryEmailForUser.mockResolvedValue('ada@example.com' as any);
   mocks.fetchLoginUserById.mockResolvedValue({ email: 'ada@gmail.com', username: 'ada', name: 'Ada L' } as any);
   mocks.resolveLoginPlace.mockReturnValue('Kathmandu, Nepal' as any);
@@ -231,5 +235,147 @@ describe('what it refuses', () => {
     const res = await supportRequestHandler(req({ message: LONG }));
     expect(res.status).toBe(429);
     expect(mocks.activityCreate).not.toHaveBeenCalled();
+  });
+});
+
+/* ═══ one open thread per account ═════════════════════════════════════════
+   The bug these tests are written against: every press of Send minted a new
+   reference and a new mail to the same reader, so an unanswered question could
+   be asked an unlimited number of times — and an account that filed twelve got
+   twelve tickets that each needed closing. A filing now lands on the thread
+   that is already open, and the words that are already on it land nowhere. */
+describe('a filing while a thread is open', () => {
+  const OPEN_REF = 'a1b2-c3d4-e5f6-7a8b';
+
+  /** One ledger row as the thread lookup reads it. `metadata` stays open on
+      purpose: a `support.closed` row carries no message, and every other kind
+      does. */
+  type LedgerRow = {
+    id: string;
+    userId: string;
+    kind: string;
+    title: string;
+    detail: string;
+    metadata: Record<string, any>;
+    createdAt: Date;
+  };
+  function ledgerRow(kind: string, message: string, at: string): LedgerRow {
+    return {
+      id: `row-${at}`,
+      userId: 'u1',
+      kind,
+      title: 'Cannot sign in',
+      detail: message.slice(0, 500),
+      metadata: { refCode: OPEN_REF, message, subject: 'Cannot sign in' },
+      createdAt: new Date(at),
+    };
+  }
+  const openWith = (...rows: LedgerRow[]) => {
+    mocks.activityFindMany.mockResolvedValue(rows as any);
+    return rows;
+  };
+
+  it('writes onto the open thread instead of opening a second one', async () => {
+    openWith(ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'));
+    const res = await supportRequestHandler(req({ subject: 'Still locked', message: LONG }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.intoThread).toBe(true);
+    expect(body.ref).toBe(OPEN_REF);
+    const data = mocks.activityCreate.mock.calls[0][0].data;
+    expect(data.kind).toBe('support.followup');
+    expect(data.metadata.refCode).toBe(OPEN_REF);
+    expect(data.metadata.inReplyTo).toBe('row-2026-10-22T08:00:00.000Z');
+    expect(data.title).toBe('Cannot sign in');
+  });
+
+  /* The whole point of the thread: the reader gets one mail about one problem,
+     however many messages the account sends into it. */
+  it('mails nobody — not the account, not staff', async () => {
+    openWith(ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'));
+    await supportRequestHandler(req({ message: LONG }));
+    expect(mocks.sendTemplateEmailAfter).not.toHaveBeenCalled();
+    expect(mocks.notifyAdminsOfSupportRequest).not.toHaveBeenCalled();
+    expect(mocks.createNotification).not.toHaveBeenCalled();
+  });
+
+  it('does not spend the filing budget it would have taken to start a thread', async () => {
+    openWith(ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'));
+    await supportRequestHandler(req({ message: LONG }));
+    const keys = mocks.checkWindowLimitDB.mock.calls.map((call) => call[0]);
+    expect(keys).toEqual(['support:followup:u1']);
+  });
+
+  it('stops a flood of follow-ups on its own budget', async () => {
+    openWith(ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'));
+    mocks.checkWindowLimitDB.mockResolvedValueOnce(false as any);
+    const res = await supportRequestHandler(req({ message: LONG }));
+    expect(res.status).toBe(429);
+    expect((await res.json()).error).toContain(OPEN_REF);
+    expect(mocks.activityCreate).not.toHaveBeenCalled();
+  });
+
+  /* The literal complaint: the same note, sent again and again. Nothing is
+     written and no counter moves, because the record already holds those words
+     and the person is waiting on an answer, not on a second copy. */
+  it('will not file the same words twice', async () => {
+    openWith(ledgerRow('support.request', LONG, '2026-10-22T08:00:00.000Z'));
+    const res = await supportRequestHandler(req({ message: `${LONG}  ` }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.alreadyOnRecord).toBe(true);
+    expect(body.ref).toBe(OPEN_REF);
+    expect(mocks.activityCreate).not.toHaveBeenCalled();
+    expect(mocks.checkWindowLimitDB).not.toHaveBeenCalled();
+  });
+
+  it('still takes a note that repeats the first one, when staff answered between them', async () => {
+    openWith(
+      ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'),
+      { ...ledgerRow('support.reply', 'Please try the recovery link again.', '2026-10-22T09:00:00.000Z'), title: 'Re: Cannot sign in' },
+    );
+    const res = await supportRequestHandler(req({ message: 'The account locked itself this morning.' }));
+    const data = mocks.activityCreate.mock.calls[0][0].data;
+    // The thread is waiting on the account, so the same words mean "still broken".
+    expect(data.kind).toBe('support.followup');
+    expect((await res.json()).intoThread).toBe(true);
+  });
+
+  it('opens a fresh request once the thread is closed', async () => {
+    openWith(
+      ledgerRow('support.request', 'The account locked itself this morning.', '2026-10-22T08:00:00.000Z'),
+      ledgerRow('support.followup', 'The account locked itself this morning.', '2026-10-22T09:00:00.000Z'),
+      { ...ledgerRow('support.closed', 'Closed by the account.', '2026-10-22T10:00:00.000Z'), metadata: { refCode: OPEN_REF } },
+    );
+    const res = await supportRequestHandler(req({ subject: 'Cannot sign in', message: LONG }));
+    await delivered();
+    expect(mocks.activityCreate.mock.calls[0][0].data.kind).toBe('support.request');
+    expect(mocks.notifyAdminsOfSupportRequest).toHaveBeenCalledTimes(1);
+    expect((await res.json()).intoThread).toBeUndefined();
+  });
+
+  it('answers on the newest open thread when there are two', async () => {
+    const older = ledgerRow('support.request', 'First thing.', '2026-10-20T08:00:00.000Z');
+    const newer = { ...ledgerRow('support.request', 'Second thing.', '2026-10-22T08:00:00.000Z'), metadata: { refCode: 'ffff-cccc-eeee-dddd', message: 'Second thing.' } };
+    openWith(older, newer);
+    const res = await supportRequestHandler(req({ message: LONG }));
+    expect((await res.json()).ref).toBe('ffff-cccc-eeee-dddd');
+  });
+
+  /* This is the door a locked-out account knocks on. A read that fails is not a
+     reason to refuse somebody their message — the limiter is the backstop, not
+     the thread lookup. */
+  it('files the message when the thread cannot be read', async () => {
+    mocks.activityFindMany.mockRejectedValueOnce(new Error('db down') as any);
+    const res = await supportRequestHandler(req({ message: LONG }));
+    await delivered();
+    expect(res.status).toBe(200);
+    expect(mocks.activityCreate.mock.calls[0][0].data.kind).toBe('support.request');
+  });
+
+  it('rejects a short note before reading anything', async () => {
+    const res = await supportRequestHandler(req({ message: 'help' }));
+    expect(res.status).toBe(400);
+    expect(mocks.activityFindMany).not.toHaveBeenCalled();
   });
 });

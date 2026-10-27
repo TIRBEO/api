@@ -660,6 +660,15 @@ async function transportFor(smtp: SmtpSettings): Promise<Transporter> {
     host: smtp.host,
     port: smtp.port,
     secure: smtp.port === 465,
+    // Submission ports (587, 2525) reach the provider in plaintext when STARTTLS
+    // silently fails — nodemailer downgrades rather than erroring, and the login
+    // credentials plus every password-reset link go out unencrypted. Refuse the
+    // downgrade. Port 25 is left alone: inside a VPC that is the ordinary relay
+    // port and many gateways genuinely have no STARTTLS, where failing closed
+    // would stop all mail rather than protect it.
+    ...(process.env.NODE_ENV === 'production' && (smtp.port === 587 || smtp.port === 2525)
+      ? { requireTLS: true }
+      : {}),
     ...(smtp.tlsServername ? { tls: { servername: smtp.tlsServername } } : {}),
     auth: { user: smtp.user, pass: smtp.pass },
     pool: true,
@@ -896,7 +905,7 @@ export async function sendTemplateEmail(
      subject line, so the identity domain sends it — a reader who lives on
      `handle@users.tirbeo.com` gets the mail about that handle from there. */
   const ACCOUNT_TEMPLATES = new Set([
-    'account_suspended', 'account_deleted', 'account_deactivated', 'reactivation', 'export_ready',
+    'account_suspended', 'account_reinstated', 'account_deleted', 'account_deactivated', 'reactivation', 'export_ready',
   ]);
   // A code and a warning about the account are different problems, and they
   // read differently in an inbox before anyone opens them.

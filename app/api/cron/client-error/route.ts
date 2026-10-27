@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { clientIp } from '@/shared/client-ip';
 
 export const runtime = 'nodejs';
 
@@ -36,8 +37,7 @@ export async function POST(req: NextRequest) {
     if (JSON.stringify(entry).length > 16 * 1024) {
       return NextResponse.json({ ok: true });
     }
-    const ip = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim()
-      || req.headers.get('x-real-ip') || req.headers.get('cf-connecting-ip') || null;
+    const ip = clientIp(req.headers);
     const { prisma } = await import('@/infrastructure/db/prisma');
     try {
       await prisma.activityEvent.create({

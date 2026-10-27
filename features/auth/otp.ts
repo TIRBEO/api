@@ -56,11 +56,50 @@ export async function verifyOtpCode(userId: string, type: 'email' | 'email_verif
     const spent = await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => ({ count: 0 }));
     return spent.count === 1;
   }
-  const next = (otp.attempts ?? 0) + 1;
-  if (next >= MAX_OTP_ATTEMPTS) {
+  // Burn the attempt in the database, not in JS: concurrent wrong codes that
+  // each read `attempts = 3` would otherwise write back `4` and stay alive.
+  const burned = await prisma.otp
+    .update({ where: { id: otp.id }, data: { attempts: { increment: 1 } }, select: { attempts: true } })
+    .catch(() => null);
+  if (!burned || burned.attempts >= MAX_OTP_ATTEMPTS) {
     await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
-  } else {
-    await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
+  }
+  return false;
+}
+
+/**
+ * Verify the code that was issued FOR one particular address.
+ *
+ * `verifyOtpCode` finds "the newest row of this kind for this user", so on an
+ * account with two addresses a code read from mailbox A can satisfy a check
+ * about address B. Rows already record the address they were mailed to, so
+ * scoping the lookup by it is enough — no change to how codes are stored.
+ */
+export async function verifyOtpCodeByAddress(
+  kind: string,
+  address: string,
+  code: string,
+  userId?: string | null,
+): Promise<boolean> {
+  const otp = await prisma.otp.findFirst({
+    where: { kind, address: address.toLowerCase(), ...(userId ? { userId } : {}) },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!otp) return false;
+  if (otp.expiresAt < new Date() || (otp.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
+    return false;
+  }
+  const ok = await verifyOtpHash(otp.otpHash, code);
+  if (ok) {
+    const spent = await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => ({ count: 0 }));
+    return spent.count === 1;
+  }
+  const burned = await prisma.otp
+    .update({ where: { id: otp.id }, data: { attempts: { increment: 1 } }, select: { attempts: true } })
+    .catch(() => null);
+  if (!burned || burned.attempts >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
   }
   return false;
 }

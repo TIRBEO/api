@@ -3,6 +3,7 @@ import type { UserStatusKind } from '@prisma/client';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSession } from '@/features/auth/http-guards';
 import { jsonUnauthorized } from '@/shared/response';
+import { writeMisc } from '@/features/status/accountLifecycle';
 
 /* ═══════════════════════════════════════════════════════════════════
    Welcome back — the one acknowledgment a restored account deserves.
@@ -59,16 +60,11 @@ async function readMisc(userId: string): Promise<Record<string, any>> {
 }
 
 /** Merge-write one key into misc, preserving everything that shares the bag
- *  (settings, consents, oauth, accountStatus) — accountLifecycle's
- *  writeOauthLink pattern exactly. */
+ *  (settings, consents, oauth, accountStatus). Goes through the same
+ *  serialised writer as the OAuth links — an unsynchronised read-modify-write
+ *  here would drop whichever sibling key committed second. */
 async function writeMiscKey(userId: string, key: string, value: unknown): Promise<void> {
-  const misc = { ...(await readMisc(userId)) };
-  misc[key] = value;
-  await prisma.userPreferences.upsert({
-    where: { userId },
-    update: { misc },
-    create: { userId, misc },
-  }).catch(() => {});
+  await writeMisc(userId, (misc) => { misc[key] = value; });
 }
 
 /**

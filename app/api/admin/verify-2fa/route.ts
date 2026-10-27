@@ -5,6 +5,7 @@ import { createSession, setSessionCookie } from '@/features/auth/http-guards';
 import { verifyTemp2faToken } from '@/features/auth/jwt';
 import { verifyTotp } from '@/features/auth/totp';
 import { createNotification } from '@/features/notifications/notifications';
+import { clientIp } from '@/shared/client-ip';
 
 const verifySchema = z.object({
   tempToken: z.string().min(1),
@@ -44,7 +45,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Access denied. You do not have admin privileges.' }, { status: 403 });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = clientIp(request.headers) ?? '';
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });
     setSessionCookie(res, token, refreshToken);

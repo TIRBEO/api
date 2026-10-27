@@ -3,6 +3,7 @@ import { verifyTempPasswordChangeToken } from '@/features/auth/jwt';
 import { hashPassword, verifyPassword } from '@/features/auth/password';
 import { prisma } from '@/infrastructure/db/prisma';
 import { createSession, setSessionCookie } from '@/features/auth/http-guards';
+import { clientIp } from '@/shared/client-ip';
 
 export async function POST(request: NextRequest) {
   try {
@@ -48,7 +49,7 @@ export async function POST(request: NextRequest) {
       update: { mustChangePw: false },
     });
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = clientIp(request.headers) ?? '';
     const adminRole = user.isAdmin ? 'admin' : undefined;
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);
     const res = NextResponse.json({ id: user.id, email: user.email });

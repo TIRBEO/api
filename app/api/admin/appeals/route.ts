@@ -11,12 +11,14 @@ import { withPermission } from '@/features/auth/permission-guard';
      account address, or a substring of the note or restriction title.
 
    PUT  /api/admin/appeals { id, decision: 'upheld' | 'overturned' }
-     One answer per appeal. `overturned` also lifts the restriction it
-     argues with (sets endsAt to now) — reversing the decision is the point
-     of an overturn. Both outcomes write an audit event under the appeal's
-     id and notify the account with `Ref: <appeal id>` in the message, so
-     the id an operator copies here finds the filing, the decision and the
-     emails on both sides. */
+     One answer per appeal. `overturned` lifts the restriction it argues with
+     (endsAt now) — reversing the decision is the point of an overturn — and
+     when that restriction was an admin enforcement, the account's status goes
+     back to active and the reinstatement is mailed, because closing the row and
+     leaving the door shut is a decision the person cannot see. Both outcomes
+     write an audit event under the appeal's id and notify the account with
+     `Ref: <appeal id>` in the message, so the id an operator copies here finds
+     the filing, the decision, the status event and the emails on both sides. */
 
 const DECISIONS = new Set(['upheld', 'overturned']);
 
@@ -108,7 +110,10 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
 
   const appeal = await prisma.userAppeal.findUnique({
     where: { id },
-    include: { restriction: { select: { id: true, endsAt: true } } },
+    include: {
+      user: { select: { email: true, status: true, profile: { select: { name: true } } } },
+      restriction: { select: { id: true, guideline: true, title: true, endsAt: true } },
+    },
   });
   if (!appeal) return NextResponse.json({ error: 'Appeal not found.' }, { status: 404 });
   if (appeal.decision && appeal.decision !== 'pending') {
@@ -121,8 +126,22 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
   const decidedAt = new Date();
   let restrictionLifted = false;
 
+  /* The read above answers "has this been decided" for whoever asked first; it
+     cannot answer it for two reviewers who ask at the same moment, and a second
+     decision on one appeal means the restriction was lifted twice and the
+     appellant was mailed twice about the same review. So the write itself is the
+     gate: `updateMany` only claims the row while it is still open, and a claim
+     that lands on zero rows is somebody else's answer that got here second. */
+  let alreadyDecided = false;
   await prisma.$transaction(async (tx: any) => {
-    await tx.userAppeal.update({ where: { id }, data: { decision, decidedAt } });
+    const claimed = await tx.userAppeal.updateMany({
+      where: { id, OR: [{ decision: null }, { decision: 'pending' }] },
+      data: { decision, decidedAt },
+    });
+    if (claimed.count !== 1) {
+      alreadyDecided = true;
+      return;
+    }
     // An overturned strike that is still in force stops being in force now;
     // an already-expired one is left honestly expired.
     if (
@@ -138,6 +157,49 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
     }
   });
 
+  if (alreadyDecided) {
+    const current = await prisma.userAppeal.findUnique({ where: { id }, select: { decision: true } });
+    return NextResponse.json(
+      { error: `Already decided (${current?.decision ?? '—'}) — one answer per appeal.` },
+      { status: 409 },
+    );
+  }
+
+  /* An overturn that closes the restriction but leaves `users.status` banned
+     tells the account it is free while the door stays shut — the one answer an
+     appeal must never give. So the write the console's own "lift the ban"
+     button performs runs here too: status back to active, the reason kept on
+     the record, and the reinstatement mailed under the code the account was
+     given at the start. Only for an enforcement this platform imposed; a
+     restriction an automatic rule filed has no status of its own to undo. */
+  const enforcementStatus =
+    appeal.user?.status === 'banned' || appeal.user?.status === 'suspended'
+      ? appeal.user.status
+      : null;
+  const reinstated =
+    restrictionLifted && appeal.restriction?.guideline === 'admin-enforcement' && !!enforcementStatus;
+
+  let reference: string | null = null;
+  if (reinstated && enforcementStatus) {
+    const { liftEnforcement, notifyReinstated } = await import('@/features/admin/adminHandlers');
+    const answer = `A reviewer went through your appeal and overturned the decision on your account${appeal.restriction?.title ? ` (${appeal.restriction.title})` : ''}. Ref: ${id}`;
+    reference = await liftEnforcement({
+      userId: appeal.userId,
+      fromStatus: enforcementStatus,
+      enforcement: enforcementStatus,
+      reason: answer,
+      liftedAt: decidedAt });
+    await notifyReinstated({
+      userId: appeal.userId,
+      email: appeal.user?.email ?? '',
+      name: appeal.user?.profile?.name ?? null,
+      kindWord: enforcementStatus === 'banned' ? 'ban' : 'suspension',
+      reason: answer,
+      refCode: reference,
+      liftedAt: decidedAt,
+      nextStep: 'You can sign in again now. Nothing on the account was deleted while the decision stood, and the reference above is the same one the first notice carried.' });
+  }
+
   const { createAuditEvent } = await import('@/features/security/audit');
   await createAuditEvent({
     actorId: session.userId,
@@ -146,7 +208,11 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
     targetType: 'appeal',
     targetId: id,
     severity: 'info',
-    metadata: { appellantId: appeal.userId, restrictionId: appeal.restrictionId, restrictionLifted },
+    metadata: {
+      appellantId: appeal.userId,
+      restrictionId: appeal.restrictionId,
+      restrictionLifted,
+      ...(reference ? { accountRestored: true, reference } : {}) },
   }).catch(() => {});
 
   // Security category: compulsory delivery, and the reference id lands in the
@@ -155,16 +221,20 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
   await createNotification({
     userId: appeal.userId,
     type: 'security',
-    title: restrictionLifted
-      ? 'Appeal overturned — restriction lifted'
-      : decision === 'overturned'
-        ? 'Appeal overturned — decision reversed'
-        : 'Appeal reviewed — restriction stands',
-    body: restrictionLifted
-      ? `A reviewer overturned the decision on your account and the restriction has been lifted. Ref: ${id}`
-      : decision === 'overturned'
-        ? `A reviewer overturned the decision on your account; the restriction had already expired. Ref: ${id}`
-        : `A reviewer went through your appeal and the decision on your account stands. Ref: ${id}`,
+    title: reinstated
+      ? 'Appeal overturned — your account is open again'
+      : restrictionLifted
+        ? 'Appeal overturned — restriction lifted'
+        : decision === 'overturned'
+          ? 'Appeal overturned — decision reversed'
+          : 'Appeal reviewed — restriction stands',
+    body: reinstated
+      ? `A reviewer overturned the decision on your account, the restriction is closed and you can sign in again. Ref: ${id}`
+      : restrictionLifted
+        ? `A reviewer overturned the decision on your account and the restriction has been lifted. Ref: ${id}`
+        : decision === 'overturned'
+          ? `A reviewer overturned the decision on your account; the restriction had already expired. Ref: ${id}`
+          : `A reviewer went through your appeal and the decision on your account stands. Ref: ${id}`,
     link: '/settings/account-status',
     metadata: { eventId: id, appealId: id, decision },
   }).catch(() => {});
@@ -173,5 +243,6 @@ export const PUT = withPermission('appeals.manage', async (request, session) => 
     ok: true,
     appeal: { id, decision, decidedAt: decidedAt.toISOString() },
     restrictionLifted,
+    reference,
   });
 });

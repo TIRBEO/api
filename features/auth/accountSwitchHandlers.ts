@@ -9,6 +9,8 @@ import {
   isKnownDeviceAccount,
 } from '@/features/auth/device-accounts';
 import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
+import { clientIp } from '@/shared/client-ip';
+import { isBlockedSignInStatus } from '@/features/auth/blockFacts';
 
 /**
  * Multi-account switching — Google-style.
@@ -75,7 +77,10 @@ export async function switchAccountHandler(request: NextRequest) {
       select: { id: true, email: true, status: true, profile: { select: { name: true, photoUrl: true } } },
     });
     if (!target) return jsonUnauthorized();
-    if (target.status === 'banned' || target.status === 'suspended' || target.status === 'deleted') {
+    // The same closed-account predicate sign-in uses. A hand-written list of
+    // "banned, suspended, deleted" let a paused or deletion-pending account be
+    // switched into a fresh 30-day session while the front door refused it.
+    if (isBlockedSignInStatus(target.status)) {
       return jsonForbidden('This account is currently unavailable');
     }
     const targetUser = {
@@ -93,10 +98,7 @@ export async function switchAccountHandler(request: NextRequest) {
       });
     }
 
-    const ip =
-      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-      request.headers.get('x-real-ip') ||
-      undefined;
+    const ip = clientIp(request.headers) ?? undefined;
     const userAgent = request.headers.get('user-agent') || undefined;
 
     // require2FA overrides the recognized-device skip: switching to this

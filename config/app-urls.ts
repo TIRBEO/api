@@ -90,6 +90,18 @@ export function getSupportBaseUrl(): string {
   return getDashboardBaseUrl();
 }
 
+/**
+ * The one page a support mail sends a person to: their side of the thread,
+ * where reading and writing back are the same screen.
+ *
+ * Mailing a reply without this link is what made the old thread one-way — the
+ * person could read the answer and nothing else, so a follow-up meant filing a
+ * new request that arrived looking like a first one.
+ */
+export function getSupportThreadUrl(ref: string): string {
+  return `${getDashboardBaseUrl()}/support/thread/${encodeURIComponent(ref)}`;
+}
+
 /** Full URL to a form's detail page in the forms app. */
 export function getFormViewUrl(formId: string): string {
   return `${getFormsBaseUrl()}/forms/${formId}`;
@@ -202,5 +214,44 @@ export function isHostAllowed(hostname: string): boolean {
     if (host === entry || host.endsWith(`.${entry.replace(/^\./, '')}`)) return true;
   }
   return false;
+}
+
+/**
+ * Third-party hosts a user-supplied picture may live on — the CSP's `img-src`
+ * list, exported so the validator and the header cannot drift into a state where
+ * an upload is accepted and then refuses to render.
+ */
+export const TRUSTED_IMAGE_HOSTS = [
+  'lh3.googleusercontent.com',
+  'avatars.githubusercontent.com',
+  'cdn.discordapp.com',
+];
+
+/**
+ * `https://` plus a deny-list of "obviously internal" hostnames is the wrong
+ * shape for this field. The value is never fetched by this server; it is put in
+ * an `<img>` by a page under this platform's own origin, so an arbitrary URL
+ * tells a chosen host which profile was just opened (and, for a reader on a
+ * corporate network, points their browser at an address they can then probe).
+ * Anything not on this list is refused at write time.
+ */
+export function isTrustedImageHost(hostname: string): boolean {
+  const host = (hostname || '').toLowerCase().replace(/\.$/, '');
+  if (!host) return false;
+  if (isHostAllowed(host)) return true;
+  // This platform's own object storage, whatever domain it happens to be
+  // mounted on — a `.r2.dev` bucket URL is as much ours as a tirbeo.com one.
+  const mediaHost = mediaStorageHost();
+  if (mediaHost && (host === mediaHost || host.endsWith(`.${mediaHost}`))) return true;
+  return TRUSTED_IMAGE_HOSTS.some((t) => host === t || host.endsWith(`.${t}`));
+}
+
+function mediaStorageHost(): string {
+  const url = process.env.R2_PUBLIC_URL || process.env.S3_PUBLIC_URL || '';
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
 }
 

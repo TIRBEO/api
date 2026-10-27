@@ -1,10 +1,12 @@
 import { prisma } from '@/infrastructure/db/prisma';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { sendTemplateEmail, escapeHtml } from '@/features/email/email';
 import { sendToUserWs } from '@/infrastructure/realtime/ws-deliver';
 import { isInQuietHours } from '@/features/email/emailPrefs';
 import { cardItem } from '@/features/email/email-fragments';
 import { tirbeoEmailFor } from '@/features/identity/tirbeo';
+import { clientIp } from '@/shared/client-ip';
+import { serializableWrite } from '@/infrastructure/db/serializable-write';
 
 export type NotifType = 'security' | 'system' | 'digest' | 'admin_alert' | 'login' | 'forms' | 'product' | 'support' | 'ticket' | 'tips' | 'tip' | 'offers';
 
@@ -82,10 +84,7 @@ export function describeDevice(ua?: string | null): string {
 }
 
 export function getClientIpFromRequest(request: { headers: Headers }): string {
-  const xff = request.headers.get('x-forwarded-for') || '';
-  const ip = xff.split(',')[0].trim() || request.headers.get('x-real-ip') || '';
-  if (ip) return ip;
-  try { return request.headers.get('cf-connecting-ip') || ''; } catch { return ''; }
+  return clientIp(request.headers) ?? '';
 }
 
 /** Where a mail to this person actually lands.
@@ -338,11 +337,23 @@ export async function listNotifications(userId: string, limit = 50, offset = 0) 
 }
 
 export async function markAsRead(userId: string, notifId?: string) {
-  if (notifId) {
-    await prisma.notification.updateMany({ where: { id: notifId, userId, isRead: { not: true } }, data: { isRead: true } });
-  } else {
-    await prisma.notification.updateMany({ where: { userId, isRead: { not: true } }, data: { isRead: true } });
-  }
+  const where = notifId
+    ? { id: notifId, userId, isRead: { not: true } }
+    : { userId, isRead: { not: true } };
+  // The ids are read first so the same rows get both writes: the flag, and a
+  // `readAt` stamped into their metadata. An announcement's "who opened it"
+  // list is answered from these rows, and "opened" without "when" is half a
+  // fact the console would have to pretend about.
+  const targets = await prisma.notification.findMany({ where, select: { id: true } });
+  if (!targets.length) return;
+  const ids = targets.map((t) => t.id);
+  await prisma.$transaction([
+    prisma.notification.updateMany({ where: { id: { in: ids } }, data: { isRead: true } }),
+    prisma.$executeRaw(Prisma.sql`
+      UPDATE "public"."notifications"
+      SET "metadata" = jsonb_set(COALESCE("metadata", '{}'::jsonb), '{readAt}', to_jsonb(now()::text))
+      WHERE "id" IN (${Prisma.join(ids)})`),
+  ]);
 }
 
 // ─── Default preferences ──────────────────────────────────────────
@@ -463,17 +474,7 @@ export async function saveNotificationPrefs(userId: string, patch: Record<string
 export async function serializedPrefsWrite<T>(
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
-  let lastErr: any;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await prisma.$transaction(fn, { isolationLevel: 'Serializable' });
-    } catch (err: any) {
-      const code = err?.code ?? err?.cause?.code;
-      if (code === '40001' || code === 'P2034') { lastErr = err; continue; }
-      throw err;
-    }
-  }
-  throw lastErr;
+  return serializableWrite(fn);
 }
 
 /** Read a user's notification preferences. */

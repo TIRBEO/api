@@ -80,6 +80,9 @@ const VARS: Record<string, string> = {
   statusType: 'suspended for 7 days',
   suspendedUntil: '3 Mar 2026, 09:00 UTC',
   suspendedNextStep: 'You cannot sign in until then',
+  kindWord: 'suspension',
+  liftedAt: '3 Mar 2026, 09:00 UTC',
+  liftedNextStep: 'You can sign in again now',
   service: 'api',
   severity: 'high',
   errorType: 'TypeError',
@@ -100,6 +103,9 @@ const VARS: Record<string, string> = {
   origin: '203.0.113.9 · Berlin, Germany',
   replyHref: 'mailto:bishnu@tirbeo.com?subject=Re%3A%20a1b2',
   replyLabel: 'Reply to bishnu@tirbeo.com',
+  // The account's own page for the thread — the button on both sides of the
+  // support mail, so a reply can be written instead of a second request.
+  threadUrl: 'https://myprofile.tirbeo.com/support/thread/a1b2-c3d4-e5f6-7a8b',
 };
 
 describe('renderTemplate escaping', () => {
@@ -329,9 +335,13 @@ function routeMatcher(route: string): RegExp {
   const src = route
     .split('/')
     .filter(Boolean)
-    .map((seg) =>
-      seg.startsWith(':') ? (seg.endsWith('*') ? '(?:/[^/]+)+' : '[^/]+') : esc(seg),
-    )
+    .map((seg) => {
+      if (seg.startsWith(':')) return seg.endsWith('*') ? '(?:/[^/]+)+' : '[^/]+';
+      // A dynamic App Router segment is one path part: `/support/thread/[ref]`
+      // serves a1b2-…, not a directory that happens to be spelled with brackets.
+      if (/^\[[^\]]+\]$/.test(seg)) return '[^/]+';
+      return esc(seg);
+    })
     .join('/');
   // `route === "/"` leaves nothing here, and the app's root address is the
   // root redirect — so an address with no path at all is the same page.

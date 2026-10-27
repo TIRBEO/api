@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { getSupportThreadUrl } from '@/config/app-urls';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requirePermission } from '@/features/auth/http-guards';
 import { sendEmail, sendTemplateEmail } from '@/features/email/email';
@@ -288,6 +289,7 @@ export async function adminEmailReplyHandler(request: NextRequest) {
         ? await sendTemplateEmail(to, 'support_reply', {
             subject,
             refCode,
+            threadUrl: getSupportThreadUrl(refCode),
             replyHtml: html,
             receivedAt: receivedAt
               ? new Date(receivedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })

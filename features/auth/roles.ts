@@ -25,27 +25,47 @@ export type Permission = string;
 export const PERMISSION_CATALOGUE: Array<{ key: Permission; label: string; screen: string }> = [
   { key: 'console.read', label: 'Open the console at all', screen: '/admin' },
   { key: 'dashboard.read', label: 'The dashboard and its counts', screen: '/admin' },
-  { key: 'analytics.read', label: 'Analytics', screen: '/admin/analytics' },
-  { key: 'activity.read', label: 'The activity ledger and the audit trail', screen: '/admin/activity' },
-  { key: 'people.read', label: 'Look up accounts', screen: '/admin/people' },
-  { key: 'people.manage', label: 'Change an account: name, status, password, role flags', screen: '/admin/people/[id]' },
-  { key: 'people.delete', label: 'Delete or hard-remove an account', screen: '/admin/people/[id]' },
-  { key: 'appeals.read', label: 'Read appeals', screen: '/admin/appeals' },
-  { key: 'appeals.manage', label: 'Uphold or overturn an appeal', screen: '/admin/appeals' },
-  { key: 'blocklist.read', label: 'Read the blocklist', screen: '/admin/blocklist' },
-  { key: 'blocklist.manage', label: 'Block and unblock addresses and accounts', screen: '/admin/blocklist' },
-  { key: 'limits.read', label: 'Read rate and verification limits', screen: '/admin/limits' },
-  { key: 'limits.manage', label: 'Change rate and verification limits', screen: '/admin/limits' },
-  { key: 'security.read', label: 'Security events and posture', screen: '/admin/security-events' },
-  { key: 'tickets.read', label: 'Read the support queue', screen: '/admin/tickets' },
-  { key: 'tickets.answer', label: 'Answer a support request', screen: '/admin/tickets/[ref]' },
-  { key: 'email.read', label: 'Deliveries and templates', screen: '/admin/email/deliveries' },
-  { key: 'email.configure', label: 'Mail configuration and template editing', screen: '/admin/email/config' },
-  { key: 'notifications.read', label: 'Read notifications', screen: '/admin/notifications' },
-  { key: 'notifications.send', label: 'Broadcast a notification to accounts', screen: '/admin/notifications' },
-  { key: 'maintenance.manage', label: 'Put the platform into maintenance', screen: '/admin/maintenance' },
-  { key: 'staff.read', label: 'See who the staff are', screen: '/admin/staff' },
-  { key: 'staff.manage', label: 'Grant and revoke staff roles', screen: '/admin/staff' },
+  { key: 'analytics.read', label: 'Analytics', screen: '/admin/reports/growth' },
+  { key: 'activity.read', label: 'The activity ledger and the audit trail', screen: '/admin/reports/activity' },
+  { key: 'people.read', label: 'Look up accounts', screen: '/admin/directory/users' },
+  { key: 'people.manage', label: 'Change an account: name, status, password, role flags', screen: '/admin/directory/users/[id]' },
+  { key: 'people.delete', label: 'Delete or hard-remove an account', screen: '/admin/directory/users/[id]' },
+  // Bulk is its own key, not a flavour of manage: suspending one account on a
+  // Tuesday afternoon and suspending two hundred from one form are different
+  // amounts of damage, and the second one needs somebody deciding it is allowed.
+  { key: 'people.bulk', label: 'Act on many accounts at once from the directory', screen: '/admin/directory/users' },
+  { key: 'groups.read', label: 'See the named sets of accounts', screen: '/admin/directory/groups' },
+  { key: 'groups.manage', label: 'Create, rename and empty a set of accounts', screen: '/admin/directory/groups' },
+  { key: 'units.read', label: 'See the organisational tree', screen: '/admin/directory/units' },
+  { key: 'units.manage', label: 'Create, rename, move and delete an organisational unit', screen: '/admin/directory/units' },
+  { key: 'appeals.read', label: 'Read appeals', screen: '/admin/security/appeals' },
+  { key: 'appeals.manage', label: 'Uphold or overturn an appeal', screen: '/admin/security/appeals' },
+  { key: 'blocklist.read', label: 'Read the blocklist', screen: '/admin/security/blocked' },
+  { key: 'blocklist.manage', label: 'Block and unblock addresses and accounts', screen: '/admin/security/blocked' },
+  { key: 'limits.read', label: 'Read rate and verification limits', screen: '/admin/security/limits' },
+  { key: 'limits.manage', label: 'Change rate and verification limits', screen: '/admin/security/limits' },
+  { key: 'security.read', label: 'Security events and posture', screen: '/admin/security/alerts' },
+  { key: 'security.purge', label: 'Delete old entries from the security and activity ledger', screen: '/admin/security/alerts' },
+  { key: 'tickets.read', label: 'Read the support queue', screen: '/admin/overview/support' },
+  { key: 'tickets.answer', label: 'Answer a support request', screen: '/admin/overview/support/[id]' },
+  { key: 'email.read', label: 'Deliveries and templates', screen: '/admin/reports/delivery' },
+  { key: 'email.configure', label: 'Mail configuration and template editing', screen: '/admin/messaging/senders' },
+  { key: 'notifications.read', label: 'Read notifications', screen: '/admin/system/notifications' },
+  { key: 'notifications.send', label: 'Broadcast a notification to accounts', screen: '/admin/system/notifications' },
+  { key: 'maintenance.manage', label: 'Put the platform into maintenance', screen: '/admin/system/lifecycle' },
+  { key: 'staff.read', label: 'See who the staff are', screen: '/admin/directory/staff' },
+  { key: 'staff.manage', label: 'Grant and revoke staff roles', screen: '/admin/directory/staff' },
+  // Data control is the one pair that is not a screen permission so much as the
+  // database itself: browsing is wide, writing is deliberately not.
+  { key: 'data.read', label: 'Browse the tables this platform keeps', screen: '/admin/system/records' },
+  { key: 'data.manage', label: 'Change a row in the database from the console', screen: '/admin/system/records' },
+  // A machine credential is not a screen feature — minting one opens a door that
+  // stays open after the person who made it goes home, so it is its own pair.
+  { key: 'keys.read', label: 'See which machine credentials exist', screen: '/admin/resources/keys' },
+  { key: 'keys.manage', label: 'Mint and revoke a machine credential', screen: '/admin/resources/keys' },
+  { key: 'settings.read', label: 'Read the organization and directory settings', screen: '/admin/system/organization' },
+  { key: 'settings.manage', label: 'Change the organization and directory settings', screen: '/admin/system/organization' },
+  { key: 'exports.read', label: 'See what was exported, and take the file back', screen: '/admin/reports/exports' },
 ];
 
 export const ALL_PERMISSION_KEYS: Permission[] = PERMISSION_CATALOGUE.map((p) => p.key);
@@ -78,9 +98,14 @@ export const ROLES: Record<RoleKey, RoleDefinition> = {
   admin: {
     key: 'admin',
     label: 'Administrator',
-    purpose: 'Everything the platform can do except decide who is staff.',
+    purpose: 'Everything the platform can do except decide who is staff and write to the database directly.',
     rank: 4,
-    permissions: ALL.filter((k) => k !== 'staff.manage'),
+    // The two powers that decide who holds power, and the one that edits rows
+    // beneath the application's own rules, stay with an owner. So does the bulk
+    // action: an administrator can already suspend any one of these accounts,
+    // and what a batch adds is not reach but speed — the mistake an operator
+    // makes at 6pm is measured in hundreds of mailed people.
+    permissions: ALL.filter((k) => k !== 'staff.manage' && k !== 'data.manage' && k !== 'people.bulk'),
   },
   moderator: {
     key: 'moderator',
@@ -92,6 +117,9 @@ export const ROLES: Record<RoleKey, RoleDefinition> = {
       'appeals.read', 'appeals.manage', 'blocklist.read', 'blocklist.manage',
       'limits.read', 'limits.manage', 'security.read',
       'tickets.read', 'tickets.answer', 'notifications.read',
+      // A moderator enforces rules on a set of accounts and needs to know which
+      // set that is; making or emptying the set stays somebody else's job.
+      'groups.read', 'units.read',
     ],
   },
   support: {
@@ -103,6 +131,9 @@ export const ROLES: Record<RoleKey, RoleDefinition> = {
       'console.read', 'dashboard.read', 'activity.read', 'people.read',
       'tickets.read', 'tickets.answer', 'appeals.read',
       'email.read', 'notifications.read',
+      // Enough to answer "which team is this person meant to be in", which is
+      // the question a support ticket asks about the directory.
+      'groups.read', 'units.read',
     ],
   },
   analyst: {
@@ -114,6 +145,7 @@ export const ROLES: Record<RoleKey, RoleDefinition> = {
       'console.read', 'dashboard.read', 'analytics.read', 'activity.read',
       'people.read', 'security.read', 'appeals.read', 'blocklist.read', 'limits.read',
       'tickets.read', 'email.read', 'notifications.read',
+      'groups.read', 'units.read', 'exports.read',
     ],
   },
 };

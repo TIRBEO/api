@@ -6,8 +6,10 @@ import { requireReauth } from '@/features/auth/reauth';
 import { maskEmail } from '@/features/auth/recovery-email';
 import { hashPassword, verifyPassword } from '@/features/auth/password';
 import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/features/auth/otp';
+import { consumeGenericWindow } from '@/features/auth/verify-limits';
 import { jsonUnauthorized } from '@/shared/response';
 import { imageBytesMatchType } from '@/features/media/imageSecurity';
+import { isTrustedImageHost } from '@/config/app-urls';
 import { sendTemplateEmailAfter } from '@/features/email/email';
 import { createNotification, describeDevice, deviceDetail, primaryEmailForUser, getClientIpFromRequest, loadNotificationPrefs, saveNotificationPrefs, serializedPrefsWrite } from '@/features/notifications/notifications';
 import { sanitizeInput } from '@/features/security/security';
@@ -48,6 +50,8 @@ import {
   renderExportArchive,
   type ExportFormat,
   type ExportRequestRecord } from '@/features/users/exportRequests';
+import { clientIp, clientIpOrUnknown } from '@/shared/client-ip';
+import { clampLimit, clampOffset } from '@/shared/limit';
 
 // The dashboard polls notifications; 30s TTL keeps the poll cheap without
 // making notifications feel stale (poll interval is 15s).
@@ -307,14 +311,21 @@ export async function extendedProfileHandler(request: NextRequest) {
         : null;
 
       // theme/language/timezone live in the appearance JSON, not on the account.
-      const currentAppearance = (await prisma.userPreferences
-        .findUnique({ where: { userId: session.userId }, select: { appearance: true } })
-        .then((r) => (r?.appearance && typeof r.appearance === 'object' ? r.appearance : {}))
-        .catch(() => ({}))) as Record<string, any>;
-      const nextAppearance: Record<string, any> = { ...currentAppearance };
-      let appearanceChanged = false;
-      for (const field of APPEARANCE_ROW_FIELDS) {
-        if (raw[field] !== undefined) { nextAppearance[field] = raw[field]; appearanceChanged = true; }
+      if (APPEARANCE_ROW_FIELDS.some((field) => raw[field] !== undefined)) {
+        await serializedPrefsWrite(async (tx) => {
+          const currentAppearance = (await tx.userPreferences
+            .findUnique({ where: { userId: session.userId }, select: { appearance: true } })
+            .then((r) => (r?.appearance && typeof r.appearance === 'object' ? r.appearance : {}))) as Record<string, any>;
+          const nextAppearance: Record<string, any> = { ...currentAppearance };
+          for (const field of APPEARANCE_ROW_FIELDS) {
+            if (raw[field] !== undefined) nextAppearance[field] = raw[field];
+          }
+          await tx.userPreferences.upsert({
+            where: { userId: session.userId },
+            create: { userId: session.userId, appearance: nextAppearance as any },
+            update: { appearance: nextAppearance as any } });
+        });
+        bustPreferencesCache(session.userId);
       }
 
       if (Object.keys(accountData).length > 0 || Object.keys(profileData).length > 0 || phoneWrite) {
@@ -329,14 +340,6 @@ export async function extendedProfileHandler(request: NextRequest) {
           select: { id: true } });
       }
 
-      if (appearanceChanged) {
-        await prisma.userPreferences.upsert({
-          where: { userId: session.userId },
-          create: { userId: session.userId, appearance: nextAppearance as any },
-          update: { appearance: nextAppearance as any } });
-        bustPreferencesCache(session.userId);
-      }
-
       // What this write intended, in wire terms, so it can be diffed against
       // what was read a moment ago.
       const next: ProfileWire = {};
@@ -347,7 +350,7 @@ export async function extendedProfileHandler(request: NextRequest) {
         if (column in profileData) next[wireKey] = profileData[column];
       }
       for (const field of APPEARANCE_ROW_FIELDS) {
-        if (field in nextAppearance) next[field] = nextAppearance[field];
+        if (raw[field] !== undefined) next[field] = raw[field];
       }
       if ('birthday' in profileData) next.birthday = profileData.birthday;
       if (raw.phoneNumber !== undefined) next.phoneNumber = raw.phoneNumber || null;
@@ -482,7 +485,7 @@ export async function changePasswordHandler(request: NextRequest) {
     const userEmail = (await primaryEmailForUser(session.userId).catch(() => null))
       || (await prisma.user.findUnique({ where: { id: session.userId }, select: { email: true } }))?.email || '';
     if (userEmail) {
-      const ip = request.headers.get('x-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+      const ip = clientIpOrUnknown(request.headers);
       sendTemplateEmailAfter(userEmail, 'password_changed', {
         name: userEmail.split('@')[0],
         changedAt: new Date().toLocaleString(),
@@ -1013,8 +1016,8 @@ export async function userActivityHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     const url = new URL(request.url);
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
-    const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0'));
+    const limit = clampLimit(url.searchParams.get('limit'), { fallback: 20, max: 50 });
+    const offset = clampOffset(url.searchParams.get('offset'));
     const cacheKey = `activity:${session.userId}:${limit}:${offset}`;
     const cached = activityCache.get(cacheKey);
     if (cached) return NextResponse.json(cached);
@@ -1153,7 +1156,9 @@ const REQUEST_EVENT_KINDS = [
   'appeal.filed',
   'account.merge',
   'support.request',
+  'support.followup',
   'support.reply',
+  'support.closed',
 ];
 
 /**
@@ -1176,7 +1181,7 @@ export async function userRequestsHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     const url = new URL(request.url);
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50') || 50, 100);
+    const limit = clampLimit(url.searchParams.get('limit'), { fallback: 50, max: 100 });
 
     const [events, exports] = await Promise.all([
       prisma.activityEvent.findMany({
@@ -1219,26 +1224,42 @@ export async function userRequestsHandler(request: NextRequest) {
       };
       if (!answers.has(code) || found.at > (answers.get(code) as { at: string }).at) answers.set(code, found);
     }
-    /** Which references have their question on this page. A reply whose
-        request is here rides inside that row; a reply whose request fell out
-        of the window stays a row of its own, so no answer is ever dropped. */
+    /** Which references have their question on this page. Every other row of a
+        thread — the answer, a write-back, the close — rides inside that row; a
+        row whose question fell out of the window stays on its own, so no answer
+        is ever dropped. */
     const asked = new Set(
       events.filter((e) => e.kind === 'support.request').map((e) => refOf(e.metadata, e.id)));
+    /** The newest close per reference. A thread closed and then written back to
+        is open again, so the close only counts when nothing came after it. */
+    const closes = new Map<string, string>();
+    const latestPerRef = new Map<string, string>();
+    for (const e of events) {
+      const code = refOf(e.metadata, e.id);
+      const at = e.createdAt.toISOString();
+      if (e.kind === 'support.closed') closes.set(code, at);
+      if (!latestPerRef.has(code) || at > (latestPerRef.get(code) as string)) latestPerRef.set(code, at);
+    }
 
     const requests = [
       ...events
-        .filter((e) => !(e.kind === 'support.reply' && asked.has(refOf(e.metadata, e.id))))
+        .filter((e) => !(e.kind !== 'support.request' && asked.has(refOf(e.metadata, e.id))))
         .map((e) => {
           const meta = (e.metadata || {}) as Record<string, any>;
           const ref = refOf(e.metadata, e.id);
           const answer = e.kind === 'support.request' ? (answers.get(ref) ?? null) : null;
+          const closedAt = e.kind === 'support.request'
+            ? (closes.get(ref) ?? null)
+            : e.kind === 'support.closed' ? e.createdAt.toISOString() : null;
+          const shut = !!closedAt && closedAt >= (latestPerRef.get(ref) ?? closedAt);
           const status = e.kind === 'support.request'
-            ? (answer ? 'answered' : 'open')
-            : e.kind === 'support.reply' ? 'answered' : null;
+            ? (shut ? 'closed' : answer ? 'answered' : 'open')
+            : e.kind === 'support.reply' ? 'answered' : e.kind === 'support.closed' ? 'closed' : null;
           return {
             id: e.id, kind: e.kind, ref, title: e.title, detail: e.detail ?? null,
             status,
             answeredAt: answer?.at ?? (e.kind === 'support.reply' ? e.createdAt.toISOString() : null),
+            closedAt: shut ? closedAt : null,
             answer: answer
               ? { at: answer.at, detail: answer.detail, title: answer.title, text: answer.text }
               : null,
@@ -1748,43 +1769,61 @@ export async function preferencesHandler(request: NextRequest) {
     if (request.method === 'PATCH' || request.method === 'PUT') {
       const body: any = await request.json().catch(() => ({}));
 
-      const nextAppearance = { ...appearance };
-      let appearanceChanged = false;
-      for (const key of ['theme', 'language', 'timezone', 'dateFormat', 'timeFormat'] as const) {
-        if (body[key] !== undefined) { nextAppearance[key] = body[key]; appearanceChanged = true; }
-      }
-
-      const nextPrivacy = { ...privacy };
-      let privacyChanged = false;
-      if (body.privacy && typeof body.privacy === 'object') {
-        if (typeof body.privacy.allowAnalytics === 'boolean') { nextPrivacy.allowAnalytics = body.privacy.allowAnalytics; privacyChanged = true; }
-        if (typeof body.privacy.allowCrashReports === 'boolean') { nextPrivacy.allowCrashReports = body.privacy.allowCrashReports; privacyChanged = true; }
-      }
-
-      // The consent switches are canonically stored in misc.consents (what
-      // features/users/consent.ts reads); mirror them there on every change so
-      // the store stays the one answer.
-      const nextMisc = privacyChanged
-        ? { ...misc, consents: { ...miscConsents, ...nextPrivacy, updatedAt: new Date().toISOString() } }
-        : null;
-
-      if (appearanceChanged || privacyChanged) {
-        await prisma.userPreferences.upsert({
+      /* Read, merge and write as one serialised pass. The row read above is a
+         snapshot taken before anyone knew this write was coming, and these
+         three columns are whole JSON blobs: merging in JS from a stale blob and
+         writing it back deletes whatever the other tab just changed — a consent
+         switch can go backwards on a page that never touched it. Same reason the
+         settings bag and notif prefs already go through this helper. */
+      const written = await serializedPrefsWrite(async (tx) => {
+        const row = await tx.userPreferences.findUnique({
           where: { userId: session.userId },
-          create: {
-            userId: session.userId,
-            appearance: nextAppearance as any,
-            privacy: nextPrivacy as any,
-            ...(nextMisc ? { misc: nextMisc as any } : {}) },
-          update: {
-            ...(appearanceChanged ? { appearance: nextAppearance as any } : {}),
-            ...(privacyChanged ? { privacy: nextPrivacy as any } : {}),
-            ...(nextMisc ? { misc: nextMisc as any } : {}) } });
-        bustPreferencesCache(session.userId);
-      }
+          select: { appearance: true, privacy: true, misc: true } });
+        const freshAppearance = (row?.appearance && typeof row.appearance === 'object' ? row.appearance : {}) as Record<string, any>;
+        const freshPrivacy = (row?.privacy && typeof row.privacy === 'object' ? row.privacy : {}) as Record<string, any>;
+        const freshMisc = (row?.misc && typeof row.misc === 'object' ? row.misc : {}) as Record<string, any>;
+        const freshConsents = (freshMisc.consents && typeof freshMisc.consents === 'object' ? freshMisc.consents : {}) as Record<string, any>;
+
+        const nextAppearance = { ...freshAppearance };
+        let appearanceChanged = false;
+        for (const key of ['theme', 'language', 'timezone', 'dateFormat', 'timeFormat'] as const) {
+          if (body[key] !== undefined) { nextAppearance[key] = body[key]; appearanceChanged = true; }
+        }
+
+        const nextPrivacy = { ...freshPrivacy };
+        let privacyChanged = false;
+        if (body.privacy && typeof body.privacy === 'object') {
+          if (typeof body.privacy.allowAnalytics === 'boolean') { nextPrivacy.allowAnalytics = body.privacy.allowAnalytics; privacyChanged = true; }
+          if (typeof body.privacy.allowCrashReports === 'boolean') { nextPrivacy.allowCrashReports = body.privacy.allowCrashReports; privacyChanged = true; }
+        }
+
+        // The consent switches are canonically stored in misc.consents (what
+        // features/users/consent.ts reads); mirror them there on every change so
+        // the store stays the one answer.
+        const nextMisc = privacyChanged
+          ? { ...freshMisc, consents: { ...freshConsents, ...nextPrivacy, updatedAt: new Date().toISOString() } }
+          : null;
+
+        if (appearanceChanged || privacyChanged) {
+          await tx.userPreferences.upsert({
+            where: { userId: session.userId },
+            create: {
+              userId: session.userId,
+              appearance: nextAppearance as any,
+              privacy: nextPrivacy as any,
+              ...(nextMisc ? { misc: nextMisc as any } : {}) },
+            update: {
+              ...(appearanceChanged ? { appearance: nextAppearance as any } : {}),
+              ...(privacyChanged ? { privacy: nextPrivacy as any } : {}),
+              ...(nextMisc ? { misc: nextMisc as any } : {}) } });
+        }
+        return { appearanceChanged, privacyChanged };
+      });
+
+      if (written.appearanceChanged || written.privacyChanged) bustPreferencesCache(session.userId);
 
       // Record consent changes in the audit log with full details.
-      if (privacyChanged) {
+      if (written.privacyChanged) {
         prisma.activityEvent.create({
           data: {
             userId: session.userId,
@@ -1798,7 +1837,7 @@ export async function preferencesHandler(request: NextRequest) {
               changedAt: new Date().toISOString(),
               changedFields: Object.keys(body.privacy).filter(k => typeof body.privacy[k] === 'boolean') },
             severity: 'info',
-            ipAddress: (request as any)?.headers?.get?.('x-forwarded-for')?.split(',')[0]?.trim() || (request as any)?.headers?.get?.('x-real-ip') || null,
+            ipAddress: clientIp(request.headers),
             userAgent: (request as any)?.headers?.get?.('user-agent')?.slice(0, 200) || null } }).catch(() => {});
       }
 
@@ -2093,6 +2132,28 @@ export async function requestProfileEditOtpHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
 
+    /* Every unthrottled "send this mail" door is a mail cannon aimed at one
+       mailbox — this one sent the same verify_email OTP to the same address an
+       unlimited number of times. Three ceilings, the same shape the appeal and
+       passkey doors use: a minute between sends, a handful per account per
+       window, and a per-IP cap so one shared address cannot burn through many
+       accounts' budgets. */
+    const ip = getClientIpFromRequest(request) ?? 'unknown';
+    const [burst, byAccount, byIp] = await Promise.all([
+      consumeGenericWindow(`profile-edit-otp:burst:${session.userId}`, 1, 60 * 1000),
+      consumeGenericWindow(`profile-edit-otp:account:${session.userId}`, 4, 15 * 60 * 1000),
+      consumeGenericWindow(`profile-edit-otp:ip:${ip}`, 12, 15 * 60 * 1000),
+    ]);
+    if (!burst.ok || !byAccount.ok || !byIp.ok) {
+      const resetAt = Math.max(burst.resetAt, byAccount.resetAt, byIp.resetAt);
+      const secs = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+      const wait = secs >= 120 ? `${Math.ceil(secs / 60)} minutes` : secs >= 60 ? '1 minute' : `${secs} seconds`;
+      return NextResponse.json(
+        { error: `Too many code requests. Try again in ${wait}.`, retryAfterSeconds: secs },
+        { status: 429 },
+      );
+    }
+
     const body = await request.json().catch(() => ({}));
     const { field } = body as { field?: string };
 
@@ -2184,20 +2245,10 @@ export async function avatarUploadHandler(request: NextRequest) {
           if (parsed.protocol !== 'https:') {
             return NextResponse.json({ error: 'Avatar URL must use HTTPS' }, { status: 400 });
           }
-          // Block known dangerous hosts / private IPs
-          const hostname = parsed.hostname;
-          if (
-            hostname === 'localhost' ||
-            hostname.endsWith('.local') ||
-            /^10\./.test(hostname) ||
-            /^192\.168\./.test(hostname) ||
-            /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) ||
-            /^127\./.test(hostname) ||
-            /^169\.254\./.test(hostname) ||
-            /^::1$/.test(hostname) ||
-            /^fc00:/.test(hostname)
-          ) {
-            return NextResponse.json({ error: 'Avatar URL host not allowed' }, { status: 400 });
+          if (!isTrustedImageHost(parsed.hostname)) {
+            return NextResponse.json({
+              error: 'That avatar host is not one we load images from. Upload the picture, or link a Google, GitHub, Discord or Tirbeo-hosted one.',
+            }, { status: 400 });
           }
         } catch {
           return NextResponse.json({ error: 'Invalid avatar URL' }, { status: 400 });
@@ -2942,8 +2993,8 @@ export async function consentHistoryHandler(request: NextRequest) {
     if (!session) return jsonUnauthorized();
 
     const url = new URL(request.url);
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 200);
-    const offset = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
+    const limit = clampLimit(url.searchParams.get('limit'), { fallback: 50, max: 200 });
+    const offset = clampOffset(url.searchParams.get('offset'));
 
     const [events, total] = await Promise.all([
       prisma.activityEvent.findMany({

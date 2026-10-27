@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requirePermission } from '@/features/auth/http-guards';
+import { clampLimit, clampOffset } from '@/shared/limit';
 
 export async function analyticsHandler(request: NextRequest) {
   const session = await requirePermission(request, 'analytics.read');
@@ -81,8 +82,8 @@ export async function adminAnalyticsConsentedUsersHandler(request: NextRequest) 
   if (session instanceof NextResponse) return session;
 
   const url = new URL(request.url);
-  const take = Math.min(parseInt(url.searchParams.get('take') || '50', 10) || 50, 200);
-  const skip = parseInt(url.searchParams.get('skip') || '0', 10) || 0;
+  const take = clampLimit(url.searchParams.get('take'), { fallback: 50, max: 200 });
+  const skip = clampOffset(url.searchParams.get('skip'));
 
   // Find all users with allowAnalytics=true
   const users = await prisma.user.findMany({

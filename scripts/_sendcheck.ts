@@ -86,7 +86,7 @@ const fixture = (to: string): Record<string, string> => {
     contact: to,
     account: 'bishnu@tirbeo.com',
     origin: '203.0.113.42 · San Francisco, CA',
-    replyHref: 'https://admin.tirbeo.com/admin/tickets/a1b2-c3d4-e5f6-7a8b',
+    replyHref: 'https://admin.tirbeo.com/admin/overview/support/a1b2-c3d4-e5f6-7a8b',
     replyLabel: 'Answer in the admin panel',
     replyHtml: '<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:#344054">We found the session you asked about — it was you, on a phone, in Kathmandu. Nothing on the account was changed, and we have left it signed in.</p><p style="margin:0;font-size:15px;line-height:25px;color:#344054">If that was not you, turn on two-step verification and end the other sessions from the security screen.</p>',
     subject: 'Three failed admin sign-ins in one minute',

@@ -11,6 +11,7 @@ import { coordsByLoginAttempt, coordsFromMeta } from '@/features/security/loginC
 import { createAuditEvent } from '@/features/security/audit';
 import { requireReauth } from '@/features/auth/reauth';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes, normalizeTotpCode } from '@/features/auth/totp';
+import { encryptSecret } from '@/features/auth/secret-box';
 import { hashRecoveryCode, verifyPassword } from '@/features/auth/password';
 import { checkPasswordBreach } from '@/features/auth/breach';
 import { scorePassword, strengthLabel } from '@/features/security/password-strength';
@@ -22,6 +23,7 @@ import { bustProfileCache } from '@/features/auth/authHandlers';
 import { fetchLoginUserById, setRecoveryContact, readRecoveryContact } from '@/features/identity/tirbeo';
 import { eventRowRef, refFromRowId } from '@/features/users/refcode';
 import { answersAbout } from '@/features/users/change-answers';
+import { clampLimit } from '@/shared/limit';
 
 async function notify(userId: string, title: string, body?: string, link?: string, type: NotifType = 'security', skipEmail = false) {
   try {
@@ -99,7 +101,7 @@ export async function securityEventsHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const url = new URL(request.url);
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 100);
+    const limit = clampLimit(url.searchParams.get('limit'), { fallback: 20, max: 100 });
 
     // auditEvent + securityEvent merged into activityEvent: the old `action`
     // string is stored as `kind`, and ip/user-agent are first-class columns.
@@ -213,11 +215,13 @@ export async function totpSetupHandler(request: NextRequest) {
         { error: 'Two-factor is already on. Turn it off before setting up a new app.' },
         { status: 409 });
     }
-    // Save secret to DB immediately (totpEnabled stays false until verify)
+    // Save secret to DB immediately (totpEnabled stays false until verify).
+    // Sealed: the row is the second factor, and a plaintext copy of it makes the
+    // database a copy of every customer's authenticator app.
     await prisma.userSecurity.upsert({
       where: { userId: session.userId },
-      create: { userId: session.userId, totpSecret: secret },
-      update: { totpSecret: secret } });
+      create: { userId: session.userId, totpSecret: encryptSecret(secret) },
+      update: { totpSecret: encryptSecret(secret) } });
     return NextResponse.json({ uri });
   } catch (err: any) {
     console.error('[TOTP SETUP]', err?.message || err);
@@ -247,6 +251,7 @@ export async function totpVerifyHandler(request: NextRequest) {
     const security = await prisma.userSecurity.findUnique({
       where: { userId: session.userId },
       select: { totpSecret: true } });
+    // verifyTotp opens a sealed value itself, so this is passed exactly as stored.
     const secretToVerify = security?.totpSecret;
     if (!secretToVerify) {
       return NextResponse.json({ error: 'TOTP not set up. Please start setup again.' }, { status: 400 });
@@ -258,10 +263,13 @@ export async function totpVerifyHandler(request: NextRequest) {
     const recoveryCodes = generateRecoveryCodes(8);
     const mintedAt = new Date().toISOString();
     const backupCodesJson = recoveryCodes.map(rc => ({ code: hashRecoveryCode(rc), used: false, createdAt: mintedAt }));
+    // The secret is not rewritten here. Setup stored it (sealed); re-writing the
+    // value read above would be the one way to turn a sealed row back into a
+    // plaintext one by accident.
     await prisma.userSecurity.upsert({
       where: { userId: session.userId },
-      create: { userId: session.userId, totpSecret: secretToVerify, totpEnabled: true, backupCodes: backupCodesJson as any },
-      update: { totpSecret: secretToVerify, totpEnabled: true, backupCodes: backupCodesJson as any } });
+      create: { userId: session.userId, totpSecret: encryptSecret(secretToVerify), totpEnabled: true, backupCodes: backupCodesJson as any },
+      update: { totpEnabled: true, backupCodes: backupCodesJson as any } });
     bustProfileCache(session.userId); // profile cache holds is2FAEnabled — refresh it
     // Secondary effects must never turn a successful enable into a 500 (e.g. a
     // transient DB/network blip on the audit insert or notification delivery).
@@ -881,7 +889,7 @@ export async function loginHistoryHandler(request: NextRequest) {
     const session = await getSession(request);
     if (!session) return jsonUnauthorized();
     const url = new URL(request.url);
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+    const limit = clampLimit(url.searchParams.get('limit'), { fallback: 20, max: 50 });
     // login_history -> user_logins: the consolidated per-attempt ledger (failed
     // sign-ins are rows there too, with success=false), so the eventType filter
     // the old security_events query needed is gone. `email` is the account's own

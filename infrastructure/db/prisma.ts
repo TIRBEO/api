@@ -100,17 +100,27 @@ function createPool(): Pool {
   //   pgbouncer=true — only for transaction-mode pooling (port 6543); session
   //     mode (5432) and direct connections keep a real backend per client.
   const isTransactionPooler = /pooler\.supabase\.com:6543/.test(base);
-  const pgbouncer = isTransactionPooler ? '&pgbouncer=true' : '';
-  const connectionString = base
-    ? `${base}${sep}uselibpqcompat=true&sslmode=require${pgbouncer}`
-    : undefined;
+  const params = ['uselibpqcompat=true'];
+  // An sslmode written into the address wins over the default. The pooler needs
+  // `require` and does not offer a CA chain worth verifying; a local scratch
+  // cluster offers no TLS at all, and saying so in its own URL is the libpq
+  // contract rather than a special case for one host.
+  if (!/[?&]sslmode=/.test(base)) params.push('sslmode=require');
+  if (isTransactionPooler) params.push('pgbouncer=true');
+  const connectionString = base ? `${base}${sep}${params.join('&')}` : undefined;
+  const plaintext = /[?&]sslmode=disable/.test(connectionString ?? '');
 
   const pool = new Pool({
     connectionString,
     ...POOL_CONFIG,
-    ssl: process.env.NODE_ENV !== 'production'
-      ? { rejectUnauthorized: false }
-      : undefined,
+    // node-postgres lets this option outrank the connection string, so a
+    // plaintext database has to be excused here too — otherwise `sslmode=disable`
+    // in the URL is silently ignored and the handshake fails.
+    ssl: plaintext
+      ? undefined
+      : process.env.NODE_ENV !== 'production'
+        ? { rejectUnauthorized: false }
+        : undefined,
     // TCP keepalive: probe dead sockets every 30s instead of hanging for
     // minutes when the network drops mid-request (VPN out, DNS failure).
     keepAlive: true,
@@ -374,6 +384,14 @@ function createPrismaClient(pool: Pool): PrismaClient {
 }
 
 // ─── Singleton Initialization ───
+/**
+ * Is this process compiling rather than serving? Next sets `NEXT_PHASE` for
+ * the whole of `next build`; `NODE_ENV=production` says nothing either way.
+ */
+function isBuildPhase(): boolean {
+  return process.env.NEXT_PHASE === 'phase-production-build';
+}
+
 function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
   // In development, reuse the global singleton to survive HMR
   if (globalForPrisma.prisma && globalForPrisma.pgPool) {
@@ -388,6 +406,13 @@ function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
   globalForPrisma.pgPool = pool;
 
   // Warm up the pool immediately (non-blocking)
+  //
+  // Not during a build, though: `next build` imports every route to collect its
+  // config, and this module-scope dial then spends the connect timeout on a
+  // sleeping Supabase instance — while the keep-alive below re-dials it every
+  // 20s for the rest of the compile. A build has no traffic to be fast for.
+  if (isBuildPhase()) return { prisma, pool };
+
   if (DB_URL_CONFIGURED) warmPool(pool);
 
   // Keep-alive: Supabase (and its pooler) closes idle connections aggressively.

@@ -1,4 +1,6 @@
 import { prisma } from '@/infrastructure/db/prisma';
+import type { Prisma } from '@prisma/client';
+import { serializableWrite } from '@/infrastructure/db/serializable-write';
 import { generateOtpCode } from '@/features/auth/otp';
 import { hashOtpCode, verifyOtpCode as verifyOtpHash } from '@/features/auth/password';
 import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
@@ -48,33 +50,51 @@ async function readMisc(userId: string): Promise<Record<string, any>> {
   return ((p?.misc as any) || {});
 }
 
+async function readMiscFrom(tx: Prisma.TransactionClient, userId: string): Promise<Record<string, any>> {
+  const p = await tx.userPreferences.findUnique({ where: { userId }, select: { misc: true } });
+  return ((p?.misc as any) || {});
+}
+
+/** The link map is one JSON blob shared by every provider, so a link write is a
+    read-modify-write. Untouched, two concurrent writes start from one snapshot and
+    the later commit drops the other provider. Serializable + retry re-reads the row
+    the winner just wrote. Best-effort like before: a failed write is swallowed, a
+    retried one is not.
+
+    Exported because `misc` is one bag with several writers (welcome-back ack,
+    settings, notification prefs) and every one of them needs the same guard. */
+export async function writeMisc(userId: string, mutate: (misc: Record<string, any>) => void): Promise<void> {
+  try {
+    await serializableWrite(async (tx) => {
+      const misc = { ...(await readMiscFrom(tx, userId)) };
+      mutate(misc);
+      await tx.userPreferences.upsert({
+        where: { userId },
+        update: { misc },
+        create: { userId, misc },
+      });
+    });
+  } catch {}
+}
+
 export async function readOauthLinks(userId: string): Promise<Record<string, string>> {
   const misc = await readMisc(userId);
   return (misc.oauth as Record<string, string>) || {};
 }
 
 export async function writeOauthLink(userId: string, provider: ProviderKey, providerId: string): Promise<void> {
-  const misc = { ...(await readMisc(userId)) };
-  misc.oauth = { ...(misc.oauth || {}), [provider]: providerId };
-  await prisma.userPreferences.upsert({
-    where: { userId },
-    update: { misc },
-    create: { userId, misc },
-  }).catch(() => {});
+  await writeMisc(userId, (misc) => {
+    misc.oauth = { ...(misc.oauth || {}), [provider]: providerId };
+  });
 }
 
 export async function clearOauthLink(userId: string, provider: ProviderKey): Promise<void> {
-  const misc = { ...(await readMisc(userId)) };
-  if (misc.oauth) {
+  await writeMisc(userId, (misc) => {
+    if (!misc.oauth) return;
     const nextOauth = { ...misc.oauth };
     delete nextOauth[provider];
     misc.oauth = nextOauth;
-  }
-  await prisma.userPreferences.upsert({
-    where: { userId },
-    update: { misc },
-    create: { userId, misc },
-  }).catch(() => {});
+  });
 }
 
 /** The link map: preferences.misc.oauth is the only store. */
@@ -399,12 +419,13 @@ export async function consumeSensitiveCode(kind: string, email: string, code: st
   }
 
   // A miss costs an attempt, and the row self-destructs at the limit, so a
-  // brute force dies with the code it is hunting.
-  const next = (otp.attempts ?? 0) + 1;
-  if (next >= MAX_OTP_ATTEMPTS) {
+  // brute force dies with the code it is hunting. The counter moves in the
+  // database: two concurrent misses that both read `3` must cost two attempts.
+  const burned = await prisma.otp
+    .update({ where: { id: otp.id }, data: { attempts: { increment: 1 } }, select: { attempts: true } })
+    .catch(() => null);
+  if (!burned || burned.attempts >= MAX_OTP_ATTEMPTS) {
     await prisma.otp.deleteMany({ where: { id: otp.id } }).catch(() => {});
-  } else {
-    await prisma.otp.update({ where: { id: otp.id }, data: { attempts: next } }).catch(() => {});
   }
   return false;
 }

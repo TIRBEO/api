@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requireAdmin } from '@/features/auth/http-guards';
 import { generateSecret, generateTotpUri, verifyTotp, generateRecoveryCodes } from '@/features/auth/totp';
+import { encryptSecret } from '@/features/auth/secret-box';
 import { hashRecoveryCode } from '@/features/auth/password';
 import { createAuditEvent } from '@/features/security/audit';
 
@@ -22,8 +23,8 @@ export async function setup2faHandler(request: NextRequest) {
 
   await prisma.userSecurity.upsert({
     where: { userId: session.userId },
-    create: { userId: session.userId, totpSecret: secret, backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
-    update: { totpSecret: secret, backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+    create: { userId: session.userId, totpSecret: encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+    update: { totpSecret: encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 
   await createAuditEvent({

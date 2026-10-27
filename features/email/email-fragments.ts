@@ -1,4 +1,4 @@
-import { FAINT, LINE, MONO, MUTED, TEXT, TEXT_2 } from '@/features/email/email-theme';
+import { FAINT, MONO, MUTED, TEXT, TEXT_2 } from '@/features/email/email-theme';
 
 /**
  * The HTML the mail's section slots are built from.
@@ -81,8 +81,13 @@ function escapeHere(value: string): string {
 }
 
 /**
- * The facts of one event, a labelled row each — the shape an operator reads when
- * an alert lands in their inbox.
+ * The facts of one event — the shape an operator reads when an alert lands in
+ * their inbox.
+ *
+ * Lines of prose, not a ruled table: an alert is one more mail in a stack, and a
+ * bordered grid inside it reads as a form somebody expects an answer from. A
+ * label in the quiet grey and its value after it is the same information at the
+ * same speed, and it wraps on a phone instead of pushing the column sideways.
  *
  * Values are escaped HERE, unlike everything else in this module: an admin alert
  * carries a user-agent string, an address and free text a person typed, none of
@@ -91,14 +96,13 @@ function escapeHere(value: string): string {
  */
 export function factPlate(rows: Array<[string, string]>): string {
   if (!rows.length) return '';
-  return `<div style="margin:24px 0;border-top:1px solid ${LINE}">`
+  return `<div style="margin:22px 0">`
     + rows.map(([label, value]) => {
         const mono = REF_SHAPE.test(String(value).trim());
-        return `<div style="padding:10px 0;border-bottom:1px solid ${LINE}">`
-          + `<div style="font-size:13px;line-height:18px;font-weight:600;color:${MUTED}">${escapeHere(label)}</div>`
-          + `<div style="margin-top:3px;font-size:14px;line-height:20px;color:${TEXT};word-break:break-word`
-          + (mono ? `;font-family:${MONO}` : '') + `">${escapeHere(value)}</div>`
-          + `</div>`;
+        return `<p style="margin:0 0 7px;font-size:14px;line-height:21px">`
+          + `<span style="color:${MUTED}">${escapeHere(label)}: </span>`
+          + `<span style="color:${TEXT};word-break:break-word${mono ? `;font-family:${MONO}` : ''}">${escapeHere(value)}</span>`
+          + `</p>`;
       }).join('')
     + `</div>`;
 }

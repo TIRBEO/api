@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { requirePermission } from '@/features/auth/http-guards';
 import { eventRowRef, refCodeCandidates } from '@/features/users/refcode';
+import { THREAD_KINDS as SUPPORT_THREAD_KINDS, threadStatusOf } from '@/features/support/threads';
+import { getSupportThreadUrl } from '@/config/app-urls';
 
 /* ═══════════════════════════════════════════════════════════════════
    GET /api/admin/support/[ref] — one thread, everything about it
@@ -17,7 +19,9 @@ import { eventRowRef, refCodeCandidates } from '@/features/users/refcode';
    address an answer would actually reach?
    ═══════════════════════════════════════════════════════════════════ */
 
-const THREAD_KINDS = ['support.request', 'support.reply'];
+/* The thread is one list of kinds, shared with the account's own read of it, so
+   a follow-up the person wrote cannot be invisible to the queue that answers it. */
+const THREAD_KINDS = SUPPORT_THREAD_KINDS;
 /** The mail this thread could have sent. The delivery log files a template
     under `event_key` as `legacy.<template>` — its `event` column holds the
     outcome ('sent'/'failed'), not the name, so matching on `event` would find
@@ -121,9 +125,13 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         // The 500-character column is a preview; the message the person wrote
         // is in metadata and is what an answer has to be written against.
         message: typeof meta.message === 'string' && meta.message ? meta.message : (asked.detail ?? ''),
-        status: replies.length ? 'answered' : 'open',
+        status: threadStatusOf(rows as never[]).status,
         askedAt: asked.createdAt.toISOString(),
         answeredAt: replies.length ? replies[replies.length - 1].createdAt.toISOString() : null,
+        closedAt: rows.filter((r) => r.kind === 'support.closed').pop()?.createdAt.toISOString() ?? null,
+        /** The account's own side of this thread — the address the reply mail
+            links to, and the one place a follow-up can be written. */
+        threadUrl: getSupportThreadUrl(eventRowRef(asked)),
         account: asked.user ? {
           id: asked.user.id,
           email: asked.user.email,
@@ -140,7 +148,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         messages: rows.map((r) => ({
           id: r.id,
           ref: eventRowRef(r),
-          from: r.kind === 'support.reply' ? 'staff' : 'account',
+          from: r.kind === 'support.reply' ? 'staff' : r.kind === 'support.closed' ? 'system' : 'account',
           at: r.createdAt.toISOString(),
           subject: r.title,
           text: (() => {
@@ -162,4 +170,178 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     console.error('[ADMIN SUPPORT THREAD]', err?.message || err);
     return NextResponse.json({ error: 'Failed to read the thread' }, { status: 500 });
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   POST /api/admin/support/[ref] — answer it, or end it
+
+   Two actions on one door, because both are a staff member acting on a thread
+   they have just read, and the record they leave has to be the same shape.
+
+     { action: 'reply', text, sendEmail? }  — answer. Always writes the row;
+       mails it only when asked.
+     { action: 'close' }                    — end the thread. The account is
+       told either way, in the app it is already signed into.
+
+   An answer without the mail is the point of `sendEmail`: most threads are
+   answered in the app the person is already reading this one in, and a mail for
+   every keystroke is how a support address becomes noise. The ledger row and
+   the account's notification are never optional — an answer that exists only in
+   one place is an answer nobody can find afterwards.
+
+   The mail, when it goes, carries the thread's own URL. That is what turns a
+   one-way reply into a conversation: the person can write back into the same
+   reference instead of filing a new request that looks like a first one.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+const REPLY_MAX = 4000;
+
+export async function POST(request: NextRequest, { params }: { params: Promise<{ ref: string }> }) {
+  try {
+    const staff = await requirePermission(request, 'tickets.answer');
+    if (staff instanceof NextResponse) return staff;
+
+    const { ref: raw } = await params;
+    const ref = decodeURIComponent(raw ?? '').trim();
+    if (!ref) return NextResponse.json({ error: 'No reference given' }, { status: 400 });
+
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+    const action = body.action === 'close' ? 'close' : body.action === 'reply' ? 'reply' : null;
+    if (!action) return NextResponse.json({ error: 'Nothing to do — reply or close.' }, { status: 400 });
+
+    const candidates = [...new Set([ref, ...refCodeCandidates(ref)])];
+    const rows = await prisma.activityEvent.findMany({
+      where: {
+        kind: { in: THREAD_KINDS },
+        OR: [
+          ...candidates.map((code) => ({ metadata: { path: ['refCode'], equals: code } })),
+          { detail: { contains: ref } },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 100,
+      select: { id: true, userId: true, kind: true, title: true, detail: true, metadata: true, createdAt: true },
+    });
+    if (!rows.length) return NextResponse.json({ error: 'No thread with that reference' }, { status: 404 });
+
+    const asked = rows.find((r) => r.kind === 'support.request') ?? rows[0];
+    const code = eventRowRef(asked);
+    const subject = asked.title;
+    const userId = asked.userId ?? rows.find((r) => r.userId)?.userId ?? null;
+    const now = new Date();
+
+    const [{ primaryEmailForUser }, { createNotification }] = await Promise.all([
+      import('@/features/notifications/notifications'),
+      import('@/features/notifications/notifications'),
+    ]);
+    const to = userId ? await primaryEmailForUser(userId).catch(() => null) : null;
+    const threadUrl = getSupportThreadUrl(code);
+
+    if (action === 'close') {
+      const row = await prisma.activityEvent.create({
+        data: {
+          userId,
+          kind: 'support.closed',
+          title: subject,
+          detail: `Closed ${code} from the panel.`,
+          severity: 'info',
+          metadata: { refCode: code, subject, byAdmin: staff.userId, by: 'staff' } as never,
+        },
+      });
+      if (userId) {
+        createNotification({
+          userId,
+          type: 'support',
+          title: 'Your request was closed',
+          body: `The thread on "${subject}" is closed. Writing to it again opens it, and the same person sees it.`,
+          link: `/support/thread/${encodeURIComponent(code)}`,
+          skipEmail: true,
+          metadata: { refCode: code, subject } as never,
+        }).catch(() => {});
+      }
+      return NextResponse.json({ ok: true, closedAt: row.createdAt ?? now, ref: code });
+    }
+
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (text.length < 2) return NextResponse.json({ error: 'Write something before sending it.' }, { status: 400 });
+    if (text.length > REPLY_MAX) {
+      return NextResponse.json({ error: `Keep it under ${REPLY_MAX} characters — a person reads these.` }, { status: 400 });
+    }
+    const sendEmail = body.sendEmail !== false;
+
+    const row = await prisma.activityEvent.create({
+      data: {
+        userId,
+        kind: 'support.reply',
+        title: `Re: ${subject}`,
+        detail: `Answered ${code} from the panel${sendEmail ? ' and by mail.' : '.'}`,
+        severity: 'info',
+        metadata: {
+          refCode: code,
+          message: text.slice(0, 2000),
+          subject,
+          byAdmin: staff.userId,
+          to,
+          emailed: sendEmail,
+          threadUrl,
+        } as never,
+      },
+    });
+
+    /* The mail is the only part allowed to fail quietly. The answer is already
+       on the record and the account is already being told; a provider that
+       takes a moment over a copy must not put the operator back at the top of
+       the form with an answer already sent. */
+    let emailed = false;
+    if (sendEmail && to) {
+      const { sendTemplateEmail } = await import('@/features/email/email');
+      const result = await sendTemplateEmail(to, 'support_reply', {
+        subject: `Re: ${subject}`,
+        refCode: code,
+        replyHtml: paragraphs(text),
+        threadUrl,
+        receivedAt: (asked.createdAt ?? now).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+      }, { replyTo: to, threadId: code, fromName: 'Tirbeo Support' }).catch(() => null);
+      emailed = !!result?.success;
+    }
+
+    if (userId) {
+      createNotification({
+        userId,
+        type: 'support',
+        title: 'The team replied to your request',
+        body: text.slice(0, 180),
+        link: `/support/thread/${encodeURIComponent(code)}`,
+        // The mail above already said this, in the same words. An account that
+        // asked to be emailed should not be emailed and pinged for one answer.
+        skipEmail: true,
+        metadata: { refCode: code, subject, threadUrl } as never,
+      }).catch(() => {});
+    }
+
+    return NextResponse.json({
+      ok: true,
+      ref: code,
+      messageId: row.id,
+      emailed,
+      // A thread answered here and nowhere else still reaches the person; say
+      // which of the two happened so the panel does not claim a mail it did not
+      // send (or hide one that failed).
+      ...(sendEmail && to && !emailed ? { warning: `Written down, but the mail to ${to} did not go.` } : {}),
+    });
+  } catch (err: any) {
+    console.error('[ADMIN SUPPORT ACTION]', err?.message || err);
+    return NextResponse.json({ error: 'Failed to act on the thread' }, { status: 500 });
+  }
+}
+
+/** Plain text from a textarea into mail-safe HTML — escaped first, so a reply
+ *  that quotes somebody's angle brackets cannot become markup in the mail. */
+function paragraphs(text: string): string {
+  const escape = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return text
+    .split(/\n{2,}/)
+    .map((block) => `<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:#344054">${escape(block).replace(/\n/g, '<br />')}</p>`)
+    .join('');
 }

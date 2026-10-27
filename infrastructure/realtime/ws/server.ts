@@ -560,13 +560,19 @@ export function startWsServer(port: number): WebSocketServer {
         if (msg.type === 'subscribe' && typeof msg.channel === 'string') {
           const client = clients.get(clientId);
           const isAdmin = client?.adminRole && ['admin', 'super_admin'].includes(client.adminRole);
-          const isOwnUserChannel = msg.channel.startsWith('user:') && msg.channel === `user:${userId}`;
-          if (msg.channel === 'admin' && !isAdmin) {
-            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'Admin channel requires an admin role' }));
-            return;
-          }
-          if (msg.channel.startsWith('user:') && !isOwnUserChannel && !isAdmin) {
-            ws.send(JSON.stringify({ type: 'error', code: 'FORBIDDEN', message: 'You can only subscribe to your own user channel' }));
+          const isOwnUserChannel = msg.channel === `user:${userId}`;
+          // An allow-list, not a deny-list: `channelSubs` is a process-global
+          // map, so any name this accepts is a name a session holder can make
+          // the server remember. The protocol only ever carries these two.
+          const allowed = isOwnUserChannel || (isAdmin && (msg.channel === 'admin' || msg.channel.startsWith('user:')));
+          if (!allowed) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              code: 'FORBIDDEN',
+              message: msg.channel.startsWith('user:') && !isOwnUserChannel
+                ? 'You can only subscribe to your own user channel'
+                : 'Unknown channel',
+            }));
             return;
           }
           let set = channelSubs.get(msg.channel);
@@ -638,24 +644,29 @@ export function startWsServer(port: number): WebSocketServer {
 
   const interval = setInterval(() => {
     const now = Date.now();
-    
+
     cleanupRateLimits();
-    
-    const hints = calculateServerHints();
-    
+
+    const dueForHints = now - lastHintsBroadcast >= HINTS_BROADCAST_INTERVAL;
+    const hints = dueForHints ? calculateServerHints() : null;
+
     wss?.clients.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }));
-        
-        if (now - lastHintsBroadcast >= HINTS_BROADCAST_INTERVAL) {
-          ws.send(JSON.stringify({ type: 'server_hints', hints }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+    });
+
+    // `server_hints` carries live connection counts and load factor — the
+    // same reason `get_hints` refuses an unauthenticated socket, the
+    // unsolicited push has to refuse one too. Only authenticated
+    // connections are in `clients`.
+    if (dueForHints && hints) {
+      for (const client of clients.values()) {
+        if (client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(JSON.stringify({ type: 'server_hints', hints }));
         }
       }
-    });
-    
-    if (now - lastHintsBroadcast >= HINTS_BROADCAST_INTERVAL) {
-      lastHintsBroadcast = now;
     }
+
+    if (dueForHints) lastHintsBroadcast = now;
   }, 30000);
 
   wss.on('close', () => clearInterval(interval));
@@ -705,10 +716,6 @@ export function broadcast(data: unknown) {
       payload: evt,
     },
   );
-}
-
-export function getOnlineUserIds(): string[] {
-  return Array.from(userConnections.keys());
 }
 
 /** Number of live WS clients on this process (for the CDN control plane). */
@@ -764,16 +771,5 @@ export function getLastSeen(userId: string): number | null {
   return lastSeenTimes.get(userId) || null;
 }
 
-export function getLastSeenMap(userIds: string[]): Record<string, { online: boolean; lastSeen: number | null }> {
-  const result: Record<string, { online: boolean; lastSeen: number | null }> = {};
-  for (const id of userIds) {
-    const isOnline = userConnections.has(id);
-    result[id] = {
-      online: isOnline,
-      lastSeen: isOnline ? 0 : (lastSeenTimes.get(id) || null),
-    };
-  }
-  return result;
-}
 
 

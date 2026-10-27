@@ -19,6 +19,7 @@ import { logSecurityEvent } from '@/features/security/security';
 import { signReauthToken } from '@/features/auth/jwt';
 import { requireReauth } from '@/features/auth/reauth';
 import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/blockFacts';
+import { clientIpOrUnknown, clientIp } from '@/shared/client-ip';
 
 const RP_NAME = 'Tirbeo';
 const CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -431,7 +432,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
        lookup and an audit write, and an unbounded endpoint is an invitation to
        both. 20 per 15 min per IP is far above real use (a person who fumbles
        their phone lock twice has used 2) and low enough to be useless. */
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     const limit = await consumeGenericWindow(`passkey-verify:ip:${ip}`, 20, 15 * 60 * 1000);
     if (!limit.ok) {
       const mins = Math.max(1, Math.ceil((limit.resetAt - Date.now()) / 60000));
@@ -504,12 +505,12 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       return blockedAccountResponse(passkeyUser as any, request);
     }
 
-    // Create session
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    // Create session — `ip` is the address the verify ceiling above was
+    // counted against, so the session records the same one it was issued from.
     const { token, refreshToken } = await createSession(
       passkey.user.id,
       request.headers.get('user-agent') || undefined,
-      clientIp,
+      ip,
     );
     // A passkey proves the person holds the credential, not that the browser in
     // front of it is one this account has ever signed in from — so the same
@@ -519,7 +520,7 @@ export async function passkeyAuthVerifyHandler(request: NextRequest) {
       userId: passkey.user.id,
       email: primaryEmail,
       name: passkeyUser.profile?.name,
-      ip: clientIp || 'unknown',
+      ip,
       userAgent: request.headers.get('user-agent'),
       fingerprint: request.cookies.get('__dfp')?.value || request.headers.get('x-device-fingerprint') || null,
       headers: request.headers,

@@ -1,18 +1,31 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 import { prisma, getPoolStatus, getDetailedPoolStatus, checkDatabaseConnection, getPoolAlertState } from '@/infrastructure/db/prisma';
-import { getSession } from '@/features/auth/http-guards';
-import { jsonUnauthorized, jsonForbidden } from '@/shared/response';
+import { requirePermission } from '@/features/auth/http-guards';
+import { jsonForbidden } from '@/shared/response';
 import { getCachedRedisClient, checkRedisHealth, getRedisHealthSummary, pingAllRedisClients } from '@/infrastructure/db/redis';
 import { deliveryDiagnostics } from '@/infrastructure/realtime/pusher-deliver';
 
 
-function isAdmin(user: any): boolean {
-  return user?.adminRole != null && ['super_admin', 'admin'].includes(user.adminRole);
-}
+/* Which internals are for staff, and which are for the world:
+   `/api/health` is a liveness probe — an uptime check, a container orchestrator,
+   the deploy platform. It answers alive-or-not and nothing else, because
+   latencies, pool sizes, connection counts and the names of the environment
+   variables that happen to be unset are a map of the installation for anybody
+   who cares to ask.
+   `/api/content/health` and `/api/health/pool` carry that detail and are gated on
+   `dashboard.read`, which is the ops overview the numbers belong to. */
 
-function isAdminUser(user: any): boolean {
-  return isAdmin(user);
+/** Trusted machine key for the monitoring pull, when one is configured. A length
+    mismatch makes `timingSafeEqual` throw rather than return false, so the two
+    are compared by length first and the secret never reaches the response. */
+function adminKeyMatches(supplied: string): boolean {
+  const expected = process.env.ADMIN_API_KEY;
+  if (!expected || !supplied) return false;
+  const a = Buffer.from(supplied, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 // Cache health check results for 15s to avoid hammering DB/Redis on every request
@@ -51,9 +64,8 @@ export async function publicHealthHandler() {
 
   // ─── Database ───
   try {
-    const dbStart = Date.now();
     await prisma.$queryRaw`SELECT 1`;
-    checks.database = { status: 'ok', latencyMs: Date.now() - dbStart };
+    checks.database = { status: 'ok' };
   } catch (e: any) {
     // The raw message can carry host/credential fragments, so it stays
     // server-side; only Prisma's error code is published.
@@ -69,52 +81,27 @@ export async function publicHealthHandler() {
   const r = getHealthRedis();
   if (r) {
     const redisHealth = await checkRedisHealth(r);
-    checks.redis = {
-      status: redisHealth.ok ? 'ok' : 'error',
-      latencyMs: redisHealth.latencyMs,
-      error: redisHealth.error || undefined };
-    if (!redisHealth.ok) healthy = false;
+    checks.redis = { status: redisHealth.ok ? 'ok' : 'error' };
+    if (!redisHealth.ok) {
+      console.error('[HEALTH] Redis check failed:', redisHealth.error || '');
+      healthy = false;
+    }
   } else {
-    checks.redis = {
-      status: process.env.REDIS_URL ? 'error' : 'not-configured',
-      error: process.env.REDIS_URL ? 'Redis client failed to initialize' : undefined };
+    checks.redis = { status: process.env.REDIS_URL ? 'error' : 'not-configured' };
+    if (process.env.REDIS_URL) healthy = false;
   }
 
-  // ─── Redis Connection Health ───
-  const redisSummary = getRedisHealthSummary();
-  checks.redisConnections = {
-    configured: redisSummary.configured,
-    total: redisSummary.totalClients,
-    connected: redisSummary.connectedClients,
-    reconnects: redisSummary.totalReconnects,
-    failedRequests: redisSummary.totalFailedRequests,
-    healthy: redisSummary.totalClients === 0 || redisSummary.connectedClients > 0 };
-  if (redisSummary.totalClients > 0 && redisSummary.connectedClients === 0) {
-    healthy = false;
-  }
-
-  // ─── Realtime + web push delivery (Pusher Channels / Beams) ───
-  // Reported but NOT counted against overall health: a missing Pusher secret
-  // silently disables realtime and push, which would otherwise be invisible.
-  // Treat a degraded `delivery` as a deployment misconfiguration to fix.
-  checks.delivery = deliveryDiagnostics();
-
-  // ─── Pool ───
-  const poolStatus = getPoolStatus();
   const result = {
     status: healthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    checks,
-    pool: poolStatus || undefined };
+    checks };
   healthCache = { data: result, ts: Date.now() };
   return NextResponse.json(result);
 }
 
 export async function detailedHealthHandler(req: NextRequest) {
-  const user = await getSession(req);
-  if (!user) return jsonUnauthorized();
-  if (!isAdmin(user)) return jsonForbidden();
+  const staff = await requirePermission(req, 'dashboard.read');
+  if (staff instanceof NextResponse) return staff;
 
   const checks: Record<string, any> = {};
   let healthy = true;
@@ -194,19 +181,17 @@ export async function detailedHealthHandler(req: NextRequest) {
 // Detailed connection pool metrics for monitoring dashboards.
 // Returns real-time pool state, utilization, health indicators, and memory usage.
 export async function poolHealthHandler(req: NextRequest) {
-  // Admin-only details. The optional x-admin-key header is only trusted when
-  // its value matches ADMIN_API_KEY exactly (constant-time), never on presence.
-  const session = await getSession(req).catch(() => null);
-  const sessionAdmin = session?.userId && isAdminUser(session);
-  const expectedKey = process.env.ADMIN_API_KEY;
-  const suppliedKey = req.headers.get('x-admin-key') || '';
-  const keyAdmin = !!expectedKey && suppliedKey.length > 0 && crypto.timingSafeEqual(
-    Buffer.from(suppliedKey, 'utf8'),
-    Buffer.from(expectedKey, 'utf8'),
-  );
-  const isAdmin = !!sessionAdmin || keyAdmin;
+  /* Who is allowed the pool's internals: a staff session that holds
+     `dashboard.read`, or the machine key an external monitor presents in
+     `x-admin-key`. Nobody else — this endpoint sits under the same path as the
+     public liveness probe, and a prefix-shaped public door used to hand it to
+     anybody who asked. */
+  const machineKey = adminKeyMatches(req.headers.get('x-admin-key') || '');
+  if (!machineKey) {
+    const staff = await requirePermission(req, 'dashboard.read');
+    if (staff instanceof NextResponse) return staff;
+  }
 
-  // Allow unauthenticated access for basic metrics, but require admin for full details
   const detailed = getDetailedPoolStatus();
   if (!detailed) {
     return NextResponse.json({ error: 'Pool not initialized' }, { status: 503 });
@@ -217,7 +202,7 @@ export async function poolHealthHandler(req: NextRequest) {
 
   const alertState = getPoolAlertState();
 
-  const response: any = {
+  const response = {
     timestamp: new Date().toISOString(),
     database: {
       connected: dbCheck.ok,
@@ -233,12 +218,6 @@ export async function poolHealthHandler(req: NextRequest) {
       lastWarningAt: alertState.lastWarningAt ? new Date(alertState.lastWarningAt).toISOString() : null,
       lastCriticalAt: alertState.lastCriticalAt ? new Date(alertState.lastCriticalAt).toISOString() : null,
       thresholds: alertState.thresholds } };
-
-  // Admin-only: include memory and full config
-  if (!isAdmin) {
-    delete response.pool.memory;
-    delete response.pool.config;
-  }
 
   return NextResponse.json(response);
 }

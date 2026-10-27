@@ -278,8 +278,12 @@ function buildUserFilters(request: NextRequest, _session: { adminRole?: string |
 
 /**
  * GET /api/admin/users/export?optIn=…&search=… — CSV report of user opt-ins.
- * Exports ALL matching users (no pagination). Row order: last active desc.
+ * Exports the matching users newest-active first, up to EXPORT_MAX_ROWS. The
+ * ceiling exists because every row can also mint a reference code; an
+ * unbounded export is a request that grows with the user table.
  */
+const EXPORT_MAX_ROWS = 20_000;
+
 export async function exportUsersCsv(request: NextRequest) {
   const session = await requirePermission(request, 'people.read');
   if (session instanceof NextResponse) return session;
@@ -288,6 +292,7 @@ export async function exportUsersCsv(request: NextRequest) {
   const usersRaw = await prisma.user.findMany({
     where: findWhere,
     select: ADMIN_USER_SELECT,
+    take: EXPORT_MAX_ROWS,
     orderBy: { lastActiveAt: 'desc' } });
 
   const { events, restrictions } = await loadEnforcement(usersRaw.map(u => u.id));
@@ -325,7 +330,10 @@ export async function exportUsersCsv(request: NextRequest) {
   }
 
   const stamp = new Date().toISOString().slice(0, 10);
-  const optIn = request.nextUrl.searchParams.get('optIn') || 'all';
+  /* The filter goes into a download filename, so it is only allowed the shapes a
+     consent value has. Quotes, semicolons and spaces would otherwise end the
+     quoted string early and let a caller write their own header. */
+  const optIn = (request.nextUrl.searchParams.get('optIn') || 'all').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 32) || 'all';
   return new NextResponse(rows.join('\n'), {
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
@@ -825,24 +833,28 @@ async function writeEnforcement(opts: {
   const refCode = (latest?.metadata as any)?.refCode || generateEventId(opts.refKind);
   const detail = opts.reason || 'No reason provided';
 
-  await prisma.user.update({ where: { id: opts.userId }, data: { status: opts.toStatus } });
+  // One transaction: a ban that flips the status but dies before writing the
+  // restriction leaves an account punished with nothing on record to appeal.
+  await prisma.$transaction(async (tx: any) => {
+    await tx.user.update({ where: { id: opts.userId }, data: { status: opts.toStatus } });
+    await tx.userRestriction.create({
+      data: {
+        userId: opts.userId,
+        guideline: 'admin-enforcement',
+        title: opts.title,
+        detail,
+        severity: 'strike',
+        endsAt: opts.until ?? null } });
+    await tx.userStatusEvent.create({
+      data: {
+        userId: opts.userId,
+        fromStatus: opts.fromStatus as any,
+        toStatus: opts.toStatus as any,
+        reason: detail,
+        actor: 'admin',
+        metadata: { refCode, until: opts.until?.toISOString() ?? null } } });
+  });
   forgetUserStatus(opts.userId);
-  await prisma.userRestriction.create({
-    data: {
-      userId: opts.userId,
-      guideline: 'admin-enforcement',
-      title: opts.title,
-      detail,
-      severity: 'strike',
-      endsAt: opts.until ?? null } });
-  await prisma.userStatusEvent.create({
-    data: {
-      userId: opts.userId,
-      fromStatus: opts.fromStatus as any,
-      toStatus: opts.toStatus as any,
-      reason: detail,
-      actor: 'admin',
-      metadata: { refCode, until: opts.until?.toISOString() ?? null } } });
 
   logSecurityEvent({
     request: opts.request,
@@ -854,18 +866,187 @@ async function writeEnforcement(opts: {
   return refCode;
 }
 
-/** Lift an enforcement: status back to active + a status event, no restriction. */
-async function liftEnforcement(userId: string, fromStatus: string, reason: string): Promise<void> {
-  await prisma.user.update({ where: { id: userId }, data: { status: 'active' } });
-  forgetUserStatus(userId);
-  await prisma.userStatusEvent.create({
-    data: {
-      userId,
-      fromStatus: fromStatus as any,
-      toStatus: 'active' as any,
-      reason,
-      actor: 'admin',
-      metadata: {} } });
+/** Lift an enforcement. This is the one write here that ENDS a decision rather
+    than making one, so it has three jobs and not one:
+    · the status goes back to active;
+    · the enforcement's own restriction row is closed at this instant — a row
+      still reading "in force until November" keeps showing up on the account's
+      checks screen and on the appeal queue after the person is already back;
+    · a status event carries the admin's reason, which is the sentence the
+      account is mailed and the sentence their own history repeats.
+    The reference code is the enforcement's, reused when one exists: two mails
+    about one decision quoting two codes is how a thread starts.
+
+    Exported for the appeal reviewer, which reaches the same state by a
+    different door and must not describe it differently. */
+export async function liftEnforcement(opts: {
+  userId: string;
+  fromStatus: string;
+  enforcement: 'banned' | 'suspended';
+  reason: string;
+  liftedAt?: Date;
+}): Promise<string> {
+  const prior = await prisma.userStatusEvent.findFirst({
+    where: { userId: opts.userId, toStatus: opts.enforcement as any },
+    orderBy: { createdAt: 'desc' },
+    select: { metadata: true } });
+  const refCode = (prior?.metadata as any)?.refCode || generateEventId('lift');
+  const now = opts.liftedAt ?? new Date();
+
+  await prisma.$transaction(async (tx: any) => {
+    await tx.user.update({ where: { id: opts.userId }, data: { status: 'active' } });
+    await tx.userRestriction.updateMany({
+      where: { userId: opts.userId, guideline: 'admin-enforcement', OR: [{ endsAt: null }, { endsAt: { gt: now } }] },
+      data: { endsAt: now } });
+    await tx.userStatusEvent.create({
+      data: {
+        userId: opts.userId,
+        fromStatus: opts.fromStatus as any,
+        toStatus: 'active' as any,
+        reason: opts.reason,
+        actor: 'admin',
+        metadata: { refCode, liftedAt: now.toISOString(), liftedFrom: opts.enforcement } } });
+  });
+  forgetUserStatus(opts.userId);
+  return refCode;
+}
+
+/** A lift with nothing to lift. Answering "User unbanned" for an account that
+    was never banned would record a successful operation that did not happen,
+    mail a person who is not under a sanction, and leave the trail describing a
+    state nobody can find. */
+function notUnderEnforcement(status: string, expected: 'banned' | 'suspended') {
+  if (status === expected) return null;
+  return NextResponse.json({
+    error: `That account is not ${expected === 'banned' ? 'banned' : 'suspended'} — its status is “${status}”. Nothing was changed.`,
+  }, { status: 409 });
+}
+
+/** Why a sanction is ending. Required, because the reason is not a formality
+    recorded next to the act: it is what the account is mailed and what their
+    own history shows them. "unbanned" restates the button rather than the
+    decision, which is what an appeal would have to work from later. */
+async function liftReason(request: NextRequest): Promise<string | NextResponse> {
+  const body: any = await request.json().catch(() => ({}));
+  const reason = typeof body?.reason === 'string' ? body.reason.trim() : '';
+  if (!reason) {
+    return NextResponse.json({
+      error: 'Say why the sanction is being lifted. The account is mailed this sentence, and it is what their own history will show them.',
+    }, { status: 400 });
+  }
+  return reason.slice(0, 2000);
+}
+
+/** Mail the account the end of its sanction. Exported because an overturned
+    appeal is the second way a sanction ends on this platform, and both of them
+    have to reach the same person in the same words — a decision that arrives by
+    one route and is silent by another is how an account stops believing the
+    mail. */
+export async function notifyReinstated(opts: {
+  userId: string;
+  email: string;
+  name?: string | null;
+  kindWord: string;
+  reason: string;
+  refCode: string;
+  liftedAt: Date;
+  nextStep: string;
+}): Promise<void> {
+  const { sendTemplateEmail } = await import('@/features/email/email');
+  const { primaryEmailForUser } = await import('@/features/notifications/notifications');
+  // The end of a sanction has to reach the person it was applied to, and a
+  // login handle is a name rather than necessarily a mailbox.
+  const mailTo = (await primaryEmailForUser(opts.userId).catch(() => null)) || opts.email;
+  if (!mailTo) return;
+  await sendTemplateEmail(mailTo, 'account_reinstated', {
+    refCode: opts.refCode,
+    primaryEmail: mailTo,
+    name: opts.name || mailTo,
+    kindWord: opts.kindWord,
+    reason: opts.reason,
+    liftedAt: opts.liftedAt.toUTCString(),
+    liftedNextStep: opts.nextStep,
+    dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl(),
+  }).catch(() => {});
+}
+
+/** The lift pair: same three writes, same mandatory reason, same mail — one
+    word and one sentence apart, so they live together rather than drifting. */
+async function liftAndNotify(
+  request: NextRequest,
+  userId: string,
+  enforcement: 'banned' | 'suspended',
+  auditAction: string,
+  eventType: string,
+  kindWord: string,
+  nextStep: string,
+) {
+  const session = await requirePermission(request, 'people.manage');
+  if (session instanceof NextResponse) return session;
+
+  const existing = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true, status: true, isAdmin: true, profile: { select: { name: true } } } });
+  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
+
+  const refusal = notUnderEnforcement(existing.status, enforcement);
+  if (refusal) return refusal;
+
+  const reason = await liftReason(request);
+  if (reason instanceof NextResponse) return reason;
+
+  const liftedAt = new Date();
+  const refCode = await liftEnforcement({ userId, fromStatus: existing.status, enforcement, reason, liftedAt });
+
+  await createAuditEvent({
+    actorId: session.userId,
+    action: auditAction,
+    targetType: 'user',
+    targetId: userId,
+    metadata: { email: existing.email, reason, reference: refCode } });
+  logSecurityEvent({
+    request,
+    userId,
+    eventType,
+    details: { reason, byAdmin: session.userId, reference: refCode, account: existing.email } }).catch(() => {});
+
+  await notifyReinstated({
+    userId,
+    email: existing.email,
+    name: existing.profile?.name ?? null,
+    kindWord,
+    reason,
+    refCode,
+    liftedAt,
+    nextStep });
+
+  // The same sentence on the account's own screen, not only in the mail: an
+  // inbox can be forwarded or lost, the account's notices are the record the
+  // person can always come back to. skipEmail — the dedicated template above
+  // is the mail for this decision.
+  const { createNotification } = await import('@/features/notifications/notifications');
+  await createNotification({
+    userId,
+    type: 'security',
+    title: `Your ${kindWord} has been lifted`,
+    body: `${reason} — reference ${refCode}.`,
+    link: '/settings/account-status',
+    skipEmail: true,
+  }).catch(() => {});
+
+  return NextResponse.json({ message: `${kindWord[0].toUpperCase()}${kindWord.slice(1)} lifted`, reference: refCode });
+}
+
+export async function unbanUser(request: NextRequest, userId: string) {
+  return liftAndNotify(
+    request,
+    userId,
+    'banned',
+    'user.unbanned',
+    'security.account_unbanned',
+    'ban',
+    'You can sign in again now. Every device was signed out when the ban was applied, so start with your own password.',
+  );
 }
 
 export async function banUser(request: NextRequest, userId: string) {
@@ -903,30 +1084,32 @@ export async function banUser(request: NextRequest, userId: string) {
     statusType: 'permanently banned',
     reason: reason || 'No reason provided',
     suspendedUntil: 'No end date',
-    suspendedNextStep: 'Contact support@tirbeo.com if you believe this is a mistake, and quote the reference above.',
+    suspendedNextStep: 'Contact support@tirbeo.com if you believe this is a mistake, and quote the reference at the end of this email.',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }, { rawVars: [] }).catch(() => {});
+
+  const { createNotification } = await import('@/features/notifications/notifications');
+  await createNotification({
+    userId,
+    type: 'security',
+    title: 'Your account was banned',
+    body: `Reason on the record: ${reason || 'No reason provided'} — reference ${refCode}.`,
+    link: '/settings/account-status',
+    skipEmail: true,
+  }).catch(() => {});
 
   return NextResponse.json({ message: 'User banned' });
 }
 
-export async function unbanUser(request: NextRequest, userId: string) {
-  const session = await requirePermission(request, 'people.manage');
-  if (session instanceof NextResponse) return session;
-
-  const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
-  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-
-  await liftEnforcement(userId, existing.status, 'unbanned');
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'user.unbanned',
-    targetType: 'user',
-    targetId: userId,
-    metadata: { email: existing.email } });
-  logSecurityEvent({ request, userId, eventType: 'security.account_unbanned', details: { byAdmin: session.userId } }).catch(() => {});
-
-  return NextResponse.json({ message: 'User unbanned' });
+export async function unsuspendUser(request: NextRequest, userId: string) {
+  return liftAndNotify(
+    request,
+    userId,
+    'suspended',
+    'user.unsuspended',
+    'security.account_unsuspended',
+    'suspension',
+    'You can sign in again now: the suspension ended before the date you were given. Nothing on the account was deleted while it stood.',
+  );
 }
 
 export async function suspendUser(request: NextRequest, userId: string) {
@@ -969,30 +1152,20 @@ export async function suspendUser(request: NextRequest, userId: string) {
     statusType: days ? `suspended for ${days} day${days > 1 ? 's' : ''}` : 'suspended indefinitely',
     reason: reason || 'No reason provided',
     suspendedUntil: until ? until.toUTCString() : 'Until support restores it',
-    suspendedNextStep: 'You cannot sign in or use Tirbeo services until then. Quote the reference above if you write about it.',
+    suspendedNextStep: 'You cannot sign in or use Tirbeo services until then. Quote the reference at the end of this email if you write about it.',
     dashboardUrl: (await import('@/config/app-urls')).getDashboardBaseUrl() }).catch(() => {});
 
+  const { createNotification } = await import('@/features/notifications/notifications');
+  await createNotification({
+    userId,
+    type: 'security',
+    title: 'Your account was suspended',
+    body: `Reason on the record: ${reason} — reference ${refCode}.`,
+    link: '/settings/account-status',
+    skipEmail: true,
+  }).catch(() => {});
+
   return NextResponse.json({ message: 'User suspended', until: until?.toISOString() || null });
-}
-
-export async function unsuspendUser(request: NextRequest, userId: string) {
-  const session = await requirePermission(request, 'people.manage');
-  if (session instanceof NextResponse) return session;
-
-  const existing = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, status: true } });
-  if (!existing) return NextResponse.json({ error: 'User not found' }, { status: 404 });
-
-  await liftEnforcement(userId, existing.status, 'unsuspended');
-
-  await createAuditEvent({
-    actorId: session.userId,
-    action: 'user.unsuspended',
-    targetType: 'user',
-    targetId: userId,
-    metadata: { email: existing.email } });
-  logSecurityEvent({ request, userId, eventType: 'security.account_unsuspended', details: { byAdmin: session.userId } }).catch(() => {});
-
-  return NextResponse.json({ message: 'User unsuspended' });
 }
 
 export async function resolveUserByRefCode(request: NextRequest) {

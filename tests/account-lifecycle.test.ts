@@ -78,8 +78,21 @@ const sorted = (rows: any[], orderBy: any) =>
   rows.slice().sort((a, b) =>
     (orderBy?.createdAt === 'desc' ? -1 : 1) * (a.createdAt.getTime() - b.createdAt.getTime()));
 
-vi.mock('@/infrastructure/db/prisma', () => ({
-  prisma: {
+vi.mock('@/infrastructure/db/prisma', () => {
+  // One stub backs both paths: a plain query and the tx client a serialised
+  // read-modify-write runs inside. Reads go through `mocks.prefs` so the
+  // per-test reset (`mocks.prefs = new Map()`) still takes effect.
+  const userPreferences = {
+    findUnique: vi.fn(async ({ where }: any) => mocks.prefs.get(where.userId) ?? null),
+    upsert: vi.fn(async ({ where, create, update }: any) => {
+      const next = mocks.prefs.has(where.userId)
+        ? { ...mocks.prefs.get(where.userId), ...update }
+        : { ...create };
+      mocks.prefs.set(where.userId, next);
+      return next;
+    }),
+  };
+  return { prisma: {
     otp: {
       create: vi.fn(async ({ data }: any) => {
         const row = { id: `otp-${mocks.otpRows.length + 1}`, attempts: 0, createdAt: new Date(), ...data };
@@ -155,18 +168,11 @@ vi.mock('@/infrastructure/db/prisma', () => ({
         return data;
       }),
     },
-    userPreferences: {
-      findUnique: vi.fn(async ({ where }: any) => mocks.prefs.get(where.userId) ?? null),
-      upsert: vi.fn(async ({ where, create, update }: any) => {
-        const next = mocks.prefs.has(where.userId)
-          ? { ...mocks.prefs.get(where.userId), ...update }
-          : { ...create };
-        mocks.prefs.set(where.userId, next);
-        return next;
-      }),
-    },
+    userPreferences,
+    $transaction: vi.fn(async (fn: any) => fn({ userPreferences })),
   },
-}));
+  };
+});
 
 import { getWelcomeBack, welcomeBackHandler, welcomeBackAckHandler } from '@/features/status/welcomeBack';
 

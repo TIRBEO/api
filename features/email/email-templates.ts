@@ -1,11 +1,14 @@
 import { getDashboardBaseUrl, prodSafeEnvUrl } from '@/config/app-urls';
 import { TIRBEO_MAIL_DOMAIN } from '@/features/identity/tirbeo-domain';
 import {
+  BRAND,
   BTN,
   CARD,
   DANGER,
+  EDGE,
   FAINT,
   FONT_STACK,
+  INFO,
   LINE,
   LINK,
   MONO,
@@ -13,8 +16,11 @@ import {
   PAGE,
   PLATE,
   SUPPORT,
+  SUCCESS,
   TEXT,
   TEXT_2,
+  WELCOME,
+  WARN,
 } from '@/features/email/email-theme';
 
 /**
@@ -32,11 +38,13 @@ import {
  * `renderTemplate` at send time, so the rendered text is cacheable per logo and
  * one template can be reused across many recipients.
  *
- * Everything is left-aligned on pure white and reads top-to-bottom like a
- * document: the wordmark, one coloured word naming the category, an ink
- * headline, the copy, a sign-off, fine print. The only fill inside the mail is
- * the pale plate around a quoted message; every other division is a hairline.
- * Landing systemBlue marks anything pressable; everything else is ink or grey.
+ * Everything is one white card with a coloured band across its top, on a white
+ * page: the band says what kind of mail this is — a code, an alarm, a change, a
+ * finished job — before the reader has read a word, and the copy underneath is
+ * ink on white, left-aligned, reading top-to-bottom like a document. A mail is
+ * paragraphs, not a form: the facts a reader needs are sentences, and the only
+ * thing set out of line is a code, which is large and centred because it is the
+ * thing they came to copy.
  */
 
 export type EmailTemplate = { subject: string; html: string };
@@ -85,18 +93,22 @@ const note = (text: string): string =>
   `<p style="margin:0 0 14px;font-size:13px;line-height:20px;color:${MUTED}">${text}</p>`;
 
 /**
- * The one-time code: the digits themselves, with nothing drawn around them.
- * A plate or a border is decoration over the one line the reader actually came
- * for, and centring them would put the only non-left-aligned thing in a mail
- * that reads top-to-bottom like a document.
+ * The one-time code: large, centred, and spaced out, because it is the only
+ * thing in the mail the reader has to copy. The padding-left takes back the
+ * trailing letter-space so the digits sit optically centred rather than nudged
+ * left by the gap after the last one.
  */
 const code = (value: string, hint?: string): string =>
-  `<div style="margin:30px 0 26px"><div class="mail-code" style="font-family:${MONO};font-size:34px;line-height:42px;font-weight:bold;letter-spacing:5px;color:${TEXT}">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
+  `<div style="margin:28px 0 24px;text-align:center">`
+  + `<div class="mail-code" style="padding-left:10px;font-size:38px;line-height:46px;font-weight:bold;letter-spacing:10px;color:${TEXT}">${value}</div>`
+  + `${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
 
-/** A secret that has to be transcribed exactly — the code's shape, but small
-    enough to fit and left untracked so a double-click selects all of it. */
+/** A secret that has to be transcribed exactly — the code's shape, small enough
+    to fit and untracked at the ends so a double-click selects all of it. */
 const secret = (value: string, hint?: string): string =>
-  `<div style="margin:30px 0 26px"><div style="font-family:${MONO};font-size:22px;line-height:30px;font-weight:bold;color:${TEXT};word-break:break-all">${value}</div>${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
+  `<div style="margin:28px 0 24px;text-align:center">`
+  + `<div style="padding-left:2px;font-family:${MONO};font-size:20px;line-height:28px;font-weight:bold;letter-spacing:2px;color:${TEXT};word-break:break-all">${value}</div>`
+  + `${hint ? `<div style="margin-top:10px;font-size:13px;line-height:19px;color:${MUTED}">${hint}</div>` : ''}</div>`;
 
 /**
  * A reference code: the short handle a person quotes and staff search by.
@@ -114,26 +126,42 @@ const refLine = (value: string, label = 'Reference'): string =>
 
 /**
  * Something a person wrote, shown as what it is: their own words inside the
- * machine's mail. The panel and the pre-wrap are the point — a quote that
- * reflows into one grey soup of a paragraph is a quote nobody trusts.
+ * machine's mail. The border and the pre-wrap are the point — a quote that
+ * reflows into one grey soup of a paragraph, or runs on from the copy above it
+ * without an edge, is a quote nobody trusts.
  */
 const messageBlock = (text: string, label = 'Your message'): string =>
-  `<div style="margin:24px 0;padding:16px 18px;background:${PLATE}">`
+  `<div class="mail-plate" style="margin:22px 0;padding:16px 18px;background:${PLATE};border:1px solid ${LINE};border-radius:6px">`
   + `<div style="font-size:13px;line-height:19px;color:${MUTED}">${label}</div>`
-  + `<div style="margin-top:8px;font-size:15px;line-height:24px;color:${TEXT};white-space:pre-wrap;word-break:break-word">${text}</div></div>`;
+  + `<div style="margin-top:8px;font-size:15px;line-height:24px;color:${TEXT};white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere">${text}</div></div>`;
+
+/**
+ * The same frame around markup somebody else wrote — the answer a support agent
+ * typed in the panel. It is boxed for the same reason the quote above is: the
+ * mail's own voice and the person's words have to be tellable apart at a glance,
+ * and the letter is the one thing in a reply the reader came for.
+ */
+const replyBlock = (content: string, label: string): string =>
+  `<div class="mail-plate" style="margin:22px 0;padding:16px 18px;background:${PLATE};border:1px solid ${LINE};border-radius:6px">`
+  + `<div style="font-size:13px;line-height:19px;color:${MUTED}">${label}</div>`
+  + `<div style="margin-top:8px;font-size:15px;line-height:24px;color:${TEXT};word-break:break-word;overflow-wrap:anywhere">${content}</div></div>`;
 
 type BtnVariant = 'primary' | 'ghost';
 /**
- * The action — an underlined sentence, never a button. A pill needs
- * `display:inline-block`, padding and a background on an anchor, which is
- * exactly the styling weaker clients strip, and a link that was meant to look
- * pressable but renders bare looks like a mistake. So the primary action is
- * bold blue text and the secondary one the same line in grey.
+ * The action. A primary action is a filled plate the eye goes straight to, and
+ * a secondary one is the same line in grey text.
+ *
+ * The fill is a `bgcolor` on the anchor plus the inline style, which is the
+ * long way round of saying Outlook: the client that ignores `border-radius` and
+ * `padding` on an anchor still honours a table cell behind it, so the button is
+ * built as a one-cell table with the anchor filling it. Worst case a client
+ * strips the padding and the reader gets a blue block with a word in it, which
+ * is still obviously the thing to press.
  *
  * A mail whose job is to deliver a code gets no `btn` at all — the reader's
- * action is transcribing digits into our app, and a call-to-action link in a
- * code mail is the exact shape of a phishing kit. Escape-hatch links in a code
- * mail are `btnGhost`.
+ * action is transcribing digits into our app, and a call-to-action in a code
+ * mail is the exact shape of a phishing kit. Escape-hatch links in a code mail
+ * are `btnGhost`.
  */
 const button = (url: string, label: string, variant: BtnVariant = 'primary'): string => {
   const href = esc(url);
@@ -141,28 +169,22 @@ const button = (url: string, label: string, variant: BtnVariant = 'primary'): st
   if (variant === 'ghost') {
     return `<p style="margin:16px 0 14px;font-size:14px;line-height:22px"><a href="${href}" style="color:${MUTED};text-decoration:underline">${text}</a></p>`;
   }
-  return `<p style="margin:22px 0 14px;font-size:15px;line-height:24px"><a href="${href}" style="color:${LINK};font-weight:bold;text-decoration:underline">${text}</a></p>`;
+  /* Centred twice over on purpose: a nested table is a block, so the outer
+     cell's `align` alone leaves the button against the left edge in Chrome and
+     Firefox, while `margin:0 auto` is ignored by Outlook, which only reads the
+     attribute. */
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 12px;border-collapse:collapse">`
+    + `<tr><td align="center" style="text-align:center">`
+    + `<table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto">`
+    + `<tr>`
+    + `<td align="center" bgcolor="${BTN}" style="background:${BTN};border-radius:6px">`
+    + `<a href="${href}" style="display:inline-block;padding:13px 24px;font-size:15px;line-height:20px;font-weight:bold;color:#FFFFFF;text-decoration:none">${text}</a>`
+    + `</td></tr></table>`
+    + `</td></tr></table>`;
 };
 
 const btn = (url: string, label: string): string => button(url, label, 'primary');
 const btnGhost = (url: string, label: string): string => button(url, label, 'ghost');
-
-/**
- * Detail rows — what happened, when, from where.
- *
- * A divided plate rather than a loose stack: these are the facts a reader
- * compares against their own memory, so they get read in order, one line each,
- * and the hairlines carry the order without a second column of labels.
- */
-const well = (pairs: Array<[string, string]>): string =>
-  `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0;border-collapse:collapse">`
-  + pairs.map(([key, value], i) =>
-      `<tr>`
-      + `<td width="120" align="left" valign="top" style="padding:9px 12px 9px 0;${i ? `border-top:1px solid ${LINE};` : ''}font-size:13px;line-height:20px;color:${MUTED}">${key}</td>`
-      + `<td align="left" valign="top" style="padding:9px 0;${i ? `border-top:1px solid ${LINE};` : ''}font-size:15px;line-height:20px;color:${TEXT};word-break:break-word">${value}</td>`
-      + `</tr>`)
-    .join('')
-  + `</table>`;
 
 /**
  * A notice: what happened in one line, then the consequence.
@@ -201,49 +223,60 @@ type MailOpts = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* Tones — the category word above the headline                                */
+/* Tones — the band across the top of the card                                 */
 /* -------------------------------------------------------------------------- */
 
-export type Tone = 'otp' | 'security' | 'brand' | 'info' | 'welcome' | 'support';
+export type Tone =
+  | 'otp' | 'security' | 'warning' | 'success' | 'info' | 'brand' | 'welcome' | 'support';
 
 /**
- * What the mail is, in one word and one colour.
+ * What the mail is, in one colour and one word.
  *
- * This used to be a band of colour across the top of the card with the headline
- * painted white inside it. A band says "automated message" before the reader
- * has seen a sentence, and every phish kit ships one, so the category moved to a
- * small coloured word over an ink headline — the arrangement a mail client uses
- * for its own labels, which reads as mail rather than as a flyer.
+ * The band is the reader's sort key: before any sentence is read, blue means
+ * "a code", red means "your account is at risk", orange means "something
+ * changed that you should look at", green means "it finished". Every band is
+ * dark enough to hold white type at headline weight, because a band you cannot
+ * read the headline on is decoration, not information.
  */
-const TONE_MARK: Record<Tone, { label: string; color: string }> = {
-  otp: { label: 'Verification', color: BTN },
-  security: { label: 'Account security', color: DANGER },
-  brand: { label: 'Tirbeo', color: TEXT },
-  info: { label: 'Notice', color: MUTED },
-  welcome: { label: 'Welcome', color: BTN },
-  support: { label: 'Support', color: SUPPORT },
+const TONE_BAND: Record<Tone, string> = {
+  otp: BTN,
+  security: DANGER,
+  warning: WARN,
+  success: SUCCESS,
+  info: INFO,
+  brand: BRAND,
+  welcome: WELCOME,
+  support: SUPPORT,
 };
 
 /** Every template's family, resolved by name at render time so no template
-    has to remember to declare it. Unknown names read as `info`. */
+    has to remember to declare it. Unknown names read as `info`.
+
+    Severity, not subject matter, decides the band: a code that confirms
+    deleting an account is an alarm, and a notice that says a change went
+    through the way it should is green, not red. */
 const TEMPLATE_TONES: Record<string, Tone> = {
   signup_otp: 'otp', login_otp: 'otp', reauth_otp: 'otp', verify_email: 'otp',
   magic_link: 'otp', password_reset_otp: 'otp', password_reset_otp_recovery: 'otp',
-  password_reset_link: 'otp', delete_account_otp: 'otp', account_recovery: 'otp',
+  password_reset_link: 'otp', account_recovery: 'warning',
+  delete_account_otp: 'security',
 
-  password_changed: 'security', suspicious_login: 'security',
-  two_factor_disabled: 'security', two_factor_enabled: 'security', login_alert: 'security', security_tip: 'security',
-  account_suspended: 'security', account_deleted: 'security',
-  account_deactivated: 'info',
-  admin_alert: 'security', admin_test: 'security',
+  password_changed: 'success', two_factor_enabled: 'success',
+  suspicious_login: 'security', login_alert: 'security',
+  account_suspended: 'security', account_deleted: 'security', admin_alert: 'security',
+  // A sanction ending is good news and is worn that way: the same decision that
+  // arrived under a red band arrives back under a green one.
+  account_reinstated: 'success',
+  two_factor_disabled: 'warning', security_tip: 'warning',
+  maintenance_notification: 'warning',
+  account_deactivated: 'info', admin_test: 'info',
 
   welcome: 'welcome',
   product_update: 'brand', reactivation: 'brand',
   tirbeo_account_onboarding: 'brand',
 
   notification_digest: 'info', weekly_summary: 'info',
-  maintenance_notification: 'info', maintenance_complete: 'info',
-  export_ready: 'info',
+  maintenance_complete: 'success', export_ready: 'success',
 
   // A conversation, not a notice: its own colour so it never reads as another
   // automated alert in a full inbox.
@@ -256,35 +289,32 @@ const TEMPLATE_TONES: Record<string, Tone> = {
 const TONE_TEAM: Record<Tone, string> = {
   otp: 'The Tirbeo Accounts team',
   security: 'The Tirbeo Security team',
-  brand: 'The Tirbeo Team',
+  warning: 'The Tirbeo Security team',
+  success: 'The Tirbeo Accounts team',
   info: 'The Tirbeo Support team',
+  brand: 'The Tirbeo Team',
   welcome: 'The Tirbeo Team',
   support: 'Tirbeo Support',
 };
 
 /**
- * The shared shell. Pure white, one column, left-aligned, no decoration beyond
- * hairlines: wordmark, category word, headline, the copy, a sign-off, and the
- * fine print under a rule.
+ * The shared shell. One white card with a coloured band across its top, sitting
+ * on a white page: band (one headline, white on the tone colour), body (the copy,
+ * one code or action, a sign-off), and the fine print below the card rather than
+ * inside it — the footer belongs to the postman, not the letter.
  *
- * The card used to be a white sheet with a border on a grey page and a colour
- * band across its top. A mail client shows a message on the same white as the
- * rest of the reading pane, and a bordered sheet on tinted canvas is the shape
- * of a template — so the canvas, the card and the band all went, and what is
- * left is the document. Categories stay recognisable in a full inbox through
- * the coloured word over the headline and the sign-off line, neither of which a
- * client has to be coaxed into rendering.
+ * The card is the only shape on the page, so it draws its own edges: a hairline
+ * all round, and the band as its top. What needs framing inside the card is
+ * framed by a plate, not by another border.
  *
- * Nothing in the mail is an image: mail clients block remote images by
- * default, so the wordmark is letterspaced type. Actions are underlined text
- * links — a filled button is decoration that weaker clients strip. The `logo`
- * URL still flows through and still keys the template cache, but is not embedded
- * anywhere in the HTML.
+ * Nothing in the mail is an image: mail clients block remote images by default.
+ * The `logo` URL still flows through and still keys the template cache, but is
+ * not embedded anywhere in the HTML.
  */
 function mail(logo: string, opts: MailOpts): string {
   const { title, sub, blocks, preheader } = opts;
   const tone = opts.tone ?? 'info';
-  const mark = TONE_MARK[tone];
+  const band = TONE_BAND[tone];
   const pre = esc(preheader || sub || title);
   const support = esc(SUPPORT_EMAIL);
 
@@ -295,6 +325,7 @@ function mail(logo: string, opts: MailOpts): string {
 <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no">
 <meta name="color-scheme" content="light">
 <meta name="supported-color-schemes" content="light">
 <title>${esc(title)}</title>
@@ -302,40 +333,46 @@ function mail(logo: string, opts: MailOpts): string {
   body,table,td,h1,p{margin:0;padding:0}
   body{-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;text-size-adjust:100%}
   a{text-decoration:none}
+  img{border:0;line-height:100%;outline:none;text-decoration:none}
+  /* A phone is where most of these are read, and a mail that needs a horizontal
+     scroll on one is a mail nobody finishes. Everything wide is allowed to give
+     way: the canvas padding, the band's headline, the plate's margins, and any
+     long word (a token, a URL, a device string) breaks instead of pushing the
+     column past the screen. */
+  table{mso-table-lspace:0;mso-table-rspace:0}
+  .mail-card,.mail-foot{width:100% !important;max-width:600px !important}
+  .mail-body{word-break:break-word;overflow-wrap:anywhere}
   @media only screen and (max-width:640px){
-    .mail-head{padding:24px 22px 0 !important}
-    .mail-body{padding:18px 22px 26px !important}
-    .mail-rule{padding:26px 22px 0 !important}
-    .mail-foot{padding:16px 4px 0 !important}
-    .mail-code{font-size:26px !important;line-height:36px !important;letter-spacing:4px !important}
+    .mail-wrap{padding:16px 8px !important}
+    .mail-band{padding:20px 18px 22px !important}
+    .mail-band-title{font-size:21px !important;line-height:27px !important}
+    .mail-body{padding:22px 18px 26px !important}
+    .mail-foot{padding:16px 2px 0 !important}
+    .mail-code{font-size:26px !important;line-height:36px !important;letter-spacing:5px !important;padding-left:5px !important}
+    .mail-plate{padding:14px 15px !important}
   }
 </style>
 </head>
 <body style="margin:0;padding:0;background:${PAGE};color:${TEXT_2};font-family:${FONT_STACK};font-size:15px;line-height:1.7;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0" data-skip-in-text="true">${pre}&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;&zwnj;</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="${PAGE}" style="background:${PAGE};border-collapse:collapse">
-<tr><td align="center" style="padding:36px 12px">
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${CARD}" style="width:100%;max-width:600px;background:${CARD};border-collapse:collapse">
-<tr><td class="mail-head" align="left" style="padding:32px 32px 0">
-<div style="font-size:12px;line-height:16px;font-weight:bold;letter-spacing:4px;color:${TEXT}">TIRBEO</div>
-<div style="margin-top:28px;font-size:12px;line-height:16px;font-weight:bold;letter-spacing:1px;text-transform:uppercase;color:${mark.color}">${mark.label}</div>
-<div style="margin-top:8px;font-size:24px;line-height:32px;font-weight:bold;color:${TEXT}">${title}</div>
+<tr><td class="mail-wrap" align="center" style="padding:34px 12px">
+<table role="presentation" class="mail-card" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${CARD}" style="width:100%;max-width:600px;background:${CARD};border:1px solid ${EDGE};border-radius:8px;border-collapse:separate;box-shadow:0 1px 2px rgba(60,64,67,0.10),0 2px 6px 1px rgba(60,64,67,0.05)">
+<tr><td class="mail-band" align="left" bgcolor="${band}" style="background:${band};background-color:${band};padding:28px 32px;border-radius:8px 8px 0 0">
+<div class="mail-band-title" style="font-size:26px;line-height:34px;font-weight:bold;color:#FFFFFF">${title}</div>
 </td></tr>
-<tr><td class="mail-body" align="left" style="padding:20px 32px 32px">
+<tr><td class="mail-body" align="left" style="padding:28px 32px 30px">
 ${sub ? `<p style="margin:0 0 18px;font-size:15px;line-height:26px;color:${TEXT_2}">${sub}</p>` : ''}
 ${blocks.join('\n')}
-<p style="margin:30px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">Sincerely yours,</p>
-<p style="margin:2px 0 0;font-size:15px;line-height:24px;color:${TEXT_2}">${TONE_TEAM[tone]}</p>
-</td></tr>
-<tr><td class="mail-rule" style="padding:28px 32px 0">
-<div style="border-top:1px solid ${LINE}"></div>
+<p style="margin:28px 0 0;font-size:15px;line-height:24px;color:${TEXT}">Sincerely yours,</p>
+<p style="margin:2px 0 0;font-size:15px;line-height:24px;color:${TEXT}">${TONE_TEAM[tone]}</p>
 </td></tr>
 </table>
-<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse">
-<tr><td class="mail-foot" align="left" style="padding:20px 6px 0">
+<table role="presentation" class="mail-foot" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse">
+<tr><td class="mail-foot" align="left" style="padding:22px 6px 0">
 <p style="margin:0 0 6px;font-size:12px;line-height:19px;color:${MUTED}">Need help? Visit the <a href="https://tirbeo.com/contact" style="color:${LINK};text-decoration:underline">Tirbeo Help Center</a> or write to <a href="mailto:${support}" style="color:${LINK};text-decoration:underline">${support}</a>.</p>
 <div style="margin:0 0 6px;font-size:12px;line-height:19px;color:${FAINT}">{{unsubscribeSection}}</div>
-<p style="margin:0;font-size:12px;line-height:19px;color:${FAINT}">&copy; ${new Date().getFullYear()} Tirbeo Inc. &nbsp;&nbsp;<a href="https://tirbeo.com/privacy" style="color:${FAINT};text-decoration:underline">Privacy</a> &nbsp;&nbsp;<a href="https://tirbeo.com/terms" style="color:${FAINT};text-decoration:underline">Terms</a></p>
+<p style="margin:0;font-size:12px;line-height:19px;color:${FAINT}">&copy; ${new Date().getFullYear()} Tirbeo Inc. &nbsp;&nbsp;<a href="https://tirbeo.com/privacy" style="color:${MUTED};text-decoration:underline">Privacy</a> &nbsp;&nbsp;<a href="https://tirbeo.com/terms" style="color:${MUTED};text-decoration:underline">Terms</a></p>
 </td></tr>
 </table>
 </td></tr>
@@ -434,10 +471,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       preheader: 'Your password has not been changed yet.',
       blocks: [
         code('{{otp}}', 'Expires in 15 minutes &middot; single use'),
-        well([
-          ['Account', '{{primaryEmail}}'],
-          ['Code sent to', '{{recoveryEmail}}'],
-        ]),
+        para(`The account being reset is {{primaryEmail}}. This code went to your recovery address, {{recoveryEmail}}, instead of the one you sign in with — that is what keeps this mail out of the hands of whoever may already hold the first.`),
         note("Didn’t request this reset? Your password has not been changed."),
         safetyNote(),
       ],
@@ -476,11 +510,8 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, the password for {{primaryEmail}} was changed.',
       preheader: 'If that wasn’t you, reset it and end every session now.',
       blocks: [
-        well([
-          ['When', '{{changedAt}}'],
-          ['IP address', '{{ipAddress}}'],
-        ]),
-        para('If the two lines above are not yours, someone else held your password. Reset it and end every session you do not recognise, from inside the app.'),
+        para(`The change was made {{changedAt}}, from {{ipAddress}}.`),
+        para('If that is your device and your time, nothing further is needed — this mail exists so a change you did not make is never silent. If it is not yours, someone else held your password. Reset it and end every session you do not recognise, from inside the app.'),
         btn(`${DASHBOARD_URL()}/settings/security`, 'Secure my account'),
         btnGhost(SESSIONS_URL(), 'Review active sessions'),
       ],
@@ -492,11 +523,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, your Tirbeo account was signed in to from a device we have not seen before.',
       preheader: 'If that wasn’t you, change your password now.',
       blocks: [
-        well([
-          ['When', '{{loginTime}}'],
-          ['Device', '{{device}}'],
-          ['IP address', '{{ipAddress}}'],
-        ]),
+        para(`It happened {{loginTime}} on {{device}}, from {{ipAddress}}. Nothing else on your account was touched.`),
         callout(
           "If this wasn't you",
           'Change your password right away and end the sessions you do not recognise. Anyone holding this session can read and change everything on your account.',
@@ -512,10 +539,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: `Hello {{name}}, two-step verification was just turned off on {{primaryEmail}}. Your password is now the only thing protecting the account.`,
       preheader: 'Turn it back on if that wasn’t you.',
       blocks: [
-        well([
-          ['When', '{{loginTime}}'],
-          ['Device', '{{device}}'],
-        ]),
+        para(`It was switched off {{loginTime}} on {{device}}.`),
         callout(
           'If this was not you',
           'Someone who could already sign in turned this off. Change your password first, then re-enable two-step — in that order, or they simply turn it off again.',
@@ -535,10 +559,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, {{primaryEmail}} now needs a second factor to sign in.',
       preheader: 'Your password is no longer the only thing protecting the account.',
       blocks: [
-        well([
-          ['When', '{{loginTime}}'],
-          ['Device', '{{device}}'],
-        ]),
+        para(`It was turned on {{loginTime}} on {{device}}.`),
         para('One-time backup codes were created with it. They are shown once and cannot be emailed, so keep them somewhere outside this account — they are the way back in if you lose the authenticator.'),
         btn('{{twoFactorUrl}}', 'Check two-step settings'),
         safetyNote(),
@@ -551,11 +572,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, your Tirbeo account was signed in to.',
       preheader: 'Recognise this device? If not, revoke it.',
       blocks: [
-        well([
-          ['Time', '{{loginTime}}'],
-          ['Device', '{{device}}'],
-          ['Location', '{{location}}'],
-        ]),
+        para(`It came from {{device}} at {{loginTime}}, reaching Tirbeo from {{location}}.`),
         note("Don’t recognise this sign-in? Change your password, and revoke the session while you are there."),
         btnGhost(SESSIONS_URL(), 'Review active sessions'),
       ],
@@ -654,11 +671,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, {{maintenanceMessage}}',
       preheader: 'What is affected, and when it should be back.',
       blocks: [
-        well([
-          ['Starts', '{{startTime}}'],
-          ['Duration', '{{duration}}'],
-          ['Ends by', '{{estimatedEnd}}'],
-        ]),
+        para(`It starts {{startTime}}, runs about {{duration}}, and everything should be back by {{estimatedEnd}}.`),
         note('Some features may be briefly unavailable during this window. Nothing you have saved is affected.'),
       ],
     }, logo, name),
@@ -669,10 +682,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, {{completionMessage}}',
       preheader: 'Everything is back and running.',
       blocks: [
-        well([
-          ['Completed', '{{completedAt}}'],
-          ['Duration', '{{duration}}'],
-        ]),
+        para(`It finished {{completedAt}}, after about {{duration}}. Nothing you had saved moved, and nothing needs to be redone.`),
         btn('{{dashboardUrl}}', 'Open Tirbeo'),
       ],
     }, logo, name),
@@ -683,20 +693,36 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, the status of {{primaryEmail}} has changed.',
       preheader: 'Why it changed, how long it lasts, and what you can do.',
       blocks: [
-        well([
-          ['Status', '{{statusType}}'],
-          ['Reason', '{{reason}}'],
-          ['Until', '{{suspendedUntil}}'],
-          // Last, not first: the decision is the news, the code is only what
-          // they quote when they write about it.
-          ['Reference', '{{refCode}}'],
-        ]),
+        para(`{{primaryEmail}} is {{statusType}}. Nothing on the account was deleted, and the profile stays hidden for as long as it stands.`),
+        para(`The reason on the record: {{reason}}. It lasts {{suspendedUntil}}.`),
         callout(
           'What this means for you',
           '{{suspendedNextStep}}',
         ),
         btn('{{dashboardUrl}}/settings', 'Open my account'),
         note('Believe this was a mistake? Appeal it from your account and a person will read it.'),
+        // One line, at the end, and the only place the code appears: the news is
+        // the sentence above, and the code is only needed when they write back.
+        refLine('{{refCode}}'),
+      ],
+    }, logo, name),
+
+  /* The other half of account_suspended, and the mail that used to be missing:
+     a sanction ending was written to the record and to no person. It says which
+     decision ended, why it ended in the admin's own words, and repeats the code
+     the account was mailed at the start — so the two mails quote one thing and
+     nobody has to open a thread to prove the ban they were told about is over. */
+  account_reinstated: (logo, name) =>
+    t('The {{kindWord}} on your Tirbeo account has been lifted', {
+      title: 'Your account is open again',
+      sub: 'Hello {{name}}, the {{kindWord}} on {{primaryEmail}} has been lifted.',
+      preheader: 'You can sign in again. Here is what was decided, and why it ended.',
+      blocks: [
+        para(`It ended {{liftedAt}}. Nothing on the account was deleted while it stood, and the account is where you left it.`),
+        para(`Why the decision was lifted, in the words kept on the record: {{reason}}.`),
+        para('{{liftedNextStep}}'),
+        btn('{{dashboardUrl}}/settings', 'Open my account'),
+        refLine('{{refCode}}'),
       ],
     }, logo, name),
 
@@ -706,11 +732,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, {{primaryEmail}} is scheduled for deletion.',
       preheader: 'You can still cancel until that date.',
       blocks: [
-        well([
-          ['Scheduled date', '{{dateLabel}}'],
-          ['Grace period', '30 days'],
-        ]),
-        para('Signing in any time before that date keeps the account open, and the cancellation button is on the delete screen. Nothing is deleted while the window is running.'),
+        para(`The date is {{dateLabel}}, and the grace period is 30 days. Signing in at any time before that date keeps the account open — the cancellation button is on the delete screen, and nothing is deleted while the window is running.`),
         btn('{{dashboardUrl}}/settings', 'Cancel deletion'),
         note('After the grace period the data is gone and cannot be recovered by anyone, including us.'),
       ],
@@ -722,11 +744,7 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, {{primaryEmail}} is deactivated.',
       preheader: 'Nothing was deleted. Signing back in brings it all back.',
       blocks: [
-        para('The profile is hidden and every other device was signed out. Nothing was deleted and no setting was changed.'),
-        well([
-          ['Deactivated', '{{dateLabel}}'],
-          ['Reason', '{{reason}}'],
-        ]),
+        para(`It went quiet {{dateLabel}}, from the account's own screen; the reason given was “{{reason}}”. The profile is hidden and every other device was signed out, but nothing was deleted and no setting was changed.`),
         para('Signing in again brings the account back exactly as you left it — this browser can do it from the account screen, and the button there says "Reactivate".'),
         btn('{{accountsUrl}}', 'Sign back in'),
       ],
@@ -756,22 +774,20 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       preheader: 'A person reads these in the order they arrive.',
       blocks: [
         messageBlock('{{message}}'),
-        para('A person reads these in the order they arrive, and we answer to this address. Nothing is needed from you in the meantime — if something has to be checked first, the reply will say exactly what.'),
-        well([
-          ['Subject', '{{ticketSubject}}'],
-          ['Received', '{{receivedAt}}'],
-          ['Account', '{{primaryEmail}}'],
-        ]),
-        note('Replying to this email keeps the whole thread together.'),
+        btn('{{threadUrl}}', 'Open this request'),
+        para(`The answer comes back to {{primaryEmail}}, and anything you add later belongs to the same thread — write it on that page rather than sending a second message.`),
+        // The one place this mail names a code. It is not in the subject and not
+        // in the band, because a reader who came for an answer should read a
+        // sentence, not a handle.
         refLine('{{refCode}}'),
       ],
     }, logo, name),
 
   /* Staff's copy of a request — a different mail from the account's receipt on
      purpose. The reader is the person who has to answer, so the message is
-     quoted in full at the top, the facts a ticket system would hide behind five
-     tabs sit under it in one plate, and the reply is a single click that opens
-     already-addressed to the account. */
+     quoted in full at the top, the facts a ticket system hides behind five tabs
+     are two sentences under it, and the reply is one click that lands on the
+     ticket already open. */
   support_request_admin: (logo, name) =>
     t('Support · {{subject}}', {
       title: '{{subject}}',
@@ -779,31 +795,28 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       preheader: 'A person is waiting on an answer to this one.',
       blocks: [
         messageBlock('{{message}}', 'Their message'),
-        well([
-          ['Account', '{{account}}'],
-          ['Answer goes to', '{{contact}}'],
-          ['Received', '{{receivedAt}}'],
-          ['Device', '{{device}}'],
-          ['Reached from', '{{origin}}'],
-          ['Reference', '{{refCode}}'],
-        ]),
+        para(`It is filed on the account {{account}}, and the answer goes back to {{contact}}. The message came in {{receivedAt}} on {{device}}, reached from {{origin}}.`),
         btn('{{replyHref}}', '{{replyLabel}}'),
         note('Answer from the panel — the reply writes the record beside the request and tells the account it was answered. Replying from your own mail client answers the person and leaves both screens silent.'),
+        refLine('{{refCode}}'),
       ],
     }, logo, name),
 
+  /* The answer, and nothing else. What the person wrote is the reason the mail
+     exists, so their reply is the first thing on the page — boxed, because it is
+     somebody's words inside our machine's mail — and the one action is the
+     thread itself, where the answer can be read and questioned on the same
+     screen. Three sentences is the whole letter; a support reply that has to
+     explain how much it listened is a support reply nobody reads past. */
   support_reply: (logo, name) =>
     t('Re: {{subject}}', {
-      title: 'A reply from Tirbeo Support',
-      sub: 'Hello {{name}}, there is an answer on your request.',
-      preheader: 'The reply is inside.',
+      title: 'An answer to your request',
+      sub: 'Hello {{name}}, this is the reply to {{subject}}.',
+      preheader: 'Read it, and write back from the same page.',
       blocks: [
-        raw('{{replyHtml}}'),
-        well([
-          ['Subject', '{{subject}}'],
-          ['Answered', '{{receivedAt}}'],
-        ]),
-        note('Reply to this email to keep the thread. This address is monitored by a person, so the answer you just read can be questioned directly.'),
+        replyBlock('{{replyHtml}}', 'Their reply'),
+        btn('{{threadUrl}}', 'Reply on Tirbeo'),
+        para(`You asked on {{receivedAt}}. Anything you add goes to the same person on the same thread — no need to start over, and no need to reply to this address.`),
         refLine('{{refCode}}'),
       ],
     }, logo, name),
@@ -814,12 +827,8 @@ export const EMAIL_TEMPLATES: Record<string, (logo: string, name: string) => Ema
       sub: 'Hello {{name}}, the export you requested for {{primaryEmail}} was generated.',
       preheader: 'One JSON archive, everything on your account.',
       blocks: [
-        well([
-          ['Generated', '{{exportedAt}}'],
-          ['Format', 'JSON'],
-        ]),
+        para(`It was built {{exportedAt}} as one JSON archive of everything on {{primaryEmail}}. The file is downloadable from your account settings for a limited time, and nobody else can reach it.`),
         btn(`${DASHBOARD_URL()}/settings`, 'Download from my account'),
-        note('The archive stays downloadable from your account settings for a limited time. Nobody else can reach it.'),
       ],
     }, logo, name),
 
@@ -985,9 +994,14 @@ export function renderTemplate(
       'gi',
     );
 
+    // Function replacer, never a string. In `String.replace`, a `$` in the
+    // replacement is a directive — `$&` splices the matched placeholder, `` $` ``
+    // everything before it, `$'` everything after. A name like `` 50% $` `` or a
+    // subject containing `$&` would pour a slice of the surrounding template into
+    // the value slot, and the escape helper above has no reason to touch `$`.
     result = rawVars.has(key)
-      ? result.replace(pattern, val)
-      : result.replace(pattern, esc(val));
+      ? result.replace(pattern, () => val)
+      : result.replace(pattern, () => esc(val));
   }
 
   return result;

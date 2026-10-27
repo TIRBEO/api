@@ -10,17 +10,24 @@ function isAdmin(user: any): boolean {
 
 /**
  * SEC-A1 fix: debug endpoints were documented "admin-only" but only required
- * any authenticated user. Every handler now goes through this guard: admin
- * role required in production; in development any session (or none) is kept
- * for local debugging convenience.
+ * any authenticated user. Every handler now goes through this guard.
+ *
+ * The old escape hatch was `NODE_ENV === 'development'` returning `null` for
+ * everybody, and `/api/debug/` is a public door — no edge session check, no CSRF.
+ * So any deployment that came up without `NODE_ENV=production` (staging, a box
+ * started by hand) handed anonymous visitors a cache and connection-pool dump,
+ * `POST /api/debug/rate-limits/reset` to wipe every throttle in the system, and
+ * `PUT /api/debug/query-perf/config` to silence the alert thresholds. A local
+ * machine is not observable from a route handler — the peer address belongs to
+ * the socket, and `X-Forwarded-For` and `Host` are both attacker-supplied — so
+ * the convenience stays, but it is now opt-in per install instead of per build
+ * mode.
  */
 export async function requireDebugAccess(req: NextRequest): Promise<NextResponse | null> {
   const session = await getSession(req).catch(() => null);
-  if (process.env.NODE_ENV === 'development') return null;
-  if (!session?.userId || !isAdmin(session)) {
-    return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
-  }
-  return null;
+  if (session?.userId && isAdmin(session)) return null;
+  if (process.env.ALLOW_ANONYMOUS_DEBUG === '1' && process.env.NODE_ENV !== 'production') return null;
+  return NextResponse.json({ error: 'Admin access required' }, { status: 403 });
 }
 
 /**

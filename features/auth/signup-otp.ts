@@ -47,25 +47,26 @@ async function findLiveOtp(email: string) {
 }
 
 /** Register a failed attempt; invalidates the code once MAX_OTP_ATTEMPTS is hit. */
-async function registerFailedAttempt(otpId: string, attempts: number) {
-  const next = attempts + 1;
-  if (next >= MAX_OTP_ATTEMPTS) {
-    await prisma.otp.delete({ where: { id: otpId } }).catch(() => {});
-  } else {
-    await prisma.otp.update({ where: { id: otpId }, data: { attempts: next } }).catch(() => {});
-  }
+async function registerFailedAttempt(otpId: string) {
+  // Let the database do the counting: two concurrent wrong codes that both
+  // read `attempts = 3` would otherwise write back `4` and buy a free attempt.
+  await prisma.otp
+    .update({ where: { id: otpId }, data: { attempts: { increment: 1 } } })
+    .catch(() => {});
+  await prisma.otp.deleteMany({ where: { id: otpId, attempts: { gte: MAX_OTP_ATTEMPTS } } }).catch(() => {});
 }
 
 export async function verifySignupOtp(email: string, code: string): Promise<boolean> {
   const otp = await findLiveOtp(email);
   if (!otp) return false;
-  const ok = await verifyOtpCode(otp.otpHash, code);
-  if (ok) {
-    await prisma.otp.delete({ where: { id: otp.id } }).catch(() => {});
-  } else {
-    await registerFailedAttempt(otp.id, otp.attempts ?? 0);
+  if (!(await verifyOtpCode(otp.otpHash, code))) {
+    await registerFailedAttempt(otp.id);
+    return false;
   }
-  return ok;
+  // Only a request that actually deleted the row has consumed the code, so a
+  // replay of the same code cannot be accepted twice.
+  const spent = await prisma.otp.deleteMany({ where: { id: otp.id } });
+  return spent.count === 1;
 }
 
 /**
@@ -76,11 +77,9 @@ export async function verifySignupOtp(email: string, code: string): Promise<bool
 export async function checkSignupOtp(email: string, code: string): Promise<boolean> {
   const otp = await findLiveOtp(email);
   if (!otp) return false;
-  const ok = await verifyOtpCode(otp.otpHash, code);
-  if (!ok) {
-    await registerFailedAttempt(otp.id, otp.attempts ?? 0);
-  }
-  return ok;
+  if (await verifyOtpCode(otp.otpHash, code)) return true;
+  await registerFailedAttempt(otp.id);
+  return false;
 }
 
 export async function sendSignupOtpEmail(email: string, code: string, templateName: string = 'signup_otp') {

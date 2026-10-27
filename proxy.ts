@@ -4,9 +4,10 @@ import { isSuspicious } from '@/features/auth/suspicious-activity';
 import { verifyTurnstile, isTurnstileConfigured } from '@/features/auth/turnstile';
 import { detectXss } from '@/features/auth/xss-scan';
 import { getMaintenanceState } from '@/shared/maintenance-state';
+import { clientIpOrUnknown } from '@/shared/client-ip';
 import { generateEventId } from '@/features/users/refcode';
 import { isPublicApiDoor } from '@/features/auth/publicDoors';
-import { CORS_ALLOWED_HEADERS, isHostAllowed } from '@/config/app-urls';
+import { CORS_ALLOWED_HEADERS, TRUSTED_IMAGE_HOSTS, getAppDomain, isHostAllowed } from '@/config/app-urls';
 
 function isAllowedOrigin(origin: string): boolean {
   if (!origin) return false;
@@ -39,8 +40,12 @@ async function scanRequestForPayloads(request: NextRequest): Promise<string | nu
         if (text.length > MAX_BODY_BYTES) {
           return 'Request body too large';
         }
-        if (text && text.length <= MAX_SCAN_BYTES) {
-          const bodyHit = detectXss(text);
+        if (text) {
+          // Scan what we can afford to scan. Skipping large bodies entirely was
+          // an instruction manual: put the payload past 64 KB and the filter
+          // looks away. A prefix is bounded work and catches the realistic
+          // cases (an HTML blob that opens with its markup).
+          const bodyHit = detectXss(text.length > MAX_SCAN_BYTES ? text.slice(0, MAX_SCAN_BYTES) : text);
           if (bodyHit) return bodyHit;
         }
       }
@@ -56,7 +61,7 @@ async function reportBlockedRequest(request: NextRequest, reason: string) {
   if (!key) return;
   const origin = request.nextUrl.origin;
   try {
-    const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     await fetch(`${origin}/api/security/log`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-security-log-key': key },
@@ -154,13 +159,40 @@ async function turnstileFallbackBudget(ip: string): Promise<{ allowed: boolean; 
   }
 }
 
+const appDomain = getAppDomain().toLowerCase();
+
+/**
+ * CSP for this service's own responses. `/api` and `/auth` answer in JSON, so
+ * the document-level directives are cheap to make strict: no inline scripts
+ * (there are none to break), no objects, no frames, nothing base- or
+ * form-targeted. Style/script inline allowances come back only in dev, where
+ * the Next dev overlay needs them.
+ */
+const contentSecurityPolicy = [
+  "default-src 'self'",
+  `script-src 'self'${isDev ? " 'unsafe-inline' 'unsafe-eval'" : ''}`,
+  `style-src 'self' 'unsafe-inline'`,
+  `img-src 'self' data: https://*.${appDomain} ${TRUSTED_IMAGE_HOSTS.map((h) => `https://${h}`).join(' ')}`,
+  "font-src 'self' data:",
+  `connect-src 'self'${isDev ? " http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*" : ` https://*.${appDomain} wss://*.${appDomain}`}`,
+  "frame-src 'none'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  ...(isDev ? [] : ['upgrade-insecure-requests']),
+].join('; ');
+
 const securityHeaders = {
   'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=(), payment=(), usb=(), serial=(), midi=(), sync-xhr=(), autoplay=(), display-capture=(), fullscreen=(), picture-in-picture=(), screen-wake-lock=(), clipboard-read=(), clipboard-write=()',
-  'Content-Security-Policy': `default-src 'self'; script-src 'self' 'unsafe-inline' ${isDev ? "'unsafe-eval'" : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: https://lh3.googleusercontent.com https://avatars.githubusercontent.com https://cdn.discordapp.com https://*.googleusercontent.com; font-src 'self' data:; connect-src 'self' https: wss: ${isDev ? "http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*" : ""}; frame-ancestors 'none';`,
+  'Content-Security-Policy': contentSecurityPolicy,
+  'X-Permitted-Cross-Domain-Policies': 'none',
+  'X-DNS-Prefetch-Control': 'off',
+  'Cross-Origin-Opener-Policy': 'same-origin',
 };
 
 function addCorsHeaders(response: NextResponse, origin: string) {
@@ -249,8 +281,7 @@ export async function proxy(request: NextRequest) {
     addCorsHeaders(response, origin);
   }
 
-  const rawIp = request.headers.get('x-forwarded-for') || 'unknown';
-  const ip = rawIp.split(',')[0].trim() || 'unknown';
+  const ip = clientIpOrUnknown(request.headers);
   const pathname = request.nextUrl.pathname;
 
   // ── Early cookie extraction for maintenance check and admin detection ──

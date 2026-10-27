@@ -122,6 +122,18 @@ export async function requirePermission(
   return { ...session, adminRole: staff.staff.role, staff: staff.staff, permissions: staff.permissions };
 }
 
+/** Does this caller's role carry `permission`?
+ *
+ *  A question, not a gate: `requirePermission` answers *for* the caller with a
+ *  403, while some screens show one set of rows to a permission holder and a
+ *  narrower set — their own — to everybody else. Those handlers must ask without
+ *  refusing, and the answer has to come from the same resolved permission set as
+ *  the gate's, so a role whose access was revoked cannot keep it through the
+ *  softer door. */
+export async function holdsPermission(request: NextRequest, permission: Permission): Promise<boolean> {
+  return !(await requirePermission(request, permission) instanceof NextResponse);
+}
+
 /** The one power that cannot be given out by an override: the roster. Ranks
  *  decide this rather than the permission set so that a mis-edited delta in
  *  `app_config` cannot make somebody an owner. */

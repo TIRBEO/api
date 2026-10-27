@@ -180,6 +180,8 @@ function isConnectionError(err: any): boolean {
 }
 
 // ─── Redis Factory ───
+const cleartextWarned = new Set<string>();
+
 interface CreateRedisOptions {
   name: string;           // Unique name for this Redis instance (for tracking)
   url?: string;           // Redis URL (defaults to REDIS_URL env)
@@ -205,6 +207,15 @@ export function createRedisClient(options: CreateRedisOptions): any {
   }
 
   const state = getState(name);
+
+  // Session state, refresh-token spends and rate-limit counters all live in this
+  // store, so a `redis://` URL in production puts them on the wire unencrypted.
+  // Loud, not fatal: a localhost sidecar is a legitimate cleartext deployment,
+  // and taking the whole API down over a URL scheme is worse than the leak.
+  if (process.env.NODE_ENV === 'production' && !url.startsWith('rediss://') && !cleartextWarned.has(name)) {
+    cleartextWarned.add(name);
+    console.warn(`[REDIS-${name}] redis:// in production — auth and session data travel unencrypted. Use rediss:// unless this Redis is reachable only on localhost.`);
+  }
 
   const config = {
     ...REDIS_CONFIG,

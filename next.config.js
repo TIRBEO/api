@@ -2,6 +2,11 @@
 const path = require('path');
 
 const nextConfig = {
+  // Two dev servers for one project would share `.next`, and Next 16 refuses
+  // that outright. The scratch run names its own build directory (NEXT_DIST_DIR
+  // below), so a database-isolated API can sit on its own port beside the normal
+  // one instead of displacing whatever is already running.
+  distDir: process.env.NEXT_DIST_DIR || '.next',
   turbopack: {
     // Pin the monorepo workspace root. Without this, Turbopack can infer
     // apps/api as the root and refuse to compile the hoisted node_modules

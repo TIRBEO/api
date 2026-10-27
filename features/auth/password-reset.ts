@@ -1,6 +1,6 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import { hashOtpCode, verifyOtpCode } from '@/features/auth/password';
-import { signPasswordResetToken, verifyPasswordResetToken } from '@/features/auth/jwt';
+import { signPasswordResetToken, verifyPasswordResetToken, consumePasswordResetToken } from '@/features/auth/jwt';
 import { addMinutes } from 'date-fns';
 import { randomInt } from 'crypto';
 import { enforceResendCooldown } from '@/features/auth/resend-cooldown';
@@ -40,14 +40,18 @@ async function findLiveResetOtp(userId: string) {
   return otp;
 }
 
-/** Register a failed guess; invalidates the code once the cap is hit. */
-async function registerResetFailedAttempt(otpId: string, attempts: number) {
-  const next = (attempts ?? 0) + 1;
-  if (next >= MAX_OTP_ATTEMPTS) {
-    await prisma.otp.delete({ where: { id: otpId } }).catch(() => {});
-  } else {
-    await prisma.otp.update({ where: { id: otpId }, data: { attempts: next } }).catch(() => {});
+/** Register a failed guess; invalidates the code once the cap is hit. Returns
+ *  the attempts now burned, read off the row we just wrote rather than off a
+ *  value we read before — concurrent guesses must not share one slot. */
+async function registerResetFailedAttempt(otpId: string): Promise<number> {
+  const burned = await prisma.otp
+    .update({ where: { id: otpId }, data: { attempts: { increment: 1 } }, select: { attempts: true } })
+    .catch(() => null);
+  const used = burned?.attempts ?? MAX_OTP_ATTEMPTS;
+  if (used >= MAX_OTP_ATTEMPTS) {
+    await prisma.otp.deleteMany({ where: { id: otpId } }).catch(() => {});
   }
+  return used;
 }
 
 /**
@@ -241,8 +245,7 @@ export async function verifyPasswordReset(
           codeError = 'That code has already been used. Please request a new one.';
         }
       } else {
-        const used = (otp.attempts ?? 0) + 1;
-        await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
+        const used = await registerResetFailedAttempt(otp.id);
         const left = MAX_OTP_ATTEMPTS - used;
         codeError = left > 0
           ? `That code is not right. ${left} ${left === 1 ? 'attempt' : 'attempts'} left before it expires.`
@@ -302,7 +305,9 @@ export async function confirmPasswordReset(
     // Non-blocking: if HIBP check fails, allow the reset
   }
 
-  const userId = await verifyPasswordResetToken(resetToken);
+  // The password change is the spend: a link that has already set one
+  // password sets no second one.
+  const userId = await consumePasswordResetToken(resetToken);
   if (!userId) return { success: false, error: 'Invalid or expired reset token' };
 
   const user = await prisma.user.findUnique({ where: { id: userId } });
@@ -370,7 +375,7 @@ export async function confirmPasswordReset(
 export async function quickLoginWithOtp(
   email: string,
   code: string
-): Promise<{ success: boolean; error?: string; sessionToken?: string; refreshToken?: string; userId?: string }> {
+): Promise<{ success: boolean; error?: string; sessionToken?: string; refreshToken?: string; userId?: string; requiresMfa?: boolean }> {
   const user = await fetchLoginUserByEmail(email);
   if (!user) return { success: false, error: 'Invalid or expired code' };
   const emailRow = await prisma.userEmail.findFirst({
@@ -387,7 +392,7 @@ export async function quickLoginWithOtp(
 
   const ok = await verifyOtpCode(otp.otpHash, code);
   if (!ok) {
-    await registerResetFailedAttempt(otp.id, otp.attempts ?? 0);
+    await registerResetFailedAttempt(otp.id);
     return { success: false, error: 'Invalid or expired code' };
   }
   // The delete of that one row is the spend: two concurrent logins carrying
@@ -408,6 +413,13 @@ export async function quickLoginWithOtp(
 
   // Delete the account's other mailbox-bound codes (spent or superseded)
   await prisma.otp.deleteMany({ where: { userId: user.id, kind: RESET_OTP_KIND, address: { not: null } } });
+
+  // The reset code proves the mailbox. It does not prove the authenticator, and
+  // every other mailbox-proven door (password login, login OTP, recovery-email
+  // login) stops here for a 2FA account instead of signing it straight in.
+  if (user.is2FAEnabled) {
+    return { success: true, requiresMfa: true, userId: user.id };
+  }
 
   // Create a session (short-term session, same as login OTP / magic link)
   const { createSession } = await import('@/features/auth/session');

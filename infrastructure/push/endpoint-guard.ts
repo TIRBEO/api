@@ -93,3 +93,35 @@ export async function isSafeExternalUrl(raw: string, opts?: { allowHttp?: boolea
 
   return true;
 }
+
+/**
+ * Delivery-time re-check.
+ *
+ * Validating a stored endpoint once, at subscribe time, leaves a window: DNS is
+ * resolved again when the push is actually sent, so a host the subscriber owns
+ * with a one-second TTL can answer "public" while the row was written and
+ * "169.254.169.254" when the POST goes out. Re-checking the same predicate at
+ * send time closes that window for everything but a sub-second race, at the
+ * cost of one lookup per host per minute (cached, because a broadcast walks
+ * every subscription of every user).
+ */
+const SEND_CHECK_TTL_MS = 60_000;
+const sendChecks = new Map<string, { ok: boolean; until: number }>();
+
+export async function isSafePushEndpointAtSendTime(endpoint: string): Promise<boolean> {
+  let host: string;
+  try {
+    host = new URL(endpoint).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  const now = Date.now();
+  const cached = sendChecks.get(host);
+  if (cached && cached.until > now) return cached.ok;
+  const ok = await isSafeExternalUrl(endpoint);
+  sendChecks.set(host, { ok, until: now + SEND_CHECK_TTL_MS });
+  if (sendChecks.size > 500) {
+    for (const [key, value] of sendChecks) if (value.until <= now) sendChecks.delete(key);
+  }
+  return ok;
+}

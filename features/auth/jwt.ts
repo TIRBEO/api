@@ -1,12 +1,37 @@
 import { SignJWT, jwtVerify, type JWTPayload } from 'jose';
+import { getRedis } from '@/features/auth/redis';
 
 function getSecret(): Uint8Array {
   const secret = process.env.JWT_SECRET;
   if (!secret) {
     throw new Error('JWT_SECRET environment variable is required');
   }
+  // HS256 security is exactly the secret's entropy. A short or placeholder value
+  // is crackable offline from any captured token, and a captured token is a
+  // session cookie a user pastes into a support thread. Refuse it loudly in
+  // production rather than sign something an attacker can brute-force.
+  if (
+    process.env.NODE_ENV === 'production' &&
+    (secret.length < 32 || PLACEHOLDER_SECRETS.has(secret.toLowerCase()))
+  ) {
+    throw new Error('JWT_SECRET is too weak for production: use a 32+ character random value that is not a placeholder');
+  }
   return new TextEncoder().encode(secret);
 }
+
+const PLACEHOLDER_SECRETS = new Set([
+  'secret',
+  'changeme',
+  'change-me',
+  'your-secret-key',
+  'yoursecretkey',
+  'jwt-secret',
+  'jwtsecret',
+  'test',
+  'dev',
+  'password',
+  'tirbeo',
+]);
 
 const COOKIE_NAME = '__session';
 
@@ -96,24 +121,75 @@ export async function verifyTempPasswordChangeToken(token: string): Promise<stri
   }
 }
 
-export async function signPasswordResetToken(userId: string): Promise<string> {
-  return new SignJWT({ sub: userId, purpose: 'password-reset' })    .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt()
-    // Every reset token carries its own id: unique per issue (no twins),
-    // traceable in logs, and one step closer to single-use enforcement.
-    .setJti(crypto.randomUUID())
-    .setExpirationTime('15m')
-    .sign(getSecret());
+const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
+
+function redisSafe(): any {
+  try { return getRedis() || null; } catch { return null; }
 }
 
-export async function verifyPasswordResetToken(token: string): Promise<string | null> {
+/**
+ * A reset link is good for one password change.
+ *
+ * The `jti` is the handle: minted into Redis with the token's own lifetime, and
+ * deleted by the first request that spends it. `verifyPasswordResetToken` stays
+ * a pure read — the audit trail and the "is this link still live" step both ask
+ * it without consuming — and only `consumePasswordResetToken` burns the link.
+ * Without that split, merely checking a token would destroy the reset it is for.
+ */
+async function readResetClaims(token: string): Promise<{ userId: string; jti: string } | null> {
   try {
     const { payload } = await jwtVerify(token, getSecret(), { algorithms: ['HS256'] });
-    if (payload.sub && payload.purpose === 'password-reset') return payload.sub as string;
-    return null;
+    if (!payload.sub || payload.purpose !== 'password-reset') return null;
+    return { userId: payload.sub as string, jti: (payload.jti as string) || '' };
   } catch {
     return null;
   }
+}
+
+async function spendResetJti(jti: string): Promise<'live' | 'spent' | 'untracked'> {
+  const r = redisSafe();
+  if (!r) return 'untracked';
+  try {
+    const v = await r.eval(
+      "local x = redis.call('GET', KEYS[1]) if x then redis.call('DEL', KEYS[1]) end return x or ''",
+      1, `reset:${jti}`,
+    );
+    return typeof v === 'string' && v ? 'live' : 'spent';
+  } catch {
+    // Redis answered badly, which is not evidence of a replay. The 15-minute
+    // expiry and the session revocation that follows a change still apply.
+    return 'untracked';
+  }
+}
+
+export async function signPasswordResetToken(userId: string): Promise<string> {
+  const jti = crypto.randomUUID();
+  const token = await new SignJWT({ sub: userId, purpose: 'password-reset' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setJti(jti)
+    .setExpirationTime('15m')
+    .sign(getSecret());
+  const r = redisSafe();
+  if (r && jti) await r.set(`reset:${jti}`, userId, 'PX', RESET_TOKEN_TTL_MS).catch(() => {});
+  return token;
+}
+
+export async function verifyPasswordResetToken(token: string): Promise<string | null> {
+  return (await readResetClaims(token))?.userId ?? null;
+}
+
+/** Verify and consume: the answer is the subject only for the first caller. */
+export async function consumePasswordResetToken(token: string): Promise<string | null> {
+  const claims = await readResetClaims(token);
+  if (!claims) return null;
+  if (!claims.jti) return claims.userId;
+  const state = await spendResetJti(claims.jti);
+  if (state === 'spent') {
+    console.warn('[RESET-TOKEN] replay refused', { jti: claims.jti.slice(0, 8) });
+    return null;
+  }
+  return claims.userId;
 }
 
 export async function signSuspiciousLoginToken(userId: string): Promise<string> {

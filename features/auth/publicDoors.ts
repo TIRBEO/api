@@ -40,15 +40,13 @@ const PUBLIC_API_DOORS = [
   '/api/forms/public/',
   '/auth/google', '/auth/google/callback', '/auth/github', '/auth/github/callback',
   '/auth/discord', '/auth/discord/callback',
-  '/api/image/',
-  '/api/cdn/share/',
-  '/api/cdn/u/',
-  '/api/health',
+  // The liveness probe itself, and the pool endpoint that its handler guards
+  // with a staff permission or a machine key. See EXACT_API_DOORS below.
+  '/api/health/pool',
   '/api/security/log',
   // Client telemetry lands events for logged-out visitors too; the ingest route
   // attributes a session when one is attached and rate-limits by IP.
   '/api/telemetry/',
-  '/api/debug/',
   '/api/email/unsubscribe',
   '/api/emails/unsubscribe',
 ];
@@ -58,9 +56,21 @@ function isPublicFormSubmit(pathname: string, method: string): boolean {
   return method === 'POST' && /^\/api\/forms\/[^/]+\/submit\/?$/.test(pathname);
 }
 
+/** Paths that are public as themselves and not as a family.
+ *
+ *  The list above is matched by prefix, which is right for `/api/public/` and
+ *  wrong for a probe: `/api/health` opened every path beneath it, so the pool
+ *  internals one level down answered anonymous visitors — latency, connection
+ *  counts, thresholds, and the names of whichever delivery secrets the install
+ *  happens to be missing. A path listed here is public for that exact pathname
+ *  and nothing deeper, and whatever lives underneath it is judged by its own
+ *  handler. */
+const EXACT_PUBLIC_DOORS = ['/api/health'];
+
 /** Takes `/api/${pathStr}` as well as a bare pathname, so the dispatcher and
  *  the edge ask the same question about the same request. */
 export function isPublicApiDoor(pathname: string, method = 'GET'): boolean {
   const path = pathname.startsWith('/api/') || pathname.startsWith('/auth/') ? pathname : `/api/${pathname}`;
+  if (EXACT_PUBLIC_DOORS.includes(path)) return true;
   return PUBLIC_API_DOORS.some((door) => path.startsWith(door)) || isPublicFormSubmit(path, method);
 }

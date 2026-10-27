@@ -2,9 +2,10 @@ import { resolveLoginLocation, resolveLoginPlace } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { prisma } from '@/infrastructure/db/prisma';
-import { generateOtpCode, storeOtp, verifyOtpCode, sendEmailOtp } from '@/features/auth/otp';
+import { generateOtpCode, storeOtp, verifyOtpCode, verifyOtpCodeByAddress, sendEmailOtp } from '@/features/auth/otp';
 import { generateOtpCode as genSignupOtp, storeSignupOtp, verifySignupOtp, sendSignupOtpEmail, checkSignupOtp } from '@/features/auth/signup-otp';
 import { hashPassword, verifyPassword, hashOtpCode, hashRecoveryCode } from '@/features/auth/password';
+import { encryptSecret } from '@/features/auth/secret-box';
 import { createSession, setSessionCookie, clearSessionCookie, clearCsrfCookie, revokeSession, rotateRefreshToken, REFRESH_COOKIE_NAME, COOKIE_DOMAIN, isSessionUnavailable } from '@/features/auth/session';
 import { resolveTirbeoIdentifier, setRecoveryContact, tirbeoEmailFor, upsertMailAccount, recordProvisioning, fetchLoginUserById, fetchLoginUserByEmail, isTirbeoEmail, parseTirbeoIdentifier, TIRBEO_MAIL_DOMAIN, type LoginUser } from '@/features/identity/tirbeo';
 import { createSupabaseAuthUser } from '@/features/auth/supabase-admin';
@@ -38,6 +39,7 @@ import { maskEmail, recoveryOption } from '@/features/auth/recovery-email';
 import { normalizeWorkFields } from '@/features/auth/profile-work';
 import { blockedAccountResponse, isBlockedSignInStatus } from '@/features/auth/blockFacts';
 import { forgetUserStatus } from '@/features/auth/user-status-cache';
+import { clientIp as clientAddress, clientIpOrUnknown } from '@/shared/client-ip';
 
 // Cache email existence lookups (login/signup fire these on every debounced
 // keystroke). Results are almost never changed mid-session, so a 30s TTL is
@@ -460,9 +462,7 @@ function isTransientError(err: any): boolean {
 }
 
 function getIp(request: NextRequest): string | undefined {
-  const xff = request.headers.get('x-forwarded-for');
-  if (xff) return xff.split(',')[0].trim();
-  return request.headers.get('x-real-ip') || undefined;
+  return clientAddress(request.headers) ?? undefined;
 }
 
 
@@ -573,17 +573,23 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
     return `https://${apiHost}/api${path}`;
   }
 
-  // 4. Local development fallback — only for localhost
-  const host = request.headers.get('host') || 'localhost:3000';
+  // 4. Local development fallback — localhost only, and never in production.
+  // The block above promises the request headers are not trusted on public
+  // deployments; this step used to fall through to them anyway. An install with
+  // `*_REDIRECT_URI` and `APP_DOMAIN` unset built its OAuth callback URL out of
+  // `Host` and `x-forwarded-proto` — both chosen by whoever sends the request —
+  // so pointing any name at this server was enough to have the provider return
+  // the code and state to that name, over the scheme of the attacker's picking.
+  // An empty string is the existing "not configured" signal: every caller
+  // answers it with a readable error instead of starting the flow.
+  const host = request.headers.get('host') || '';
   if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) {
-    console.warn(
-      `[OAUTH:${provider}] Host "${host}" is not trusted for redirect URIs. ` +
-      `Set ${provider.toUpperCase()}_REDIRECT_URI or APP_DOMAIN to pin the callback URL.`,
+    console.error(
+      `[OAUTH:${provider}] No pinned redirect URI — set ${provider.toUpperCase()}_REDIRECT_URI (or API_DOMAIN/APP_DOMAIN). Refusing to build one from the request Host header.`,
     );
+    return '';
   }
-  const protoHeader = (request.headers.get('x-forwarded-proto') || '').split(',')[0].trim();
-  const protocol = protoHeader || 'https';
-  return `${protocol}://${host}/api${path}`;
+  return `http://${host}/api${path}`;
 }
 
 interface OauthProviderConfig {
@@ -659,6 +665,14 @@ interface ProviderProfile {
   email?: string;
   name?: string;
   photoUrl?: string;
+  /**
+   * True when the provider never asserted this address and we built it from the
+   * login (GitHub's `login@users.noreply.github.com`). GitHub mints that string
+   * from a login, logins can be re-registered after an account goes away, and
+   * nobody at Tirbeo can tell a legitimate holder from a squatter. So a
+   * synthesized address may label an account, but it may never *find* one.
+   */
+  emailSynthesized?: boolean;
 }
 
 const SUPPORTED_OAUTH_PROVIDERS = ['google', 'github', 'discord'];
@@ -696,7 +710,7 @@ async function findProviderUser(provider: string, profile: ProviderProfile) {
     if (user && user.status !== 'deleted') return { user, matchedBy: 'provider' as const };
   }
 
-  if (profile.email) {
+  if (profile.email && !profile.emailSynthesized) {
     const userId = await userIdForEmail(profile.email.toLowerCase());
     if (userId) {
       const user = await fetchLoginUserById(userId);
@@ -704,18 +718,14 @@ async function findProviderUser(provider: string, profile: ProviderProfile) {
     }
   }
 
-  // GitHub noreply addresses are issued by GitHub and derived from the login,
-  // so completing this OAuth already proves control of that account. When the
-  // login matches a Tirbeo username, offer the merge — the person confirms it.
-  if (provider === 'github' && profile.email?.toLowerCase().endsWith('@users.noreply.github.com')) {
-    const login = profile.email.split('@')[0].toLowerCase();
-    const byName = await prisma.user.findUnique({ where: { username: login }, select: { id: true } });
-    if (byName) {
-      const user = await fetchLoginUserById(byName.id);
-      if (user) return { user, matchedBy: 'email' as const };
-    }
-  }
-
+  // No username heuristic here. GitHub's noreply address can be *synthesised*
+  // from any login (see the callback fallback), and a Tirbeo username is a free
+  // string somebody picked years ago — so "provider login == someone's username"
+  // proves control of a GitHub account, never of the Tirbeo account behind that
+  // name. Anyone can register the unclaimed login and be handed a merge token
+  // for a stranger's account, which `/api/auth/oauth/merge` redeems without a
+  // session or a password. Identity links and matching emails are the only
+  // evidence that may open a merge.
   return { user: null, matchedBy: null };
 }
 
@@ -742,7 +752,7 @@ async function finishProviderSignIn(
   if (state.link) {
     const existingSession = await getSession(request);
     if (existingSession) {
-      const ownerUserId = profile.email ? await userIdForEmail(profile.email.toLowerCase()) : null;
+      const ownerUserId = profile.email && !profile.emailSynthesized ? await userIdForEmail(profile.email.toLowerCase()) : null;
       // Identity/email belongs to a DIFFERENT account → signed transfer decision.
       if (ownerUserId && ownerUserId !== existingSession.userId) {
         const owner = await fetchLoginUserById(ownerUserId);
@@ -832,7 +842,7 @@ async function finishProviderSignIn(
   }
 
   const redirectTo = normalizeOAuthRedirect(state.redirect);
-  const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  const ip = clientAddress(request.headers) ?? '';
   // Session + login bookkeeping run concurrently — neither depends on
   // the other and the round-trips were previously serial.
   const [, { token, refreshToken }] = await Promise.all([
@@ -922,7 +932,7 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
           await prisma.userProfile.update({ where: { userId: target.id }, data: { photoUrl: data.photoUrl } }).catch(() => {});
         }
       })(),
-      createSession(target.id, request.headers.get('user-agent') || undefined, (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()),
+      createSession(target.id, request.headers.get('user-agent') || undefined, clientAddress(request.headers) ?? ''),
     ]);
     bustProfileCache(target.id);
     prisma.activityEvent.create({
@@ -945,7 +955,7 @@ export async function oauthMergeCompleteHandler(request: NextRequest) {
       userId: target.id,
       email: target.email,
       name: target.name,
-      ip: (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown',
+      ip: clientIpOrUnknown(request.headers),
       userAgent: request.headers.get('user-agent'),
       fingerprint: deviceFingerprint(request),
       headers: request.headers,
@@ -982,6 +992,52 @@ function clearOauthStateCookie(res: NextResponse, request: NextRequest) {
     path: '/',
     maxAge: 0,
     domain: getOauthCookieDomain(request) });
+}
+
+/**
+ * PKCE (RFC 7636) for the provider sign-in redirect.
+ *
+ * `state` proves the callback came from *this browser*; the verifier proves the
+ * code being exchanged was requested by it too. Without the pair, an attacker
+ * who observed an authorization code (a proxy log, a misconfigured redirect)
+ * could spend it — the client secret does not cover that path, because the
+ * secret is ours, not per-flow. One flow at a time per browser, so one cookie
+ * holds it; the verifier lives only in this browser and the provider.
+ */
+const OAUTH_PKCE_COOKIE = '__oauth_pkce';
+
+async function pkcePair(): Promise<{ verifier: string; challenge: string }> {
+  const random = new Uint8Array(32);
+  crypto.getRandomValues(random);
+  const verifier = Buffer.from(random).toString('base64url');
+  // S256: the challenge is the digest of the verifier as the browser will send
+  // it, not of the bytes the verifier was built from.
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  return { verifier, challenge: Buffer.from(digest).toString('base64url') };
+}
+
+function setOauthPkceCookie(res: NextResponse, verifier: string, request: NextRequest) {
+  res.cookies.set(OAUTH_PKCE_COOKIE, verifier, {
+    httpOnly: true,
+    secure: !isLoopbackRequest(request),
+    sameSite: 'lax',
+    // Scoped to the whole app, not to `/auth`. The callback is served at
+    // `/api/auth/<provider>/callback`, and a cookie path only matches prefixes
+    // — a `/auth` cookie is never sent to `/api/auth/…`, so every provider
+    // exchange came back without its verifier: Google answered "Missing code
+    // verifier" and GitHub "code_verifiers must be between 43 and 128
+    // characters", both of which are the same empty string in two dialects.
+    path: '/',
+    maxAge: 600,
+    domain: getOauthCookieDomain(request) });
+}
+
+/** The verifier this browser asked for. Every flow start overwrites the cookie,
+ *  so a missing value means the callback is not the continuation of a flow this
+ *  browser began — the exchange then fails loudly at the provider, which is the
+ *  point. No cleanup: it is scoped to `/auth` and dead within 10 minutes. */
+function readOauthPkce(request: NextRequest): string {
+  return request.cookies.get(OAUTH_PKCE_COOKIE)?.value || '';
 }
 
 const OAUTH_CONSUMED_COOKIE = '__oauth_state_consumed';
@@ -1088,7 +1144,7 @@ export async function loginHandler(request: NextRequest) {
       || request.headers.get('x-device-fingerprint')
       || '';
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
     const sessionId = captchaSession;
@@ -1269,7 +1325,7 @@ export async function adminLoginHandler(request: NextRequest, preParsed?: z.infe
       || request.headers.get('x-device-fingerprint')
       || '';
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
     const sessionId = captchaSession;
@@ -1404,7 +1460,7 @@ export async function verify2faLoginHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`2fa:ip:${clientIp}`, 15, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, {
         action: 'auth/verify-2fa',
@@ -1477,7 +1533,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`2fa-recovery:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, {
         action: 'auth/recovery-2fa',
@@ -1514,7 +1570,7 @@ export async function recovery2faLoginHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid recovery code' }, { status: 401 });
     }
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const ip = clientAddress(request.headers) ?? '';
     const { token, refreshToken, saveLoginInfo } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
     setSessionCookie(res, token, refreshToken, request, { shortSession: !saveLoginInfo });
@@ -1555,7 +1611,10 @@ const signupSchema = z.object({
   occupation: z.string().max(120).optional(),
   recoveryEmail: z.string().email().optional().or(z.literal('')),
   // Client-generated TOTP secret + flag when the user set up 2FA during signup.
-  totpSecret: z.string().optional(),
+  // Bounded: base32 secrets are 16-32 characters, and this string is stored on
+  // the account (and sealed, which lengthens it) — an unbounded field here is a
+  // request-size hole straight into the row.
+  totpSecret: z.string().max(64).optional(),
   is2FAEnabled: z.boolean().optional(),
   policyAccepted: z.boolean(),
   adminDataAccess: z.boolean().optional(),
@@ -1602,7 +1661,7 @@ export async function emailExistsHandler(request: NextRequest) {
     // screen can generate (a 30s result cache absorbs keystroke re-checks)
     // and far below what a scraper needs. The edge limiter over
     // `auth/email-exists` (rate-limit.ts) is the outer coarse layer.
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`email-exists:ip:${clientIp}`, 10, 10 * 60 * 1000, clientIp))) {
       return rateLimited(request, {
         action: 'auth/email-exists',
@@ -1733,7 +1792,7 @@ export async function signupHandler(request: NextRequest) {
 
 
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     const userAgent = request.headers.get('user-agent') || '';
     const captchaSession = request.cookies.get('__captcha_session')?.value || 'anonymous';
 
@@ -1840,7 +1899,7 @@ export async function signupHandler(request: NextRequest) {
                   { address: identityEmail, kind: 'secondary', isDefault: false, verifiedAt: new Date() },
                 ] },
           security: (is2FAEnabled && normalizedTotpSecret) ? {
-            create: { totpSecret: normalizedTotpSecret, totpEnabled: true } } : undefined,
+            create: { totpSecret: encryptSecret(normalizedTotpSecret), totpEnabled: true } } : undefined,
           preferences: {
             create: {
               notif: NEW_ACCOUNT_PREFS,
@@ -1937,7 +1996,7 @@ export async function signupHandler(request: NextRequest) {
       sendTemplateEmailAfter(accountEmail, 'verify_email', { otp: verifyCode, name: name || accountEmail.split('@')[0] });
       // The verification OTP is an auth artifact like every other one — log its
       // generation (truncated, never the plain code).
-      logOtpJson(accountEmail, 'signup-verify', verifyCode.slice(0, 3) + '***', ip, { userId: user.id }, 'signup_otp').catch(() => {});
+      logOtpJson(accountEmail, 'signup-verify', hashOtpCode(verifyCode), ip, { userId: user.id }, 'signup_otp').catch(() => {});
     }
 
     // Account created with a password: land both the auth event and the
@@ -1963,7 +2022,7 @@ export async function requestSignupOtpHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     // Relaxed OTP rate limits - 10 per hour per IP, 5 per hour per email
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/signup-otp/request', message: 'Too many verification attempts. Please try again later.', email, keyHint: 'global:email' });
@@ -2000,7 +2059,7 @@ export async function requestSignupOtpHandler(request: NextRequest) {
 
     const code = genSignupOtp();
     await storeSignupOtp(email, code);
-    logAuthJson('signup_otp', { email: email.toLowerCase(), ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
+    logAuthJson('signup_otp', { email: email.toLowerCase(), ip: clientIp, otpHash: hashOtpCode(code), method: 'signup-otp' }).catch(()=>{});
     try {
       await sendSignupOtpEmail(email, code);
     } catch (emailErr) {
@@ -2041,15 +2100,35 @@ export async function limitsHandler(request: NextRequest) {
       // Admin only for PUT
       const session = await requirePermission(request as any, 'limits.manage');
       if (session instanceof Response) return session as any;
+      // `max` is the throttle every brute-force path reads back out of Redis, so
+      // an unclamped write is a self-inflicted outage or a self-inflicted open
+      // door: 0 locks every real user out of the flow, 1e9 makes the limit
+      // decorative. The method name is allow-listed too — it is interpolated
+      // into a Redis key, and a blank space or newline there invents a limit
+      // nothing in the UI can find or fix.
+      const known = await getAllVerifyMaxes();
+      if (!Object.prototype.hasOwnProperty.call(known, String(method))) {
+        return NextResponse.json({ error: `Unknown limit method. Expected one of: ${Object.keys(known).join(', ')}` }, { status: 400 });
+      }
+      if (!Number.isInteger(max) || max < 1 || max > 100) {
+        return NextResponse.json({ error: 'max must be a whole number between 1 and 100' }, { status: 400 });
+      }
+      const window = typeof windowMs === 'number' && Number.isInteger(windowMs) && windowMs >= 60_000 && windowMs <= 24 * 60 * 60 * 1000
+        ? windowMs : null;
       const r = getRedis();
       if (!r) return NextResponse.json({ error: 'Redis unavailable' }, { status: 503 });
       await r.set(`vl:max:${method}`, String(max));
-      if (windowMs) await r.set(`vl:win:${method}`, String(windowMs));
-      return NextResponse.json({ ok: true, limit: { method, max, windowMs: windowMs || 15 * 60 * 1000 } });
+      if (window) await r.set(`vl:win:${method}`, String(window));
+      return NextResponse.json({ ok: true, limit: { method, max, windowMs: window || 15 * 60 * 1000 } });
     }
     const limits = await getAllVerifyMaxes();
     return NextResponse.json({ limits });
-  } catch (e:any) { return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 }); }
+  } catch (e: any) {
+    // The message often carries a driver or Redis complaint; the caller only
+    // needs to know it failed.
+    console.error('[AUTH-LIMITS]', e?.message || e);
+    return NextResponse.json({ error: 'Could not read the verification limits.' }, { status: 500 });
+  }
 }
 
 export async function remainingHandler(request: NextRequest) {
@@ -2057,11 +2136,24 @@ export async function remainingHandler(request: NextRequest) {
     const email = (request.nextUrl.searchParams.get('email') || '').toLowerCase().trim();
     const method = request.nextUrl.searchParams.get('method') || '';
     if (!email) return NextResponse.json({ error: 'email required' }, { status: 400 });
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || request.headers.get('x-real-ip') || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
+    // A public door whose whole job is reading counters — one request costs a
+    // global-ip peek, a global-email peek and a status read per method, so
+    // unthrottled it is an anonymous amplifier against Redis and the pool. The
+    // login screen only needs this a couple of times per visit.
+    if (!checkWindowLimit(`auth-remaining:ip:${ip}`, 30, 60 * 1000)) {
+      return NextResponse.json({ error: 'Too many requests. Please try again later.' }, { status: 429 });
+    }
     // ── Fast status: Redis counters + in-memory mirror (no DB scans) ──
     // Maxes come from the VerificationLimit table (30s cache).
     const maxes = await getAllVerifyMaxes();
     const out: Record<string, { used: number; remaining: number; max: number; resetAt: number; exceeded: boolean }> = {};
+    // The name is a key into the counter store, so an unknown one is not a
+    // question this endpoint can answer — and answering it anyway is what makes
+    // the request cost something.
+    if (method && !Object.prototype.hasOwnProperty.call(maxes, method)) {
+      return NextResponse.json({ error: `Unknown method. Expected one of: ${Object.keys(maxes).join(', ')}` }, { status: 400 });
+    }
     const methods = method ? [method] : Object.keys(maxes);
     const globalIp = await peekGenericWindow(`global:ip:${ip}`, maxes['global-ip'] ?? 20, VERIFY_WINDOW_MS);
     const globalEmailStatus = await getGlobalEmailStatus(email);
@@ -2098,7 +2190,8 @@ export async function remainingHandler(request: NextRequest) {
       remaining: out,
       globalEmailUsed: globalEmailStatus.used });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 });
+    console.error('[AUTH-REMAINING]', e?.message || e);
+    return NextResponse.json({ error: 'Could not read the attempt counter.' }, { status: 500 });
   }
 }
 
@@ -2120,7 +2213,8 @@ export async function initLimitsHandler() {
     }
     return NextResponse.json({ ok: true, message: 'Verification limits initialized' });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || 'failed' }, { status: 500 });
+    console.error('[AUTH-INIT-LIMITS]', e?.message || e);
+    return NextResponse.json({ error: 'Could not initialize the verification limits.' }, { status: 500 });
   }
 }
 
@@ -2378,7 +2472,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
         await prisma.userProfile.update({ where: { userId: existing.id }, data: { photoUrl: chosenPhoto } }).catch(() => {});
       }
 
-      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+      const ip = clientAddress(request.headers) ?? '';
       const { token: sessionToken, refreshToken } = await createSession(existingId, request.headers.get('user-agent') || undefined, ip);
       logSecurityEvent({ request, userId: existingId, eventType: 'auth.oauth_login', severity: 'info', details: { provider: data.provider, isNewUser: false, attached: true, email } }).catch(() => {});
       const res = NextResponse.json({
@@ -2454,7 +2548,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
     }
 
     prisma.activityEvent.create({
-      data: { userId: user.id, kind: 'user.created', title: 'Account created via OAuth', severity: 'info', ipAddress: (request.headers.get('x-forwarded-for') || '').split(',')[0].trim(), metadata: { provider: data.provider, email, via: 'oauth_complete' } } }).catch(() => {});
+      data: { userId: user.id, kind: 'user.created', title: 'Account created via OAuth', severity: 'info', ipAddress: clientAddress(request.headers) ?? '', metadata: { provider: data.provider, email, via: 'oauth_complete' } } }).catch(() => {});
 
     // Welcome notification (best-effort). Email already sent above via the
     // 'welcome' template (single recipient) — skip the notification digest path.
@@ -2468,7 +2562,7 @@ export async function oauthSignupCompleteHandler(request: NextRequest) {
       skipEmail: true,
       skipPush: false })).catch(() => {});
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const ip = clientAddress(request.headers) ?? '';
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     // First social sign-in of a freshly created account — the isNewUser:true
     // half of the auth.oauth_login family.
@@ -2501,7 +2595,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     // ptr gate — a live code flow is keyed to the device that started it.
     const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
@@ -2605,7 +2699,7 @@ export async function requestLoginOtpHandler(request: NextRequest) {
     // verify with their primary email would find no code.
     const deliverTo = (user.email || email).toLowerCase();
     await storeSignupOtp(deliverTo, code);
-    logAuthJson('signup_otp', { email: deliverTo, ip: clientIp, otpHash: code.slice(0,3)+'***', method: 'signup-otp' }).catch(()=>{});
+    logAuthJson('signup_otp', { email: deliverTo, ip: clientIp, otpHash: hashOtpCode(code), method: 'signup-otp' }).catch(()=>{});
     // Await the provider: a "code sent" response after a rejected send
     // strands the user on the OTP screen waiting for mail that never comes.
     const send = await sendSignupOtpEmail(deliverTo, code, 'login_otp');
@@ -2638,7 +2732,7 @@ export async function verifyLoginOtpHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`login-otp-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, {
         action: 'auth/login-otp/verify',
@@ -2775,7 +2869,7 @@ export async function requestEmailOtpHandler(request: NextRequest) {
     if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
     const user = await fetchLoginUserById(session.userId);
     if (!user || !user.email) return NextResponse.json({ error: 'User email missing' }, { status: 400 });
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`global:email:${user.email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/email-otp/request', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
     }
@@ -2796,7 +2890,7 @@ export async function requestEmailOtpHandler(request: NextRequest) {
       });
     }
     const code = generateOtpCode();
-    await storeOtp(session.userId, 'email', code);
+    await storeOtp(session.userId, 'email', code, user.email);
     await sendEmailOtp(user.email, code);
     return NextResponse.json({ error: 'OTP sent to email' }, { status: 200 });
   } catch (err: any) {
@@ -2810,17 +2904,18 @@ export async function verifyEmailOtpHandler(request: NextRequest) {
   try {
     const session = await getSession(request);
     if (!session) return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
-    const { code, email } = (await request.json()) as any;
+    const { code } = (await request.json()) as any;
     if (typeof code !== 'string') return NextResponse.json({ error: 'Invalid OTP payload' }, { status: 400 });
-    const ok = await verifyOtpCode(session.userId, 'email', code);
+    const user = await fetchLoginUserById(session.userId);
+    if (!user?.email) return NextResponse.json({ error: 'No email on this account' }, { status: 400 });
+    // Bound to the address the code was mailed to. This endpoint used to take an
+    // `email` in the body and write it as the account's recovery contact with
+    // `verifiedBy: 'code'` — a code read from the primary mailbox therefore
+    // "verified" some other, never-checked address. Adding a recovery address has
+    // its own bound flow (/api/security/recovery-email/*), which mails the code
+    // to the new address; nothing belongs here.
+    const ok = await verifyOtpCode(session.userId, 'email', code, user.email);
     if (!ok) return NextResponse.json({ error: 'Invalid or expired OTP' }, { status: 400 });
-    if (email && typeof email === 'string') {
-      await setRecoveryContact({
-        userId: session.userId,
-        email: email.trim().toLowerCase(),
-        verifiedBy: 'code',
-        verifiedAt: new Date() });
-    }
     return NextResponse.json({ error: 'Email OTP verified' }, { status: 200 });
   } catch (err: any) {
     console.error('[EMAIL OTP VERIFY]', err?.message || err);
@@ -2857,7 +2952,7 @@ export async function changeEmailRequestHandler(request: NextRequest) {
       if (existing) return NextResponse.json({ error: 'That email is already in use' }, { status: 400 });
     }
 
-    const clientIp2 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp2 = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp2))) {
       return rateLimited(request, { action: 'auth/change-email/request', message: 'Too many verification attempts. Please try again later.', email, userId: user.id, keyHint: 'global:email' });
     }
@@ -2875,7 +2970,11 @@ export async function changeEmailRequestHandler(request: NextRequest) {
       });
     }
     const code = generateOtpCode();
-    await storeOtp(user.id, 'email_verify', code);
+    // Bound to the address it was mailed to. Without the bind this code — read
+    // from whichever mailbox the caller chose — could be spent against any
+    // other address typed into the verify step, and the account would adopt an
+    // address nobody proved it controls.
+    await storeOtp(user.id, 'email_verify', code, email);
     await sendEmailOtp(email, code);
     return NextResponse.json({ error: 'Verification code sent' }, { status: 200 });
   } catch (err: any) {
@@ -2899,7 +2998,7 @@ export async function changeEmailVerifyHandler(request: NextRequest) {
     const user = await fetchLoginUserById(session.userId);
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
 
-    const ok = await verifyOtpCode(user.id, 'email_verify', code);
+    const ok = await verifyOtpCode(user.id, 'email_verify', code, email);
     if (!ok) {
       logSecurityEvent({ request, userId: user.id, eventType: 'user.email_verify_failed', severity: 'warning', details: { reason: 'invalid_or_expired_code' } }).catch(() => {});
       return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
@@ -2986,7 +3085,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
 
     // Resend request — generate a new OTP and email it again
     if (!code) {
-      const clientIp3 = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+      const clientIp3 = clientIpOrUnknown(request.headers);
       if (!(await checkWindowLimitDB(`global:email:${email.toLowerCase()}`, 5, 15 * 60 * 1000, clientIp3))) {
         return rateLimited(request, { action: 'auth/verify-email', message: 'Too many verification attempts. Please try again later.', email: user.email, userId: user.id, keyHint: 'global:email' });
       }
@@ -3015,7 +3114,7 @@ export async function verifySignupEmailHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Verification code resent' }, { status: 200 });
     }
 
-    const ok = await verifyOtpCode(user.id, 'email', code);
+    const ok = await verifyOtpCodeByAddress('email', email, code, user.id);
     if (!ok) return NextResponse.json({ error: 'Invalid or expired verification code' }, { status: 400 });
 
     await prisma.userEmail.updateMany({
@@ -3045,6 +3144,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
     const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
     const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const pkce = await pkcePair();
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -3053,10 +3153,13 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
       // No prompt=consent / access_type=offline: we don't need Google refresh
       // tokens and forcing re-approval every sign-in slows returning users to
       // a crawl. Returning users now sail through with one click.
+      code_challenge: pkce.challenge,
+      code_challenge_method: 'S256',
       state: stateToken });
     const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
     const res = NextResponse.redirect(googleAuthUrl);
     setOauthStateCookie(res, nonce, request);
+    setOauthPkceCookie(res, pkce.verifier, request);
     return res;
   } catch (err: any) {
     console.error('[GOOGLE AUTH]', err?.message || err);
@@ -3067,7 +3170,7 @@ export async function googleAuthRedirectHandler(request: NextRequest) {
 // Google OAuth callback handler
 export async function googleAuthCallbackHandler(request: NextRequest) {
   try {
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/oauth/callback:google', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
@@ -3098,6 +3201,7 @@ export async function googleAuthCallbackHandler(request: NextRequest) {
         client_id: clientId,
         client_secret: clientSecret,
         redirect_uri: redirectUri,
+        code_verifier: readOauthPkce(request),
         grant_type: 'authorization_code' }).toString() });
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
@@ -3143,14 +3247,18 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
     const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
     const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const pkce = await pkcePair();
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
       scope: 'read:user user:email',
+      code_challenge: pkce.challenge,
+      code_challenge_method: 'S256',
       state: stateToken });
     const githubAuthUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
     const res = NextResponse.redirect(githubAuthUrl);
     setOauthStateCookie(res, nonce, request);
+    setOauthPkceCookie(res, pkce.verifier, request);
     return res;
   } catch (err: any) {
     console.error('[GITHUB AUTH]', err?.message || err);
@@ -3161,7 +3269,7 @@ export async function githubAuthRedirectHandler(request: NextRequest) {
 // GitHub OAuth callback handler
 export async function githubAuthCallbackHandler(request: NextRequest) {
   try {
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/oauth/callback:github', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
@@ -3187,7 +3295,7 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
     const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }) });
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri, code_verifier: readOauthPkce(request) }) });
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text();
       console.error('[GITHUB TOKEN EXCHANGE] Failed:', tokenRes.status, errBody, 'redirect_uri:', redirectUri);
@@ -3237,14 +3345,17 @@ export async function githubAuthCallbackHandler(request: NextRequest) {
       }
     }
     // Last resort: construct GitHub's noreply address from the username
+    let emailSynthesized = false;
     if (!email && profile.login) {
       email = `${profile.login}@users.noreply.github.com`;
+      emailSynthesized = true;
       console.info(`[OAUTH:github] Using noreply fallback: ${email}`);
     }
 
     return finishProviderSignIn(request, 'github', {
       providerId: String(profile.id),
       ...(email ? { email } : {}),
+      ...(emailSynthesized ? { emailSynthesized: true } : {}),
       name: (profile.name as string) || (profile.login as string),
       photoUrl: profile.avatar_url as string | undefined }, state);
   } catch (err: any) {
@@ -3269,15 +3380,19 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
     const isLink = sp.get('link') === '1';
     const nonce = crypto.randomUUID();
     const stateToken = await signOauthStateToken(nonce, safeRedirect, isLink);
+    const pkce = await pkcePair();
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
       scope: 'identify email',
+      code_challenge: pkce.challenge,
+      code_challenge_method: 'S256',
       state: stateToken });
     const discordAuthUrl = `https://discord.com/api/oauth2/authorize?${params.toString()}`;
     const res = NextResponse.redirect(discordAuthUrl);
     setOauthStateCookie(res, nonce, request);
+    setOauthPkceCookie(res, pkce.verifier, request);
     return res;
   } catch (err: any) {
     console.error('[DISCORD AUTH]', err?.message || err);
@@ -3288,7 +3403,7 @@ export async function discordAuthRedirectHandler(request: NextRequest) {
 // Discord OAuth callback handler
 export async function discordAuthCallbackHandler(request: NextRequest) {
   try {
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`oauth-cb:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/oauth/callback:discord', message: 'Too many attempts. Please try again later.', keyHint: 'oauth-cb:ip' });
     }
@@ -3319,6 +3434,7 @@ export async function discordAuthCallbackHandler(request: NextRequest) {
         client_secret: clientSecret,
         code,
         redirect_uri: redirectUri,
+        code_verifier: readOauthPkce(request),
         grant_type: 'authorization_code' }).toString() });
      if (!tokenRes.ok) {
        const errBody = await tokenRes.text();
@@ -3740,7 +3856,7 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     // Same windows the dedicated OTP / magic-link endpoints apply. A reset
     // request that skips them because it arrived through the older route would
     // be the cheapest way to spend somebody's mailbox quota.
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     // ptr gate — a live reset flow is keyed to the device that started it.
     const ptrDevice = ptrDeviceId(request.headers.get('user-agent'), deviceFingerprint(request));
@@ -3802,7 +3918,7 @@ export async function requestPasswordResetHandler(request: NextRequest) {
     // then the reset_requested event, attributed when the artifact names a
     // real account (a returned code/resetUrl only exists for one).
     if (result.code) {
-      logOtpJson(email, `password-reset-${resetMethod}`, result.code.slice(0, 3) + '***', clientIp, undefined, 'password_reset_otp').catch(() => {});
+      logOtpJson(email, `password-reset-${resetMethod}`, hashOtpCode(result.code), clientIp, undefined, 'password_reset_otp').catch(() => {});
     }
     const resetEvent = (userId: string | null) =>
       logSecurityEvent({ request, userId, eventType: 'auth.reset_requested', severity: 'info', details: { email: email.toLowerCase(), method: resetMethod } });
@@ -3844,7 +3960,7 @@ export async function verifyPasswordResetHandler(request: NextRequest) {
     if (!code && !token) {
       return NextResponse.json({ error: 'Code or token required' }, { status: 400 });
     }
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     if (!checkWindowLimit(`pw-reset-verify:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return rateLimited(request, { action: 'auth/password-reset/verify', message: 'Too many attempts. Please try again later.', email, keyHint: 'pw-reset-verify:ip' });
@@ -3881,7 +3997,7 @@ export async function confirmPasswordResetHandler(request: NextRequest) {
     if (!/[a-z]/.test(newPassword) || !/[A-Z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
       return NextResponse.json({ error: 'Password must include uppercase, lowercase, and a number.' }, { status: 400 });
     }
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     if (!checkWindowLimit(`pw-reset-confirm:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return rateLimited(request, { action: 'auth/password-reset/confirm', message: 'Too many attempts. Please try again later.', keyHint: 'pw-reset-confirm:ip' });
@@ -3914,7 +4030,7 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid code format' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!checkWindowLimit(`quick-login:ip:${clientIp}`, 10, 15 * 60 * 1000)) {
       return rateLimited(request, { action: 'auth/password-reset/quick-login', message: 'Too many attempts. Please try again later.', email, keyHint: 'quick-login:ip' });
     }
@@ -3938,6 +4054,11 @@ export async function quickLoginWithOtpHandler(request: NextRequest) {
     }
 
     // Set session + refresh cookies (same pattern as login)
+    if (result.requiresMfa) {
+      const tempToken = await signTemp2faToken(result.userId!);
+      logSecurityEvent({ request, userId: result.userId ?? null, eventType: 'auth.otp_login', severity: 'info', details: { email: String(email).toLowerCase(), method: 'reset_otp_quick_login', stage: 'awaiting_second_factor' } }).catch(() => {});
+      return NextResponse.json({ requiresMfa: true, tempToken });
+    }
     logSecurityEvent({ request, userId: result.userId ?? null, eventType: 'auth.otp_login', severity: 'info', details: { email: String(email).toLowerCase(), method: 'reset_otp_quick_login' } }).catch(() => {});
     const resp = NextResponse.json({ message: 'Logged in successfully', userId: result.userId });
     setSessionCookie(resp, result.sessionToken!, result.refreshToken, request);
@@ -3961,7 +4082,7 @@ export async function requestMagicLinkHandler(request: NextRequest) {
     // open redirect onto whatever host the requester named.
     const safeRedirect = normalizeOAuthRedirect(typeof redirect_to === 'string' ? redirect_to : null);
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     // ── ptr gate ──
     // A live send flow for this email is keyed to the device that started it:
@@ -4124,7 +4245,7 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Token required' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!(await checkWindowLimitDB(`magic-link-verify:ip:${clientIp}`, 10, 15 * 60 * 1000, clientIp))) {
       return rateLimited(request, { action: 'auth/magic-link/verify', message: 'Too many attempts. Please try again later.', keyHint: 'magic-link-verify:ip' });
     }
@@ -4171,7 +4292,17 @@ export async function verifyMagicLinkHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Please verify your email before signing in' }, { status: 403 });
     }
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    // A magic link proves the mailbox, not the second factor. Every other
+    // mailbox-proven door (login OTP, recovery-email login, suspicious-login
+    // confirm) answers a 2FA account with a temp token and demands the
+    // authenticator; this one handed out a session, which made the
+    // authenticator optional for anyone who could read an inbox.
+    if (user.is2FAEnabled) {
+      const tempToken = await signTemp2faToken(user.id);
+      return NextResponse.json({ requiresMfa: true, tempToken, email: user.email });
+    }
+
+    const ip = clientAddress(request.headers) ?? '';
     // Magic link creates a SHORT-TERM session (3 days) — expires after logout or 3 days
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, undefined, true);
     // The link redeemed: record the verification (both the GET from the email
@@ -4255,6 +4386,29 @@ export async function accountRecoveryHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
+    // This sends a mail through the provider, so it needs the same three gates
+    // every other mail-sending auth flow has. Without them an anonymous caller
+    // could point Tirbeo's mailer at any address, any number of times.
+    const ip = clientIpOrUnknown(request.headers);
+    if (!checkWindowLimit(`account-recovery:ip:${ip}`, 5, 15 * 60 * 1000)) {
+      return rateLimited(request, { action: 'auth/account-recovery', message: 'Too many requests. Please try again later.', email, keyHint: 'account-recovery:ip' });
+    }
+    if (!checkWindowLimit(`account-recovery:email:${email.toLowerCase()}`, 3, 15 * 60 * 1000)) {
+      return rateLimited(request, { action: 'auth/account-recovery', message: 'Too many requests. Please try again later.', email, keyHint: 'account-recovery:email' });
+    }
+    const cooldown = await enforceResendCooldown(`account-recovery:${email.toLowerCase()}`);
+    if (!cooldown.allowed) {
+      return rateLimited(request, {
+        action: 'auth/account-recovery',
+        message: 'Please wait before requesting another recovery email.',
+        email,
+        keyHint: 'account-recovery:resend-cooldown',
+        resetsAt: Date.now() + cooldown.remainingMs,
+        retryAfterSec: cooldown.remainingMs / 1000,
+        extra: { message: 'Please wait before requesting another recovery email.', retryAfterMs: cooldown.remainingMs },
+      });
+    }
+
     const user = await fetchLoginUserByEmail(email.toLowerCase());
     // Always return success to prevent email enumeration
     if (!user) {
@@ -4272,7 +4426,10 @@ export async function accountRecoveryHandler(request: NextRequest) {
       name: user.name || 'there' });
     if (!send.success) {
       console.error('[ACCOUNT RECOVERY] Email send failed:', send.error);
-      return NextResponse.json({ error: 'Could not send the recovery email. Please try again.' }, { status: 502 });
+      // A 502 here is an oracle: "account exists, delivery failed" reads
+      // differently from the neutral answer an unknown address gets. Same
+      // message either way — the failure is in the log, and the person is
+      // told nothing about whether the address is ours.
     }
 
     return NextResponse.json({ message: 'If an account exists, recovery instructions have been sent.' });
@@ -4296,7 +4453,7 @@ export async function recoveryLoginRequestHandler(request: NextRequest) {
       return NextResponse.json({ error: 'Email is required' }, { status: 400 });
     }
 
-    const clientIp = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
 
     if (!checkWindowLimit(`recovery-login:ip:${clientIp}`, 5, 15 * 60 * 1000)) {
       return rateLimited(request, { action: 'auth/recovery-login', message: 'Too many requests. Please try again later.', email, keyHint: 'recovery-login:ip' });
@@ -4384,7 +4541,7 @@ export async function recoveryLoginVerifyHandler(request: NextRequest) {
       return NextResponse.json({ requiresMfa: true, tempToken });
     }
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const ip = clientIpOrUnknown(request.headers);
     // Recovery-email code login = SHORT-TERM session (3 days), same as login OTP / magic link.
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, undefined, true);
     const res = NextResponse.json({ id: user.id, email: user.email, token });
@@ -4441,7 +4598,7 @@ export async function suspiciousLoginConfirmHandler(request: NextRequest) {
       return NextResponse.json({ needs2FA: true, tempToken });
     }
 
-    const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    const ip = clientAddress(request.headers) ?? '';
     const { token: sessionToken, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip);
     const res = NextResponse.json({ id: user.id, email: user.email, token: sessionToken });
     setSessionCookie(res, sessionToken, refreshToken, request);
@@ -4496,7 +4653,7 @@ export async function suspiciousLoginDenyHandler(request: NextRequest) {
         details: { reason: 'owner_denied_suspicious_login' },
       }).catch(() => null);
 
-      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+      const ip = clientAddress(request.headers) ?? '';
       const place = resolveLoginPlace(request.headers);
       const account = await prisma.user.findUnique({
         where: { id: userId },
@@ -4624,7 +4781,7 @@ function checkChatRateLimit(ip: string, maxRequests = 20, windowMs = 60000): boo
 
 export async function chatHandler(request: NextRequest) {
   try {
-    const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+    const clientIp = clientIpOrUnknown(request.headers);
     if (!checkChatRateLimit(clientIp)) {
       return NextResponse.json({ error: 'Rate limit exceeded. Please try again later.' }, { status: 429 });
     }

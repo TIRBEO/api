@@ -2,6 +2,7 @@ import { resolveLoginLocation } from '@/shared/geo';
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { adminLoginHandler } from '@/features/auth/authHandlers';
+import { clientIp } from '@/shared/client-ip';
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -71,7 +72,7 @@ async function handleVerify(request: NextRequest) {
       return NextResponse.json({ needsPasswordChange: true, tempToken: pwToken });
     }
 
-    const ip = request.headers.get('x-forwarded-for') || '';
+    const ip = clientIp(request.headers) ?? '';
     const { createSession, setSessionCookie } = await import('@/features/auth/http-guards');
     const adminRole = user.isAdmin ? 'admin' : undefined;
     const { token, refreshToken } = await createSession(user.id, request.headers.get('user-agent') || undefined, ip, adminRole);

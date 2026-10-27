@@ -1,4 +1,6 @@
 // ═══ PUSH NOTIFICATIONS (Web Push / VAPID) — DB-backed with in-memory fallback ═══
+import { isSafePushEndpointAtSendTime } from '@/infrastructure/push/endpoint-guard';
+
 const PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || '';
 const PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const SUBJECT = process.env.VAPID_SUBJECT || 'mailto:support@tirbeo.com';
@@ -131,6 +133,11 @@ export async function sendPushNotification(userIdOrSubscription: string | { endp
   let sent = 0, failed = 0;
   await Promise.all(subs.map(async (sub) => {
     try {
+      if (!(await isSafePushEndpointAtSendTime(sub.endpoint))) {
+        failed++;
+        console.warn('[PUSH] send refused — endpoint no longer resolves to a public address:', sub.endpoint);
+        return;
+      }
       await webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify({
         title: payload?.title || 'Tirbeo',
         body: payload?.body || '',

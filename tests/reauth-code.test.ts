@@ -74,7 +74,12 @@ vi.mock('@/features/email/email', () => ({
 
 const matches = (row: any, where: any) =>
   Object.entries(where || {}).every(([k, v]) => {
-    if (v && typeof v === 'object' && 'equals' in (v as any)) return row[k] === (v as any).equals;
+    if (v && typeof v === 'object') {
+      const ops = v as any;
+      if ('equals' in ops) return row[k] === ops.equals;
+      if ('gte' in ops) return Number(row[k] ?? 0) >= ops.gte;
+      if ('increment' in ops) return true; // write-only operator, never a filter
+    }
     return row[k] === v;
   });
 
@@ -103,7 +108,16 @@ vi.mock('@/infrastructure/db/prisma', () => ({
       }),
       update: vi.fn(async ({ where, data }: any) => {
         const row = mocks.rows.find((r) => r.id === where?.id);
-        if (row) Object.assign(row, data);
+        if (row) {
+          for (const [key, value] of Object.entries(data)) {
+            // `{ increment: n }` is an atomic counter in Prisma; assigning it
+            // literally would put an object in the row.
+            row[key] =
+              value && typeof value === 'object' && 'increment' in (value as any)
+                ? (row[key] ?? 0) + (value as any).increment
+                : value;
+          }
+        }
         return row;
       }),
     },

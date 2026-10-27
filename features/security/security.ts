@@ -1,24 +1,19 @@
 import { prisma } from '@/infrastructure/db/prisma';
 import type { Prisma } from '@prisma/client';
+import { getAdminBaseUrl } from '@/config/app-urls';
 import { getRedis } from '@/features/auth/redis';
 import { sendTemplateEmail } from '@/features/email/email';
 import { getBranding } from '@/features/branding/branding';
 import { currentRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { resolveLoginPlace, resolveLoginCoords } from '@/shared/geo';
+import { clientIp, clientIpOrUnknown } from '@/shared/client-ip';
 import { refCodeCandidates, generateEventId, refFromRowId } from '@/features/users/refcode';
 import { factPlate } from '@/features/email/email-fragments';
 
 export type SecuritySeverity = 'info' | 'warning' | 'error' | 'critical';
 
 export function getClientIp(request: Request): string {
-  const fwd = request.headers.get('x-forwarded-for');
-  if (fwd) return fwd.split(',')[0].trim();
-  return (
-    request.headers.get('x-real-ip') ||
-    request.headers.get('cf-connecting-ip') ||
-    request.headers.get('x-vercel-forwarded-for') ||
-    'unknown'
-  );
+  return clientIpOrUnknown(request.headers);
 }
 
 /** `getClientIp` answers 'unknown' for a header-less hop; a row should store
@@ -135,8 +130,7 @@ export type AdminAlert = {
  * the row keeps.
  */
 async function buildAdminAlert(input: AdminAlert, recipients: number) {
-  const { getApiOrigin } = await import('@/features/branding/branding');
-  const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
+  const consoleUrl = getAdminBaseUrl();
   const branding = await getBranding();
   const refCode = input.refCode?.trim() || generateEventId('system');
   const severity = input.severity || 'warning';
@@ -151,7 +145,7 @@ async function buildAdminAlert(input: AdminAlert, recipients: number) {
       refCode,
       message: input.message,
       details: factPlate(await detailRows(input.details)),
-      dashboardUrl,
+      dashboardUrl: consoleUrl,
       brandName: branding.brandName,
       logoUrl: branding.logoUrl,
     },
@@ -170,7 +164,7 @@ async function buildAdminAlert(input: AdminAlert, recipients: number) {
         severity,
         refCode,
         notifiedAdmins: recipients,
-        dashboardUrl,
+        dashboardUrl: consoleUrl,
       },
     },
   };
@@ -208,7 +202,7 @@ export async function alertAdminPanelAttempt(
   email: string,
 ): Promise<void> {
   const { deviceDetail } = await import('@/features/notifications/notifications');
-  const ip = (headers.get('x-forwarded-for') || '').split(',')[0].trim();
+  const ip = clientIp(headers) ?? '';
   const device = deviceDetail(headers.get('user-agent'));
   const place = resolveLoginPlace(headers);
   await sendAdminAlert(email, {
@@ -242,6 +236,34 @@ export async function staffRecipients(permission: string): Promise<string[]> {
   const out = new Set<string>(staff.map((s) => s.email.toLowerCase()));
   if (shared) out.add(shared);
   return [...out];
+}
+
+/**
+ * Who a customer's support request is *mailed* to — a queue, not a broadcast.
+ *
+ * `SUPPORT_INBOX_EMAIL` (comma-separated) is the address the desk is read from.
+ * It falls back to the shared staff mailbox, and with neither set the request
+ * still reaches the panel: the ledger row, the ticket screen and every role with
+ * `tickets.answer` are unaffected by this list, because visibility there is a
+ * permission, not a recipient.
+ */
+export async function supportInboxRecipients(): Promise<string[]> {
+  const listed = (values: string | undefined) =>
+    (values ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+  // A fallback chain, not a union: setting the desk address must not keep the
+  // shared staff mailbox on the copy.
+  const desk = listed(process.env.SUPPORT_INBOX_EMAIL);
+  if (desk.length) return [...new Set(desk)];
+
+  const shared = listed(process.env.STAFF_ALERT_EMAIL);
+  if (shared.length) return [...new Set(shared)];
+
+  // Nothing configured: the people who can answer, rather than silence.
+  return staffRecipients('tickets.answer');
 }
 
 export async function notifyAdmins(input: AdminAlert): Promise<void> {
@@ -303,16 +325,19 @@ export async function notifyAdminsOfSupportRequest(input: {
   ip: string | null;
 }): Promise<void> {
   try {
-    // Whoever can answer a request, not whoever can open the console: a
-    // moderator on holiday should not decide whether this one gets a reply.
-    const recipients = await staffRecipients('tickets.answer');
+    /* Mailed to the one address that reads the queue, not to every account whose
+       role can answer. `tickets.answer` is held by everyone who could act on this,
+       and each of them getting a copy of every message turns a mailbox into a
+       broadcast — forty mails a day about other people's questions is a thread
+       nobody reads. The panel is where the request is shown to all admins and to
+       every role that holds the permission; the mail is only the ping. */
+    const recipients = await supportInboxRecipients();
     if (recipients.length === 0) return;
 
     const { supportSender } = await import('@/features/email/email');
-    const { getApiOrigin } = await import('@/features/branding/branding');
     const sender = supportSender(input.identity, input.senderName);
     const origin = [input.ip, input.location].filter(Boolean).join(' · ');
-    const dashboardUrl = `${getApiOrigin().replace('api.', 'admin.')}`;
+    const consoleUrl = getAdminBaseUrl();
     // An account with no address on file still deserves an answer, so the one
     // action in the mail changes shape rather than going dead.
     const contact = input.replyTo || 'an address we cannot see';
@@ -321,7 +346,7 @@ export async function notifyAdminsOfSupportRequest(input: {
        beside the request, no notification on the account, no record of the
        answer on either side. The panel's reply box is the one door that does
        all three, so this button goes there and quotes the code it is about. */
-    const replyHref = `${dashboardUrl}/admin/tickets/${encodeURIComponent(input.refCode)}`;
+    const replyHref = `${consoleUrl}/admin/overview/support/${encodeURIComponent(input.refCode)}`;
 
     await Promise.all(recipients.map(email =>
       sendTemplateEmail(email, 'support_request_admin', {
@@ -334,7 +359,7 @@ export async function notifyAdminsOfSupportRequest(input: {
         origin: origin || 'Not recorded',
         refCode: input.refCode,
         message: input.message,
-        dashboardUrl,
+        dashboardUrl: consoleUrl,
         replyHref,
         replyLabel: 'Answer in the admin panel',
       }, {

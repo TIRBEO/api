@@ -38,4 +38,50 @@ describe('post-sign-in redirect targets', () => {
     expect(normalizeOAuthRedirect('https://evil.example/')).toBeUndefined();
     expect(normalizeOAuthRedirect(null)).toBeUndefined();
   });
+
+  /* The shapes that try to look like a Tirbeo target without being one. Each of
+     these was a live bypass somewhere in the wild: the userinfo trick reads as
+     `myprofile.tirbeo.com` to a human and to a naive `startsWith` check while
+     `URL.hostname` says otherwise, and the label-appendage cases defeat a match
+     that forgets the dot. */
+  it('refuses a target that only spells itself as Tirbeo', () => {
+    const refused = [
+      'https://myprofile.tirbeo.com@evil.example/',
+      'https://tirbeo.com@evil.example/settings',
+      'https://evil.example/?next=https://myprofile.tirbeo.com',
+      'https://evil.example#https://myprofile.tirbeo.com',
+      'https://tirbeo.com.evil.example/',
+      'https://tirbeo.com.evil.example/myprofile.tirbeo.com',
+      'https://evil-tirbeo.com/',
+      'https://myprofiletirbeo.com/',
+      'https://tirbeo.co/settings',
+      'https://tirbeo.comx/',
+      'evil.example',
+      '//evil.example/',
+      '\\\\evil.example\\',
+      'javascript:alert(1)//tirbeo.com',
+      'data:text/html,https://tirbeo.com',
+      'http://myprofile.tirbeo.com/settings',
+    ];
+    for (const target of refused) {
+      expect(normalizeOAuthRedirect(target), target).toBeUndefined();
+    }
+  });
+
+  it('does not let an evil target ride inside a Tirbeo handoff URL', () => {
+    const nested = encodeURIComponent('https://evil.example/steal');
+    expect(normalizeOAuthRedirect(`https://accounts.tirbeo.com/oauth-complete?redirect_to=${nested}`))
+      .toBeUndefined();
+    // Same trick one level down, on a real app origin that is not a handoff
+    // screen: the outer URL is the destination, and its query is data.
+    expect(normalizeOAuthRedirect(`https://myprofile.tirbeo.com/settings?back=${nested}`))
+      .toBe('https://myprofile.tirbeo.com/settings?back=https%3A%2F%2Fevil.example%2Fsteal');
+  });
+
+  it('keeps the legitimate spellings, including case and a deep path', () => {
+    expect(normalizeOAuthRedirect('https://MYPROFILE.TIRBEO.COM/settings'))
+      .toBe('https://MYPROFILE.TIRBEO.COM/settings');
+    expect(normalizeOAuthRedirect('https://admin.tirbeo.com/dash/users?tab=staff'))
+      .toBe('https://admin.tirbeo.com/dash/users?tab=staff');
+  });
 });

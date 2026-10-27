@@ -3,6 +3,7 @@ import { prisma } from '@/infrastructure/db/prisma';
 import { ensureRefCode } from '@/features/users/refcode';
 import { cachedUserStatus, forgetUserStatus } from '@/features/auth/user-status-cache';
 import { activeDeletionFor, liveRestrictionRow, type RestrictionRow } from '@/features/status/accountLifecycle';
+import { clientIpOrUnknown } from '@/shared/client-ip';
 
 /* ═══════════════════════════════════════════════════════════════════
    The single source of truth about a closed account.
@@ -161,8 +162,7 @@ export async function blockedAccountResponse(
   if (request) {
     try {
       const { createSession, setSessionCookie } = await import('@/features/auth/session');
-      const ip = (request.headers.get('x-forwarded-for') || '').split(',')[0].trim()
-        || request.headers.get('x-real-ip') || 'unknown';
+      const ip = clientIpOrUnknown(request.headers);
       const userAgent = request.headers.get('user-agent') || undefined;
       const { token, refreshToken, saveLoginInfo } = await createSession(
         user.id, userAgent, ip, user.isAdmin ? 'admin' : undefined,
@@ -195,7 +195,17 @@ export async function blockedAccountResponse(
  *  feeds the settings screen, the appeal, a message to support, and signing
  *  out. A shut-out is precisely when the message is needed, so being closed
  *  never closes the door that asks about the closure. */
-const CLOSED_ACCOUNT_DOORS = ['/api/user/account-state', '/api/support/appeal', '/api/support/request'];
+const CLOSED_ACCOUNT_DOORS = [
+  '/api/user/account-state',
+  '/api/support/appeal',
+  '/api/support/request',
+  // A closed account still has to be able to read the answer and ask about it —
+  // being shut out is exactly when the thread matters, and a thread the account
+  // cannot open is a decision nobody can question.
+  '/api/support/thread',
+  '/api/support/thread/reply',
+  '/api/support/thread/close',
+];
 
 /** A pause and a scheduled deletion are the person's own doing, so the session
  *  stays read-only and keeps the one write that undoes it. A ban, a suspension

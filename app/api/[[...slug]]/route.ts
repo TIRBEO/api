@@ -1,11 +1,12 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma, isDbHealthy, dbErrorResponse } from '@/infrastructure/db/prisma';
-import { getSession, requireSession, isSessionUnavailable } from '@/features/auth/http-guards';
+import { getSession, holdsPermission, requireSession, isSessionUnavailable } from '@/features/auth/http-guards';
 import { withRequestOrigin } from '@/infrastructure/observability/requestContext';
 import { jsonError, jsonForbidden, jsonSessionUnavailable, addCorsToResponse } from '@/shared/response';
 import { isPublicApiDoor } from '@/features/auth/publicDoors';
 import { checkRateLimitWithInfo, ROUTE_LIMITS, type RateLimitResult } from '@/features/auth/rate-limit';
 import { systemFaultRef } from '@/features/users/refcode';
+import { clientIpOrUnknown } from '@/shared/client-ip';
 
 import {
   loginHandler,
@@ -153,6 +154,8 @@ import { getAccountsBaseUrl, getDashboardBaseUrl, getFormsBaseUrl, getSupportBas
 import { accountChecksHandler } from '@/features/status/accountChecks';
 import { appealFileHandler, appealsListHandler } from '@/features/support/appeals';
 import { supportRequestHandler } from '@/features/support/requests';
+import { supportThreadCloseHandler, supportThreadGetHandler, supportThreadReplyHandler } from '@/features/support/threads';
+import { clampLimit, clampOffset } from '@/shared/limit';
 
 const appUrl = (subdomain: string, path: string) => {
   const base = (() => {
@@ -259,7 +262,7 @@ const INTERNAL_ROUTES = [
     'debug/rate-limits/reset',
   // Support
   'support/tickets', 'support/tickets/create',  'support/tickets/appeals', 'support/appeal',
-  'support/request',
+  'support/request', 'support/thread', 'support/thread/reply', 'support/thread/close',
 
 
 ];
@@ -452,7 +455,10 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'support/tickets/create': ['POST'],
       'support/appeal': ['POST'],
       'support/tickets/appeals': ['GET'],
-      'support/request': ['POST'] };
+      'support/request': ['POST'],
+      'support/thread': ['GET'],
+      'support/thread/reply': ['POST'],
+      'support/thread/close': ['POST'] };
     const allowed = methodMap[pathPart];
     if (allowed && allowed.includes(method.toUpperCase())) {
       return { path: pathPart, method, internal: true, allowedRoles: ['guest'] };
@@ -493,8 +499,7 @@ async function handler(request: NextRequest, slug: string[], method: string) {
 }
 
 async function dispatch(request: NextRequest, slug: string[], method: string) {
-  const rawIp = request.headers.get('x-forwarded-for') || '';
-  const ip = rawIp.split(',')[0].trim();
+  const ip = clientIpOrUnknown(request.headers);
   const authHeader = request.headers.get('authorization') || '';
   const pathStr = slug.join('/');
   let session: any = null;
@@ -965,12 +970,13 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         if (emSession instanceof NextResponse) { resp = emSession; break; }
         const { prisma: emPrisma } = await import('@/infrastructure/db/prisma');
         const emUrl = new URL(request.url);
-        const emLimit = Math.min(parseInt(emUrl.searchParams.get('limit') || '50', 10), 200);
-        const emOffset = parseInt(emUrl.searchParams.get('offset') || '0', 10);
-        const emUser = await emPrisma.user.findUnique({ where: { id: emSession.userId }, select: { isAdmin: true } });
-        // User.email/role are gone — admins see every job, everyone else only
-        // their own email jobs (userId covers all of a user's addresses).
-        const emWhere: any = emUser?.isAdmin ? {} : { userId: emSession.userId };
+        const emLimit = clampLimit(emUrl.searchParams.get('limit'), { fallback: 50, max: 200 });
+        const emOffset = clampOffset(emUrl.searchParams.get('offset'));
+        // The whole queue only for a role that holds `email.read` — `isAdmin`
+        // says somebody is staff, not which kind. Everyone else sees their own
+        // jobs (userId covers all of a user's addresses).
+        const emSeesAll = await holdsPermission(request, 'email.read');
+        const emWhere: any = emSeesAll ? {} : { userId: emSession.userId };
         const [emItems, emTotal] = await Promise.all([
           emPrisma.email_jobs.findMany({ where: emWhere, orderBy: { createdAt: 'desc' }, take: emLimit, skip: emOffset }),
           emPrisma.email_jobs.count({ where: emWhere }),
@@ -1143,6 +1149,15 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       case 'support/request':
         resp = await supportRequestHandler(request);
+        break;
+      case 'support/thread':
+        resp = await supportThreadGetHandler(request);
+        break;
+      case 'support/thread/reply':
+        resp = await supportThreadReplyHandler(request);
+        break;
+      case 'support/thread/close':
+        resp = await supportThreadCloseHandler(request);
         break;
       case 'health':
         resp = await publicHealthHandler();

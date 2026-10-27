@@ -3,12 +3,21 @@ import { generateAuthenticationOptions, verifyAuthenticationResponse } from '@si
 import type { AuthenticationResponseJSON, AuthenticatorTransport } from '@simplewebauthn/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { storeChallenge, getAndConsumeChallenge } from '@/features/auth/passkeys/challenge-store';
+import { consumeGenericWindow } from '@/features/auth/verify-limits';
 import { getAppDomain } from '@/config/app-urls';
 import { createSession, setSessionCookie } from '@/features/auth/session';
 import { logSecurityEvent } from '@/features/security/security';
 import { createAuditEvent } from '@/features/security/audit';
+import { clientIpOrUnknown } from '@/shared/client-ip';
 
 export const runtime = 'nodejs';
+
+/* Ceilings on the anonymous passkey-options call. A staff passkey login is
+   entered a handful of times a day by real people, so these are wide enough to
+   never be felt and narrow enough that the endpoint cannot be walked. */
+const PASSKEY_OPTIONS_WINDOW_MS = 15 * 60 * 1000;
+const PASSKEY_OPTIONS_PER_ADDRESS = 10;
+const PASSKEY_OPTIONS_PER_IP = 30;
 
 /* ── rpID / origin resolution — mirrors apps/api/app/api/auth/passkey/* ── */
 function getRpID(req: NextRequest): string {
@@ -35,35 +44,34 @@ function getOrigin(req: NextRequest): string {
 /**
  * POST /api/admin/passkey/options
  * Body: { email?: string }
- * Returns WebAuthn authentication options scoped to the email's passkeys
- * (or discoverable credentials when no email given), plus a challenge nonce.
+ * Returns WebAuthn authentication options plus a challenge nonce.
+ *
+ * The response is deliberately identical whatever the caller types. Scoping
+ * `allowCredentials` to an address used to answer "does this staff mailbox
+ * exist, and which passkeys hangs off it" to anyone with a curl — and the
+ * verifier never needed the list: it looks the credential up by the id the
+ * authenticator returns. So `email` is accepted and ignored, and unauthenticated
+ * traffic is capped per address and per device.
  */
 export async function adminPasskeyOptionsHandler(req: NextRequest) {
   try {
     const body = (await req.json().catch(() => ({}))) as { email?: string };
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
 
-    let allowCredentials: { id: string; transports?: AuthenticatorTransport[] }[] = [];
     if (email) {
-      const user = await prisma.user.findUnique({
-        where: { email },
-        select: { id: true },
-      });
-      if (user) {
-        const passkeys = await prisma.passkey.findMany({
-          where: { userId: user.id },
-          select: { credentialId: true, transports: true },
-        });
-        allowCredentials = passkeys.map((pk) => ({
-          id: pk.credentialId,
-          transports: pk.transports ? (pk.transports.split(',') as AuthenticatorTransport[]) : undefined,
-        }));
+      const ip = clientIpOrUnknown(req.headers);
+      const [byAddress, byIp] = await Promise.all([
+        consumeGenericWindow(`passkey-options:email:${email}`, PASSKEY_OPTIONS_PER_ADDRESS, PASSKEY_OPTIONS_WINDOW_MS),
+        consumeGenericWindow(`passkey-options:ip:${ip}`, PASSKEY_OPTIONS_PER_IP, PASSKEY_OPTIONS_WINDOW_MS),
+      ]);
+      if (!byAddress.ok || !byIp.ok) {
+        return NextResponse.json({ error: 'Too many tries. Wait a minute and try again.' }, { status: 429 });
       }
     }
 
     const options = await generateAuthenticationOptions({
       rpID: getRpID(req),
-      allowCredentials: allowCredentials.length > 0 ? allowCredentials : undefined,
+      allowCredentials: undefined,
       userVerification: 'preferred',
     });
 
@@ -144,7 +152,7 @@ export async function adminPasskeyVerifyHandler(req: NextRequest) {
     });
 
     const userAgent = req.headers.get('user-agent') || '';
-    const ip = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'unknown';
+    const ip = clientIpOrUnknown(req.headers);
     const { token } = await createSession(passkey.userId, userAgent, ip);
 
     logSecurityEvent({

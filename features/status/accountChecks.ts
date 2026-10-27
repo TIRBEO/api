@@ -137,6 +137,33 @@ export async function buildAccountChecks(userId: string): Promise<AccountChecks>
       ask: '',
     });
   }
+  /* A sanction that was lifted is a decision the account lived under, and the
+     mail saying it ended quotes a reason. The account's own screen repeats it:
+     which decision, when it ended, and the admin's words — the same sentence, so
+     the mail and the profile cannot drift into describing two different lifts.
+     Read only while the account is open; while a closure stands, the item above
+     is the one in force and a lift line under it would read as a second opinion. */
+  if (accountStatus === 'active') {
+    const lift = await prisma.userStatusEvent.findFirst({
+      where: { userId, toStatus: 'active' as any, actor: 'admin' },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true, reason: true, metadata: true },
+    }).catch(() => null);
+    if (lift) {
+      const kind = (lift.metadata as Record<string, any> | null)?.liftedFrom;
+      standingItems.push({
+        id: `standing-lifted-${lift.createdAt.getTime()}`,
+        title: kind === 'banned' ? 'The ban on the account was lifted'
+          : kind === 'suspended' ? 'The suspension on the account was lifted'
+            : 'An admin restored the account',
+        sub: `Reason kept on the decision: ${lift.reason}.`,
+        guideline: 'Account status — lifted by an admin',
+        at: iso(lift.createdAt),
+        appealable: false,
+        ask: '',
+      });
+    }
+  }
   if (status.level > 0) {
     standingItems.push({
       id: 'standing-level',

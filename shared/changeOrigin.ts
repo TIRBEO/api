@@ -1,3 +1,4 @@
+import { clientIp } from '@/shared/client-ip';
 import {
   cleanCityName,
   cleanCountryCode,
@@ -29,27 +30,19 @@ export type ChangeOrigin = {
 
 export const NO_ORIGIN: ChangeOrigin = { ip: null, userAgent: null, location: null, coords: null };
 
-/** The client address, not any proxy behind it in the chain. */
-export function firstForwardedFor(headers: HeaderLike): string | null {
-  return (headers.get('x-forwarded-for') || '').split(',')[0].trim() || null;
-}
-
 /**
  * The address the hop itself was taken from.
  *
- * An edge in front of this service names the visitor in `x-forwarded-for`;
- * Cloudflare also names it in `cf-connecting-ip` and plain proxies use
- * `x-real-ip`. A tunnel that attaches none of them (a dev server reached on a
- * bare address) leaves this null — and null is kept: an unknown address is
- * recorded as unknown, never as whatever machine happened to relay the call.
+ * Cloudflare names the visitor in `cf-connecting-ip`, plain proxies in
+ * `x-real-ip`, and both are rewritten by the edge rather than passed through —
+ * so `clientIp` asks them first and only then falls back to the
+ * `x-forwarded-for` chain, which is the caller's own claim. A tunnel that
+ * attaches none of them (a dev server reached on a bare address) leaves this
+ * null — and null is kept: an unknown address is recorded as unknown, never as
+ * whatever machine happened to relay the call.
  */
 export function hopClientIp(headers: HeaderLike): string | null {
-  return (
-    firstForwardedFor(headers) ||
-    headers.get('cf-connecting-ip')?.trim() ||
-    headers.get('x-real-ip')?.trim() ||
-    null
-  );
+  return clientIp(headers);
 }
 
 /** The browser's own request: the edge headers and the client's UA are all here. */

@@ -3,6 +3,7 @@ import { requirePermission, type StaffSession } from '@/features/auth/http-guard
 import { jsonTooManyRequests } from '@/shared/response';
 import { checkRateLimit } from '@/features/auth/rate-limit';
 import type { Permission } from '@/features/auth/roles';
+import { clientIpOrUnknown } from '@/shared/client-ip';
 
 /**
  * The wrapper form of `requirePermission`, for a route that reads better with
@@ -39,9 +40,7 @@ export function withPermission(
     if (session instanceof NextResponse) return session;
 
     if (!options.skipRateLimit) {
-      const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-        || request.headers.get('x-real-ip')
-        || 'unknown';
+      const ip = clientIpOrUnknown(request.headers);
       const allowed = await checkRateLimit(
         `${ip}:${request.nextUrl.pathname}`,
         true,

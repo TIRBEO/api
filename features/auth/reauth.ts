@@ -4,7 +4,7 @@ import { verifyReauthToken } from '@/features/auth/jwt';
 import { verifyPassword } from '@/features/auth/password';
 import { verifyTotp } from '@/features/auth/totp';
 import { checkWindowLimitDB } from '@/features/captcha/risk';
-import { isRequire2FA, secondFactorBlocker } from '@/features/auth/second-factor';
+import { consumeBackupCode, isRequire2FA, secondFactorBlocker } from '@/features/auth/second-factor';
 import { getSession } from '@/features/auth/http-guards';
 import { consumeReauthCode, issueReauthCode, signInEmailOf } from '@/features/auth/reauthCode';
 import { OTP_TTL_MINUTES } from '@/features/status/accountLifecycle';
@@ -322,6 +322,24 @@ async function checkProof(
     (typeof body?.code === 'string' && body.code) ||
     request.nextUrl?.searchParams.get('code') ||
     undefined;
+  /* A backup code is the same door as the app — one of the eight codes minted
+     at setup, spent by being used. With the policy ON it is a chain link and
+     `secondFactorBlocker` takes it below; with the policy OFF it has to be
+     honored here, or a sheet that offered it as an alternative to an app code
+     would take a refusal and reopen itself. */
+  const backupCode = typeof body?.backupCode === 'string' ? body.backupCode : '';
+  if (!totpCode && backupCode && opts.allowTotp !== false && !(await isRequire2FA(sessionUserId))) {
+    if (await consumeBackupCode(sessionUserId, backupCode)) {
+      logReauthProof(request, sessionUserId, 'verified', 'totp');
+      return { ok: true, method: 'totp', body };
+    }
+    logReauthProof(request, sessionUserId, 'failed', 'totp', 'invalid_backup_code');
+    return {
+      ok: false,
+      response: NextResponse.json({ error: 'INVALID_CODE', requires2FA: true, message: 'That backup code is wrong or has been used.' }, { status: 400 }),
+    };
+  }
+
   if (totpCode && opts.allowTotp !== false && !(await isRequire2FA(sessionUserId))) {
     if (typeof totpCode !== 'string' || totpCode.length !== 6) {
       return {

@@ -1,5 +1,6 @@
  
 import * as otplib from 'otplib';
+import { decryptSecret } from '@/features/auth/secret-box';
 
 const { generateSecret: otpGenerateSecret, generateURI, verify } = otplib as any;
 
@@ -16,7 +17,20 @@ export async function verifyTotp(token: string, secret: string): Promise<boolean
   // apps commonly run on devices with a few seconds of clock skew, and users
   // often scan/enter codes right at the window boundary; requiring the exact
   // current step alone causes intermittent 400 "Invalid code" failures.
-  const result = await verify({ secret, token, epochTolerance: 30 });
+  //
+  // `secret` is whatever the row holds — a sealed value since the fleet started
+  // encrypting two-factor secrets at rest, bare base32 for rows written before
+  // that. Opening it here, at the one place a secret is used, means no caller can
+  // forget to: a check that "verified" a ciphertext would silently fail 2FA for
+  // everybody.
+  let plain: string;
+  try {
+    plain = decryptSecret(secret);
+  } catch (err: any) {
+    console.error('[TOTP] Secret could not be opened:', err?.message || err);
+    return false;
+  }
+  const result = await verify({ secret: plain, token, epochTolerance: 30 });
   return result.valid === true;
 }
 

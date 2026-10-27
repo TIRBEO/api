@@ -159,18 +159,23 @@ async function requireOwnerActor(actorId: string): Promise<void> {
   if (!canGrantRole(actor)) throw new StaffGuardError('Only an owner can change the staff roster', 403);
 }
 
-const countOwners = () => prisma.staffRole.count({ where: { role: 'owner' } });
-const countStaff = () => prisma.user.count({ where: { isAdmin: true } });
+/** Every roster mutation takes this lock for the length of its transaction.
+    The owner and staff floors are decided by *counting*, and a count taken
+    before the write is a fact about a moment that has already passed: two
+    owners revoking each other each counted two, each saw the floor satisfied,
+    and together they emptied the roster — which is the one state the floor
+    exists to prevent, because a platform with no owner cannot appoint one
+    again. The lock makes the second mutation wait for the first to commit and
+    count what it left behind. */
+const ROSTER_LOCK = "SELECT pg_advisory_xact_lock(hashtext('staff-roster'))";
 
 /**
  * Make an account staff of a given kind, or change which kind it is.
  *
  * The two refusals are the reason this is a service and not an `upsert` at the
  * call site: a platform with no owner cannot appoint one, and removing the
- * last owner does that by accident. Both are decided against the counts as
- * they are immediately before the write, in the same transaction path, so two
- * owners revoking each other cannot both pass a check that was true for only
- * one of them.
+ * last owner does that by accident. Both are decided on the counts taken inside
+ * the locked transaction, immediately before the write they guard.
  */
 export async function grantStaffRole(opts: {
   userId: string;
@@ -188,11 +193,15 @@ export async function grantStaffRole(opts: {
   if (!target) throw new StaffGuardError('No such account', 404);
 
   const wasOwner = target.staffRole?.role === 'owner';
-  if (wasOwner && role !== 'owner' && (await countOwners()) <= 1) {
-    throw new StaffGuardError('This is the last owner. Appoint another before changing this one.', 409);
-  }
 
-  await prisma.$transaction(async (tx) => {
+  await prisma.$transaction(async (tx: any) => {
+    await tx.$executeRaw(ROSTER_LOCK);
+    if (wasOwner && role !== 'owner') {
+      const owners = await tx.staffRole.count({ where: { role: 'owner' } });
+      if (owners <= 1) {
+        throw new StaffGuardError('This is the last owner. Appoint another before changing this one.', 409);
+      }
+    }
     await tx.user.update({ where: { id: userId }, data: { isAdmin: true } });
     await tx.staffRole.upsert({
       where: { userId },
@@ -222,16 +231,21 @@ export async function revokeStaffRole(opts: { userId: string; actorId: string })
   if (!target) throw new StaffGuardError('No such account', 404);
   if (!target.isAdmin && !target.staffRole) return;
 
-  if (target.staffRole?.role === 'owner' && (await countOwners()) <= 1) {
-    throw new StaffGuardError('This is the last owner. Appoint another before removing this one.', 409);
-  }
-  if ((await countStaff()) <= 1) {
-    throw new StaffGuardError('The last staff account cannot be removed.', 409);
-  }
-
-  await prisma.$transaction([
-    prisma.staffRole.deleteMany({ where: { userId } }),
-    prisma.user.update({ where: { id: userId }, data: { isAdmin: false } })]);
+  await prisma.$transaction(async (tx: any) => {
+    await tx.$executeRaw(ROSTER_LOCK);
+    const [owners, staff] = await Promise.all([
+      tx.staffRole.count({ where: { role: 'owner' } }),
+      tx.user.count({ where: { isAdmin: true } }),
+    ]);
+    if (target.staffRole?.role === 'owner' && owners <= 1) {
+      throw new StaffGuardError('This is the last owner. Appoint another before removing this one.', 409);
+    }
+    if (staff <= 1) {
+      throw new StaffGuardError('The last staff account cannot be removed.', 409);
+    }
+    await tx.staffRole.deleteMany({ where: { userId } });
+    await tx.user.update({ where: { id: userId }, data: { isAdmin: false } });
+  });
 
   await createAuditEvent({
     actorId,

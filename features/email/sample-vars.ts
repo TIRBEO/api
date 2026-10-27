@@ -89,6 +89,11 @@ const PLAIN_VALUES: Record<string, string> = {
   statusType: 'suspended for 7 days',
   suspendedUntil: '3 Mar 2026, 09:00 UTC',
   suspendedNextStep: 'You cannot sign in or use Tirbeo services until then',
+  // …and the same decision ending: which sanction, when it stopped, what it
+  // means for the reader now.
+  kindWord: 'suspension',
+  liftedAt: '3 Mar 2026, 09:00 UTC',
+  liftedNextStep: 'You can sign in again now',
   dateLabel: '28 Feb 2026',
   exportedAt: '28 Feb 2026, 16:00 UTC',
   changedAt: '28 Feb 2026, 13:58 UTC',
@@ -121,7 +126,9 @@ const PLAIN_VALUES: Record<string, string> = {
   contact: 'john@example.com',
   account: 'johndoe@tirbeo.com',
   origin: '203.0.113.9 · Berlin, Germany',
-  replyHref: 'https://admin.tirbeo.com/admin/tickets/a1b2-c3d4-e5f6-7a8b',
+  replyHref: 'https://admin.tirbeo.com/admin/overview/support/a1b2-c3d4-e5f6-7a8b',
+  // The account's own side of the same thread — the button in the answer mail.
+  threadUrl: 'https://myprofile.tirbeo.com/support/thread/a1b2-c3d4-e5f6-7a8b',
   replyLabel: 'Answer in the admin panel',
   replyHtml: `<p style="margin:0 0 12px;font-size:15px;line-height:25px;color:${TEXT_2}">We found the session you asked about — it was you, on a phone, in Kathmandu. Nothing was changed on the account, and we have left it signed in.</p>`
     + `<p style="margin:0;font-size:15px;line-height:25px;color:${TEXT_2}">If that was not you, turn on two-step verification and end the other sessions from the security screen.</p>`,

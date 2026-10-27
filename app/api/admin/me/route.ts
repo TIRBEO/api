@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { getSessionOrResponse } from '@/features/auth/http-guards';
 import { isRoleKey, LEGACY_ROLE, ROLES, resolveStaff } from '@/features/auth/roles';
+import { readAppearance } from '@/features/admin/preferences';
 
 /* GET /api/admin/me — who is holding the console, and what they may open.
  *
- * The console gates its whole layout on this answer, so it carries three things
+ * The console gates its whole layout on this answer, so it carries four things
  * and not one: the identity (a name to greet and an id to attribute writes to),
  * the role as a *label* rather than a rank string to compare, and the resolved
  * permission set the rail is drawn from. A screen that inferred its own rights
@@ -45,5 +46,9 @@ export async function GET(request: NextRequest) {
       assigned: staff.staff.assigned },
     permissions: staff.permissions,
     canManageStaff: role === 'owner',
+    // The console's own look, off the account rather than off this browser. It
+    // is the truth; the copy in localStorage is what paints before this answer
+    // arrives, and is replaced by it the moment it does.
+    appearance: await readAppearance(session.userId),
   }, { headers: { 'Cache-Control': 'private, no-store' } });
 }

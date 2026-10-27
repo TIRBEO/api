@@ -84,6 +84,9 @@ const db: any = {
     }),
   },
   $transaction: vi.fn(async (arg: any) => (Array.isArray(arg) ? Promise.all(arg) : arg(db))),
+  // The roster lock is a real advisory lock in Postgres; here it is the call
+  // that must exist for the mutation path to run.
+  $executeRaw: vi.fn(async () => 1),
 };
 
   return { state, db };

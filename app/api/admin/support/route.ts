@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/infrastructure/db/prisma';
 import { withPermission } from '@/features/auth/permission-guard';
 import { eventRowRef } from '@/features/users/refcode';
+import { THREAD_KINDS, threadStatusOf } from '@/features/support/threads';
 
 /* ═══════════════════════════════════════════════════════════════════
    GET /api/admin/support — the helpdesk queue, read from the ledger
@@ -15,9 +16,12 @@ import { eventRowRef } from '@/features/users/refcode';
    A thread is open until a `support.reply` carries its code. That is a fact
    about the ledger, not a flag somebody has to remember to set, so a reply sent
    from the mail pipeline closes the queue row on its own.
-   ═══════════════════════════════════════════════════════════════════ */
 
-const THREAD_KINDS = ['support.request', 'support.reply'];
+   The kinds and the status rule come from the account side of the thread
+   (`features/support/threads`), not from a list kept here. A follow-up the
+   console could not see, or a status the two screens derive differently, is
+   exactly the bug a shared constant prevents.
+   ═══════════════════════════════════════════════════════════════════ */
 
 /** How far back the queue looks. Threads are assembled in one pass, so this is
     the window the page is honest about — a queue that quietly truncated at 300
@@ -113,13 +117,16 @@ export const GET = withPermission('tickets.read', async (request) => {
       const replies = sorted.filter((r) => r.kind === 'support.reply');
       const last = sorted[sorted.length - 1];
       const meta = (asked.metadata || {}) as Record<string, any>;
+      const status = threadStatusOf(sorted);
       return {
         ref,
         subject: asked.title,
         message: text(asked),
-        status: replies.length ? 'answered' : 'open',
+        status: status.status,
+        waitingOn: status.waitingOn,
         askedAt: asked.createdAt.toISOString(),
         answeredAt: replies.length ? replies[replies.length - 1].createdAt.toISOString() : null,
+        closedAt: sorted.filter((r) => r.kind === 'support.closed').pop()?.createdAt.toISOString() ?? null,
         lastAt: last.createdAt.toISOString(),
         replies: replies.length,
         account: account(asked),
@@ -130,7 +137,10 @@ export const GET = withPermission('tickets.read', async (request) => {
       };
     });
 
-    const filtered = (status === 'open' || status === 'answered'
+    /* `open` and `answered` are what the ledger says now, not what it said when
+       the question was first filed — an account that wrote back moves its own
+       row out of "answered" and back into the team's column. */
+    const filtered = (status === 'open' || status === 'answered' || status === 'closed'
       ? items.filter((t) => t.status === status)
       : items).sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
 
@@ -139,6 +149,7 @@ export const GET = withPermission('tickets.read', async (request) => {
       total: filtered.length,
       open: items.filter((t) => t.status === 'open').length,
       answered: items.filter((t) => t.status === 'answered').length,
+      closed: items.filter((t) => t.status === 'closed').length,
       window: rows.length,
     }, { headers: { 'Cache-Control': 'private, no-store' } });
   } catch (err: any) {
