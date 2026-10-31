@@ -28,6 +28,6 @@ export async function POST(request: NextRequest) {
   }
 
   const result = await runSingleJobIfDue(job as JobName);
-  console.log(`[CRON/RUN] ${job} → ${result.ran ? (result.error ? `error: ${result.error}` : `ok (${Math.round(result.duration ?? 0)}ms)`) : 'not due / already running'}`);
+  console.log(`[CRON/RUN] ${job} → ${JSON.stringify(result).slice(0, 120)}`);
   return NextResponse.json({ job, ...result });
 }
