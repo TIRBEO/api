@@ -542,7 +542,7 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   // busy request stream does not turn a daily job check into a pool contest.
   if (process.env.VERCEL && pathStr !== 'cron') {
     import('@/jobs/job-gate').then(({ runDueJobsFromRequest }) => {
-      runDueJobsFromRequest().catch(() => {});
+      if (!pathStr.startsWith("cron/") && !pathStr.startsWith("queue/")) runDueJobsFromRequest().catch(() => {});
     }).catch(() => {});
   }
 
