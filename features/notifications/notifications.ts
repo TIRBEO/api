@@ -264,6 +264,26 @@ export async function createNotification(input: CreateNotifInput) {
     if (quiet) return notif;
   }
 
+  // Cloudflare Queues path: when configured, the slow legs (push + mail) leave
+  // this request entirely — a signed envelope drains through /api/queue/drain.
+  // The decision made above (prefs, quiet hours, rate limit) is stamped into
+  // row metadata so redelivery never re-litigates it. Unset env → inline, as
+  // always, for dev and self-hosted installs.
+  {
+    const { enqueueWork } = await import('@/shared/queue-client');
+    const queued = await enqueueWork('notify', 'deliver', {
+      notificationId: notif.id,
+      channels: { push: effectivePushOn, email: effectiveEmailOn && category !== 'product' },
+    });
+    if (queued) {
+      prisma.notification.update({
+        where: { id: notif.id },
+        data: { metadata: { ...(input.metadata ?? {}), __q: { push: effectivePushOn, email: effectiveEmailOn && category !== 'product' } } } as any,
+      }).catch(() => {});
+      return notif;
+    }
+  }
+
   // Push/email are best-effort and must NOT block the in-app response — fire-and-forget for per-user speed
   // All external channels are strictly single-recipient (targetUserId only).
   if (effectivePushOn) {

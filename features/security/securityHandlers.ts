@@ -220,8 +220,8 @@ export async function totpSetupHandler(request: NextRequest) {
     // database a copy of every customer's authenticator app.
     await prisma.userSecurity.upsert({
       where: { userId: session.userId },
-      create: { userId: session.userId, totpSecret: encryptSecret(secret) },
-      update: { totpSecret: encryptSecret(secret) } });
+      create: { userId: session.userId, totpSecret: await encryptSecret(secret) },
+      update: { totpSecret: await encryptSecret(secret) } });
     return NextResponse.json({ uri });
   } catch (err: any) {
     console.error('[TOTP SETUP]', err?.message || err);
@@ -268,7 +268,7 @@ export async function totpVerifyHandler(request: NextRequest) {
     // plaintext one by accident.
     await prisma.userSecurity.upsert({
       where: { userId: session.userId },
-      create: { userId: session.userId, totpSecret: encryptSecret(secretToVerify), totpEnabled: true, backupCodes: backupCodesJson as any },
+      create: { userId: session.userId, totpSecret: await encryptSecret(secretToVerify), totpEnabled: true, backupCodes: backupCodesJson as any },
       update: { totpEnabled: true, backupCodes: backupCodesJson as any } });
     bustProfileCache(session.userId); // profile cache holds is2FAEnabled — refresh it
     // Secondary effects must never turn a successful enable into a 500 (e.g. a

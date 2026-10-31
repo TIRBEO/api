@@ -43,3 +43,33 @@ export const ESSENTIAL_TEMPLATES = new Set([
   'support_reply',
   'support_request_admin',
 ]);
+
+/**
+ * Which provider sends which mail.
+ *
+ * The split follows what each service's reputation is for: Brevo carries the
+ * marketing/digest family (product news, digests, recaps, tips, reactivation,
+ * maintenance) where an unsubscribe link and a bulk-sending domain belong —
+ * updates.tirbeo.com is authenticated and branded there. Resend keeps every
+ * essential/auth delivery (OTPs, resets, magic links, security alerts, support
+ * replies), because a one-time code must never share sending history with a
+ * promotional blast. Anything unknown stays on Resend: it is the path that has
+ * always worked, and a misclassified digest is a annoyance while a misclassified
+ * OTP is a failed login.
+ */
+export const BREVO_TEMPLATES = new Set([
+  'product_update',
+  'notification_digest',
+  'weekly_summary',
+  'security_tip',
+  'reactivation',
+  'maintenance_notification',
+  'maintenance_complete',
+]);
+
+/** True when this template should go out through Brevo. */
+export function usesBrevo(templateName?: string): boolean {
+  if (!templateName || templateName.startsWith('brain:')) return false;
+  if ((ESSENTIAL_TEMPLATES as Set<string>).has(templateName)) return false;
+  return BREVO_TEMPLATES.has(templateName);
+}

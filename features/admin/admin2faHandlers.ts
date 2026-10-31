@@ -23,8 +23,8 @@ export async function setup2faHandler(request: NextRequest) {
 
   await prisma.userSecurity.upsert({
     where: { userId: session.userId },
-    create: { userId: session.userId, totpSecret: encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
-    update: { totpSecret: encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+    create: { userId: session.userId, totpSecret: await encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
+    update: { totpSecret: await encryptSecret(secret), backupCodes: recoveryCodes.map(code => ({ code: hashRecoveryCode(code), used: false })) },
   });
 
   await createAuditEvent({

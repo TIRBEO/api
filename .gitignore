@@ -16,3 +16,12 @@ prisma/*backup*.sql
 !.env.scratch.example
 .vercel
 .next-scratch/
+
+# vinext/Workers spike artifacts
+.vinext/
+dist/
+.wrangler/
+agent/
+.claude/
+.agents/skills/
+skills-lock.json

@@ -17,6 +17,20 @@
 //   BEAMS_INSTANCE_ID / BEAMS_PRIMARY_KEY
 
 import crypto from 'crypto';
+import { hmac } from '@noble/hashes/hmac.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { md5 } from '@noble/hashes/legacy.js';
+
+const enc = new TextEncoder();
+const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
+/** HMAC-SHA256 hex — WebCrypto in Workers, node:crypto on the self-hosted box. */
+async function hmacHex(secret: string, data: string): Promise<string> {
+  if (typeof crypto.subtle !== 'undefined') {
+    const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return hex(new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(data))));
+  }
+  return hex(hmac(sha256, enc.encode(secret), enc.encode(data)));
+}
 
 // ─── Env helpers ────────────────────────────────────────────────────────────
 
@@ -53,28 +67,81 @@ export function isPusherConfigured(): boolean {
   return getPusherApps().length > 0;
 }
 
+// ─── Clock drift guard ─────────────────────────────────────────────────────
+/* Pusher rejects signatures whose auth_timestamp is >600 s from ITS clock. A
+   dev box with a skewed system clock fails every app in every region at once
+   — which looks like a code bug but is really "fix your time sync". Measure
+   the offset against one cluster's HTTP Date header (cached 5 min) and sign
+   with the corrected clock; the first failure also names the cause plainly. */
+
+let driftMs = 0;
+let driftMeasuredAt = 0;
+const DRIFT_TTL_MS = 5 * 60_000;
+let driftWarned = false;
+
+async function measureDrift(cluster: string): Promise<void> {
+  if (Date.now() - driftMeasuredAt < DRIFT_TTL_MS) return;
+  driftMeasuredAt = Date.now();
+  try {
+    const res = await fetch(`https://api-${cluster}.pusher.com/`, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
+    const server = res.headers.get('date');
+    if (server) {
+      const t = Date.parse(server);
+      if (!Number.isNaN(t)) driftMs = t - Date.now();
+    }
+  } catch {
+    /* keep the last known offset */
+  }
+  if (Math.abs(driftMs) > 60_000 && !driftWarned) {
+    driftWarned = true;
+    console.warn(`[PUSHER] local clock is ${(driftMs / 1000).toFixed(0)}s off Pusher's — signing with the corrected time. Fix OS time sync (systemd-timesyncd/chrony/NTP) to clear this.`);
+  }
+}
+
+function nowSeconds(): number {
+  return Math.floor((Date.now() + driftMs) / 1000);
+}
+
 // ─── Channels REST trigger (HMAC-SHA256 signed, no SDK dependency) ─────────
 
 /** Sign + POST to a Channels app's events endpoint. Returns true on 2xx. */
 async function triggerOnApp(app: PusherAppConfig, body: string): Promise<boolean> {
-  const md5 = crypto.createHash('md5').update(body).digest('hex');
-  const qs = new URLSearchParams({
-    auth_key: app.key,
-    auth_timestamp: String(Math.floor(Date.now() / 1000)),
-    auth_version: '1.0',
-    body_md5: md5,
-  }).toString();
-  const toSign = `POST\n/apps/${app.appId}/events\n${qs}`;
-  const sig = crypto.createHmac('sha256', app.secret).update(toSign).digest('hex');
-  const url = `https://api-${app.cluster}.pusher.com/apps/${app.appId}/events?${qs}&auth_signature=${sig}`;
-
-  try {
-    const res = await fetch(url, {
+  const send = async (): Promise<Response> => {
+    const md5hex = hex(md5(enc.encode(body)));
+    const qs = new URLSearchParams({
+      auth_key: app.key,
+      auth_timestamp: String(nowSeconds()),
+      auth_version: '1.0',
+      body_md5: md5hex,
+    }).toString();
+    const toSign = `POST\n/apps/${app.appId}/events\n${qs}`;
+    const sig = await hmacHex(app.secret, toSign);
+    const url = `https://api-${app.cluster}.pusher.com/apps/${app.appId}/events?${qs}&auth_signature=${sig}`;
+    return fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
       signal: AbortSignal.timeout(5000),
     });
+  };
+
+  try {
+    let res = await send();
+    if (res.status === 401) {
+      const text = await res.text();
+      // One re-measure + retry per call for the expired-timestamp signature;
+      // anything else surfaces as-is.
+      if (/Timestamp expired/i.test(text)) {
+        driftMeasuredAt = 0;
+        await measureDrift(app.cluster);
+        res = await send();
+        if (res.ok) return true;
+        console.warn(`[PUSHER] ${app.name} trigger failed after drift resync: ${res.status} ${(await res.text()).slice(0, 100)}`);
+        return false;
+      }
+      console.warn(`[PUSHER] ${app.name} trigger failed: ${res.status} ${text.slice(0, 100)}`);
+      return false;
+    }
     if (!res.ok) {
       console.warn(`[PUSHER] ${app.name} trigger failed: ${res.status} ${(await res.text()).slice(0, 100)}`);
       return false;
@@ -106,6 +173,7 @@ export async function pusherTrigger(
 ): Promise<PusherTriggerResult> {
   const apps = getPusherApps().filter((a) => !opts.regions || opts.regions.includes(a.name));
   if (apps.length === 0) return { ok: 0, failed: 0, total: 0 };
+  await measureDrift(apps[0].cluster);
 
   const body = JSON.stringify({
     name: event,
@@ -147,18 +215,18 @@ export async function pusherAnnounce(message: string): Promise<PusherTriggerResu
  * userData is IGNORED for private channels — including it there produces an
  * invalid signature (Pusher validates exactly `socket:channel` for them).
  */
-export function pusherAuthorizeChannel(
+export async function pusherAuthorizeChannel(
   socketId: string,
   channel: string,
   app: PusherAppConfig,
   userData?: Record<string, unknown>,
-): { auth: string; appKey: string } {
+): Promise<{ auth: string; appKey: string }> {
   const isPresence = channel.startsWith('presence-');
   let toSign = `${socketId}:${channel}`;
   if (isPresence && userData) {
     toSign += `:${JSON.stringify({ user_id: '', ...userData })}`;
   }
-  const sig = crypto.createHmac('sha256', app.secret).update(toSign).digest('hex');
+  const sig = await hmacHex(app.secret, toSign);
   return { auth: `${app.key}:${sig}`, appKey: app.key };
 }
 

@@ -687,7 +687,7 @@ export function sendToUser(userId: string, data: unknown) {
     }
   }
 
-  // Mirror into the realtime platform (wss://ws.tirbeo.com/ws) via shared Redis.
+  // Mirror into the realtime platform (wss://live.tirbeo.com/ws) via shared Redis.
   const evt = data && typeof data === 'object' ? (data as Record<string, unknown>) : { type: 'message', payload: data };
   publishToRealtime(
     { userId },
@@ -735,7 +735,7 @@ export function getWsChannelCounts(): Record<string, number> {
 /**
  * Deliver a realtime event to every client subscribed to a channel
  * (local protocol parity with the realtime platform), and mirror it into
- * wss://ws.tirbeo.com/ws via shared Redis.
+ * wss://live.tirbeo.com/ws via shared Redis.
  */
 export function sendToChannel(channel: string, data: unknown, excludeClientId?: string) {
   const set = channelSubs.get(channel);

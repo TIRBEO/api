@@ -8,14 +8,14 @@
     }
   ],
   "env": {
-    "NEXT_PUBLIC_API_URL": "https://api.tirbeo.com",
+    "NEXT_PUBLIC_API_URL": "https://tirbeo.com",
     "NEXT_PUBLIC_APP_DOMAIN": "tirbeo.com",
     "NEXT_PUBLIC_COOKIE_DOMAIN": "tirbeo.com",
     "APP_DOMAIN": "tirbeo.com",
-    "API_DOMAIN": "api.tirbeo.com",
+    "API_DOMAIN": "tirbeo.com",
     "PORT": "3000",
     "RT_API_TOKEN": "",
-    "RT_PUBLISH_URL": "https://ws.tirbeo.com/api/publish",
+    "RT_PUBLISH_URL": "https://tirbeo-realtime.rexux.workers.dev/api/publish",
     "VAPID_PUBLIC_KEY": "",
     "VAPID_PRIVATE_KEY": "",
     "VAPID_SUBJECT": "mailto:support@tirbeo.com",
@@ -34,6 +34,8 @@
     "PUSHER_APP_ID_AP4": "2194271",
     "PUSHER_KEY_AP4": "30d7c6e7fe9433069371",
     "PUSHER_CLUSTER_AP4": "ap4",
-    "BEAMS_INSTANCE_ID": "869b3b95-386f-4984-ae8c-9b9735966bc8"
+    "BEAMS_INSTANCE_ID": "869b3b95-386f-4984-ae8c-9b9735966bc8",
+    "BREVO_FROM_DOMAIN": "",
+    "CRON_SECRET": ""
   }
 }

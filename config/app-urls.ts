@@ -33,10 +33,14 @@ export function getAppDomain(): string {
   return prodSafeEnvUrl(process.env.NEXT_PUBLIC_APP_DOMAIN) || 'tirbeo.com';
 }
 
-/** API base URL */
+/** API base URL — one domain now: every app's own origin serves its /api/*.
+ *  NEXT_PUBLIC_API_URL still overrides (dev apps on :300x call the API on
+ *  :3000); api.tirbeo.com is kept alive as a redirect for old links. */
 export function getApiBaseUrl(): string {
   if (isLocalEnv()) return 'http://localhost:3000';
-  return prodSafeEnvUrl(process.env.NEXT_PUBLIC_API_URL) || `https://api.${getAppDomain()}`;
+  const explicit = prodSafeEnvUrl(process.env.NEXT_PUBLIC_API_URL);
+  if (explicit) return explicit.replace(/\/+$/, '');
+  return `https://${getAppDomain()}`;
 }
 
 /** Accounts app base URL (e.g. http://localhost:3002 in dev, https://accounts.tirbeo.com in prod). */
@@ -117,7 +121,7 @@ export function getCdnBaseUrl(): string {
 /** WebSocket server URL */
 export function getWsUrl(): string {
   if (isLocalEnv()) return 'ws://localhost:3001';
-  return `wss://ws.${getAppDomain()}`;
+  return `wss://live.${getAppDomain()}`;
 }
 
 /** WebSocket server full path */

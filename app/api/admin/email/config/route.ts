@@ -44,7 +44,7 @@ const NEVER_CONFIGURED = {
    is a legitimate postmark/SMTP gateway, and the operator who sets it is the same
    person who owns the network. */
 
-const PROVIDERS = new Set(['resend', 'smtp']);
+const PROVIDERS = new Set(['resend', 'smtp', 'brevo']);
 const LOOPBACK_AND_METADATA = /^(127\.|0\.0\.0\.0|\[?::1\]?|169\.254\.169\.254|metadata\.google\.internal$|localhost$|.*\.local$|.*\.internal$)/i;
 
 /** Bare hostname or IPv6 literal — no scheme, no credentials, no port suffix. */
@@ -59,7 +59,7 @@ function isBareHostname(raw: unknown): raw is string {
 
 function invalidSmtpField(body: any): string | null {
   const { provider, smtpHost, smtpPort } = body;
-  if (provider !== undefined && !PROVIDERS.has(String(provider))) return "provider must be 'resend' or 'smtp'";
+  if (provider !== undefined && !PROVIDERS.has(String(provider))) return "provider must be 'resend', 'smtp' or 'brevo'";
   if (smtpHost !== undefined && smtpHost !== null && smtpHost !== '') {
     if (!isBareHostname(smtpHost)) return 'smtpHost must be a bare hostname with no scheme, port, or credentials';
     if (LOOPBACK_AND_METADATA.test(String(smtpHost).trim())) return 'smtpHost must not be a loopback or cloud-metadata address';

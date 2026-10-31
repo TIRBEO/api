@@ -162,6 +162,56 @@ export async function runJobIfDue(
 }
 
 /**
+ * Every scheduled job's runner, keyed by its gate name. Exported so the
+ * single-job trigger (/api/cron/run — what the Cloudflare queue consumer
+ * calls) dispatches through the exact same code as the all-jobs sweep, and a
+ * new job is added in one place only.
+ */
+export const JOB_DEFS: [JobName, () => Promise<void>][] = [
+  /* Deletion first, on purpose. The run has an 8-second budget before this
+     process would be cut off, and the job behind it used to sit third —
+     after two mail jobs that send one message per account — so a night with
+     anything to say starved the sweep entirely: accounts whose 30 days were
+     up stayed `deletion_pending` with the screen still promising them a date.
+     The one job that cannot be undone is the one that must not be queued. */
+  ['permanent_deletion', async () => {
+    const m = await import('@/jobs/jobs-permanent-deletion');
+    await m.permanentDeletionJob();
+  }],
+  ['deletion_sweep', async () => {
+    const { processScheduledDeletions } = await import('@/features/users/userHandlers');
+    await processScheduledDeletions();
+  }],
+  ['cleanup', async () => {
+    const { cleanupOldNotifications } = await import('@/jobs/jobs');
+    await cleanupOldNotifications();
+  }],
+  ['recap', async () => {
+    const { sendAccountSummaries } = await import('@/jobs/jobs');
+    await sendAccountSummaries();
+  }],
+  ['push_prune', async () => {
+    const m = await import('@/infrastructure/push/push-notifications');
+    await m.pruneStalePushSubscriptions();
+  }],
+  ['reactivation', async () => {
+    const { sendReactivationEmails } = await import('@/jobs/jobs');
+    await sendReactivationEmails();
+  }],
+  ['tips', async () => {
+    const m = await import('@/features/users/tips');
+    await m.runAutoTipsSweep();
+  }],
+];
+
+/** Run exactly one due job. Shared by /api/cron/run and the sweep below. */
+export async function runSingleJobIfDue(job: JobName): Promise<{ ran: boolean; duration?: number; error?: string }> {
+  const def = JOB_DEFS.find(([name]) => name === job);
+  if (!def) return { ran: false, error: `unknown job: ${job}` };
+  return runJobIfDue(job, def[1]);
+}
+
+/**
  * Run ALL due jobs. Called from /api/cron and optionally from a middleware gate.
  * Bails early if execution is approaching Vercel's timeout (8s safe margin for hobby).
  */
@@ -172,44 +222,7 @@ export async function runDueJobs(): Promise<{ job: string; ran: boolean; duratio
   // query rather than one per job.
   const runs = await lastRuns();
 
-  const jobDefs: [JobName, () => Promise<void>][] = [
-    /* Deletion first, on purpose. The run has an 8-second budget before this
-       process would be cut off, and the job behind it used to sit third —
-       after two mail jobs that send one message per account — so a night with
-       anything to say starved the sweep entirely: accounts whose 30 days were
-       up stayed `deletion_pending` with the screen still promising them a date.
-       The one job that cannot be undone is the one that must not be queued. */
-    ['permanent_deletion', async () => {
-      const m = await import('@/jobs/jobs-permanent-deletion');
-      await m.permanentDeletionJob();
-    }],
-    ['deletion_sweep', async () => {
-      const { processScheduledDeletions } = await import('@/features/users/userHandlers');
-      await processScheduledDeletions();
-    }],
-    ['cleanup', async () => {
-      const { cleanupOldNotifications } = await import('@/jobs/jobs');
-      await cleanupOldNotifications();
-    }],
-    ['recap', async () => {
-      const { sendAccountSummaries } = await import('@/jobs/jobs');
-      await sendAccountSummaries();
-    }],
-    ['push_prune', async () => {
-      const m = await import('@/infrastructure/push/push-notifications');
-      await m.pruneStalePushSubscriptions();
-    }],
-    ['reactivation', async () => {
-      const { sendReactivationEmails } = await import('@/jobs/jobs');
-      await sendReactivationEmails();
-    }],
-    ['tips', async () => {
-      const m = await import('@/features/users/tips');
-      await m.runAutoTipsSweep();
-    }],
-  ];
-
-  for (const [job, fn] of jobDefs) {
+  for (const [job, fn] of JOB_DEFS) {
     if (Date.now() > deadline) {
       results.push({ job, ran: false });
       continue;

@@ -555,13 +555,16 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
     const rawDomain = process.env.API_DOMAIN || process.env.APP_DOMAIN || '';
     const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
     if (cleanDomain && !cleanDomain.includes('localhost')) {
-      const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
-      console.warn(`[OAUTH:${provider}] Env var ${provider.toUpperCase()}_REDIRECT_URI is localhost but NODE_ENV=production. Using https://${apiHost}/api${path}`);
-      return `https://${apiHost}/api${path}`;
+      // One domain: the app host serves /api itself unless API_DOMAIN pins an
+      // api-prefixed host explicitly.
+      console.warn(`[OAUTH:${provider}] Env var ${provider.toUpperCase()}_REDIRECT_URI is localhost but NODE_ENV=production. Using https://${cleanDomain}/api${path}`);
+      return `https://${cleanDomain}/api${path}`;
     }
   }
 
-  // 3. Derived from APP_DOMAIN / API_DOMAIN env vars
+  // 3. Derived from APP_DOMAIN / API_DOMAIN env vars — one domain: the bare
+  //    app host serves /api/* itself; only an explicitly api-flavored domain
+  //    keeps its own prefix (legacy self-hosted installs).
   const rawDomain =
     process.env.API_DOMAIN ||
     process.env.APP_DOMAIN ||
@@ -569,8 +572,7 @@ function getDynamicRedirectUri(request: NextRequest, path: string): string {
     '';
   const cleanDomain = rawDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (cleanDomain && !cleanDomain.includes('localhost') && !cleanDomain.includes('127.0.0.1')) {
-    const apiHost = /^(api\.|api-)/.test(cleanDomain) ? cleanDomain : `api.${cleanDomain}`;
-    return `https://${apiHost}/api${path}`;
+    return `https://${cleanDomain}/api${path}`;
   }
 
   // 4. Local development fallback — localhost only, and never in production.
@@ -1899,7 +1901,7 @@ export async function signupHandler(request: NextRequest) {
                   { address: identityEmail, kind: 'secondary', isDefault: false, verifiedAt: new Date() },
                 ] },
           security: (is2FAEnabled && normalizedTotpSecret) ? {
-            create: { totpSecret: encryptSecret(normalizedTotpSecret), totpEnabled: true } } : undefined,
+            create: { totpSecret: await encryptSecret(normalizedTotpSecret), totpEnabled: true } } : undefined,
           preferences: {
             create: {
               notif: NEW_ACCOUNT_PREFS,

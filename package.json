@@ -21,7 +21,9 @@
     "seed:defaults": "tsx scripts/seed-defaults.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev:vinext": "vite dev",
+    "build:vinext": "vite build"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",
@@ -59,5 +61,6 @@
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "type": "module"
 }

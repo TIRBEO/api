@@ -25,7 +25,7 @@ export async function verifyTotp(token: string, secret: string): Promise<boolean
   // everybody.
   let plain: string;
   try {
-    plain = decryptSecret(secret);
+    plain = await decryptSecret(secret);
   } catch (err: any) {
     console.error('[TOTP] Secret could not be opened:', err?.message || err);
     return false;

@@ -49,6 +49,8 @@ const PUBLIC_API_DOORS = [
   '/api/telemetry/',
   '/api/email/unsubscribe',
   '/api/emails/unsubscribe',
+  '/api/cron/run',
+  '/api/queue/drain',
 ];
 
 /** POST /api/forms/{slug}/submit authenticates with an access_key in the body. */

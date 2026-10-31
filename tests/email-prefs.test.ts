@@ -695,4 +695,73 @@ describe('processUnsubscribe', () => {
     expect(prefs.email).toBe(false);
     expect((prisma as any).userPreferences.upsert).toHaveBeenCalledTimes(1);
   });
+
+  it("'all' mirrors every channel off, like the settings master switch", async () => {
+    mockFindUnique.mockResolvedValue({
+      notificationPreferences: { email: true, formsEmail: true, productEmail: true, supportEmail: true, tipsEmail: true, digestEnabled: true, summaryEnabled: true },
+      emailUnsubscribed: {},
+    });
+    const prefs = await processUnsubscribe('u1', 'all');
+    expect(prefs.formsEmail).toBe(false);
+    expect(prefs.productEmail).toBe(false);
+    expect(prefs.supportEmail).toBe(false);
+    expect(prefs.tipsEmail).toBe(false);
+    expect(prefs.digestEnabled).toBe(false);
+    expect(prefs.summaryEnabled).toBe(false);
+    expect((prefs.unsubscribed as any).all).toBe(true);
+  });
+
+  it("'product' also stops tips mail (its gate never reads productEmail)", async () => {
+    mockFindUnique.mockResolvedValue({
+      notificationPreferences: { email: true, productEmail: true, tipsEmail: true },
+      emailUnsubscribed: {},
+    });
+    const prefs = await processUnsubscribe('u1', 'product');
+    expect(prefs.tipsEmail).toBe(false);
+  });
+});
+
+// ─── Token round-trip ──────────────────────────────────────────────
+
+describe('unsubscribe tokens', () => {
+  it('verifies a freshly minted token and decodes userId+category', async () => {
+    const { generateUnsubscribeToken, verifyUnsubscribeToken } = await import('@/features/email/emailPrefs');
+    const token = generateUnsubscribeToken('u-42', 'product');
+    expect(verifyUnsubscribeToken(token)).toEqual({ userId: 'u-42', category: 'product' });
+  });
+
+  it('rejects tampered payloads and garbage', async () => {
+    const { generateUnsubscribeToken, verifyUnsubscribeToken } = await import('@/features/email/emailPrefs');
+    const token = generateUnsubscribeToken('u-42', 'product');
+    const [userId, category, expiry] = Buffer.from(token, 'base64url').toString('utf8').split(':');
+    const forged = Buffer.from(`${userId}:${category}:${Number(expiry) + 10 * 86400000}:deadbeef`).toString('base64url');
+    expect(verifyUnsubscribeToken(forged)).toBeNull();
+    expect(verifyUnsubscribeToken('not-a-token')).toBeNull();
+    expect(verifyUnsubscribeToken('')).toBeNull();
+  });
+});
+
+// ─── Provider routing (Brevo marketing vs Resend essential) ──────
+
+describe('usesBrevo', () => {
+  it('routes the marketing/digest family to Brevo', async () => {
+    const { usesBrevo } = await import('@/features/email/email-classification');
+    for (const t of ['product_update', 'notification_digest', 'weekly_summary', 'security_tip', 'reactivation', 'maintenance_notification', 'maintenance_complete']) {
+      expect(usesBrevo(t)).toBe(true);
+    }
+  });
+
+  it('keeps every essential/auth template on Resend', async () => {
+    const { usesBrevo, ESSENTIAL_TEMPLATES } = await import('@/features/email/email-classification');
+    for (const t of ESSENTIAL_TEMPLATES) {
+      expect(usesBrevo(t)).toBe(false);
+    }
+  });
+
+  it('unknown templates and brain events stay on Resend', async () => {
+    const { usesBrevo } = await import('@/features/email/email-classification');
+    expect(usesBrevo(undefined)).toBe(false);
+    expect(usesBrevo('some_future_template')).toBe(false);
+    expect(usesBrevo('brain:activity.comment')).toBe(false);
+  });
 });

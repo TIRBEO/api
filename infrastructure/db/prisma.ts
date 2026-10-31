@@ -48,7 +48,15 @@ const POOL_CONFIG = {
   // the result as the socket (pg/lib/connection.js). The override only
   // changes name resolution (family 4 +3s timeout + cache); TLS upgrade,
   // keepalive and destroy semantics all keep working on the returned socket.
-  stream: () => new BoundedLookupSocket(boundedPoolLookup) };
+  // Workers must NOT set this: its net polyfill reads `options.lookup` off the
+  // stream factory's argument list and workerd's dns.resolve4 rejects options
+  // outright (ERR_OPTION_NOT_IMPLEMENTED). Plain connect works there.
+  ...(isWorkersRuntimeLike() ? {} : { stream: () => new BoundedLookupSocket(boundedPoolLookup) }) };
+
+/** Same test as isWorkersRuntime below, hoisted above POOL_CONFIG's use. */
+function isWorkersRuntimeLike(): boolean {
+  return typeof (globalThis as any).WebSocketPair !== 'undefined' || process.env.CF_WORKER === 'true';
+}
 
 // ─── Pool Creation ───
 function createPool(): Pool {
@@ -455,7 +463,28 @@ function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
   return { prisma, pool };
 }
 
-export const { prisma } = initializePoolAndPrisma();
+/* Lazy on Workers: module scope there forbids timers, sockets, and random
+   generation, and the Prisma client constructor touches all three. On Node the
+   pool is built at import exactly as before — same warm-up, same keep-alive. */
+const isWorkersRuntime = typeof (globalThis as any).WebSocketPair !== 'undefined'
+  || process.env.CF_WORKER === 'true';
+
+export const prisma: PrismaClient = isWorkersRuntime
+  ? new Proxy({} as PrismaClient, {
+      get(_target, prop) {
+        if (prop === '$isProxyMarker') return undefined;
+        return (getPrisma() as any)[prop];
+      },
+    })
+  : initializePoolAndPrisma().prisma;
+
+/** The one client every code path shares, created on first real use. */
+function getPrisma(): PrismaClient {
+  if (!globalForPrisma.prisma) {
+    globalForPrisma.prisma = initializePoolAndPrisma().prisma;
+  }
+  return globalForPrisma.prisma;
+}
 
 // ─── Cold Start Detection ───
 // Supabase free tier databases go to sleep after ~7 minutes of inactivity.
@@ -704,7 +733,8 @@ function monitorPool() {
 
 // Start monitoring in production and development (skip on Vercel — no persistent process)
 // Uses setTimeout recursion instead of setInterval to avoid CJS bundler warnings.
-if (typeof setTimeout !== 'undefined' && !process.env.VERCEL) {
+// Workers forbids timers at module scope, so it is skipped there too.
+if (typeof setTimeout !== 'undefined' && !process.env.VERCEL && !isWorkersRuntime) {
   const gMonitor = globalThis as any;
   if (!gMonitor.__tirbeoPoolMonitorRunning) {
     gMonitor.__tirbeoPoolMonitorRunning = true;
@@ -735,7 +765,7 @@ export async function checkDatabaseConnection(): Promise<{
 }> {
   const start = performance.now();
   try {
-    await withRetry(() => prisma.$queryRaw`SELECT 1`, 2, 300);
+    await withRetry(() => getPrisma().$queryRaw`SELECT 1`, 2, 300);
     recordActivity();
     const latencyMs = performance.now() - start;
     const pool = globalForPrisma.pgPool;

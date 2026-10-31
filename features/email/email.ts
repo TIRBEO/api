@@ -6,6 +6,7 @@ import { getBranding } from '@/features/branding/branding';
 import { getApiBaseUrl, getDashboardBaseUrl } from '@/config/app-urls';
 import { createTtlCache } from '@/infrastructure/cache';
 import { unsubscribeSection } from '@/features/email/email-fragments';
+import { usesBrevo } from '@/features/email/email-classification';
 import {
   EMAIL_CACHE_KEYS,
   EMAIL_CACHE_TTL,
@@ -182,9 +183,13 @@ async function finalizeEmailLog(
 }
 
 /** Stable thread id so replies and follow-ups group in mail clients. */
-function deriveThreadId(to: string, subject: string, explicit?: string): string {
+function deriveThreadId(to: string, subject: string, explicit?: string, salt?: string): string {
   if (explicit) return explicit.slice(0, 255);
-  return crypto.createHash('sha1').update(`${to.toLowerCase()}|${subject}`).digest('hex').slice(0, 24);
+  // A notificationId salt makes the thread unique per row: queued redelivery of
+  // one notification must reply to its own mail, while two notifications
+  // sharing a title still get separate threads.
+  const uniq = salt ? `|${salt}` : '';
+  return crypto.createHash('sha1').update(`${to.toLowerCase()}|${subject}${uniq}`).digest('hex').slice(0, 24);
 }
 
 // Mailcow's postfix pins MAIL FROM to the authenticated mailbox (rejects
@@ -455,8 +460,18 @@ export async function sendEmail(
 
   const dbApiKey = config?.apiKey || '';
   const apiKey = dbApiKey || process.env.RESEND_API_KEY || '';
-  const provider = String(config?.provider || 'resend').toLowerCase();
+  let provider = String(config?.provider || 'resend').toLowerCase();
   const enabled = config?.enabled !== false;
+
+  /* Marketing/digest mail leaves through Brevo when it is configured — the
+     authenticated branded domain (updates.tirbeo.com) and its unsubscribe
+     machinery live there. Essential/auth templates never join that route
+     (`usesBrevo` refuses them), so a code or a reset stays on Resend even if
+     an admin adds its name to the marketing set. */
+  const brevoKey = process.env.BREVO_API_KEY || '';
+  if (provider === 'resend' && brevoKey && usesBrevo(options?.templateName)) {
+    provider = 'brevo';
+  }
 
   if (!enabled && dbApiKey) {
     console.warn(`[EMAIL] DB config disabled — not sending to ${to}: ${subject}`);
@@ -472,7 +487,11 @@ export async function sendEmail(
   const smtpPass = config?.smtpPass || process.env.SMTP_PASS || '';
   const smtpTlsServername = process.env.SMTP_TLS_SERVERNAME || '';
 
-  if (!apiKey && provider !== 'smtp') {
+  if (provider === 'brevo' && !brevoKey) {
+    console.error(`[EMAIL] provider=brevo but BREVO_API_KEY is missing. Cannot send to ${to}: ${subject}`);
+    return { success: false, error: 'Brevo not configured' };
+  }
+  if (!apiKey && provider !== 'smtp' && provider !== 'brevo') {
     console.error(`[EMAIL] No API key configured (DB: ${dbApiKey ? 'set' : 'empty'}, ENV: ${process.env.RESEND_API_KEY ? 'set' : 'missing'}). Cannot send to ${to}: ${subject}`);
     return { success: false, error: 'No email API key configured' };
   }
@@ -488,9 +507,19 @@ export async function sendEmail(
   if (provider === 'smtp' && smtpUser && fromEmail.toLowerCase() !== smtpUser.toLowerCase()) {
     fromEmail = smtpUser;
   }
-  if (provider !== 'smtp') fromEmail = verifiedSender(fromEmail);
+  if (provider === 'brevo') {
+    // Brevo accepts mail from its authenticated domains only; the marketing
+    // identity defaults to the branded subdomain and can be overridden.
+    const brevoDomain = (process.env.BREVO_FROM_DOMAIN || 'updates.tirbeo.com').trim().toLowerCase();
+    const local = fromEmail.split('@')[0] || 'mails';
+    if (!fromEmail.toLowerCase().endsWith(`@${brevoDomain}`)) {
+      fromEmail = `${local}@${brevoDomain}`;
+    }
+  } else if (provider !== 'smtp') {
+    fromEmail = verifiedSender(fromEmail);
+  }
   const fromName = options?.fromName || config?.fromName || 'Tirbeo';
-  const threadId = deriveThreadId(to, subject, options?.threadId);
+  const threadId = deriveThreadId(to, subject, options?.threadId, typeof options?.metadata?.notificationId === 'string' ? options.metadata.notificationId : undefined);
 
   // Create the log row up front so the provider response can finalize it.
   let logId: string | null = null;
@@ -508,14 +537,17 @@ export async function sendEmail(
   } catch { /* logging is best-effort */ }
 
   let result: EmailResult = { success: false };
-  if (provider !== 'resend' && provider !== 'smtp') {
+  if (provider !== 'resend' && provider !== 'smtp' && provider !== 'brevo') {
     console.error(`[EMAIL] Unknown provider "${provider}" — defaulting to resend.`);
+    provider = 'resend';
   }
   if (provider === 'smtp') {
     result = await sendViaSmtp(
       { host: smtpHost, port: smtpPort, user: smtpUser, pass: smtpPass, tlsServername: smtpTlsServername },
       to, fromEmail, fromName, subject, htmlBody, options?.replyTo, options?.headers,
     );
+  } else if (provider === 'brevo') {
+    result = await sendViaBrevo(brevoKey, to, fromEmail, fromName, subject, htmlBody, options?.replyTo, options?.headers);
   } else {
     result = await sendViaResend(apiKey, to, fromEmail, fromName, subject, htmlBody, options?.replyTo, options?.headers);
   }
@@ -712,6 +744,63 @@ async function sendViaSmtp(smtp: SmtpSettings, to: string, fromEmail: string, fr
   } catch (err: unknown) {
     return { success: false, error: `SMTP error: ${String(err)}` };
   }
+}
+
+/* Brevo transactional REST (v3/smtp/email). Raw fetch, no SDK: the same call
+   shape works in Node and on Workers, and the API key rides a header so it
+   never lands in a URL log line. Single-recipient only, like Resend. */
+async function sendViaBrevo(
+  apiKey: string,
+  to: string,
+  fromEmail: string,
+  fromName: string,
+  subject: string,
+  html: string,
+  replyTo?: string,
+  headers?: Record<string, string>,
+): Promise<EmailResult> {
+  const body: Record<string, any> = {
+    sender: { name: fromName || 'Tirbeo', email: fromEmail },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+    textContent: htmlToText(html),
+  };
+  if (replyTo) body.replyTo = { email: replyTo };
+  if (headers && Object.keys(headers).length) body.headers = headers;
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'api-key': apiKey,
+          'content-type': 'application/json',
+          'accept': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        // 4xx is a permanent answer (bad payload, unverified sender) — do not retry.
+        if (res.status < 500) return { success: false, error: `Brevo error ${res.status}: ${err.slice(0, 200)}` };
+        if (attempt < 2) { await new Promise(r => setTimeout(r, 500 * attempt)); continue; }
+        return { success: false, error: `Brevo error ${res.status}: ${err.slice(0, 200)}` };
+      }
+      const data: any = await res.json();
+      // Brevo answers { messageId: "<2024…@hostname>", messageIds: [...] }
+      return { success: true, messageId: data.messageId || undefined };
+    } catch (err: unknown) {
+      const msg = String(err);
+      if (attempt < 2 && (msg.includes('fetch failed') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('TimeoutError'))) {
+        await new Promise(r => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      return { success: false, error: msg };
+    }
+  }
+  return { success: false, error: 'Brevo delivery failed after retries' };
 }
 
 async function sendViaResend(apiKey: string, to: string, fromEmail: string, fromName: string, subject: string, html: string, replyTo?: string, headers?: Record<string, string>): Promise<EmailResult> {

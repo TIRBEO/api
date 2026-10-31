@@ -68,6 +68,12 @@ app.prepare().then(() => {
       // ── Vercel Serverless: no setInterval jobs ──
       // Jobs run via /api/cron (Vercel Cron) and on-demand gate checks.
       console.log('[SERVER] Vercel mode — periodic jobs disabled (use /api/cron)');
+    } else if (process.env.SELF_HOSTED_JOBS === '0') {
+      // Cloudflare owns the schedule: apps/jobs' Cron Triggers push messages
+      // onto a Queue, and its consumer POSTs each one to /api/cron/run. The
+      // in-process timers would only duplicate that work (the job_runs gate
+      // makes it harmless, but there is no reason to run both).
+      console.log('[SERVER] SELF_HOSTED_JOBS=0 — periodic timers off, Cloudflare Queues drives /api/cron/run');
     } else {
       // ── Local / self-hosted: start periodic jobs ──
       const { startPeriodicCleanup, startPeriodicSummaries, startPeriodicDeletionSweep, startPeriodicPushPrune, startPeriodicReactivation } = require('@/jobs/jobs');
@@ -99,10 +105,10 @@ app.prepare().then(() => {
           console.log(`> WebSocket server ready on ws://${hostname}:${wsPort}`);
         } catch (e: any) {
           console.warn(`[WS] Embedded WS server skipped: ${e?.message || e}`);
-          console.log(`> WebSocket service: use external realtime server (ws.tirbeo.com)`);
+          console.log(`> WebSocket service: use external realtime server (live.tirbeo.com)`);
         }
       } else {
-        console.log(`> WebSocket service: external realtime server (ws.tirbeo.com)`);
+        console.log(`> WebSocket service: external realtime server (live.tirbeo.com)`);
       }
     }
   });

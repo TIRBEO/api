@@ -1,8 +1,8 @@
 
 /**
- * Publish events from api.tirbeo.com into the Tirbeo Realtime Platform.
+ * Publish events from the API origin into the Tirbeo Realtime Platform.
  *
- * The realtime platform (wss://ws.tirbeo.com/ws) is a Cloudflare Worker that
+ * The realtime platform (wss://live.tirbeo.com/ws) is a Cloudflare Worker that
  * only accepts events over HTTP `POST /api/publish` (Bearer token) — it has no
  * shared Redis channel. This module fans api events out to that endpoint.
  * Fire-and-forget: never throws, never blocks callers. If the Worker is
@@ -31,8 +31,10 @@ function publishUrl(): string {
       /* fall through to default */
     }
   }
-  // Derive from app domain
-  return `https://ws.${getAppDomain()}/api/publish`;
+  // live.tirbeo.com is the route we want, but Cloudflare has not provisioned
+  // its DNS record yet (the OAuth token can't write zone records). The
+  // workers.dev hostname resolves today, so it stays the fallback until then.
+  return 'https://tirbeo-realtime.rexux.workers.dev/api/publish';
 }
 
 export interface RtPublishTarget {

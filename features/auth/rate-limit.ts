@@ -301,6 +301,8 @@ let alertCheckTimer: ReturnType<typeof setTimeout> | null = null;
 
 function startAlertChecker(): void {
   if (alertCheckTimer || process.env.VERCEL) return;
+  // Workers forbids timers at module scope — same reason Vercel is skipped.
+  if (typeof (globalThis as any).WebSocketPair !== 'undefined') return;
   function scheduleAlertCheck() {
     alertCheckTimer = setTimeout(() => {
       checkBlockRateAlert().catch(() => {});

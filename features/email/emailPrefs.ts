@@ -352,14 +352,38 @@ export async function processUnsubscribe(userId: string, category: string): Prom
   if (category === 'all') {
     prefs.email = false;
     emailUnsub.all = true;
+    // The same mirror the settings screen writes when its master switch goes
+    // off (app/api/notifications/prefs/route.ts): a re-enable there restores
+    // every channel, so an unsubscribe here must read as the identical state.
+    prefs.formsEmail = false;
+    prefs.productEmail = false;
+    prefs.supportEmail = false;
+    prefs.offersEmail = false;
+    prefs.tipsEmail = false;
+    prefs.digestEnabled = false;
+    prefs.summaryEnabled = false;
   } else {
     const categoryEmailKey = `${category}Email`;
     prefs[categoryEmailKey] = false;
     emailUnsub[category] = true;
+    // Tips has its own gate (tips !== false / tipsEmail !== false) that never
+    // reads `productEmail`, so an 'all'-style product link must flip it too.
+    if (category === 'product') prefs.tipsEmail = false;
+    if (category === 'digest') {
+      prefs.digestEnabled = false;
+      prefs.summaryEnabled = false;
+    }
   }
   prefs.unsubscribed = emailUnsub;
 
   // One write, both places — an unsubscribe that only the mailer could see
   // would be re-decided by the settings screen on the next visit.
-  return saveNotificationPrefs(userId, prefs);
+  const saved = await saveNotificationPrefs(userId, prefs);
+  // A person who just unsubscribed must not be mailable for one more cache
+  // window anywhere on the send path.
+  try {
+    const { invalidateEmailCache, EMAIL_CACHE_KEYS } = await import('@/features/email/emailCache');
+    await invalidateEmailCache(EMAIL_CACHE_KEYS.switches);
+  } catch { /* best-effort; the TTL expires it */ }
+  return saved;
 }

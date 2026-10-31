@@ -78,7 +78,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unknown app' }, { status: 400, headers });
     }
 
-    const { auth } = pusherAuthorizeChannel(socketId, channel, app, {
+    const { auth } = await pusherAuthorizeChannel(socketId, channel, app, {
       user_id: session.userId,
     });
     return NextResponse.json({ auth }, { headers });

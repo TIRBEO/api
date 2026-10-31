@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requirePermission } from '@/features/auth/http-guards';
-import { setMaintenanceMode, getMaintenanceState } from '@/infrastructure/realtime/ws/server';
+import { setMaintenanceMode, getMaintenanceState } from '@/shared/maintenance-state';
 import { sendMaintenanceNotification, sendMaintenanceCompleteNotification } from '@/jobs/maintenance-notifications';
 import { createAuditEvent } from '@/features/security/audit';
 

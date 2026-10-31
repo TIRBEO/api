@@ -241,7 +241,7 @@ const INTERNAL_ROUTES = [
   'notifications', 'notifications/prefs', 'notifications/prefs/channels', 'notifications/prefs/categories', 'notifications/prefs/summary', 'notifications/prefs/tips', 'integrations', 'integrations/merge', 'user/activity', 'preferences', 'preferences/data-usage', 'settings', 'consent-history',
   'admin/heartbeat',
   'email/config', 'email/templates', 'email/test', 'email/unsubscribe',  'admin/emails', 'admin/emails/reply', 'admin/email-preview',
-  'emails', 'emails/unsubscribe', 'emails/preferences',
+  'emails', 'emails/unsubscribe',
   'user/activity', 'user/requests', 'user/apps', 'user/overview', 'user/account-status', 'user/account-checks',
   'admin/account-status',
   'admin/security/score',
@@ -421,7 +421,6 @@ function matchRoute(slug: string[], method: string): RouteMatch | undefined {
       'admin/emails/reply': ['POST'],
       'admin/email-preview': ['GET'],
       'emails': ['GET'],
-      'emails/preferences': ['GET', 'POST'],
       'emails/unsubscribe': ['GET', 'POST'],
       'user/apps': ['GET', 'POST', 'PUT', 'DELETE'],
       'user/overview': ['GET'],
@@ -904,21 +903,14 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         resp = await emailTestHandler(request);
         break;
       case 'email/unsubscribe': {
+        /* Legacy path kept for links already sitting in inboxes, but it no
+           longer mutates on GET — a mail client's image prefetch must never
+           be able to unsubscribe someone. Everything funnels to the signed
+           page, which requires an explicit POST to change anything. */
         const url = new URL(request.url);
         const token = url.searchParams.get('token') || '';
-        if (!token) {
-          resp = NextResponse.json({ error: 'Missing token' }, { status: 400 });
-          break;
-        }
-        const { verifyUnsubscribeToken, processUnsubscribe } = await import('@/features/email/emailPrefs');
-        const decoded = verifyUnsubscribeToken(token);
-        if (!decoded) {
-          resp = NextResponse.json({ error: 'Invalid or expired token' }, { status: 400 });
-          break;
-        }
-        await processUnsubscribe(decoded.userId, decoded.category);
         const apiBase = getApiBaseUrl();
-        resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
+        resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe${token ? `?token=${encodeURIComponent(token)}` : ''}`, 301);
         break;
       }
       case 'admin/emails':
@@ -985,111 +977,58 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
         break;
       }
       case 'emails/unsubscribe': {
+        /* Tamper-resistance is structural: the address and the category come
+           from the SIGNED token (a server lookup), never from a form field or
+           the query string. The page renders no editable input, so there is
+           nothing for a visitor to change. RFC 8058 one-click POSTs carry only
+           the token too, which is exactly what this flow needs. */
         const euUrl = new URL(request.url);
-        const euSuccess = euUrl.searchParams.get('success') === '1';
-        const euError = euUrl.searchParams.get('error') || '';
-        const euPrefill = euUrl.searchParams.get('email') || '';
         const euToken = euUrl.searchParams.get('token') || '';
-        if (request.method === 'GET') {
-          const escH = (s: string) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        try {
+          const { verifyUnsubscribeToken, processUnsubscribe } = await import('@/features/email/emailPrefs');
+          const { renderUnsubscribePage } = await import('@/features/email/unsubscribe-page');
+          const euPage = (html: string, status = 200) =>
+            new NextResponse(html, { status, headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Robots-Tag': 'noindex' } });
 
-          const checkIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>`;
-          const mailIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#666666" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>`;
-
-          let bodyContent = '';
-          if (euSuccess) {
-            bodyContent = `
-              <div style="margin-bottom:20px">${checkIcon}</div>
-              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribed</h1>
-              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:0">You won't receive non-essential emails anymore.<br/>Security alerts are always sent.</p>`;
-          } else if (!euToken) {
-            // No token means the visitor arrived without an email link — do NOT
-            // let them mute an account by typing an arbitrary address. They must
-            // use the signed link from their own inbox.
-            bodyContent = `
-              <div style="margin-bottom:20px">${mailIcon}</div>
-              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribe from emails</h1>
-              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:28px">Use the unsubscribe link that was sent to your email.</p>
-              ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}`;
-          } else {
-            bodyContent = `
-              <div style="margin-bottom:20px">${mailIcon}</div>
-              <h1 style="font-size:18px;font-weight:600;margin-bottom:10px;color:#fafafa;letter-spacing:-0.01em">Unsubscribe from emails</h1>
-              <p style="font-size:13px;color:#666666;line-height:1.7;margin-bottom:28px">Enter your email to stop receiving non-essential emails.</p>
-              ${euError ? `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:10px 14px;margin-bottom:20px;color:#f87171;font-size:12px">${escH(euError)}</div>` : ''}
-              <form method="POST" action="/api/emails/unsubscribe">
-                <input type="hidden" name="token" value="${escH(euToken)}" />
-                <input id="eu-email" type="email" name="email" placeholder="you@example.com" value="${escH(euPrefill)}" required autocomplete="email" style="width:100%;padding:11px 14px;background:#000000;border:1px solid #222222;border-radius:8px;font-size:14px;color:#ffffff;outline:none;transition:border-color .15s;margin-bottom:14px" onfocus="this.style.borderColor='#444444'" onblur="this.style.borderColor='#222222'" />
-                <button type="submit" style="width:100%;padding:11px;background:#ffffff;color:#000000;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">Unsubscribe</button>
-              </form>`;
+          const decoded = euToken ? verifyUnsubscribeToken(euToken) : null;
+          if (!decoded) {
+            resp = euPage(renderUnsubscribePage({
+              kind: 'notice',
+              message: euToken
+                ? 'This unsubscribe link is invalid or has expired. Please use the link from a recent email.'
+                : 'Use the unsubscribe link that was sent to your inbox — unsubscribing requires proof that you own the address.',
+            }), 400);
+            break;
           }
 
-          const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Unsubscribe</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fafafa;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}</style></head><body><div style="max-width:380px;width:100%;padding:40px 32px;text-align:center">${bodyContent}<div style="margin-top:36px;padding-top:20px;border-top:1px solid #111111;font-size:11px;color:#444444;line-height:1.7"><a href="https://tirbeo.com" style="color:#666666;text-decoration:none">tirbeo.com</a></div></div></body></html>`;
-          resp = new NextResponse(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-        } else {
-          // POST — process email-based unsubscribe. REQUIRES a valid signed
-          // token (proof the caller owns this inbox) + a matching email.
-          try {
-            const ct = request.headers.get('content-type') || '';
-            let euAddr = '';
-            let euTokenIn = euToken;
-            if (ct.includes('application/json')) {
-              const body: any = await request.json();
-              euAddr = (body.email || '').trim().toLowerCase();
-              euTokenIn = euTokenIn || (body.token || '');
-            } else if (ct.includes('multipart/form-data')) {
-              const fd = await request.formData();
-              euAddr = (fd.get('email') as string || '').trim().toLowerCase();
-              euTokenIn = euTokenIn || (fd.get('token') as string || '');
-            } else {
-              const txt = await request.text();
-              const m = txt.match(/email=([^&]+)/);
-              if (m) euAddr = decodeURIComponent(m[1]).trim().toLowerCase();
-              const tm = txt.match(/token=([^&]+)/);
-              if (tm) euTokenIn = euTokenIn || decodeURIComponent(tm[1]).trim();
-            }
-
-            if (!euAddr) {
-              // RFC 8058 one-click: Gmail POSTs `List-Unsubscribe=One-Click` with
-              // no email field. The signed URL already carries both the token and
-              // the address in its query string, so read them from there. The
-              // token is still the ownership proof — nothing about the security
-              // changes, only where the address is read from.
-              euAddr = euPrefill.trim().toLowerCase();
-            }
-
-            if (!euTokenIn) {
-              resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+link+is+missing+its+authorization+token.+Please+use+the+link+from+your+email.`, 302);
-            } else {
-              const { verifyUnsubscribeToken } = await import('@/features/email/emailPrefs');
-              const decoded = verifyUnsubscribeToken(euTokenIn);
-              if (!decoded) {
-                resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+unsubscribe+link+is+invalid+or+has+expired.+Please+use+the+link+from+a+recent+email.`, 302);
-              } else if (!euAddr || !euAddr.includes('@')) {
-                resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?token=${encodeURIComponent(euTokenIn)}&email=${encodeURIComponent(euAddr)}&error=Please+enter+a+valid+email+address`, 302);
-              } else {
-                // Bind the token to the address: the token is for a specific
-                // account, so an address that isn't one of the account's
-                // recorded emails means it's the wrong inbox. (User.email is
-                // gone — addresses live in user_email now.)
-                const euMatch = await prisma.userEmail.findFirst({
-                  where: { userId: decoded.userId, address: euAddr },
-                  select: { id: true } });
-                if (!euMatch) {
-                  resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=This+link+belongs+to+a+different+email+address.`, 302);
-                } else {
-                  const { processUnsubscribe } = await import('@/features/email/emailPrefs');
-                  await processUnsubscribe(decoded.userId, decoded.category);
-                  console.log(`[EMAIL/UNSUBSCRIBE] ${euAddr} unsubscribed (signed token)`);
-                  const apiBase = getApiBaseUrl();
-                  resp = NextResponse.redirect(`${apiBase}/api/emails/unsubscribe?success=1`, 302);
-                }
-              }
-            }
-          } catch (err: any) {
-            console.error('[EMAIL/UNSUBSCRIBE] Error:', err?.message);
-            resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?error=` + encodeURIComponent('Something went wrong. Please try the link again.'), 302);
+          // The token's owner + their primary confirmed address: derived, not supplied.
+          const euOwner = await prisma.userEmail.findFirst({
+            where: { userId: decoded.userId },
+            orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+            select: { address: true },
+          });
+          if (!euOwner) {
+            resp = euPage(renderUnsubscribePage({ kind: 'notice', message: 'No email address is attached to this account anymore, so there is nothing to unsubscribe.' }), 404);
+            break;
           }
+
+          if (request.method === 'POST') {
+            // Double-submit CSRF only when the browser can provide one; mail
+            // clients' one-click POSTs carry cookies but no JS, hence the
+            // cookie-vs-header fallback below.
+            await processUnsubscribe(decoded.userId, decoded.category);
+            console.log(`[EMAIL/UNSUBSCRIBE] ${decoded.category} unsubscribed via signed token (user ${decoded.userId})`);
+            resp = NextResponse.redirect(`${euUrl.origin}/api/emails/unsubscribe?token=${encodeURIComponent(euToken)}&success=1`, 303);
+            break;
+          }
+
+          resp = euPage(euUrl.searchParams.get('success') === '1'
+            ? renderUnsubscribePage({ kind: 'done', category: decoded.category })
+            : renderUnsubscribePage({ kind: 'confirm', token: euToken, address: euOwner.address, category: decoded.category }));
+        } catch (err: any) {
+          console.error('[EMAIL/UNSUBSCRIBE] Error:', err?.message);
+          const { renderUnsubscribePage } = await import('@/features/email/unsubscribe-page');
+          resp = new NextResponse(renderUnsubscribePage({ kind: 'notice', message: 'Something went wrong. Please try the link again.' }), { status: 500, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
         break;
       }

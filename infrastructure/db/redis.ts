@@ -26,6 +26,19 @@ function getRedisClass(): any {
   return _Redis;
 }
 
+// ─── Transport selection ───────────────────────────────────────────────────
+/* Serverless instances pay a full TCP+TLS handshake on every cold start and
+   have their sockets torn down between invocations; Upstash's REST proxy rides
+   a reused HTTPS connection instead. `REDIS_HTTP=force` opts in explicitly —
+   a warm long-lived Node process is genuinely faster on plain TCP, so that is
+   the default and this stays the escape hatch. */
+import { createHttpRedisClient, httpRedisSupported } from '@/infrastructure/db/redis-http';
+
+export function redisTransport(): 'http' | 'tcp' {
+  const mode = (process.env.REDIS_HTTP || '').toLowerCase();
+  return mode === 'force' ? 'http' : 'tcp';
+}
+
 // ─── Log Throttling ───
 // Upstash (serverless Redis) drops idle connections regularly, so reconnect
 // logs fire constantly. Throttle them to keep the console readable.
@@ -215,6 +228,15 @@ export function createRedisClient(options: CreateRedisOptions): any {
   if (process.env.NODE_ENV === 'production' && !url.startsWith('rediss://') && !cleartextWarned.has(name)) {
     cleartextWarned.add(name);
     console.warn(`[REDIS-${name}] redis:// in production — auth and session data travel unencrypted. Use rediss:// unless this Redis is reachable only on localhost.`);
+  }
+
+  /* Forced HTTP mode routes through the Upstash REST transport — see
+     redis-http.ts for the command surface. Warm TCP stays the default. */
+  if (redisTransport() === 'http') {
+    if (!httpRedisSupported(url)) {
+      throw new Error(`[REDIS] REDIS_HTTP=force but "${name}" host has no known REST proxy`);
+    }
+    return createHttpRedisClient(name, { url, restBase: process.env.REDIS_REST_BASE });
   }
 
   const config = {
