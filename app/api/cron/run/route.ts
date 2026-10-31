@@ -13,6 +13,12 @@ export const runtime = 'nodejs';
 
 const JOBS = new Set<string>(JOB_DEFS.map(([n]) => n));
 
+// Vercel's static analysis can mistake this module-level Set for an export
+// route config ("jobs") and fail the build; keep it inside the handler.
+function validJobs(): Set<string> {
+  return new Set<string>(JOB_DEFS.map(([n]) => n as string));
+}
+
 export async function POST(request: NextRequest) {
   if (!isCronAuthorized(request)) return cronUnauthorized();
 
@@ -23,8 +29,9 @@ export async function POST(request: NextRequest) {
   } catch {
     return NextResponse.json({ error: 'Body must be JSON: { "job": "<name>" }' }, { status: 400 });
   }
-  if (!JOBS.has(job)) {
-    return NextResponse.json({ error: `Unknown job. Valid: ${[...JOBS].join(', ')}` }, { status: 400 });
+  const jobs = validJobs();
+  if (!jobs.has(job)) {
+    return NextResponse.json({ error: `Unknown job. Valid: ${[...jobs].join(', ')}` }, { status: 400 });
   }
 
   const result = await runSingleJobIfDue(job as JobName);
