@@ -540,9 +540,9 @@ async function dispatch(request: NextRequest, slug: string[], method: string) {
   // ── Vercel serverless: trigger due background jobs on first request ──
   // Fire-and-forget — does not block the response, and gated per instance so a
   // busy request stream does not turn a daily job check into a pool contest.
-  if (process.env.VERCEL && pathStr !== 'cron') {
+  if (process.env.VERCEL && !pathStr.startsWith('cron') && !pathStr.startsWith('queue')) {
     import('@/jobs/job-gate').then(({ runDueJobsFromRequest }) => {
-      if (!pathStr.startsWith("cron/") && !pathStr.startsWith("queue/")) runDueJobsFromRequest().catch(() => {});
+      runDueJobsFromRequest().catch(() => {});
     }).catch(() => {});
   }
 
