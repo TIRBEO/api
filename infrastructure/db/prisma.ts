@@ -54,12 +54,37 @@ const POOL_CONFIG = {
   ...(isWorkersRuntimeLike() ? {} : { stream: () => new BoundedLookupSocket(boundedPoolLookup) }) };
 
 /** Same test as isWorkersRuntime below, hoisted above POOL_CONFIG's use. */
-function isWorkersRuntimeLike(): boolean {
+export function isWorkersRuntimeLike(): boolean {
   return typeof (globalThis as any).WebSocketPair !== 'undefined' || process.env.CF_WORKER === 'true';
 }
 
+/* pg's socket pool cannot exist on Workers: Hyperdrive speaks the Connect-on-
+   Worker protocol, which only @prisma/adapter-hyperdrive drives. Until the app
+   moves to it, the API runs where Node does — and this names the reason in the
+   health check instead of hanging a request until the runtime cancels it. */
+function workersPoolUnsupportedError(): Error {
+  return new Error('Postgres via pg Pool is unavailable on Workers; deploy the API on Node (Vercel) or wire @prisma/adapter-hyperdrive');
+}
+
+/* On Workers, `import { env } from 'cloudflare:workers'` carries the bindings —
+   HYPERDRIVE.url is a postgres:// connection string routed through Cloudflare's
+   TCP proxy, which is the only way a Worker may reach Supabase. */
+let hyperdriveUrl: string | null = null;
+async function workersDatabaseUrl(): Promise<string> {
+  if (!hyperdriveUrl) {
+    // Dynamic specifier keeps Node's tsc off the Workers-only module.
+    const modName = 'cloudflare:workers';
+    const { env } = (await import(/* @vite-ignore */ modName)) as { env: Record<string, unknown> };
+    const hd = env.HYPERDRIVE as { url?: string } | undefined;
+    if (!hd?.url) throw new Error('[DB] Workers build needs a HYPERDRIVE binding (wrangler.jsonc → hyperdrive)');
+    hyperdriveUrl = String(hd.url);
+  }
+  return hyperdriveUrl;
+}
+
 // ─── Pool Creation ───
-function createPool(): Pool {
+async function createPool(): Promise<Pool> {
+  if (isWorkersRuntimeLike()) throw workersPoolUnsupportedError();
   // Runtime prefers DATABASE_URL, which by Supabase convention points at the
   // transaction pooler (:6543). Transaction mode assigns a backend per
   // transaction, so N idle client sockets cost ~0 server sessions — a dev
@@ -115,9 +140,19 @@ function createPool(): Pool {
   // contract rather than a special case for one host.
   if (!/[?&]sslmode=/.test(base)) params.push('sslmode=require');
   if (isTransactionPooler) params.push('pgbouncer=true');
-  const connectionString = base ? `${base}${sep}${params.join('&')}` : undefined;
-  const plaintext = /[?&]sslmode=disable/.test(connectionString ?? '');
+  let plaintext = false;
+  let connectionString = base ? `${base}${sep}${params.join('&')}` : undefined;
+  if (isWorkersRuntimeLike()) {
+    // Pool creation is lazy on Workers; this await runs at first query inside a
+    // request handler, never at module scope. The Hyperdrive connection string
+    // carries no libpq-style params — pg's parser would trip on them and TLS
+    // is handled by the proxy itself.
+    connectionString = await workersDatabaseUrl();
+    plaintext = true;
+  }
+  plaintext = /[?&]sslmode=disable/.test(connectionString ?? '');
 
+  const workersSafe = isWorkersRuntimeLike();
   const pool = new Pool({
     connectionString,
     ...POOL_CONFIG,
@@ -131,13 +166,12 @@ function createPool(): Pool {
         : undefined,
     // TCP keepalive: probe dead sockets every 30s instead of hanging for
     // minutes when the network drops mid-request (VPN out, DNS failure).
-    keepAlive: true,
-    keepAliveInitialDelayMillis: 30_000,
+    ...(workersSafe ? {} : { keepAlive: true, keepAliveInitialDelayMillis: 30_000 }),
     // Client-side deadline for any single query. During a network outage
     // (EAI_AGAIN / ETIMEDOUT) queries never reach the server, so a server-side
     // statement_timeout can't help — this client-side timer fails them fast
     // instead of letting requests hang for 10+ minutes.
-    query_timeout: 15_000 });
+    ...(workersSafe ? {} : { query_timeout: 15_000 }) });
 
   // Surface pool errors so they don't go silent — throttled so routine idle
   // resets from the pooler don't flood the logs.
@@ -400,13 +434,13 @@ function isBuildPhase(): boolean {
   return process.env.NEXT_PHASE === 'phase-production-build';
 }
 
-function initializePoolAndPrisma(): { prisma: PrismaClient; pool: Pool } {
+async function initializePoolAndPrisma(): Promise<{ prisma: PrismaClient; pool: Pool }> {
   // In development, reuse the global singleton to survive HMR
   if (globalForPrisma.prisma && globalForPrisma.pgPool) {
     return { prisma: globalForPrisma.prisma, pool: globalForPrisma.pgPool };
   }
 
-  const pool = createPool();
+  const pool = await createPool();
   const prisma = createPrismaClient(pool);
 
   // Store on globalThis for HMR persistence
@@ -473,17 +507,29 @@ export const prisma: PrismaClient = isWorkersRuntime
   ? new Proxy({} as PrismaClient, {
       get(_target, prop) {
         if (prop === '$isProxyMarker') return undefined;
-        return (getPrisma() as any)[prop];
+        const p = getPrisma();
+        const v = (p as any)[prop];
+        return typeof v === 'function' ? v.bind(p) : v;
       },
     })
-  : initializePoolAndPrisma().prisma;
+  : (() => { const x = initializePoolAndPrisma(); void x; return globalForPrisma.prisma!; })();
+
+let prismaReady: Promise<PrismaClient> | null = null;
 
 /** The one client every code path shares, created on first real use. */
 function getPrisma(): PrismaClient {
-  if (!globalForPrisma.prisma) {
-    globalForPrisma.prisma = initializePoolAndPrisma().prisma;
-  }
-  return globalForPrisma.prisma;
+  if (globalForPrisma.prisma) return globalForPrisma.prisma;
+  if (!prismaReady) prismaReady = initializePoolAndPrisma().then(({ prisma: p }) => p);
+  // Sync callers below await via withDeadline wrappers; throwing here keeps a
+  // cold start surfacing as a retryable error instead of a hang.
+  throw new Error('[DB] Prisma client still initializing — await prismaReady');
+}
+
+/** Awaited handle for Workers paths (the Proxy forwards into it lazily). */
+export async function getPrismaClient(): Promise<PrismaClient> {
+  if (globalForPrisma.prisma) return globalForPrisma.prisma;
+  if (!prismaReady) prismaReady = initializePoolAndPrisma().then(({ prisma: p }) => p);
+  return prismaReady;
 }
 
 // ─── Cold Start Detection ───
@@ -778,6 +824,9 @@ export async function checkDatabaseConnection(): Promise<{
         total: pool.totalCount } };
   } catch (err: any) {
     const latencyMs = performance.now() - start;
+    if (String(err?.message || '').includes('unavailable on Workers')) {
+      return { ok: false, latencyMs: Math.round(latencyMs), poolStats: { idle: 0, waiting: 0, total: 0 } };
+    }
 
     // Detect cold start and trigger reconnection
     if (isColdStartError(err) && isIdleLongEnough()) {
