@@ -34,7 +34,7 @@ function publishUrl(): string {
   // live.tirbeo.com is the intended hostname; its custom-domain binding is
   // pending one dashboard click (see apps/jobs/DNS.md). Until that lands the
   // workers.dev route is the working endpoint — same Worker, same secrets.
-  return process.env.RT_PUBLISH_FALLBACK_URL || 'https://tirbeo-realtime.rexux.workers.dev/api/publish';
+  return process.env.RT_PUBLISH_FALLBACK_URL || 'https://tirbeo-realtime.bishnuneup4ne.workers.dev/api/publish';
 }
 
 export interface RtPublishTarget {

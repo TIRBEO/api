@@ -15,7 +15,7 @@
     "API_DOMAIN": "tirbeo.com",
     "PORT": "3000",
     "RT_API_TOKEN": "",
-    "RT_PUBLISH_URL": "https://tirbeo-realtime.rexux.workers.dev/api/publish",
+    "RT_PUBLISH_URL": "https://tirbeo-realtime.bishnuneup4ne.workers.dev/api/publish",
     "VAPID_PUBLIC_KEY": "",
     "VAPID_PRIVATE_KEY": "",
     "VAPID_SUBJECT": "mailto:support@tirbeo.com",
