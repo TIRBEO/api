@@ -6,7 +6,7 @@ import { signEnvelope } from '@/shared/queue-envelope';
    speed, never correctness. Requires QUEUE_ENQUEUE_URL + QUEUE_SIGNING_SECRET;
    unset means "queues off", which keeps self-hosted/dev installs unchanged. */
 
-export async function enqueueWork(kind: 'job' | 'email' | 'notify', action: string, payload: unknown): Promise<boolean> {
+export async function enqueueWork(kind: 'job' | 'email' | 'notify' | 'mail' | 'reco', action: string, payload: unknown): Promise<boolean> {
   const url = process.env.QUEUE_ENQUEUE_URL;
   if (!url || !process.env.QUEUE_SIGNING_SECRET) return false;
   try {

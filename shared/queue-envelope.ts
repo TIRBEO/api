@@ -13,7 +13,7 @@ import crypto from 'crypto';
    sides get the same value from the deployment env, and the signature covers
    body + timestamp so a leaked envelope expires in 5 minutes anyway. */
 
-export type QueueKind = 'job' | 'email' | 'notify' | 'mail';
+export type QueueKind = 'job' | 'email' | 'notify' | 'mail' | 'reco';
 
 export interface QueueEnvelope {
   kind: QueueKind;

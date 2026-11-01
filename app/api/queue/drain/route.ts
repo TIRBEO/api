@@ -47,6 +47,12 @@ export async function POST(request: NextRequest) {
         const { deliverQueuedNotification } = await import('@/features/notifications/queue-delivery');
         await deliverQueuedNotification(p.notificationId);
         results.push({ kind: env.kind, action: env.action, ok: true });
+      } else if (env.kind === 'reco') {
+        const p = env.payload as any;
+        if (!p?.userId) throw new Error('reco payload incomplete');
+        const { consumeRecoEvent } = await import('@/features/recommendations/consume');
+        await consumeRecoEvent(p);
+        results.push({ kind: env.kind, action: env.action, ok: true });
       } else if (env.kind === 'email') {
         const p = env.payload as { to?: string; subject?: string; html?: string; options?: Record<string, unknown> };
         if (!p?.to || !p?.subject) throw new Error('email payload incomplete');
