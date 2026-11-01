@@ -31,10 +31,10 @@ function publishUrl(): string {
       /* fall through to default */
     }
   }
-  // live.tirbeo.com is the route we want, but Cloudflare has not provisioned
-  // its DNS record yet (the OAuth token can't write zone records). The
-  // workers.dev hostname resolves today, so it stays the fallback until then.
-  return 'https://tirbeo-realtime.rexux.workers.dev/api/publish';
+  // live.tirbeo.com is the intended hostname; its custom-domain binding is
+  // pending one dashboard click (see apps/jobs/DNS.md). Until that lands the
+  // workers.dev route is the working endpoint — same Worker, same secrets.
+  return process.env.RT_PUBLISH_FALLBACK_URL || 'https://tirbeo-realtime.rexux.workers.dev/api/publish';
 }
 
 export interface RtPublishTarget {
