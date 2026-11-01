@@ -64,6 +64,12 @@ export async function publicHealthHandler() {
 
   // ─── Database ───
   try {
+    // Workers has no pg socket pool; the proxy would hang this query until
+    // workerd cancels the request. Fail fast with an honest shape instead.
+    const { isWorkersRuntimeLike } = await import('@/infrastructure/db/prisma');
+    if (isWorkersRuntimeLike()) {
+      throw new Error('unavailable on Workers: needs @prisma/adapter-hyperdrive');
+    }
     await prisma.$queryRaw`SELECT 1`;
     checks.database = { status: 'ok' };
   } catch (e: any) {
@@ -190,6 +196,18 @@ export async function poolHealthHandler(req: NextRequest) {
   if (!machineKey) {
     const staff = await requirePermission(req, 'dashboard.read');
     if (staff instanceof NextResponse) return staff;
+  }
+
+  // Workers has no pg socket pool (needs @prisma/adapter-hyperdrive); report
+  // that honestly instead of probing a pool that can never exist here.
+  const { isWorkersRuntimeLike } = await import('@/infrastructure/db/prisma');
+  if (isWorkersRuntimeLike()) {
+    return NextResponse.json({
+      status: 'degraded',
+      runtime: 'cloudflare-workers',
+      note: 'pg Pool unavailable on Workers — wire @prisma/adapter-hyperdrive or run the API on Node',
+      checks: { database: { status: 'error' }, redis: { status: 'ok' } },
+    });
   }
 
   const detailed = getDetailedPoolStatus();
