@@ -155,7 +155,10 @@ async function createPool(): Promise<Pool> {
   const workersSafe = isWorkersRuntimeLike();
   const pool = new Pool({
     connectionString,
-    ...POOL_CONFIG,
+    /* POOL_CONFIG carries socket-pool tuning (timeouts, keep-alive) that
+       only makes sense with a real TCP pool; on Workers the pg client would
+       hang forever waiting for a socket that can never open. */
+    ...(isWorkersRuntimeLike() ? { max: 1, min: 0, idleTimeoutMillis: 1000, connectionTimeoutMillis: 3000 } : POOL_CONFIG),
     // node-postgres lets this option outrank the connection string, so a
     // plaintext database has to be excused here too — otherwise `sslmode=disable`
     // in the URL is silently ignored and the handshake fails.
